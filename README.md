@@ -83,6 +83,8 @@ python scripts/verify_release.py
 
 Artifacts are written to `dist/`.
 
+If this repository is on GitHub, pushing a tag like `v0.1.1` also triggers `.github/workflows/release.yml`, which builds the update zip and uploads `latest.json` to the GitHub Release.
+
 ## Development Notes
 
 This project intentionally stays a thin UI. Do not add an extra agent layer that changes Claude Code behavior. When adding features, keep user data outside release artifacts and update `VERSION` before publishing.

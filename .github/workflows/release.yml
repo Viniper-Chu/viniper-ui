@@ -1,0 +1,37 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python scripts/build_release.py --version "$VERSION" --repo "$GITHUB_REPOSITORY" --notes "Viniper UI $GITHUB_REF_NAME"
+          python scripts/verify_release.py
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ViniperUI-v*.zip
+            dist/ViniperUI-v*.zip.sha256
+            dist/latest.json
+          name: Viniper UI ${{ github.ref_name }}
+          body: Viniper UI release ${{ github.ref_name }}.
