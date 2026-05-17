@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Viniper UI</title>
+  <script>
+    (() => {
+      const savedTheme = localStorage.getItem("viniper-ui:theme");
+      document.documentElement.dataset.theme = savedTheme === "dark" ? "dark" : "light";
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/style.css?v=20260517-viniper-update1">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar" aria-label="会话">
+      <header class="sidebar-header">
+        <div>
+          <div class="brand">Viniper UI</div>
+          <div id="status-line" class="subtle">DeepSeek</div>
+        </div>
+        <button id="new-chat-btn" class="icon-button" title="新建会话" aria-label="新建会话">+</button>
+      </header>
+
+      <nav id="session-list" aria-label="会话列表"></nav>
+
+      <footer class="sidebar-footer">
+        <button id="toggle-skills-btn" class="panel-button" type="button">技能库</button>
+      </footer>
+    </aside>
+
+    <main id="main">
+      <header id="topbar">
+        <div>
+          <div id="session-title">新会话</div>
+          <div id="workdir-display" class="subtle"></div>
+        </div>
+        <div id="context-meter" class="context-meter" aria-label="上下文占用">
+          <div class="context-meter-head">
+            <span id="context-label">上下文</span>
+            <span id="context-percent">0%</span>
+          </div>
+          <div class="context-track" aria-hidden="true">
+            <div id="context-fill" class="context-fill"></div>
+          </div>
+          <button id="context-compress-btn" class="context-compress-btn hidden" type="button">压缩</button>
+        </div>
+        <div class="topbar-actions">
+          <button id="update-btn" class="ghost-button update-button" type="button" title="检查更新">更新</button>
+          <button id="theme-toggle-btn" class="theme-toggle-btn" type="button" title="切换主题" aria-label="切换主题">
+            <span id="theme-toggle-icon" aria-hidden="true">☀</span>
+            <span id="theme-toggle-text">浅色</span>
+          </button>
+          <label class="model-picker" for="model-select">
+            <span>模型</span>
+            <select id="model-select" aria-label="选择模型"></select>
+          </label>
+          <label class="permission-picker" for="permission-select">
+            <span>权限</span>
+            <select id="permission-select" aria-label="选择权限模式"></select>
+          </label>
+          <button id="change-workdir-btn" class="ghost-button" type="button">目录</button>
+        </div>
+      </header>
+
+      <section id="chat-container" aria-live="polite">
+        <div id="messages"></div>
+        <div id="thinking" class="hidden">
+          <span class="spinner"></span>
+          <span>正在生成</span>
+        </div>
+      </section>
+
+      <section id="input-area">
+        <div id="context-files"></div>
+        <div id="composer">
+          <textarea id="user-input" rows="1" placeholder="输入消息" autofocus></textarea>
+          <div id="input-actions">
+            <button id="file-btn" class="icon-button" title="附加文件" aria-label="附加文件">＋</button>
+            <input id="file-input" type="file" hidden multiple>
+            <button id="stop-btn" class="stop-button hidden" type="button" title="停止当前任务" aria-label="停止当前任务">■</button>
+            <button id="send-btn" class="send-button" title="发送" aria-label="发送">↵</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <aside id="skills-panel" class="hidden" aria-label="技能库">
+      <header class="skills-header">
+        <strong>技能库</strong>
+        <button id="close-skills-btn" class="icon-button" title="关闭" aria-label="关闭">×</button>
+      </header>
+      <div class="skills-search">
+        <input id="skill-search" type="search" placeholder="搜索技能">
+      </div>
+      <div id="skills-categories"></div>
+      <div id="skills-list"></div>
+      <div id="skill-detail" class="hidden">
+        <button id="back-to-skills" class="ghost-button" type="button">返回</button>
+        <article id="skill-detail-content"></article>
+        <button id="use-skill-btn" class="primary-button" type="button">插入技能</button>
+      </div>
+    </aside>
+  </div>
+
+  <div id="new-session-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="new-session-title">
+    <div class="modal-content">
+      <h2 id="new-session-title">新建会话</h2>
+      <label for="new-session-name">名称</label>
+      <input id="new-session-name" type="text" placeholder="例如：网页修复">
+      <label for="new-session-workdir">工作目录</label>
+      <input id="new-session-workdir" type="text" placeholder="留空使用默认目录">
+      <div class="modal-actions">
+        <button id="cancel-session-btn" class="ghost-button" type="button">取消</button>
+        <button id="create-session-btn" class="primary-button" type="button">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="update-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="update-title">
+    <div class="modal-content update-modal-content">
+      <h2 id="update-title">发现新版本</h2>
+      <p id="update-summary" class="modal-copy"></p>
+      <div id="update-notes" class="update-notes"></div>
+      <div class="modal-actions">
+        <button id="cancel-update-btn" class="ghost-button" type="button">稍后</button>
+        <button id="install-update-btn" class="primary-button" type="button">立即更新</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="permission-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="permission-title">
+    <div class="modal-content permission-modal-content">
+      <h2 id="permission-title">允许本次 Viniper UI 调用 Claude Code 执行？</h2>
+      <p class="modal-copy">这个任务可能需要读取/修改文件、运行命令或打开本地程序。确认后只会授权本次请求，避免网页流式模式卡在权限等待。</p>
+      <div class="permission-request">
+        <div class="permission-request-label">请求</div>
+        <div id="permission-summary"></div>
+      </div>
+      <div class="permission-workdir">
+        <span>目录</span>
+        <code id="permission-workdir"></code>
+      </div>
+      <div class="modal-actions">
+        <button id="deny-permission-btn" class="ghost-button" type="button">取消</button>
+        <button id="allow-once-btn" class="primary-button" type="button">仅本次允许</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=20260517-viniper-update1"></script>
+</body>
+</html>

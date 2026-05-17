@@ -1,0 +1,5 @@
+{
+  "repository": "your-github-name/viniper-ui",
+  "manifest_url": "https://github.com/your-github-name/viniper-ui/releases/latest/download/latest.json",
+  "channel": "stable"
+}

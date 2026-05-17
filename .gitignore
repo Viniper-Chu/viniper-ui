@@ -1,0 +1,24 @@
+# Runtime data
+data/
+tmp/
+*.log
+verify_server.log
+update_source.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build output
+dist/
+*.zip
+*.tar.gz
+
+# Local/editor files
+.env
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
