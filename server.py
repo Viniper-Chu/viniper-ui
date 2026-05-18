@@ -389,7 +389,7 @@ def find_update_app_root(extract_dir: Path) -> Path:
 def copy_update_tree(src: Path, dst: Path) -> None:
     backup_dir = DATA_DIR / "update-backups" / time.strftime("%Y%m%d-%H%M%S")
     backup_dir.mkdir(parents=True, exist_ok=True)
-    allowed_files = ["server.py", "requirements.txt", "VERSION", "update_source.json"]
+    allowed_files = ["server.py", "requirements.txt", "VERSION", "update_source.json", "start.bat"]
     allowed_dirs = ["static"]
 
     for name in allowed_files:
@@ -1500,7 +1500,7 @@ async def install_update(request: Request):
             "previous_version": APP_VERSION,
             "latest_version": latest_version,
             "restart_required": True,
-            "message": "更新已安装。请关闭当前窗口并重新打开 Viniper UI，或重启本地服务以加载新版后端。",
+            "message": "更新已安装到磁盘。请关闭当前浏览器窗口并重新双击 Viniper UI；启动器会自动停止旧服务并打开新版。",
             "asset": result.get("asset", {}),
             "dependencies": result.get("dependencies", ""),
         }
