@@ -40,6 +40,9 @@ def main() -> int:
         require(path)
 
     package = json.loads((DESKTOP / "package.json").read_text(encoding="utf-8"))
+    root_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    if package.get("version") != root_version:
+        raise SystemExit("desktop package version must match VERSION")
     if package.get("build", {}).get("productName") != "Viniper UI":
         raise SystemExit("desktop package productName must be Viniper UI")
     if not package.get("build", {}).get("extraResources"):
@@ -50,6 +53,8 @@ def main() -> int:
         raise SystemExit("desktop shell must disable automatic browser launch when it starts the server")
     if "requestSingleInstanceLock" not in main_js:
         raise SystemExit("desktop shell must keep a single running instance")
+    if "runDiagnosticsDialog" not in main_js:
+        raise SystemExit("desktop shell must expose a self-check action")
 
     server_py = (ROOT / "server.py").read_text(encoding="utf-8")
     if "VINIPER_UI_OPEN_BROWSER" not in server_py:

@@ -7,7 +7,10 @@
   <script>
     (() => {
       const savedTheme = localStorage.getItem("viniper-ui:theme");
-      document.documentElement.dataset.theme = savedTheme === "dark" ? "dark" : "light";
+      const savedAccent = localStorage.getItem("viniper-ui:accent") || "husky";
+      const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+      document.documentElement.dataset.theme = savedTheme === "dark" || (savedTheme === "system" && prefersDark) ? "dark" : "light";
+      document.documentElement.dataset.accent = savedAccent;
     })();
   </script>
   <link rel="icon" href="/favicon.ico?v=20260518-husky1">
@@ -53,6 +56,7 @@
             <span id="theme-toggle-icon" aria-hidden="true">☀</span>
             <span id="theme-toggle-text">浅色</span>
           </button>
+          <button id="settings-btn" class="ghost-button" type="button">设置</button>
           <label class="model-picker" for="model-select">
             <span>模型</span>
             <select id="model-select" aria-label="选择模型"></select>
@@ -146,6 +150,70 @@
       <div class="modal-actions">
         <button id="deny-permission-btn" class="ghost-button" type="button">取消</button>
         <button id="allow-once-btn" class="primary-button" type="button">仅本次允许</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-content settings-modal-content">
+      <div class="settings-head">
+        <div>
+          <h2 id="settings-title">设置</h2>
+          <p class="modal-copy">配置外观、模型供应商、Agent 壳和本地账号。API Key 只保存在这台电脑。</p>
+        </div>
+        <button id="close-settings-btn" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button>
+      </div>
+
+      <div class="settings-grid">
+        <section class="settings-section">
+          <h3>账号</h3>
+          <label for="settings-display-name">显示名称</label>
+          <input id="settings-display-name" type="text" autocomplete="name">
+          <label class="check-row">
+            <input id="settings-signed-in" type="checkbox">
+            <span>启用本地账号状态</span>
+          </label>
+        </section>
+
+        <section class="settings-section">
+          <h3>外观</h3>
+          <label for="settings-language">语言</label>
+          <select id="settings-language"></select>
+          <label for="settings-theme">主题</label>
+          <select id="settings-theme"></select>
+          <label for="settings-accent">颜色</label>
+          <select id="settings-accent"></select>
+        </section>
+
+        <section class="settings-section">
+          <h3>Agent 壳</h3>
+          <label for="settings-shell">壳</label>
+          <select id="settings-shell"></select>
+          <p class="settings-help">当前生产通道使用 Claude Code。自定义 CLI 入口已预留，后续可以接入 Codex、Aider 或其他本地 Agent。</p>
+        </section>
+
+        <section class="settings-section">
+          <h3>模型供应商</h3>
+          <label for="settings-provider-label">供应商名称</label>
+          <input id="settings-provider-label" type="text" placeholder="DeepSeek">
+          <label for="settings-base-url">Base URL</label>
+          <input id="settings-base-url" type="url" placeholder="https://api.deepseek.com/anthropic">
+          <label for="settings-api-key">API Key</label>
+          <input id="settings-api-key" type="password" placeholder="留空表示保持当前密钥">
+          <label for="settings-provider-model">默认模型</label>
+          <select id="settings-provider-model"></select>
+          <label for="settings-models">模型列表</label>
+          <textarea id="settings-models" rows="5" spellcheck="false" placeholder="model-id | 显示名称 | 上下文长度"></textarea>
+          <p class="settings-help">每行一个模型，例如：deepseek-v4-pro[1m] | DeepSeek V4 Pro | 200000</p>
+        </section>
+      </div>
+
+      <div id="diagnostics-panel" class="diagnostics-panel"></div>
+
+      <div class="modal-actions">
+        <button id="run-diagnostics-btn" class="ghost-button" type="button">运行自检</button>
+        <button id="cancel-settings-btn" class="ghost-button" type="button">取消</button>
+        <button id="save-settings-btn" class="primary-button" type="button">保存设置</button>
       </div>
     </div>
   </div>

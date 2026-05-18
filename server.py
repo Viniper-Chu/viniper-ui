@@ -89,17 +89,49 @@ UPDATE_SOURCE_FILE = VERSION_FILE.with_name("update_source.json")
 UPDATE_MANIFEST_URL_ENV = env_value("VINIPER_UI_UPDATE_MANIFEST_URL", "").strip()
 UPDATE_REPOSITORY_ENV = env_value("VINIPER_UI_UPDATE_REPO", "").strip()
 UPDATE_HTTP_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_UPDATE_TIMEOUT", "45"))
+DEFAULT_CONTEXT_LIMIT = 128000
 MODEL_OPTIONS = [
     {
         "id": "deepseek-v4-pro[1m]",
         "label": "DeepSeek V4 Pro",
         "description": "Complex coding and long context work",
+        "context": 200000,
     },
     {
         "id": "deepseek-v4-flash",
         "label": "DeepSeek V4 Flash",
         "description": "Faster daily work",
+        "context": 128000,
     },
+]
+SHELL_OPTIONS = [
+    {
+        "id": "claude-code",
+        "label": "Claude Code",
+        "description": "Run the Claude Code CLI as the agent shell.",
+        "available": True,
+    },
+    {
+        "id": "custom-cli",
+        "label": "Custom CLI",
+        "description": "Reserved for future external agent shells with a command template.",
+        "available": False,
+    },
+]
+LANGUAGE_OPTIONS = [
+    {"id": "zh-CN", "label": "简体中文"},
+    {"id": "en-US", "label": "English"},
+]
+THEME_OPTIONS = [
+    {"id": "system", "label": "跟随系统"},
+    {"id": "light", "label": "浅色"},
+    {"id": "dark", "label": "深色"},
+]
+ACCENT_OPTIONS = [
+    {"id": "husky", "label": "Husky"},
+    {"id": "blue", "label": "Ocean"},
+    {"id": "green", "label": "Forest"},
+    {"id": "rose", "label": "Rose"},
 ]
 
 MOJIBAKE_MARKERS = (
@@ -172,6 +204,7 @@ def default_data_dir() -> Path:
 DATA_DIR = default_data_dir()
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
 KNOWN_WORK_DIRS = [
     BASE_DIR,
     Path("D:/高中数学交流app"),
@@ -244,6 +277,125 @@ def save_sessions_to_disk() -> None:
     tmp_path = SESSIONS_FILE.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(sessions, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(SESSIONS_FILE)
+
+
+def default_settings() -> dict[str, Any]:
+    return {
+        "account": {
+            "display_name": "Viniper 用户",
+            "signed_in": False,
+        },
+        "appearance": {
+            "language": "zh-CN",
+            "theme": "system",
+            "accent": "husky",
+        },
+        "shell": {
+            "id": "claude-code",
+            "custom_command": "",
+        },
+        "provider": {
+            "id": "deepseek",
+            "label": "DeepSeek",
+            "base_url": "https://api.deepseek.com/anthropic",
+            "api_key": "",
+            "model": "deepseek-v4-pro[1m]",
+            "models": MODEL_OPTIONS,
+        },
+        "desktop": {
+            "open_at_login": False,
+            "minimize_to_tray": True,
+        },
+    }
+
+
+def merge_dict(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_dict(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def normalize_model_options(value: Any) -> list[dict[str, Any]]:
+    raw_items = value if isinstance(value, list) else MODEL_OPTIONS
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        label = str(item.get("label") or model_id).strip()
+        description = str(item.get("description") or "").strip()
+        try:
+            context = int(item.get("context") or DEFAULT_CONTEXT_LIMIT)
+        except Exception:
+            context = DEFAULT_CONTEXT_LIMIT
+        normalized.append(
+            {
+                "id": model_id,
+                "label": label,
+                "description": description,
+                "context": max(context, 8192),
+            }
+        )
+    return normalized or [dict(item) for item in MODEL_OPTIONS]
+
+
+def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    settings = merge_dict(default_settings(), raw or {})
+    appearance = settings["appearance"]
+    if appearance.get("language") not in {item["id"] for item in LANGUAGE_OPTIONS}:
+        appearance["language"] = "zh-CN"
+    if appearance.get("theme") not in {item["id"] for item in THEME_OPTIONS}:
+        appearance["theme"] = "system"
+    if appearance.get("accent") not in {item["id"] for item in ACCENT_OPTIONS}:
+        appearance["accent"] = "husky"
+
+    shell = settings["shell"]
+    if shell.get("id") not in {item["id"] for item in SHELL_OPTIONS}:
+        shell["id"] = "claude-code"
+
+    provider = settings["provider"]
+    provider["base_url"] = str(provider.get("base_url") or "https://api.deepseek.com/anthropic").strip()
+    provider["api_key"] = str(provider.get("api_key") or "").strip()
+    provider["models"] = normalize_model_options(provider.get("models"))
+    ids = {item["id"] for item in provider["models"]}
+    if provider.get("model") not in ids:
+        provider["model"] = provider["models"][0]["id"]
+    return settings
+
+
+def load_app_settings() -> dict[str, Any]:
+    if not SETTINGS_FILE.exists():
+        return normalize_settings()
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    return normalize_settings(raw if isinstance(raw, dict) else {})
+
+
+def save_app_settings(settings: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    normalized = normalize_settings(settings)
+    tmp_path = SETTINGS_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(SETTINGS_FILE)
+
+
+def public_settings(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    safe = json.loads(json.dumps(settings or load_app_settings(), ensure_ascii=False))
+    provider = safe.get("provider", {})
+    api_key = str(provider.get("api_key") or "")
+    provider["api_key"] = ""
+    provider["api_key_configured"] = bool(api_key or merged_env(include_app_settings=False).get("ANTHROPIC_AUTH_TOKEN") or merged_env(include_app_settings=False).get("ANTHROPIC_API_KEY"))
+    return safe
 
 
 def read_sessions_file(path: Path) -> dict[str, Any]:
@@ -612,9 +764,20 @@ def load_claude_settings() -> dict[str, Any]:
         return {}
 
 
-def merged_env() -> dict[str, str]:
+def merged_env(include_app_settings: bool = True) -> dict[str, str]:
     settings_env = load_claude_settings().get("env", {})
     result = {k: str(v) for k, v in settings_env.items() if v is not None}
+    if include_app_settings:
+        provider = load_app_settings().get("provider", {})
+        api_key = str(provider.get("api_key") or "").strip()
+        base_url = str(provider.get("base_url") or "").strip()
+        model = str(provider.get("model") or "").strip()
+        if api_key:
+            result["ANTHROPIC_AUTH_TOKEN"] = api_key
+        if base_url:
+            result["ANTHROPIC_BASE_URL"] = base_url
+        if model:
+            result["ANTHROPIC_MODEL"] = model
     for key in (
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_API_KEY",
@@ -628,12 +791,17 @@ def merged_env() -> dict[str, str]:
     return result
 
 
+def effective_model_options() -> list[dict[str, Any]]:
+    return normalize_model_options(load_app_settings().get("provider", {}).get("models"))
+
+
 def allowed_model(model: str | None) -> str:
-    ids = {item["id"] for item in MODEL_OPTIONS}
+    models = effective_model_options()
+    ids = {item["id"] for item in models}
     if model in ids:
         return str(model)
-    configured = merged_env().get("ANTHROPIC_MODEL", "deepseek-v4-pro[1m]")
-    return configured if configured in ids else "deepseek-v4-pro[1m]"
+    configured = merged_env().get("ANTHROPIC_MODEL", models[0]["id"])
+    return configured if configured in ids else models[0]["id"]
 
 
 def allowed_permission_mode(permission_mode: str | None) -> str:
@@ -1577,6 +1745,7 @@ async def favicon():
 async def status():
     cfg = deepseek_config()
     update_source = read_update_source()
+    settings = public_settings()
     return {
         "ok": True,
         "mode": "claude-code-cli",
@@ -1586,15 +1755,100 @@ async def status():
         "base_url": cfg["base_url"],
         "messages_url": messages_url(cfg["base_url"]),
         "model": cfg["model"],
-        "models": MODEL_OPTIONS,
+        "models": effective_model_options(),
+        "settings": settings,
+        "shells": SHELL_OPTIONS,
+        "languages": LANGUAGE_OPTIONS,
+        "themes": THEME_OPTIONS,
+        "accents": ACCENT_OPTIONS,
         "claude_available": claude_available(),
         "permission_mode": DEFAULT_PERMISSION_MODE,
         "permission_modes": PERMISSION_MODE_OPTIONS,
+        "data_dir": str(DATA_DIR),
         "update": {
             "configured": bool(update_source.get("manifest_url")),
             "repository": update_source.get("repository", ""),
             "manifest_url": update_source.get("manifest_url", ""),
         },
+    }
+
+
+@app.get("/api/settings")
+async def get_settings():
+    return {
+        "ok": True,
+        "settings": public_settings(),
+        "shells": SHELL_OPTIONS,
+        "languages": LANGUAGE_OPTIONS,
+        "themes": THEME_OPTIONS,
+        "accents": ACCENT_OPTIONS,
+        "models": effective_model_options(),
+    }
+
+
+@app.put("/api/settings")
+async def update_settings(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="settings body must be an object")
+
+    current = load_app_settings()
+    incoming = body.get("settings") if isinstance(body.get("settings"), dict) else body
+    merged = merge_dict(current, incoming)
+
+    incoming_provider = incoming.get("provider") if isinstance(incoming.get("provider"), dict) else {}
+    if not incoming_provider.get("api_key"):
+        merged["provider"]["api_key"] = current.get("provider", {}).get("api_key", "")
+    if incoming_provider.get("clear_api_key") is True:
+        merged["provider"]["api_key"] = ""
+
+    save_app_settings(merged)
+    return {
+        "ok": True,
+        "settings": public_settings(load_app_settings()),
+        "models": effective_model_options(),
+    }
+
+
+@app.get("/api/diagnostics")
+async def diagnostics():
+    cfg = deepseek_config()
+    checks = [
+        {
+            "id": "python",
+            "label": "Python",
+            "ok": True,
+            "detail": sys.version.split()[0],
+        },
+        {
+            "id": "claude",
+            "label": "Claude Code CLI",
+            "ok": claude_available(),
+            "detail": "available" if claude_available() else "not found on PATH",
+        },
+        {
+            "id": "provider",
+            "label": "Model provider",
+            "ok": bool(cfg["api_key"] and cfg["base_url"]),
+            "detail": messages_url(cfg["base_url"]),
+        },
+        {
+            "id": "data",
+            "label": "User data",
+            "ok": DATA_DIR.exists() or DATA_DIR.parent.exists(),
+            "detail": str(DATA_DIR),
+        },
+        {
+            "id": "static",
+            "label": "Static assets",
+            "ok": STATIC_DIR.exists() and (STATIC_DIR / "app.js").exists(),
+            "detail": str(STATIC_DIR),
+        },
+    ]
+    return {
+        "ok": all(item["ok"] for item in checks),
+        "version": APP_VERSION,
+        "checks": checks,
     }
 
 

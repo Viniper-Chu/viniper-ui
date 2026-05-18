@@ -48,6 +48,48 @@
   --button-on-accent: #fffaf4;
 }
 
+:root[data-accent="blue"] {
+  --accent: #3778c2;
+  --accent-strong: #245f9f;
+  --focus: rgba(55, 120, 194, 0.16);
+  --link: #1f65ad;
+}
+
+:root[data-theme="dark"][data-accent="blue"] {
+  --accent: #6da8e8;
+  --accent-strong: #8fbdf0;
+  --focus: rgba(109, 168, 232, 0.16);
+  --link: #9fc5ff;
+}
+
+:root[data-accent="green"] {
+  --accent: #3f8b68;
+  --accent-strong: #2f7154;
+  --focus: rgba(63, 139, 104, 0.16);
+  --link: #2d6f58;
+}
+
+:root[data-theme="dark"][data-accent="green"] {
+  --accent: #78bd92;
+  --accent-strong: #93d0a9;
+  --focus: rgba(120, 189, 146, 0.15);
+  --link: #a8d7be;
+}
+
+:root[data-accent="rose"] {
+  --accent: #c45572;
+  --accent-strong: #a9405c;
+  --focus: rgba(196, 85, 114, 0.16);
+  --link: #a43f64;
+}
+
+:root[data-theme="dark"][data-accent="rose"] {
+  --accent: #e98aa0;
+  --accent-strong: #f1a3b3;
+  --focus: rgba(233, 138, 160, 0.15);
+  --link: #f0b3c0;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -969,6 +1011,122 @@ textarea:disabled {
   width: min(560px, 100%);
 }
 
+.settings-modal-content {
+  width: min(980px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+}
+
+.settings-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.settings-head h2 {
+  margin: 0 0 4px;
+}
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.settings-section {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg);
+}
+
+.settings-section h3 {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+
+.settings-section label {
+  display: block;
+  margin: 10px 0 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.settings-section input,
+.settings-section select,
+.settings-section textarea {
+  width: 100%;
+  min-height: 34px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  outline: 0;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.settings-section textarea {
+  resize: vertical;
+  min-height: 116px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.settings-section input:focus,
+.settings-section select:focus,
+.settings-section textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--focus);
+}
+
+.check-row {
+  display: flex !important;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px !important;
+  color: var(--text-soft) !important;
+}
+
+.check-row input {
+  width: auto;
+  min-height: 0;
+}
+
+.settings-help {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.diagnostics-panel {
+  margin-top: 14px;
+  display: grid;
+  gap: 6px;
+}
+
+.diagnostic-row {
+  display: grid;
+  grid-template-columns: 86px 1fr;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-soft);
+  color: var(--text-soft);
+  font-size: 13px;
+}
+
+.diagnostic-row.ok strong {
+  color: var(--green);
+}
+
+.diagnostic-row.fail strong {
+  color: var(--red);
+}
+
 .permission-request {
   padding: 12px;
   border: 1px solid var(--line);
@@ -1046,6 +1204,10 @@ textarea:disabled {
 }
 
 @media (max-width: 900px) {
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+
   #sidebar {
     width: 230px;
     flex-basis: 230px;

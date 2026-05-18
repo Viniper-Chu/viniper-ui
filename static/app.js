@@ -12,6 +12,9 @@ const state = {
   selectedModel: "deepseek-v4-pro[1m]",
   permissionMode: "ask",
   theme: "light",
+  language: "zh-CN",
+  accent: "husky",
+  settings: null,
   updateInfo: null,
   abortController: null,
   cancelRequested: false,
@@ -25,6 +28,8 @@ const LAST_SESSION_KEY = `${STORAGE_PREFIX}last-session-id`;
 const MODEL_KEY = `${STORAGE_PREFIX}selected-model`;
 const PERMISSION_KEY = `${STORAGE_PREFIX}permission-mode`;
 const THEME_KEY = `${STORAGE_PREFIX}theme`;
+const LANGUAGE_KEY = `${STORAGE_PREFIX}language`;
+const ACCENT_KEY = `${STORAGE_PREFIX}accent`;
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 
 function storageGet(key) {
@@ -64,6 +69,46 @@ const PERMISSION_MODES = [
 const PERMISSION_ACTION_RE = /(打开|运行|执行|安装|删除|修改|修复|编辑|写入|新建|创建|转换|导出|保存|移动|复制|重命名|启动|停止|读取|扫描|部署|提交|克隆|下载)/i;
 const PERMISSION_TARGET_RE = /(文件|目录|文件夹|项目|仓库|网页|网站|浏览器|桌面|快捷方式|程序|应用|服务|word|excel|pdf|docx|xlsx|ppt|pptx|powershell|cmd|bash|npm|pnpm|yarn|pip|python|node|git|github|skill|app|端口|服务器)/i;
 const PERMISSION_DIRECT_RE = /([a-z]:[\\/]|\\\\|\\.(docx|xlsx|pptx|pdf|zip|exe|bat|cmd|ps1|html|css|json|md)\\b|powershell\\s+-|cmd\\.exe|npm\\s+|pnpm\\s+|yarn\\s+|pip\\s+|git\\s+(clone|pull|push|commit|status|checkout|merge|fetch)|github|skill)/i;
+const I18N = {
+  "zh-CN": {
+    newChat: "新建会话",
+    skills: "技能库",
+    settings: "设置",
+    model: "模型",
+    permission: "权限",
+    directory: "目录",
+    inputPlaceholder: "输入消息",
+    attach: "添加附件",
+    stop: "停止当前任务",
+    send: "发送",
+    themeLight: "浅色",
+    themeDark: "深色",
+    themeSystem: "系统",
+    connected: "已连接",
+    waitingKey: "等待配置 API key",
+    thinking: "正在生成",
+    update: "更新"
+  },
+  "en-US": {
+    newChat: "New chat",
+    skills: "Skills",
+    settings: "Settings",
+    model: "Model",
+    permission: "Permission",
+    directory: "Directory",
+    inputPlaceholder: "Message",
+    attach: "Attach file",
+    stop: "Stop current task",
+    send: "Send",
+    themeLight: "Light",
+    themeDark: "Dark",
+    themeSystem: "System",
+    connected: "connected",
+    waitingKey: "Waiting for API key",
+    thinking: "Generating",
+    update: "Update"
+  }
+};
 
 function estimateTokens(text) {
   return Math.ceil((text || "").length / 3);
@@ -78,38 +123,106 @@ function totalHistoryTokens() {
 }
 
 function getContextLimit() {
+  const model = (state.status?.models || []).find((item) => item.id === state.selectedModel);
+  if (model?.context) return Number(model.context) || DEFAULT_CONTEXT_LIMIT;
   return CONTEXT_LIMITS[state.selectedModel] || DEFAULT_CONTEXT_LIMIT;
+}
+
+function applySettingsFromServer(settings) {
+  if (!settings || typeof settings !== "object") return;
+  state.settings = settings;
+  const appearance = settings.appearance || {};
+  applyLanguage(appearance.language || state.language);
+  applyAccent(appearance.accent || state.accent);
+  applyTheme(appearance.theme || state.theme);
 }
 
 function getInitialTheme() {
   const savedTheme = storageGet(THEME_KEY);
-  return savedTheme === "dark" ? "dark" : "light";
+  return ["system", "light", "dark"].includes(savedTheme) ? savedTheme : "system";
 }
 
 function applyTheme(theme) {
-  state.theme = theme === "dark" ? "dark" : "light";
-  document.documentElement.dataset.theme = state.theme;
+  state.theme = ["system", "light", "dark"].includes(theme) ? theme : "system";
+  const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = state.theme === "system"
+    ? (prefersDark ? "dark" : "light")
+    : state.theme;
   storageSet(THEME_KEY, state.theme);
   updateThemeButton();
+}
+
+function getInitialLanguage() {
+  const savedLanguage = storageGet(LANGUAGE_KEY);
+  return savedLanguage === "en-US" ? "en-US" : "zh-CN";
+}
+
+function applyLanguage(language) {
+  state.language = language === "en-US" ? "en-US" : "zh-CN";
+  document.documentElement.lang = state.language;
+  storageSet(LANGUAGE_KEY, state.language);
+  translateChrome();
+}
+
+function getInitialAccent() {
+  const savedAccent = storageGet(ACCENT_KEY);
+  return ["husky", "blue", "green", "rose"].includes(savedAccent) ? savedAccent : "husky";
+}
+
+function applyAccent(accent) {
+  state.accent = ["husky", "blue", "green", "rose"].includes(accent) ? accent : "husky";
+  document.documentElement.dataset.accent = state.accent;
+  storageSet(ACCENT_KEY, state.accent);
+}
+
+function t(key) {
+  return (I18N[state.language] || I18N["zh-CN"])[key] || I18N["zh-CN"][key] || key;
+}
+
+function translateChrome() {
+  $("#new-chat-btn").title = t("newChat");
+  $("#new-chat-btn").setAttribute("aria-label", t("newChat"));
+  $("#toggle-skills-btn").textContent = t("skills");
+  $("#settings-btn").textContent = t("settings");
+  $(".model-picker span").textContent = t("model");
+  $(".permission-picker span").textContent = t("permission");
+  $("#change-workdir-btn").textContent = t("directory");
+  $("#user-input").placeholder = t("inputPlaceholder");
+  $("#file-btn").title = t("attach");
+  $("#file-btn").setAttribute("aria-label", t("attach"));
+  $("#stop-btn").title = t("stop");
+  $("#stop-btn").setAttribute("aria-label", t("stop"));
+  $("#send-btn").title = t("send");
+  $("#send-btn").setAttribute("aria-label", t("send"));
+  $("#thinking span:last-child").textContent = t("thinking");
+  updateThemeButton();
+  updateModelLabels();
+  renderUpdateButton();
 }
 
 function updateThemeButton() {
   const button = $("#theme-toggle-btn");
   if (!button) return;
 
-  const isDark = state.theme === "dark";
-  $("#theme-toggle-icon").textContent = isDark ? "☾" : "☀";
-  $("#theme-toggle-text").textContent = isDark ? "深色" : "浅色";
-  button.title = isDark ? "切换到浅色主题" : "切换到深色主题";
+  const applied = document.documentElement.dataset.theme;
+  $("#theme-toggle-icon").textContent = state.theme === "system" ? "◐" : (applied === "dark" ? "☾" : "☀");
+  $("#theme-toggle-text").textContent = state.theme === "system"
+    ? t("themeSystem")
+    : (applied === "dark" ? t("themeDark") : t("themeLight"));
+  button.title = t("themeSystem");
   button.setAttribute("aria-label", button.title);
 }
 
 function toggleTheme() {
-  applyTheme(state.theme === "dark" ? "light" : "dark");
+  const order = ["light", "dark", "system"];
+  const index = order.indexOf(state.theme);
+  applyTheme(order[(index + 1) % order.length]);
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  applyAccent(getInitialAccent());
   applyTheme(getInitialTheme());
+  applyLanguage(getInitialLanguage());
   bindEvents();
   await loadStatus();
   await loadSkills();
@@ -148,6 +261,12 @@ function bindEvents() {
   $("#cancel-update-btn").addEventListener("click", closeUpdateModal);
   $("#install-update-btn").addEventListener("click", installUpdate);
   $("#theme-toggle-btn").addEventListener("click", toggleTheme);
+  $("#settings-btn").addEventListener("click", openSettingsModal);
+  $("#close-settings-btn").addEventListener("click", closeSettingsModal);
+  $("#cancel-settings-btn").addEventListener("click", closeSettingsModal);
+  $("#save-settings-btn").addEventListener("click", saveSettings);
+  $("#run-diagnostics-btn").addEventListener("click", runDiagnostics);
+  $("#settings-models").addEventListener("input", renderSettingsModelSelect);
   $("#model-select").addEventListener("change", (event) => {
     state.selectedModel = event.target.value;
     storageSet(MODEL_KEY, state.selectedModel);
@@ -170,9 +289,16 @@ function bindEvents() {
     if (event.key === "Escape") {
       closePermissionModal(false);
       closeNewSessionModal();
+      closeSettingsModal();
       $("#skills-panel").classList.add("hidden");
     }
   });
+
+  if (window.matchMedia) {
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      if (state.theme === "system") applyTheme("system");
+    });
+  }
 
   document.addEventListener("click", (event) => {
     const copyButton = event.target.closest("[data-copy]");
@@ -200,6 +326,7 @@ async function loadStatus() {
   try {
     const response = await fetch("/api/status");
     state.status = await response.json();
+    applySettingsFromServer(state.status.settings);
     const rememberedModel = storageGet(MODEL_KEY);
     const available = (state.status.models || []).map((model) => model.id);
     state.selectedModel = available.includes(rememberedModel)
@@ -211,6 +338,7 @@ async function loadStatus() {
     updateModelLabels();
     updateContextMeter();
     renderUpdateButton();
+    translateChrome();
   } catch {
     $("#status-line").textContent = "服务未就绪";
   }
@@ -220,7 +348,7 @@ function renderUpdateButton() {
   const button = $("#update-btn");
   if (!button) return;
 
-  const version = state.status?.version ? `v${state.status.version}` : "更新";
+  const version = state.status?.version ? `v${state.status.version}` : t("update");
   if (state.updateInfo?.update_available) {
     button.textContent = `更新 ${state.updateInfo.latest_version || ""}`.trim();
     button.classList.add("update-available");
@@ -311,6 +439,178 @@ async function installUpdate() {
   }
 }
 
+function modelsToText(models = []) {
+  return models.map((model) => [
+    model.id || "",
+    model.label || model.id || "",
+    model.context || ""
+  ].join(" | ")).join("\n");
+}
+
+function parseModelsText(text) {
+  const models = [];
+  const seen = new Set();
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parts = line.split("|").map((part) => part.trim());
+    const id = parts[0];
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const context = Number(parts[2] || DEFAULT_CONTEXT_LIMIT);
+    models.push({
+      id,
+      label: parts[1] || id,
+      description: "",
+      context: Number.isFinite(context) ? Math.max(context, 8192) : DEFAULT_CONTEXT_LIMIT
+    });
+  }
+  return models.length ? models : [
+    { id: "deepseek-v4-pro[1m]", label: "DeepSeek V4 Pro", description: "", context: 200000 },
+    { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", description: "", context: 128000 }
+  ];
+}
+
+function renderSettingsOptions(select, options, selected) {
+  select.innerHTML = options.map((item) => `
+    <option value="${escapeAttr(item.id)}"${item.available === false ? " disabled" : ""}>
+      ${escapeHtml(item.label || item.id)}
+    </option>
+  `).join("");
+  select.value = selected;
+}
+
+function renderSettingsModelSelect() {
+  const select = $("#settings-provider-model");
+  if (!select) return;
+  const previous = select.value || state.settings?.provider?.model || state.selectedModel;
+  const models = parseModelsText($("#settings-models").value);
+  select.innerHTML = models.map((model) => `
+    <option value="${escapeAttr(model.id)}">${escapeHtml(model.label || model.id)}</option>
+  `).join("");
+  select.value = models.some((model) => model.id === previous) ? previous : models[0]?.id || "";
+}
+
+async function openSettingsModal() {
+  try {
+    const response = await fetch("/api/settings");
+    const data = await response.json();
+    if (data.settings) {
+      state.settings = data.settings;
+      state.status = {
+        ...(state.status || {}),
+        shells: data.shells,
+        languages: data.languages,
+        themes: data.themes,
+        accents: data.accents,
+        models: data.models
+      };
+    }
+  } catch {}
+
+  const settings = state.settings || state.status?.settings || {};
+  const account = settings.account || {};
+  const appearance = settings.appearance || {};
+  const shell = settings.shell || {};
+  const provider = settings.provider || {};
+
+  $("#settings-display-name").value = account.display_name || "";
+  $("#settings-signed-in").checked = Boolean(account.signed_in);
+  renderSettingsOptions($("#settings-language"), state.status?.languages || [], appearance.language || state.language);
+  renderSettingsOptions($("#settings-theme"), state.status?.themes || [], appearance.theme || state.theme);
+  renderSettingsOptions($("#settings-accent"), state.status?.accents || [], appearance.accent || state.accent);
+  renderSettingsOptions($("#settings-shell"), state.status?.shells || [], shell.id || "claude-code");
+  $("#settings-provider-label").value = provider.label || "DeepSeek";
+  $("#settings-base-url").value = provider.base_url || "";
+  $("#settings-api-key").value = "";
+  $("#settings-api-key").placeholder = provider.api_key_configured ? "已保存，留空保持不变" : "输入 API Key";
+  $("#settings-models").value = modelsToText(provider.models || state.status?.models || []);
+  renderSettingsModelSelect();
+  $("#settings-provider-model").value = provider.model || state.selectedModel;
+  $("#diagnostics-panel").innerHTML = "";
+  $("#settings-modal").classList.remove("hidden");
+  $("#settings-display-name").focus();
+}
+
+function closeSettingsModal() {
+  const modal = $("#settings-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+async function saveSettings() {
+  const models = parseModelsText($("#settings-models").value);
+  const apiKey = $("#settings-api-key").value.trim();
+  const settings = {
+    account: {
+      display_name: $("#settings-display-name").value.trim() || "Viniper 用户",
+      signed_in: $("#settings-signed-in").checked
+    },
+    appearance: {
+      language: $("#settings-language").value,
+      theme: $("#settings-theme").value,
+      accent: $("#settings-accent").value
+    },
+    shell: {
+      id: $("#settings-shell").value
+    },
+    provider: {
+      label: $("#settings-provider-label").value.trim() || "DeepSeek",
+      base_url: $("#settings-base-url").value.trim(),
+      model: $("#settings-provider-model").value || models[0].id,
+      models
+    }
+  };
+  if (apiKey) settings.provider.api_key = apiKey;
+
+  const button = $("#save-settings-btn");
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = "保存中";
+  try {
+    const response = await fetch("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings })
+    });
+    const data = await response.json();
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.detail || "保存失败");
+    }
+    state.settings = data.settings;
+    state.status = { ...(state.status || {}), models: data.models, settings: data.settings };
+    applySettingsFromServer(data.settings);
+    renderModelSelect();
+    state.selectedModel = data.settings.provider?.model || state.selectedModel;
+    storageSet(MODEL_KEY, state.selectedModel);
+    renderModelSelect();
+    updateModelLabels();
+    updateContextMeter();
+    closeSettingsModal();
+  } catch (error) {
+    $("#diagnostics-panel").innerHTML = `<div class="diagnostic-row fail"><strong>失败</strong><span>${escapeHtml(error.message)}</span></div>`;
+  } finally {
+    button.disabled = false;
+    button.textContent = oldText;
+  }
+}
+
+async function runDiagnostics() {
+  const panel = $("#diagnostics-panel");
+  panel.innerHTML = `<div class="diagnostic-row"><strong>检查</strong><span>正在运行自检...</span></div>`;
+  try {
+    const response = await fetch("/api/diagnostics");
+    const data = await response.json();
+    panel.innerHTML = (data.checks || []).map((item) => `
+      <div class="diagnostic-row ${item.ok ? "ok" : "fail"}">
+        <strong>${item.ok ? "通过" : "失败"}</strong>
+        <span>${escapeHtml(item.label)}：${escapeHtml(item.detail || "")}</span>
+      </div>
+    `).join("");
+  } catch (error) {
+    panel.innerHTML = `<div class="diagnostic-row fail"><strong>失败</strong><span>${escapeHtml(error.message)}</span></div>`;
+  }
+}
+
 function renderModelSelect() {
   const select = $("#model-select");
   const models = state.status?.models || [
@@ -323,6 +623,9 @@ function renderModelSelect() {
       ${escapeHtml(model.label)}
     </option>
   `).join("");
+  if (!models.some((model) => model.id === state.selectedModel)) {
+    state.selectedModel = models[0]?.id || state.selectedModel;
+  }
   select.value = state.selectedModel;
 }
 
@@ -355,8 +658,8 @@ function renderPermissionSelect() {
 function updateModelLabels() {
   const option = getSelectedModelOption();
   $("#status-line").textContent = state.status?.configured
-    ? `${option.label} 已连接`
-    : "等待配置 API key";
+    ? `${option.label} ${t("connected")}`
+    : t("waitingKey");
 }
 
 function getSelectedModelOption() {

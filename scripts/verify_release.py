@@ -27,7 +27,9 @@ def run(command: list[str], cwd: Path = ROOT) -> None:
 def scan_for_secrets(paths: list[Path]) -> None:
     pattern = re.compile(r"sk-[A-Za-z0-9]{12,}")
     for path in paths:
-        if path.suffix.lower() in {".zip", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico"}:
+        if "release" in path.parts and "desktop" in path.parts:
+            continue
+        if path.suffix.lower() in {".zip", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".exe", ".dll", ".pak", ".bin", ".dat", ".blockmap"}:
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")

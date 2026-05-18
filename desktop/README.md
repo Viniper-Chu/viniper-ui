@@ -1,6 +1,6 @@
 # Viniper UI Desktop
 
-This folder is the first desktop shell for Viniper UI. It keeps the current thin web UI and local Claude Code bridge, then wraps it in an Electron window with tray/background behavior.
+This folder contains the desktop shell for Viniper UI. It keeps the current thin web UI and local Claude Code bridge, then wraps it in an Electron window with tray/background behavior.
 
 ## Development
 
@@ -15,9 +15,14 @@ The desktop shell starts `../server.py` with `VINIPER_UI_OPEN_BROWSER=0`, waits 
 ## Build
 
 ```bash
-cd desktop
-npm install
-npm run dist
+cd ..
+python scripts/build_desktop.py --target win
+```
+
+On macOS:
+
+```bash
+python3 scripts/build_desktop.py --target mac
 ```
 
 Build output is written to `desktop/release/`.
@@ -26,4 +31,5 @@ Build output is written to `desktop/release/`.
 
 - User data remains in the normal Viniper UI data directory, not inside the app bundle.
 - The window close button hides the app to the tray; the tray menu contains Quit.
-- The desktop shell is intentionally thin. Claude Code execution, permissions, skills, sessions, model selection, updates, and attachments still live in the existing local service.
+- The tray menu includes self-check and restart actions.
+- The desktop shell is intentionally thin. Claude Code execution, permissions, skills, sessions, model selection, settings, updates, and attachments still live in the existing local service.
