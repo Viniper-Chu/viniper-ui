@@ -1,6 +1,6 @@
 {
   "name": "viniper-ui-desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Desktop shell for Viniper UI.",
   "main": "main.js",
@@ -59,7 +59,6 @@
     },
     "mac": {
       "target": [
-        "dmg",
         "zip"
       ],
       "category": "public.app-category.productivity",

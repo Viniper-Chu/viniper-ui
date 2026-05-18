@@ -91,7 +91,6 @@ jobs:
         with:
           name: desktop-macos
           path: |
-            desktop/release/*.dmg
             desktop/release/*.zip
             desktop/release/*.blockmap
 
@@ -119,6 +118,6 @@ jobs:
             Includes:
             - Web/update package for the existing local UI
             - Windows desktop installer
-            - macOS desktop package
+            - macOS desktop app zip
           make_latest: true
           overwrite_files: true
