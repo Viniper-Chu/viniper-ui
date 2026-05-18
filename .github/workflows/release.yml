@@ -35,3 +35,5 @@ jobs:
             dist/latest.json
           name: Viniper UI ${{ github.ref_name }}
           body: Viniper UI release ${{ github.ref_name }}.
+          make_latest: true
+          overwrite_files: true

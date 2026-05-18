@@ -124,7 +124,7 @@ _active_runs: dict[str, dict[str, Any]] = {}
 
 @app.on_event("startup")
 async def startup_tasks():
-    await asyncio.to_thread(refresh_windows_shortcut_icons)
+    await asyncio.to_thread(refresh_windows_shortcuts)
 
 
 def now_ts() -> float:
@@ -568,30 +568,38 @@ def claude_available() -> bool:
         return False
 
 
-def refresh_windows_shortcut_icons() -> None:
+def refresh_windows_shortcuts() -> None:
     if os.name != "nt":
         return
     icon = STATIC_DIR / "assets" / "viniper-husky.ico"
     start_script = APP_DIR / "start.bat"
-    if not icon.exists() or not start_script.exists():
+    if not start_script.exists():
         return
 
     desktop = Path.home() / "Desktop"
     if not desktop.exists():
         return
 
+    icon_location = f"{icon},0" if icon.exists() else ""
     ps = rf"""
 $shell = New-Object -ComObject WScript.Shell
-$icon = '{str(icon).replace("'", "''")},0'
 $target = '{str(start_script).replace("'", "''")}'
 $workdir = '{str(APP_DIR).replace("'", "''")}'
-Get-ChildItem -LiteralPath '{str(desktop).replace("'", "''")}' -Filter 'Viniper UI*.lnk' -ErrorAction SilentlyContinue | ForEach-Object {{
+$icon = '{icon_location.replace("'", "''")}'
+$desktop = '{str(desktop).replace("'", "''")}'
+$links = @(Get-ChildItem -LiteralPath $desktop -Filter 'Viniper UI*.lnk' -ErrorAction SilentlyContinue)
+if ($links.Count -eq 0) {{
+  $links = @([pscustomobject]@{{ FullName = (Join-Path $desktop 'Viniper UI.lnk') }})
+}}
+$links | ForEach-Object {{
   try {{
     $shortcut = $shell.CreateShortcut($_.FullName)
-    if ($shortcut.TargetPath -eq $target -or $shortcut.WorkingDirectory -eq $workdir) {{
+    $shortcut.TargetPath = $target
+    $shortcut.WorkingDirectory = $workdir
+    if ($icon) {{
       $shortcut.IconLocation = $icon
-      $shortcut.Save()
     }}
+    $shortcut.Save()
   }} catch {{}}
 }}
 """
