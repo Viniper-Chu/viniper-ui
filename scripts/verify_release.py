@@ -50,7 +50,16 @@ def verify_zip(zip_path: Path) -> None:
         if not app_roots:
             raise SystemExit("release zip does not contain viniper-ui/server.py")
         app = app_roots[0]
-        required = ["server.py", "requirements.txt", "VERSION", "static/index.html", "static/app.js", "static/style.css"]
+        required = [
+            "server.py",
+            "requirements.txt",
+            "VERSION",
+            "static/assets/viniper-husky.ico",
+            "static/assets/viniper-husky.png",
+            "static/index.html",
+            "static/app.js",
+            "static/style.css",
+        ]
         for item in required:
             if not (app / item).exists():
                 raise SystemExit(f"release zip missing {item}")

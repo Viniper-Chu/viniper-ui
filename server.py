@@ -122,6 +122,11 @@ _session_locks: dict[str, asyncio.Lock] = {}
 _active_runs: dict[str, dict[str, Any]] = {}
 
 
+@app.on_event("startup")
+async def startup_tasks():
+    await asyncio.to_thread(refresh_windows_shortcut_icons)
+
+
 def now_ts() -> float:
     return time.time()
 
@@ -561,6 +566,45 @@ def claude_available() -> bool:
         return bool(claude_launcher())
     except Exception:
         return False
+
+
+def refresh_windows_shortcut_icons() -> None:
+    if os.name != "nt":
+        return
+    icon = STATIC_DIR / "assets" / "viniper-husky.ico"
+    start_script = APP_DIR / "start.bat"
+    if not icon.exists() or not start_script.exists():
+        return
+
+    desktop = Path.home() / "Desktop"
+    if not desktop.exists():
+        return
+
+    ps = rf"""
+$shell = New-Object -ComObject WScript.Shell
+$icon = '{str(icon).replace("'", "''")},0'
+$target = '{str(start_script).replace("'", "''")}'
+$workdir = '{str(APP_DIR).replace("'", "''")}'
+Get-ChildItem -LiteralPath '{str(desktop).replace("'", "''")}' -Filter 'Viniper UI*.lnk' -ErrorAction SilentlyContinue | ForEach-Object {{
+  try {{
+    $shortcut = $shell.CreateShortcut($_.FullName)
+    if ($shortcut.TargetPath -eq $target -or $shortcut.WorkingDirectory -eq $workdir) {{
+      $shortcut.IconLocation = $icon
+      $shortcut.Save()
+    }}
+  }} catch {{}}
+}}
+"""
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        pass
 
 
 def build_claude_env() -> dict[str, str]:
@@ -1337,7 +1381,10 @@ async def index():
 
 @app.get("/favicon.ico")
 async def favicon():
-    icon = BASE_DIR / "claude.ico"
+    icon = STATIC_DIR / "assets" / "viniper-husky.ico"
+    if icon.exists():
+        return FileResponse(icon)
+    icon = BASE_DIR / "viniper.ico"
     if icon.exists():
         return FileResponse(icon)
     raise HTTPException(status_code=404, detail="favicon not found")
