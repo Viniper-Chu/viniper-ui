@@ -14,6 +14,7 @@ It keeps the original Claude Code execution model: prompts are sent to the Claud
 - Expandable thinking/tool trace panel.
 - Attachments saved as files and passed to Claude Code by path, not pasted into chat text.
 - Built-in update checking through GitHub Releases.
+- Optional desktop shell scaffold for Windows/macOS packaging.
 
 ## Install
 
@@ -83,7 +84,7 @@ On first launch, Viniper UI migrates any old install-local `data/` folder into t
 ## Build A Release
 
 ```bash
-python scripts/build_release.py --version 0.1.0 --repo your-github-name/viniper-ui
+python scripts/build_release.py --version 0.1.3 --repo your-github-name/viniper-ui
 python scripts/verify_release.py
 ```
 
@@ -94,3 +95,15 @@ If this repository is on GitHub, pushing a tag like `v0.1.1` also triggers `.git
 ## Development Notes
 
 This project intentionally stays a thin UI. Do not add an extra agent layer that changes Claude Code behavior. When adding features, keep user data outside release artifacts and update `VERSION` before publishing.
+
+## Desktop Shell
+
+The first desktop app scaffold lives in `desktop/`. It uses Electron to wrap the existing local service without changing the Claude Code execution path.
+
+```bash
+cd desktop
+npm install
+npm start
+```
+
+The desktop shell starts `server.py` with browser auto-open disabled, waits for the local service, then opens the current Viniper UI in a native window. Closing the window hides it to the tray so it can stay in the background. Packaging is handled by `npm run dist` inside `desktop/`.

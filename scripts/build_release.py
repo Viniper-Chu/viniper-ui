@@ -29,6 +29,7 @@ APP_FILES = [
 APP_DIRS = [
     "static",
     "scripts",
+    "desktop",
 ]
 
 
@@ -55,6 +56,8 @@ def copy_clean_tree(source: Path, target: Path) -> None:
             "data",
             "tmp",
             "dist",
+            "node_modules",
+            "release",
         }
         return {name for name in names if name in ignored or name.endswith(".pyc")}
 

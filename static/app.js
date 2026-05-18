@@ -592,13 +592,15 @@ function assistantLabel(modelId) {
 }
 
 function messageTemplate(roleClass, label, content, thinking = "") {
+  const displayContent = repairTextForDisplay(content);
+  const displayThinking = repairTextForDisplay(thinking);
   const body = roleClass === "assistant" || roleClass === "error"
-    ? renderMarkdown(content)
-    : escapeHtml(content);
+    ? renderMarkdown(displayContent)
+    : escapeHtml(displayContent);
   return `
     <article class="message ${roleClass}">
       <header class="msg-header">${escapeHtml(label)}</header>
-      ${thinking && roleClass === "assistant" ? renderThinkingPanel(thinking) : ""}
+      ${displayThinking && roleClass === "assistant" ? renderThinkingPanel(displayThinking) : ""}
       <div class="msg-content">${body}</div>
     </article>
   `;
@@ -769,9 +771,79 @@ async function sendMessage() {
     const decoder = new TextDecoder("utf-8");
     let buffer = "";
 
+    const handleSsePart = (part) => {
+      const line = part.split("\n").find((item) => item.startsWith("data: "));
+      if (!line) return;
+
+      let payload = null;
+      try {
+        payload = JSON.parse(line.slice(6));
+      } catch {
+        return;
+      }
+
+      if (typeof payload.content === "string") {
+        payload.content = repairTextForDisplay(payload.content);
+      }
+
+      if (payload.type === "thinking") {
+        showThinking(false);
+        thinkingText += payload.content || "";
+        if (!thinkingBody || !thinkingPreview) {
+          const wrapper = document.createElement("div");
+          wrapper.innerHTML = renderThinkingPanel("");
+          assistantArticle.insertBefore(wrapper.firstElementChild, assistantContent);
+          thinkingBody = assistantArticle.querySelector(".thinking-body");
+          thinkingPreview = assistantArticle.querySelector(".thinking-preview");
+        }
+        thinkingPreview.textContent = previewThinking(thinkingText);
+        thinkingBody.innerHTML = renderMarkdown(thinkingText);
+        scrollBottom();
+      } else if (payload.type === "text") {
+        showThinking(false);
+        fullText += payload.content || "";
+        assistantContent.innerHTML = renderMarkdown(fullText);
+        scrollBottom();
+      } else if (payload.type === "error") {
+        showThinking(false);
+        if (state.cancelRequested) {
+          fullText = "已停止当前任务，输入已恢复。";
+          assistantContent.innerHTML = renderMarkdown(fullText);
+        } else {
+          fullText = `错误：${payload.content || ""}`;
+          assistantContent.innerHTML = renderMarkdown(fullText);
+          assistantContent.closest(".message").classList.add("error");
+        }
+      } else if (payload.type === "heartbeat") {
+        showThinking(false);
+        if (!fullText) {
+          const minutes = Math.max(1, Math.round((Number(payload.elapsed) || 0) / 60));
+          const note = payload.action_task
+            ? `动作任务仍在运行，已等待约 ${minutes} 分钟。我会继续等；如果你判断它卡住，可以点停止按钮。`
+            : `长任务仍在运行，已等待约 ${minutes} 分钟。我会保持连接，不会提前打断。`;
+          assistantContent.innerHTML = renderMarkdown(`(${note})`);
+        }
+      } else if (payload.type === "done") {
+        receivedDone = true;
+        showThinking(false);
+      }
+    };
+
+    const consumeSseBuffer = (final = false) => {
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+      if (final && buffer.trim()) {
+        parts.push(buffer);
+        buffer = "";
+      }
+      for (const part of parts) handleSsePart(part);
+    };
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
+        buffer += decoder.decode();
+        consumeSseBuffer(true);
         // Stream closed by server, but we may not have received an explicit "done" SSE event
         if (!receivedDone) {
           showThinking(false);
@@ -779,55 +851,7 @@ async function sendMessage() {
         break;
       }
       buffer += decoder.decode(value, { stream: true });
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-
-      for (const part of parts) {
-        const line = part.split("\n").find((item) => item.startsWith("data: "));
-        if (!line) continue;
-        const payload = JSON.parse(line.slice(6));
-        if (payload.type === "thinking") {
-          showThinking(false);
-          thinkingText += payload.content;
-          if (!thinkingBody || !thinkingPreview) {
-            const wrapper = document.createElement("div");
-            wrapper.innerHTML = renderThinkingPanel("");
-            assistantArticle.insertBefore(wrapper.firstElementChild, assistantContent);
-            thinkingBody = assistantArticle.querySelector(".thinking-body");
-            thinkingPreview = assistantArticle.querySelector(".thinking-preview");
-          }
-          thinkingPreview.textContent = previewThinking(thinkingText);
-          thinkingBody.innerHTML = renderMarkdown(thinkingText);
-          scrollBottom();
-        } else if (payload.type === "text") {
-          showThinking(false);
-          fullText += payload.content;
-          assistantContent.innerHTML = renderMarkdown(fullText);
-          scrollBottom();
-        } else if (payload.type === "error") {
-          showThinking(false);
-          if (state.cancelRequested) {
-            fullText = "已停止当前任务，输入已恢复。";
-            assistantContent.innerHTML = renderMarkdown(fullText);
-          } else {
-            fullText = `错误：${payload.content}`;
-            assistantContent.innerHTML = renderMarkdown(fullText);
-            assistantContent.closest(".message").classList.add("error");
-          }
-        } else if (payload.type === "heartbeat") {
-          showThinking(false);
-          if (!fullText) {
-            const minutes = Math.max(1, Math.round((Number(payload.elapsed) || 0) / 60));
-            const note = payload.action_task
-              ? `动作任务仍在运行，已等待约 ${minutes} 分钟。我会继续等；如果你判断它卡住，可以点停止按钮。`
-              : `长任务仍在运行，已等待约 ${minutes} 分钟。我会保持连接，不会提前打断。`;
-            assistantContent.innerHTML = renderMarkdown(`(${note})`);
-          }
-        } else if (payload.type === "done") {
-          receivedDone = true;
-          showThinking(false);
-        }
-      }
+      consumeSseBuffer();
     }
   } catch (error) {
     showThinking(false);
@@ -963,7 +987,7 @@ function renderThinkingPanel(thinking) {
 }
 
 function previewThinking(thinking) {
-  const clean = String(thinking || "").replace(/\s+/g, " ").trim();
+  const clean = repairTextForDisplay(thinking).replace(/\s+/g, " ").trim();
   if (!clean) return "正在梳理...";
   return clean.length > 140 ? `${clean.slice(0, 140)}...` : clean;
 }
@@ -1117,10 +1141,78 @@ function toggleSkillsPanel() {
   if (!panel.classList.contains("hidden")) loadSkills();
 }
 
+const MOJIBAKE_MARKERS = [
+  "\uFFFD", "\u00C2", "\u00C3", "\u00C5", "\u00C6", "\u00C7",
+  "\u00C8", "\u00C9", "\u00E2", "\u00E4", "\u00E5", "\u00E6",
+  "\u00E7", "\u00E8", "\u00E9", "\u00EF", "\u2018", "\u2019",
+  "\u201C", "\u201D", "\u2026", "\u2030"
+];
+const CP1252_EXTRA_BYTES = new Map([
+  ["\u20AC", 0x80], ["\u201A", 0x82], ["\u0192", 0x83], ["\u201E", 0x84],
+  ["\u2026", 0x85], ["\u2020", 0x86], ["\u2021", 0x87], ["\u02C6", 0x88],
+  ["\u2030", 0x89], ["\u0160", 0x8A], ["\u2039", 0x8B], ["\u0152", 0x8C],
+  ["\u017D", 0x8E], ["\u2018", 0x91], ["\u2019", 0x92], ["\u201C", 0x93],
+  ["\u201D", 0x94], ["\u2022", 0x95], ["\u2013", 0x96], ["\u2014", 0x97],
+  ["\u02DC", 0x98], ["\u2122", 0x99], ["\u0161", 0x9A], ["\u203A", 0x9B],
+  ["\u0153", 0x9C], ["\u017E", 0x9E], ["\u0178", 0x9F]
+]);
+
+function mojibakeScore(text) {
+  const value = String(text || "");
+  let score = (value.match(/\uFFFD/g) || []).length * 30;
+  score += (value.match(/[\u0080-\u009F]/g) || []).length * 8;
+  for (const marker of MOJIBAKE_MARKERS) {
+    score += value.split(marker).length - 1;
+  }
+  return score;
+}
+
+function encodeSingleByte(text, encoding) {
+  const bytes = [];
+  for (const char of String(text || "")) {
+    const code = char.codePointAt(0);
+    if (code <= 0xFF) {
+      bytes.push(code);
+    } else if (encoding === "cp1252" && CP1252_EXTRA_BYTES.has(char)) {
+      bytes.push(CP1252_EXTRA_BYTES.get(char));
+    } else {
+      return null;
+    }
+  }
+  return new Uint8Array(bytes);
+}
+
+function repairWithSingleByteEncoding(text, encoding) {
+  const bytes = encodeSingleByte(text, encoding);
+  if (!bytes) return null;
+  try {
+    const repaired = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return repaired && repaired !== text ? repaired : null;
+  } catch {
+    return null;
+  }
+}
+
+function repairTextForDisplay(value) {
+  const text = String(value || "");
+  const score = mojibakeScore(text);
+  if (score < 6) return text;
+
+  const candidates = [text];
+  for (const encoding of ["latin1", "cp1252"]) {
+    const repaired = repairWithSingleByteEncoding(text, encoding);
+    if (repaired) candidates.push(repaired);
+  }
+  const best = candidates.reduce((winner, candidate) => (
+    mojibakeScore(candidate) < mojibakeScore(winner) ? candidate : winner
+  ), text);
+  return mojibakeScore(best) < score ? best : text;
+}
+
 function renderMarkdown(rawText) {
   if (!rawText) return "";
 
-  let text = String(rawText);
+  let text = repairTextForDisplay(rawText);
   const codeBlocks = [];
   text = text.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (_match, lang, code) => {
     const index = codeBlocks.length;

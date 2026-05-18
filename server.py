@@ -102,6 +102,52 @@ MODEL_OPTIONS = [
     },
 ]
 
+MOJIBAKE_MARKERS = (
+    "\ufffd",
+    "\u00c2",
+    "\u00c3",
+    "\u00c5",
+    "\u00c6",
+    "\u00c7",
+    "\u00c8",
+    "\u00c9",
+    "\u00e2",
+    "\u00e4",
+    "\u00e5",
+    "\u00e6",
+    "\u00e7",
+    "\u00e8",
+    "\u00e9",
+    "\u00ef",
+    "\u2018",
+    "\u2019",
+    "\u201c",
+    "\u201d",
+    "\u2026",
+    "\u2030",
+)
+GBK_MOJIBAKE_MARKERS = (
+    "\u59dd",
+    "\u6d93",
+    "\u95c7",
+    "\u7039",
+    "\u7487",
+    "\u9359",
+    "\u934f",
+    "\u95c8",
+    "\u7e43",
+    "\u7eeb",
+    "\u9365",
+    "\u9436",
+    "\u93b4",
+    "\u951b",
+    "\u951f",
+    "\u69b4",
+    "\u6fb6",
+    "\u6fa7",
+    "\u93c2",
+)
+
 APP_DIR = Path(__file__).resolve().parent
 BASE_DIR = APP_DIR.parent
 STATIC_DIR = APP_DIR / "static"
@@ -744,8 +790,62 @@ def add_dir_args(session: dict[str, Any], prompt: str, attachments: list[dict[st
     return result
 
 
+def mojibake_score(text: str) -> int:
+    if not text:
+        return 0
+    score = text.count("\ufffd") * 30
+    score += sum(8 for ch in text if 0x80 <= ord(ch) <= 0x9F)
+    for marker in MOJIBAKE_MARKERS:
+        score += text.count(marker) * 2
+    for marker in GBK_MOJIBAKE_MARKERS:
+        score += text.count(marker) * 4
+    return score
+
+
+def repair_with_encoding(text: str, encoding: str) -> str | None:
+    try:
+        repaired = text.encode(encoding).decode("utf-8")
+    except UnicodeError:
+        return None
+    return repaired if repaired != text else None
+
+
+def clean_stream_text(value: str) -> str:
+    text = str(value)
+    score = mojibake_score(text)
+    if score < 6:
+        return text
+
+    candidates = [text]
+    for encoding in ("latin1", "cp1252", "gb18030", "gbk"):
+        repaired = repair_with_encoding(text, encoding)
+        if repaired:
+            candidates.append(repaired)
+
+    # Some terminal paths double-wrap mojibake. One extra pass is enough and
+    # keeps normal multilingual text from being touched.
+    for candidate in list(candidates[1:]):
+        for encoding in ("latin1", "cp1252", "gb18030", "gbk"):
+            repaired = repair_with_encoding(candidate, encoding)
+            if repaired:
+                candidates.append(repaired)
+
+    best = min(candidates, key=lambda item: (mojibake_score(item), -len(item)))
+    return best if mojibake_score(best) < score else text
+
+
+def clean_payload_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return clean_stream_text(value)
+    if isinstance(value, list):
+        return [clean_payload_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: clean_payload_value(item) for key, item in value.items()}
+    return value
+
+
 def sse(payload: dict[str, Any]) -> str:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    return f"data: {json.dumps(clean_payload_value(payload), ensure_ascii=False)}\n\n"
 
 
 def tool_use_text(block: dict[str, Any]) -> str:
@@ -753,7 +853,7 @@ def tool_use_text(block: dict[str, Any]) -> str:
     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
     command = tool_input.get("command") or tool_input.get("file_path") or tool_input.get("path") or ""
     description = tool_input.get("description") or ""
-    details = " ".join(str(part) for part in (description, command) if part)
+    details = clean_stream_text(" ".join(str(part) for part in (description, command) if part))
     return f"\n\n[Claude Code 工具] {name}{': ' + details if details else ''}\n"
 
 
@@ -769,7 +869,7 @@ def tool_result_text(message: dict[str, Any]) -> str:
         raw = block.get("content") or ""
         if isinstance(raw, list):
             raw = "\n".join(str(item.get("text", item)) for item in raw if isinstance(item, dict))
-        text = str(raw).strip()
+        text = clean_stream_text(str(raw).strip())
         if len(text) > TOOL_RESULT_DISPLAY_LIMIT:
             text = text[:TOOL_RESULT_DISPLAY_LIMIT] + "\n...[工具输出过长，显示已截断]"
         status = "失败" if block.get("is_error") else "完成"
@@ -786,7 +886,7 @@ async def read_stderr(proc: asyncio.subprocess.Process) -> str:
         if not chunk:
             break
         chunks.append(chunk)
-    return b"".join(chunks).decode("utf-8", errors="replace").strip()
+    return clean_stream_text(b"".join(chunks).decode("utf-8", errors="replace").strip())
 
 
 async def kill_process_tree(pid: int | None) -> None:
@@ -1177,7 +1277,7 @@ async def stream_chat_impl(
                     continue
                 if len(line) < 4:
                     continue
-                text = f"{line}\n"
+                text = f"{clean_stream_text(line)}\n"
                 assistant_text += text
                 yield sse({"type": "text", "content": text})
                 continue
@@ -1188,10 +1288,10 @@ async def stream_chat_impl(
                 if event.get("type") == "content_block_delta":
                     delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
                     if delta.get("type") == "thinking_delta":
-                        text = str(delta.get("thinking") or "")
+                        text = clean_stream_text(str(delta.get("thinking") or ""))
                         raw_thinking_text += text
                     elif delta.get("type") == "text_delta":
-                        text = str(delta.get("text") or "")
+                        text = clean_stream_text(str(delta.get("text") or ""))
                         assistant_text += text
                         yield sse({"type": "text", "content": text})
                 continue
@@ -1204,7 +1304,7 @@ async def stream_chat_impl(
                         if not isinstance(block, dict):
                             continue
                         if block.get("type") == "text":
-                            full_text = str(block.get("text") or "")
+                            full_text = clean_stream_text(str(block.get("text") or ""))
                             if full_text and full_text not in assistant_text:
                                 if full_text.startswith(assistant_text):
                                     delta = full_text[len(assistant_text):]
@@ -1246,9 +1346,9 @@ async def stream_chat_impl(
                 continue
 
             if event_type == "result":
-                final_result = str(data.get("result") or "")
+                final_result = clean_stream_text(str(data.get("result") or ""))
                 if data.get("is_error"):
-                    error_text = final_result or str(data)
+                    error_text = final_result or clean_stream_text(str(data))
                     yield sse({"type": "error", "content": error_text})
                 continue
 
@@ -1676,7 +1776,7 @@ async def last_session():
         candidates,
         key=lambda item: item[1].get("updated", item[1].get("created", 0)),
     )
-    return {
+    return clean_payload_value({
         "session": {
             "session_id": sid,
             "name": session.get("name", ""),
@@ -1684,7 +1784,7 @@ async def last_session():
             "messages": session.get("messages", []),
             "message_count": len(session.get("messages", [])),
         }
-    }
+    })
 
 
 @app.get("/api/sessions/{session_id}")
@@ -1692,13 +1792,13 @@ async def get_session(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="session not found")
     session = safe_session(session_id)
-    return {
+    return clean_payload_value({
         "session_id": session_id,
         "name": session.get("name", ""),
         "workdir": session.get("workdir", str(BASE_DIR)),
         "messages": session.get("messages", []),
         "message_count": len(session.get("messages", [])),
-    }
+    })
 
 
 @app.put("/api/sessions/{session_id}")
@@ -1865,5 +1965,6 @@ if __name__ == "__main__":
     port = int(env_value("VINIPER_UI_PORT", "17373"))
     url = f"http://127.0.0.1:{port}"
     print(f"\n  Viniper UI -> {url}\n")
-    webbrowser.open(url)
+    if env_value("VINIPER_UI_OPEN_BROWSER", "1") != "0":
+        webbrowser.open(url)
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")

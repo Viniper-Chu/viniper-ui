@@ -54,6 +54,10 @@ def verify_zip(zip_path: Path) -> None:
             "server.py",
             "requirements.txt",
             "VERSION",
+            "desktop/package.json",
+            "desktop/package-lock.json",
+            "desktop/main.js",
+            "desktop/preload.js",
             "static/assets/viniper-husky.ico",
             "static/assets/viniper-husky.png",
             "static/index.html",
@@ -72,6 +76,7 @@ def verify_zip(zip_path: Path) -> None:
 
 def main() -> int:
     run([sys.executable, "-m", "py_compile", str(ROOT / "server.py")])
+    run([sys.executable, str(ROOT / "scripts" / "verify_desktop.py")])
     if shutil.which("node"):
         run(["node", "--check", str(ROOT / "static" / "app.js")])
     scan_for_secrets([path for path in ROOT.rglob("*") if path.is_file() and "data" not in path.parts and "dist" not in path.parts])
