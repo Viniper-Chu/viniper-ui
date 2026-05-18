@@ -107,7 +107,23 @@ BASE_DIR = APP_DIR.parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_SKILLS_DIR = BASE_DIR / ".claude" / "skills"
 USER_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
-DATA_DIR = Path(env_value("VINIPER_UI_DATA_DIR") or APP_DIR / "data").expanduser()
+LEGACY_DATA_DIR = APP_DIR / "data"
+
+
+def default_data_dir() -> Path:
+    configured = env_value("VINIPER_UI_DATA_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if os.name == "nt":
+        base = os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "Viniper UI"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Viniper UI"
+    return Path.home() / ".local" / "share" / "viniper-ui"
+
+
+DATA_DIR = default_data_dir()
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 KNOWN_WORK_DIRS = [
@@ -182,6 +198,64 @@ def save_sessions_to_disk() -> None:
     tmp_path = SESSIONS_FILE.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(sessions, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(SESSIONS_FILE)
+
+
+def read_sessions_file(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def merge_session_files(source: Path, target: Path) -> None:
+    source_data = read_sessions_file(source)
+    if not source_data:
+        return
+
+    target_data = read_sessions_file(target) if target.exists() else {}
+    changed = False
+    for session_id, source_session in source_data.items():
+        if not isinstance(source_session, dict):
+            continue
+        existing = target_data.get(session_id)
+        if not isinstance(existing, dict):
+            target_data[session_id] = source_session
+            changed = True
+            continue
+        source_updated = float(source_session.get("updated") or source_session.get("created") or 0)
+        existing_updated = float(existing.get("updated") or existing.get("created") or 0)
+        if source_updated > existing_updated:
+            target_data[session_id] = source_session
+            changed = True
+
+    if changed:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(target_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def migrate_legacy_data_dir() -> None:
+    try:
+        if LEGACY_DATA_DIR.resolve() == DATA_DIR.resolve():
+            return
+    except Exception:
+        pass
+
+    legacy_sessions = LEGACY_DATA_DIR / "sessions.json"
+    if legacy_sessions.exists():
+        merge_session_files(legacy_sessions, SESSIONS_FILE)
+
+    legacy_attachments = LEGACY_DATA_DIR / "attachments"
+    if legacy_attachments.exists() and legacy_attachments.is_dir():
+        ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        for item in legacy_attachments.iterdir():
+            target = ATTACHMENTS_DIR / item.name
+            if target.exists():
+                continue
+            if item.is_dir():
+                shutil.copytree(item, target)
+            elif item.is_file():
+                shutil.copy2(item, target)
 
 
 def format_bytes(size: int) -> str:
@@ -460,6 +534,7 @@ def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str 
     }
 
 
+migrate_legacy_data_dir()
 sessions.update(load_sessions_from_disk())
 
 

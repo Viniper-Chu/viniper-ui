@@ -72,7 +72,13 @@ Example `update_source.json`:
 }
 ```
 
-The update installer only replaces app files such as `server.py`, `requirements.txt`, `VERSION`, `update_source.json`, and `static/`. It does not touch runtime `data/`, sessions, attachments, API keys, or local Claude settings.
+Runtime data is stored outside the install directory by default:
+
+- Windows: `%APPDATA%\Viniper UI`
+- macOS: `~/Library/Application Support/Viniper UI`
+- Linux: `~/.local/share/viniper-ui`
+
+On first launch, Viniper UI migrates any old install-local `data/` folder into this user data directory. The update installer only replaces app files such as `server.py`, `requirements.txt`, `VERSION`, `update_source.json`, `start.bat`, and `static/`. It does not touch sessions, attachments, API keys, or local Claude settings.
 
 ## Build A Release
 
