@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+data/
+tmp/
+dist/
+node_modules/
+.vscode/
+.idea/
+*.egg-info/
+.env
+.DS_Store
+Thumbs.db
+desktop/release/
+desktop/node_modules/
