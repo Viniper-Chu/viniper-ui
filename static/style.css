@@ -152,6 +152,20 @@ button {
   font-weight: 700;
 }
 
+.brand-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.brand-icon {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  object-fit: contain;
+}
+
 .subtle {
   color: var(--muted);
   font-size: 12px;

@@ -53,7 +53,7 @@ const PERMISSION_MODES = [
   {
     id: "ask",
     label: "需要时确认",
-    description: "普通聊天直接执行；本地文件、命令、程序操作前确认"
+    description: "交给 Claude Code 在真正需要授权时确认；网页端不预先弹窗"
   },
   {
     id: "auto",
@@ -655,6 +655,10 @@ function renderPermissionSelect() {
   select.value = state.permissionMode;
 }
 
+function storageRemove(key) {
+  localStorage.removeItem(key);
+}
+
 function updateModelLabels() {
   const option = getSelectedModelOption();
   $("#status-line").textContent = state.status?.configured
@@ -756,8 +760,8 @@ async function loadSessionList() {
           <span class="session-name">${escapeHtml(title)}</span>
           <span class="session-meta">${escapeHtml(meta)}</span>
         </button>
-        <button class="mini-button" title="重命名" data-rename-session="${escapeAttr(session.id)}">✎</button>
-        <button class="mini-button danger" title="删除" data-delete-session="${escapeAttr(session.id)}">×</button>
+        <button class="mini-button" type="button" title="重命名" data-rename-session="${escapeAttr(session.id)}">✎</button>
+        <button class="mini-button danger" type="button" title="删除" data-delete-session="${escapeAttr(session.id)}">×</button>
       </div>
     `;
   }).join("");
@@ -777,7 +781,15 @@ async function loadSessionList() {
         const resp = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         if (id === state.sessionId) {
-          await createSession({ silent: true });
+          if (storageGet(LAST_SESSION_KEY) === id) storageRemove(LAST_SESSION_KEY);
+          const latest = await fetch("/api/sessions/last").then((r) => r.json()).catch(() => null);
+          if (latest?.session?.session_id) {
+            applySession(latest.session.session_id, latest.session);
+            rememberSession(latest.session.session_id);
+            await loadSessionList();
+          } else {
+            await createSession({ silent: true });
+          }
         } else {
           await loadSessionList();
         }
@@ -917,8 +929,8 @@ function messageTemplate(roleClass, label, content, thinking = "") {
 }
 
 function needsPermissionForPrompt(text, files = []) {
-  // Only pre-screen for attachments; command-level permission is handled by Claude Code itself
-  if (files.length) return true;
+  // Command-level permission is handled by Claude Code itself. The web UI should
+  // not ask before the run starts; "需要时确认" means "ask when Claude Code needs it".
   return false;
 }
 

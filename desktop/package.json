@@ -1,6 +1,6 @@
 {
   "name": "viniper-ui-desktop",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": true,
   "description": "Desktop shell for Viniper UI.",
   "main": "main.js",
@@ -14,7 +14,8 @@
   },
   "devDependencies": {
     "electron": "^42.1.0",
-    "electron-builder": "^26.8.1"
+    "electron-builder": "^26.8.1",
+    "rcedit": "^5.0.2"
   },
   "build": {
     "appId": "com.viniper.ui",
@@ -53,7 +54,7 @@
     ],
     "win": {
       "target": "nsis",
-      "icon": "../static/assets/viniper-husky.ico",
+      "icon": "../static/assets/viniper-icon.ico",
       "signAndEditExecutable": false,
       "verifyUpdateCodeSignature": false
     },

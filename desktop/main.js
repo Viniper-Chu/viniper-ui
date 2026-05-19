@@ -9,8 +9,8 @@ const APP_ROOT = app.isPackaged
   ? path.join(process.resourcesPath, "viniper-ui")
   : path.resolve(__dirname, "..");
 const ICON_PATH = process.platform === "win32"
-  ? path.join(APP_ROOT, "static", "assets", "viniper-husky.ico")
-  : path.join(APP_ROOT, "static", "assets", "viniper-husky.png");
+  ? path.join(APP_ROOT, "static", "assets", "viniper-icon.ico")
+  : path.join(APP_ROOT, "static", "assets", "viniper-icon.png");
 const BUNDLED_VERSION = readBundledVersion();
 
 let port = Number(process.env.VINIPER_UI_PORT || 17373);
@@ -21,6 +21,12 @@ let isQuitting = false;
 
 function localUrl() {
   return `http://127.0.0.1:${port}`;
+}
+
+function appIcon(size = 0) {
+  const image = nativeImage.createFromPath(ICON_PATH);
+  if (image.isEmpty() || !size) return image;
+  return image.resize({ width: size, height: size, quality: "best" });
 }
 
 function readBundledVersion() {
@@ -170,7 +176,7 @@ async function ensureServer() {
 
 function createTray() {
   if (tray) return;
-  const image = nativeImage.createFromPath(ICON_PATH);
+  const image = appIcon(process.platform === "win32" ? 16 : 22);
   tray = new Tray(image.isEmpty() ? nativeImage.createEmpty() : image);
   tray.setToolTip("Viniper UI");
   tray.setContextMenu(Menu.buildFromTemplate([
@@ -208,7 +214,7 @@ async function createMainWindow() {
     minWidth: 960,
     minHeight: 680,
     title: "Viniper UI",
-    icon: ICON_PATH,
+    icon: appIcon(),
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -217,6 +223,7 @@ async function createMainWindow() {
       sandbox: false
     }
   });
+  mainWindow.setIcon(appIcon());
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith(localUrl())) return { action: "allow" };
@@ -231,7 +238,10 @@ async function createMainWindow() {
   });
 
   mainWindow.loadURL(localUrl());
-  mainWindow.once("ready-to-show", () => mainWindow.show());
+  mainWindow.once("ready-to-show", () => {
+    mainWindow.setIcon(appIcon());
+    mainWindow.show();
+  });
   mainWindow.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault();

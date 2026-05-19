@@ -33,8 +33,8 @@ def main() -> int:
         DESKTOP / "main.js",
         DESKTOP / "preload.js",
         DESKTOP / "README.md",
-        ROOT / "static" / "assets" / "viniper-husky.ico",
-        ROOT / "static" / "assets" / "viniper-husky.png",
+        ROOT / "static" / "assets" / "viniper-icon.ico",
+        ROOT / "static" / "assets" / "viniper-icon.png",
     ]
     for path in required:
         require(path)

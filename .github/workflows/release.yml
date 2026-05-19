@@ -23,7 +23,21 @@ jobs:
       - name: Build update package
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          python scripts/build_release.py --version "$VERSION" --repo "$GITHUB_REPOSITORY" --notes "Viniper UI $GITHUB_REF_NAME"
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["GITHUB_REF_NAME"]
+          text = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = rf"^##\s+{re.escape(version)}[^\n]*\n(?P<body>.*?)(?=^##\s+v|\Z)"
+          match = re.search(pattern, text, flags=re.M | re.S)
+          notes = match.group("body").strip() if match else f"Viniper UI {version}"
+          Path("dist").mkdir(exist_ok=True)
+          Path("dist/release-notes.md").write_text(notes + "\n", encoding="utf-8")
+          PY
+          NOTES="$(cat dist/release-notes.md)"
+          python scripts/build_release.py --version "$VERSION" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
           python scripts/verify_release.py
 
       - name: Upload update package
@@ -34,6 +48,7 @@ jobs:
             dist/ViniperUI-v*.zip
             dist/ViniperUI-v*.zip.sha256
             dist/latest.json
+            dist/release-notes.md
 
   build-windows-desktop:
     runs-on: windows-latest
@@ -112,12 +127,6 @@ jobs:
         with:
           files: release-artifacts/*
           name: Viniper UI ${{ github.ref_name }}
-          body: |
-            Viniper UI release ${{ github.ref_name }}.
-
-            Includes:
-            - Web/update package for the existing local UI
-            - Windows desktop installer
-            - macOS desktop app zip
+          body_path: release-artifacts/release-notes.md
           make_latest: true
           overwrite_files: true

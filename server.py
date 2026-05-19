@@ -736,6 +736,38 @@ migrate_legacy_data_dir()
 sessions.update(load_sessions_from_disk())
 
 
+def next_session_name() -> str:
+    existing_numbers: set[int] = set()
+    for session in sessions.values():
+        existing_name = str(session.get("name") or "")
+        match = re.fullmatch(r"新建会话（(\d+)）", existing_name)
+        if match:
+            existing_numbers.add(int(match.group(1)))
+
+    number = 1
+    while number in existing_numbers:
+        number += 1
+    return f"新建会话（{number}）"
+
+
+def remove_dir_inside(path: Path, base: Path) -> None:
+    try:
+        resolved = path.resolve()
+        base_resolved = base.resolve()
+        if resolved == base_resolved or not resolved.is_relative_to(base_resolved):
+            return
+        if resolved.exists() and resolved.is_dir():
+            shutil.rmtree(resolved)
+    except Exception:
+        pass
+
+
+def remove_session_runtime_data(session_id: str) -> None:
+    safe_id = safe_attachment_filename(session_id)
+    remove_dir_inside(ATTACHMENTS_DIR / safe_id, ATTACHMENTS_DIR)
+    remove_dir_inside(DATA_DIR / "session-memory" / safe_id, DATA_DIR / "session-memory")
+
+
 def safe_session(session_id: str) -> dict[str, Any]:
     if session_id not in sessions:
         sessions[session_id] = {
@@ -743,7 +775,7 @@ def safe_session(session_id: str) -> dict[str, Any]:
             "messages": [],
             "created": now_ts(),
             "updated": now_ts(),
-            "name": "",
+            "name": next_session_name(),
             "workdir": str(BASE_DIR),
             "claude_session_id": str(uuid.uuid4()),
             "claude_initialized": False,
@@ -860,20 +892,26 @@ def claude_available() -> bool:
 def refresh_windows_shortcuts() -> None:
     if os.name != "nt":
         return
-    icon = STATIC_DIR / "assets" / "claude.ico"
+    icon = STATIC_DIR / "assets" / "viniper-icon.ico"
+    installed_candidates = [
+        Path("D:/Viniper UI/Viniper UI.exe"),
+        BASE_DIR.parent / "Viniper UI.exe",
+    ]
+    installed_exe = next((path for path in installed_candidates if path.exists()), installed_candidates[-1])
     start_script = APP_DIR / "start.bat"
-    if not start_script.exists():
+    target_path = installed_exe if installed_exe.exists() else start_script
+    if not target_path.exists():
         return
 
     desktop = Path.home() / "Desktop"
     if not desktop.exists():
         return
 
-    icon_location = f"{icon},0" if icon.exists() else ""
+    icon_location = f"{target_path},0" if installed_exe.exists() else (f"{icon},0" if icon.exists() else "")
     ps = rf"""
 $shell = New-Object -ComObject WScript.Shell
-$target = '{str(start_script).replace("'", "''")}'
-$workdir = '{str(APP_DIR).replace("'", "''")}'
+$target = '{str(target_path).replace("'", "''")}'
+$workdir = '{str(target_path.parent).replace("'", "''")}'
 $icon = '{icon_location.replace("'", "''")}'
 $desktop = '{str(desktop).replace("'", "''")}'
 $links = @(Get-ChildItem -LiteralPath $desktop -Filter 'Viniper UI*.lnk' -ErrorAction SilentlyContinue)
@@ -915,9 +953,13 @@ def build_claude_env() -> dict[str, str]:
 
 def build_system_append(session: dict[str, Any]) -> str:
     summary = str(session.get("summary") or "").strip()
+    isolation_note = (
+        "当前 Viniper UI 会话与其他会话隔离。只把本会话传入的历史摘要、当前工作目录和用户消息"
+        "作为连续上下文；不要主动引用其他 UI 会话的记忆。"
+    )
     if not summary:
-        return ""
-    return f"以下是网页端压缩后的历史摘要，请在回答时保持连续性：{summary}"
+        return isolation_note
+    return f"{isolation_note}\n\n以下是网页端压缩后的历史摘要，请在回答时保持连续性：{summary}"
 
 
 def existing_workdir(value: str | None) -> Path:
@@ -1328,10 +1370,6 @@ async def stream_chat_impl(
 
     session_args = ["--resume", claude_session_id] if resume_existing else ["--session-id", claude_session_id]
 
-    # Per-session isolated memory directory
-    session_memory_dir = DATA_DIR / "session-memory" / safe_attachment_filename(session_id)
-    session_memory_dir.mkdir(parents=True, exist_ok=True)
-
     command = [
         *claude_launcher(),
         "-p",
@@ -1345,9 +1383,11 @@ async def stream_chat_impl(
         *session_args,
         "--permission-mode",
         selected_permission_mode,
-        f"--mcp-config={session_memory_dir}",
         *add_dir_args(session, prompt, attachments),
     ]
+    session_name = str(session.get("name") or "").strip()
+    if session_name:
+        command.extend(["--name", session_name])
     system_append = build_system_append(session)
     if system_append:
         command.extend(["--append-system-prompt", system_append])
@@ -1745,7 +1785,7 @@ async def index():
 
 @app.get("/favicon.ico")
 async def favicon():
-    icon = STATIC_DIR / "assets" / "claude.ico"
+    icon = STATIC_DIR / "assets" / "viniper-icon.ico"
     if icon.exists():
         return FileResponse(icon)
     icon = BASE_DIR / "viniper.ico"
@@ -1998,18 +2038,7 @@ async def new_session(request: Request):
     sid = str(uuid.uuid4())[:8]
     name = str(body.get("name") or "").strip()
     if not name:
-        existing_numbers = set()
-        for s in sessions.values():
-            existing_name = str(s.get("name") or "")
-            match = re.match(r"新建会话（(\d+)）", existing_name)
-            if match:
-                existing_numbers.add(int(match.group(1)))
-            elif not existing_name:
-                existing_numbers.add(0)
-        n = 1
-        while n in existing_numbers:
-            n += 1
-        name = f"新建会话（{n}）"
+        name = next_session_name()
     sessions[sid] = {
         "id": sid,
         "messages": [],
@@ -2097,9 +2126,11 @@ async def update_session(session_id: str, request: Request):
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str):
+    existed = session_id in sessions
     sessions.pop(session_id, None)
+    remove_session_runtime_data(session_id)
     save_sessions_to_disk()
-    return {"ok": True}
+    return {"ok": True, "deleted": existed}
 
 
 @app.get("/api/skills")

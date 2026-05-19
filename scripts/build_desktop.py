@@ -44,10 +44,37 @@ def run(command: list[str], cwd: Path = ROOT, timeout: int | None = None) -> Non
         raise SystemExit(f"command failed: {' '.join(command)}")
 
 
+def rcedit_tool() -> Path:
+    candidates = [
+        DESKTOP / "node_modules" / "rcedit" / "bin" / "rcedit-x64.exe",
+        DESKTOP / "node_modules" / "rcedit" / "bin" / "rcedit.exe",
+        DESKTOP / "node_modules" / "electron-winstaller" / "vendor" / "rcedit.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    found = shutil.which("rcedit")
+    if found:
+        return Path(found)
+    raise SystemExit("rcedit was not found. Run npm install in desktop first.")
+
+
+def patch_windows_icon() -> None:
+    if sys.platform != "win32":
+        return
+    exe_path = DESKTOP / "release" / "win-unpacked" / "Viniper UI.exe"
+    icon_path = ROOT / "static" / "assets" / "viniper-icon.ico"
+    if not exe_path.exists():
+        raise SystemExit(f"missing packaged executable: {exe_path}")
+    if not icon_path.exists():
+        raise SystemExit(f"missing icon file: {icon_path}")
+    run([str(rcedit_tool()), str(exe_path), "--set-icon", str(icon_path)], timeout=60)
+
+
 def prepare_macos_icon() -> None:
     if sys.platform != "darwin":
         return
-    source = ROOT / "static" / "assets" / "viniper-husky.png"
+    source = ROOT / "static" / "assets" / "viniper-icon.png"
     if not source.exists():
         raise SystemExit(f"missing icon source: {source}")
     build_dir = DESKTOP / "build"
@@ -80,8 +107,12 @@ def main() -> int:
 
     if args.target == "dir":
         run([npm, "run", "pack"], cwd=DESKTOP, timeout=600)
+        patch_windows_icon()
     elif args.target == "win":
-        run([npm, "run", "dist", "--", "--win", "nsis"], cwd=DESKTOP, timeout=900)
+        run([npm, "run", "pack"], cwd=DESKTOP, timeout=600)
+        patch_windows_icon()
+        prepackaged = DESKTOP / "release" / "win-unpacked"
+        run([npm, "run", "dist", "--", "--win", "nsis", "--prepackaged", str(prepackaged)], cwd=DESKTOP, timeout=900)
     elif args.target == "mac":
         if sys.platform != "darwin":
             raise SystemExit("macOS desktop packages must be built on macOS.")
@@ -89,7 +120,10 @@ def main() -> int:
         run([npm, "run", "dist", "--", "--mac"], cwd=DESKTOP, timeout=900)
     else:
         if sys.platform == "win32":
-            run([npm, "run", "dist", "--", "--win", "nsis"], cwd=DESKTOP, timeout=900)
+            run([npm, "run", "pack"], cwd=DESKTOP, timeout=600)
+            patch_windows_icon()
+            prepackaged = DESKTOP / "release" / "win-unpacked"
+            run([npm, "run", "dist", "--", "--win", "nsis", "--prepackaged", str(prepackaged)], cwd=DESKTOP, timeout=900)
         elif sys.platform == "darwin":
             prepare_macos_icon()
             run([npm, "run", "dist", "--", "--mac"], cwd=DESKTOP, timeout=900)
