@@ -767,15 +767,22 @@ async function loadSessionList() {
   });
 
   $$("[data-delete-session]").forEach((button) => {
-    button.addEventListener("click", async () => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
       const id = button.dataset.deleteSession;
       const item = button.closest(".session-item");
       const title = item?.querySelector(".session-name")?.textContent?.trim() || id;
       if (!window.confirm(`删除会话“${title}”？`)) return;
-      await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (id === state.sessionId) {
-        await createSession({ silent: true });
-      } else {
+      try {
+        const resp = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        if (id === state.sessionId) {
+          await createSession({ silent: true });
+        } else {
+          await loadSessionList();
+        }
+      } catch (err) {
+        alert(`删除失败：${err.message}`);
         await loadSessionList();
       }
     });
@@ -910,10 +917,9 @@ function messageTemplate(roleClass, label, content, thinking = "") {
 }
 
 function needsPermissionForPrompt(text, files = []) {
+  // Only pre-screen for attachments; command-level permission is handled by Claude Code itself
   if (files.length) return true;
-  const value = String(text || "");
-  return PERMISSION_DIRECT_RE.test(value)
-    || (PERMISSION_ACTION_RE.test(value) && PERMISSION_TARGET_RE.test(value));
+  return false;
 }
 
 async function resolvePermissionMode(text, files = []) {

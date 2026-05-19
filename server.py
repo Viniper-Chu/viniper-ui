@@ -860,7 +860,7 @@ def claude_available() -> bool:
 def refresh_windows_shortcuts() -> None:
     if os.name != "nt":
         return
-    icon = STATIC_DIR / "assets" / "viniper-husky.ico"
+    icon = STATIC_DIR / "assets" / "claude.ico"
     start_script = APP_DIR / "start.bat"
     if not start_script.exists():
         return
@@ -1328,6 +1328,10 @@ async def stream_chat_impl(
 
     session_args = ["--resume", claude_session_id] if resume_existing else ["--session-id", claude_session_id]
 
+    # Per-session isolated memory directory
+    session_memory_dir = DATA_DIR / "session-memory" / safe_attachment_filename(session_id)
+    session_memory_dir.mkdir(parents=True, exist_ok=True)
+
     command = [
         *claude_launcher(),
         "-p",
@@ -1341,6 +1345,7 @@ async def stream_chat_impl(
         *session_args,
         "--permission-mode",
         selected_permission_mode,
+        f"--mcp-config={session_memory_dir}",
         *add_dir_args(session, prompt, attachments),
     ]
     system_append = build_system_append(session)
@@ -1740,7 +1745,7 @@ async def index():
 
 @app.get("/favicon.ico")
 async def favicon():
-    icon = STATIC_DIR / "assets" / "viniper-husky.ico"
+    icon = STATIC_DIR / "assets" / "claude.ico"
     if icon.exists():
         return FileResponse(icon)
     icon = BASE_DIR / "viniper.ico"
@@ -1991,12 +1996,26 @@ async def new_session(request: Request):
     if request.headers.get("content-type", "").startswith("application/json"):
         body = await request.json()
     sid = str(uuid.uuid4())[:8]
+    name = str(body.get("name") or "").strip()
+    if not name:
+        existing_numbers = set()
+        for s in sessions.values():
+            existing_name = str(s.get("name") or "")
+            match = re.match(r"新建会话（(\d+)）", existing_name)
+            if match:
+                existing_numbers.add(int(match.group(1)))
+            elif not existing_name:
+                existing_numbers.add(0)
+        n = 1
+        while n in existing_numbers:
+            n += 1
+        name = f"新建会话（{n}）"
     sessions[sid] = {
         "id": sid,
         "messages": [],
         "created": now_ts(),
         "updated": now_ts(),
-        "name": str(body.get("name") or ""),
+        "name": name,
         "workdir": str(body.get("workdir") or BASE_DIR),
         "claude_session_id": str(uuid.uuid4()),
         "claude_initialized": False,
