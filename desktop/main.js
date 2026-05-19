@@ -169,8 +169,10 @@ async function ensureServer() {
   const existing = await waitForServer(1200);
   if (existing && (!BUNDLED_VERSION || existing.version === BUNDLED_VERSION)) return true;
   if (existing && BUNDLED_VERSION && existing.version !== BUNDLED_VERSION) {
+    if (serverProcess) { serverProcess.kill(); serverProcess = null; }
     port = await findOpenPort(port + 1);
   }
+  if (serverProcess) { serverProcess.kill(); serverProcess = null; }
   startServerProcess();
   return Boolean(await waitForServer(30000));
 }

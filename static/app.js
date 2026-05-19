@@ -808,9 +808,14 @@ async function createNamedSession() {
 }
 
 async function loadSessionList() {
-  const response = await fetch("/api/sessions");
-  const data = await response.json();
-  const sessions = data.sessions || [];
+  let sessions;
+  try {
+    const response = await fetch("/api/sessions");
+    const data = await response.json();
+    sessions = data.sessions || [];
+  } catch {
+    return;
+  }
   const list = $("#session-list");
 
   if (!sessions.length) {
@@ -1648,7 +1653,7 @@ function renderMarkdown(rawText) {
   text = text.replace(/^# (.+)$/gm, "<h1>$1</h1>");
   text = text.replace(/^> (.+)$/gm, "<blockquote>$1</blockquote>");
   text = text.replace(/^\s*[-*] (.+)$/gm, "<li>$1</li>");
-  text = text.replace(/(<li>[\s\S]*?<\/li>)(?!(\s*<li>))/g, "<ul>$1</ul>");
+  text = text.replace(/((?:<li>[\s\S]*?<\/li>)+)/g, "<ul>$1</ul>");
   text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+|mailto:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
   text = text.split(/\n{2,}/).map((block) => {
     if (/^\s*<(h1|h2|h3|ul|blockquote|pre|table)/.test(block)) return block;

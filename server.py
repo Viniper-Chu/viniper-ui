@@ -911,8 +911,9 @@ def refresh_windows_shortcuts() -> None:
         return
     icon = STATIC_DIR / "assets" / "viniper-icon.ico"
     installed_candidates = [
-        Path("D:/Viniper UI/Viniper UI.exe"),
         BASE_DIR.parent / "Viniper UI.exe",
+        Path("C:/Program Files/Viniper UI/Viniper UI.exe"),
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Viniper UI" / "Viniper UI.exe",
     ]
     installed_exe = next((path for path in installed_candidates if path.exists()), installed_candidates[-1])
     start_script = APP_DIR / "start.bat"
@@ -1423,7 +1424,6 @@ async def stream_chat_impl(
     cwd = existing_workdir(str(session.get("workdir") or ""))
     assistant_text = ""
     thinking_text = ""
-    raw_thinking_text = ""
     final_result = ""
     stderr_text = ""
     timed_out = False
@@ -1530,7 +1530,6 @@ async def stream_chat_impl(
                     delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
                     if delta.get("type") == "thinking_delta":
                         text = clean_stream_text(str(delta.get("thinking") or ""))
-                        raw_thinking_text += text
                     elif delta.get("type") == "text_delta":
                         text = clean_stream_text(str(delta.get("text") or ""))
                         assistant_text += text
