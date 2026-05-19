@@ -45,7 +45,7 @@ function storageSet(key, value) {
 // Token estimation: ~3 chars per token for mixed Chinese/English text
 // Context window limits (approximate for DeepSeek V4 models):
 const CONTEXT_LIMITS = {
-  "deepseek-v4-pro[1m]": 200000,  // DeepSeek V4 Pro
+  "deepseek-v4-pro[1m]": 1000000,  // DeepSeek V4 Pro 1M
   "deepseek-v4-flash": 128000,    // DeepSeek V4 Flash
 };
 const DEFAULT_CONTEXT_LIMIT = 128000;
@@ -512,7 +512,7 @@ function parseModelsText(text) {
     });
   }
   return models.length ? models : [
-    { id: "deepseek-v4-pro[1m]", label: "DeepSeek V4 Pro", description: "", context: 200000 },
+    { id: "deepseek-v4-pro[1m]", label: "DeepSeek V4 Pro", description: "", context: 1000000 },
     { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", description: "", context: 128000 }
   ];
 }

@@ -95,7 +95,7 @@ MODEL_OPTIONS = [
         "id": "deepseek-v4-pro[1m]",
         "label": "DeepSeek V4 Pro",
         "description": "Complex coding and long context work",
-        "context": 200000,
+        "context": 1000000,
     },
     {
         "id": "deepseek-v4-flash",
@@ -2213,7 +2213,7 @@ async def compress_context(session_id: str, request: Request):
 
     # Token estimation matching frontend: ~3 chars per token
     model = allowed_model(str(body.get("model") or merged_env().get("ANTHROPIC_MODEL", "deepseek-v4-pro[1m]")))
-    context_limits = {"deepseek-v4-pro[1m]": 200000, "deepseek-v4-flash": 128000}
+    context_limits = {"deepseek-v4-pro[1m]": 1000000, "deepseek-v4-flash": 128000}
     limit = context_limits.get(model, 128000)
     threshold = int(limit * 0.65)
 
