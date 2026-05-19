@@ -315,7 +315,37 @@ function bindEvents() {
     });
   }
 
+  window.renameSession = async function(button, event = null) {
+    if (event) event.stopPropagation();
+    const id = button.dataset.renameSession;
+    const item = button.closest(".session-item");
+    const currentName = item?.querySelector(".session-name")?.textContent?.trim() || (id === state.sessionId ? state.sessionName : "");
+    const nextName = await showRenameSessionModal(currentName);
+    if (nextName === null) return;
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: nextName || currentName || id })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.detail || `HTTP ${response.status}`);
+      }
+      if (id === state.sessionId) state.sessionName = data.session?.name || nextName || currentName;
+      renderCurrentSession();
+      await loadSessionList();
+    } catch (err) {
+      alert(`重命名失败：${err.message}`);
+    }
+  };
+
   document.addEventListener("click", (event) => {
+    const renameButton = event.target.closest("[data-rename-session]");
+    if (renameButton) renameSession(renameButton, event);
+  });
+
+  document.addEventListener("click", async (event) => {
     const copyButton = event.target.closest("[data-copy]");
     if (copyButton) {
       navigator.clipboard.writeText(copyButton.dataset.copy || "").then(() => {
@@ -334,6 +364,7 @@ function bindEvents() {
       $("#user-input").focus();
       sendMessage();
     }
+
   });
 }
 
@@ -841,30 +872,7 @@ async function loadSessionList() {
   });
 
   $$("[data-rename-session]").forEach((button) => {
-    button.addEventListener("click", async (event) => {
-      event.stopPropagation();
-      const id = button.dataset.renameSession;
-      const item = button.closest(".session-item");
-      const currentName = item?.querySelector(".session-name")?.textContent?.trim() || (id === state.sessionId ? state.sessionName : "");
-      const nextName = await showRenameSessionModal(currentName);
-      if (nextName === null) return;
-      try {
-        const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: nextName || currentName || id })
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || data.ok === false) {
-          throw new Error(data.detail || `HTTP ${response.status}`);
-        }
-        if (id === state.sessionId) state.sessionName = data.session?.name || nextName || currentName;
-        renderCurrentSession();
-        await loadSessionList();
-      } catch (err) {
-        alert(`重命名失败：${err.message}`);
-      }
-    });
+    button.addEventListener("click", (event) => renameSession(button, event));
   });
 }
 
