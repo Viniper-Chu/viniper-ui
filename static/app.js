@@ -13,7 +13,7 @@ const state = {
   permissionMode: "ask",
   theme: "light",
   language: "zh-CN",
-  accent: "husky",
+  accent: "viniper",
   settings: null,
   updateInfo: null,
   abortController: null,
@@ -166,11 +166,12 @@ function applyLanguage(language) {
 
 function getInitialAccent() {
   const savedAccent = storageGet(ACCENT_KEY);
-  return ["husky", "blue", "green", "rose"].includes(savedAccent) ? savedAccent : "husky";
+  if (savedAccent === "husky") return "viniper";
+  return ["viniper", "blue", "green", "rose"].includes(savedAccent) ? savedAccent : "viniper";
 }
 
 function applyAccent(accent) {
-  state.accent = ["husky", "blue", "green", "rose"].includes(accent) ? accent : "husky";
+  state.accent = accent === "husky" ? "viniper" : (["viniper", "blue", "green", "rose"].includes(accent) ? accent : "viniper");
   document.documentElement.dataset.accent = state.accent;
   storageSet(ACCENT_KEY, state.accent);
 }
@@ -300,7 +301,7 @@ function bindEvents() {
     });
   }
 
-  document.addEventListener("click", (event) => {
+  document.addEventListener("click", async (event) => {
     const copyButton = event.target.closest("[data-copy]");
     if (copyButton) {
       navigator.clipboard.writeText(copyButton.dataset.copy || "").then(() => {
@@ -318,6 +319,24 @@ function bindEvents() {
       autoResize($("#user-input"));
       $("#user-input").focus();
       sendMessage();
+    }
+
+    const renameButton = event.target.closest("[data-rename-session]");
+    if (renameButton) {
+      const id = renameButton.dataset.renameSession;
+      const item = renameButton.closest(".session-item");
+      const nameEl = item?.querySelector(".session-name");
+      const currentName = nameEl ? nameEl.textContent.trim() : "";
+      const nextName = window.prompt("新的会话名称", currentName);
+      if (nextName === null) return;
+      await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: nextName.trim() })
+      });
+      if (id === state.sessionId) state.sessionName = nextName.trim();
+      renderCurrentSession();
+      await loadSessionList();
     }
   });
 }
@@ -800,22 +819,6 @@ async function loadSessionList() {
     });
   });
 
-  $$("[data-rename-session]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const id = button.dataset.renameSession;
-      const currentName = id === state.sessionId ? state.sessionName : "";
-      const nextName = window.prompt("新的会话名称", currentName);
-      if (nextName === null) return;
-      await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: nextName.trim() })
-      });
-      if (id === state.sessionId) state.sessionName = nextName.trim();
-      renderCurrentSession();
-      await loadSessionList();
-    });
-  });
 }
 
 async function switchSession(sessionId, { quiet = false } = {}) {
