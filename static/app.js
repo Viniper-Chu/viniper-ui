@@ -301,6 +301,28 @@ function bindEvents() {
     });
   }
 
+  window.renameSession = async function(button) {
+    const id = button.dataset.renameSession;
+    const item = button.closest(".session-item");
+    const nameEl = item ? item.querySelector(".session-name") : null;
+    const currentName = nameEl ? nameEl.textContent.trim() : "";
+    const nextName = window.prompt("新的会话名称", currentName);
+    if (nextName === null) return;
+    await fetch("/api/sessions/" + encodeURIComponent(id), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: nextName.trim() })
+    });
+    if (id === state.sessionId) state.sessionName = nextName.trim();
+    renderCurrentSession();
+    await loadSessionList();
+  };
+
+  document.addEventListener("click", (event) => {
+    const renameButton = event.target.closest("[data-rename-session]");
+    if (renameButton) renameSession(renameButton);
+  });
+
   document.addEventListener("click", async (event) => {
     const copyButton = event.target.closest("[data-copy]");
     if (copyButton) {
@@ -321,23 +343,6 @@ function bindEvents() {
       sendMessage();
     }
 
-    const renameButton = event.target.closest("[data-rename-session]");
-    if (renameButton) {
-      const id = renameButton.dataset.renameSession;
-      const item = renameButton.closest(".session-item");
-      const nameEl = item?.querySelector(".session-name");
-      const currentName = nameEl ? nameEl.textContent.trim() : "";
-      const nextName = window.prompt("新的会话名称", currentName);
-      if (nextName === null) return;
-      await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: nextName.trim() })
-      });
-      if (id === state.sessionId) state.sessionName = nextName.trim();
-      renderCurrentSession();
-      await loadSessionList();
-    }
   });
 }
 
@@ -779,7 +784,7 @@ async function loadSessionList() {
           <span class="session-name">${escapeHtml(title)}</span>
           <span class="session-meta">${escapeHtml(meta)}</span>
         </button>
-        <button class="mini-button" type="button" title="重命名" data-rename-session="${escapeAttr(session.id)}">✎</button>
+        <button class="mini-button" type="button" title="重命名" data-rename-session="${escapeAttr(session.id)}" onclick="renameSession(this)">✎</button>
         <button class="mini-button danger" type="button" title="删除" data-delete-session="${escapeAttr(session.id)}">×</button>
       </div>
     `;
