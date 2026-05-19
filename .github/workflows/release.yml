@@ -211,3 +211,31 @@ jobs:
                 core.warning(`Could not delete tag ${release.tag_name}: ${error.message}`);
               }
             }
+            const tagRefs = await github.paginate(github.rest.git.listMatchingRefs, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: "tags/v"
+            });
+            const semverTags = tagRefs
+              .map((item) => item.ref.replace("refs/tags/", ""))
+              .filter((tag) => /^v?\d+\.\d+\.\d+$/.test(tag))
+              .sort((a, b) => {
+                const av = semver(a);
+                const bv = semver(b);
+                for (let i = 0; i < 3; i += 1) {
+                  if (av[i] !== bv[i]) return bv[i] - av[i];
+                }
+                return 0;
+              });
+            for (const tag of semverTags.slice(keep)) {
+              core.info(`Deleting old tag ${tag}`);
+              try {
+                await github.rest.git.deleteRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `tags/${tag}`
+                });
+              } catch (error) {
+                core.warning(`Could not delete tag ${tag}: ${error.message}`);
+              }
+            }
