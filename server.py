@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 
@@ -1727,7 +1727,15 @@ def get_skills() -> list[dict[str, str]]:
 
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    asset_version = re.sub(r"[^A-Za-z0-9_.-]", "", APP_VERSION) or str(int(time.time()))
+    html = html.replace("__APP_VERSION__", asset_version)
+    return HTMLResponse(
+        html,
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
 
 
 @app.get("/favicon.ico")
