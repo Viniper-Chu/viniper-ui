@@ -8,7 +8,7 @@
     (() => {
       const savedTheme = localStorage.getItem("viniper-ui:theme");
       const savedAccentRaw = localStorage.getItem("viniper-ui:accent") || "viniper";
-      const savedAccent = savedAccentRaw === "husky" ? "viniper" : savedAccentRaw;
+      const savedAccent = savedAccentRaw;
       const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
       document.documentElement.dataset.theme = savedTheme === "dark" || (savedTheme === "system" && prefersDark) ? "dark" : "light";
       document.documentElement.dataset.accent = savedAccent;

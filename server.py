@@ -356,8 +356,6 @@ def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
         appearance["language"] = "zh-CN"
     if appearance.get("theme") not in {item["id"] for item in THEME_OPTIONS}:
         appearance["theme"] = "system"
-    if appearance.get("accent") == "husky":
-        appearance["accent"] = "viniper"
     if appearance.get("accent") not in {item["id"] for item in ACCENT_OPTIONS}:
         appearance["accent"] = "viniper"
 

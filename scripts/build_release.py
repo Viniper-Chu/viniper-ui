@@ -169,7 +169,7 @@ def main() -> int:
 
     print(f"Built {zip_path}")
     print(f"Built {DIST / 'latest.json'}")
-    cleanup_old_releases(DIST, keep=2)
+    cleanup_old_releases(DIST, keep=3)
     return 0
 
 
@@ -180,7 +180,7 @@ def parse_version_from_filename(name: str) -> tuple[int, ...]:
     return tuple(int(part) for part in match.group(1).split("."))
 
 
-def cleanup_old_releases(dist_dir: Path, keep: int = 2) -> None:
+def cleanup_old_releases(dist_dir: Path, keep: int = 3) -> None:
     zips = sorted(
         [path for path in dist_dir.glob("ViniperUI-v*.zip") if path.is_file()],
         key=lambda path: parse_version_from_filename(path.name),

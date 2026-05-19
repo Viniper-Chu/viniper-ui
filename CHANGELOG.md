@@ -1,6 +1,21 @@
-## v1.0.0 (2026-05-19)
+## v1.0.0 (2026-05-20)
 
 ### 重大更新
+- **首个正式版**：经过 0.1.0 ~ 0.2.9 共 10+ 个版本的迭代，Viniper UI 现已稳定。
+- **FastAPI 现代化**：`@app.on_event` 弃用迁移为 `lifespan` 异步上下文管理器，兼容 FastAPI 0.136+。
+- **硬编码清理**：移除 `KNOWN_WORK_DIRS` 中写死的用户私有路径，改为仅包含项目根目录。
+- **主题命名彻底清理**：`husky` → `viniper` 向后兼容代码已在 linter 格式化时移除，CHANGELOG 承诺已兑现。
+- **上下文窗口**：DeepSeek V4 Pro 调整为完整的 100 万 token。
+- **版本号统一**：`VERSION`、`desktop/package.json`、`package-lock.json` 全部对齐为 1.0.0。
+
+### 基础设施
+- `server.py` lifespan 替代 `on_event`
+- `build_release.py` 自动保留最新 3 个版本构建产物
+- GitHub Actions 全平台构建（Windows NSIS + macOS ARM64 zip + Web UI 更新包）
+
+### 版本策略
+- 主版本号 1.x：稳定发布线
+- 每次版本更新后自动清理最旧版本，本地和 GitHub Release 均保留当前版本与前 2 个版本
 - **FastAPI lifespan 迁移**：`@app.on_event("startup")` 已弃用，迁移至 `asynccontextmanager` lifespan 模式，兼容 FastAPI 0.136+。
 - **上下文提升至 100 万 token**：DeepSeek V4 Pro 上下文限制从 200K 改为 1,000,000 token。
 - **硬编码路径清理**：移除 `KNOWN_WORK_DIRS` 中用户特定路径，改用环境变量驱动。
