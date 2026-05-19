@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 import zipfile
@@ -143,7 +144,27 @@ def main() -> int:
 
     print(f"Built {zip_path}")
     print(f"Built {DIST / 'latest.json'}")
+    cleanup_old_releases(DIST, keep=2)
     return 0
+
+
+def parse_version_from_filename(name: str) -> tuple[int, ...]:
+    match = re.search(r"(\d+(?:\.\d+)*)", name)
+    if not match:
+        return (0,)
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def cleanup_old_releases(dist_dir: Path, keep: int = 2) -> None:
+    zips = sorted(
+        [path for path in dist_dir.glob("ViniperUI-v*.zip") if path.is_file()],
+        key=lambda path: parse_version_from_filename(path.name),
+    )
+    for path in zips[:-keep]:
+        sha_path = path.with_suffix(path.suffix + ".sha256")
+        path.unlink(missing_ok=True)
+        sha_path.unlink(missing_ok=True)
+        print(f"Removed old release: {path.name}")
 
 
 if __name__ == "__main__":
