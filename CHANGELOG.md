@@ -1,3 +1,26 @@
+## v1.0.0 (2026-05-19)
+
+### 重大更新
+- **FastAPI lifespan 迁移**：`@app.on_event("startup")` 已弃用，迁移至 `asynccontextmanager` lifespan 模式，兼容 FastAPI 0.136+。
+- **上下文提升至 100 万 token**：DeepSeek V4 Pro 上下文限制从 200K 改为 1,000,000 token。
+- **硬编码路径清理**：移除 `KNOWN_WORK_DIRS` 中用户特定路径，改用环境变量驱动。
+- **版本统一**：VERSION、desktop/package.json、package-lock.json 全部同步为 1.0.0。
+- **主题清理**：移除 `husky` 向后兼容代码，统一为 `viniper` 主题标识。
+- **桌面壳 AppUserModelID**：切换为 `com.viniper.ui.desktop`，搭配新图标避免 Windows 图标缓存问题。
+- **工件命名**：Windows 安装器使用 `Viniper.UI.Setup.${version}.exe`，macOS 使用 `Viniper.UI.${version}-${arch}-mac.zip`。
+
+### 修复
+- 会话重命名改为网页内弹窗，不依赖浏览器原生 `prompt`（v0.2.7 → v0.2.8 持续修复）。
+- 桌面快捷方式统一指向安装版 exe 和黑色 Viniper 图标。
+- 构建产物自动保留当前版本及前两个版本。
+
+### 自检
+- `python scripts/verify_app.py` ✅
+- `python scripts/verify_release.py` ✅
+- `node --check static/app.js` ✅
+- `node --check desktop/main.js` ✅
+- `node --check desktop/preload.js` ✅
+
 ## v0.2.8 (2026-05-19)
 
 ### 修复

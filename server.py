@@ -16,6 +16,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -207,19 +209,19 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 KNOWN_WORK_DIRS = [
     BASE_DIR,
-    Path("D:/高中数学交流app"),
 ]
 
-app = FastAPI(title=APP_TITLE)
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await asyncio.to_thread(refresh_windows_shortcuts)
+    yield
+
+
+app = FastAPI(title=APP_TITLE, lifespan=lifespan)
 sessions: dict[str, dict[str, Any]] = {}
 _skills_cache: dict[str, Any] = {"time": 0.0, "items": []}
 _session_locks: dict[str, asyncio.Lock] = {}
 _active_runs: dict[str, dict[str, Any]] = {}
-
-
-@app.on_event("startup")
-async def startup_tasks():
-    await asyncio.to_thread(refresh_windows_shortcuts)
 
 
 def now_ts() -> float:

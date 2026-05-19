@@ -1,6 +1,6 @@
 {
   "name": "viniper-ui-desktop",
-  "version": "0.2.8",
+  "version": "1.0.0",
   "private": true,
   "description": "Desktop shell for Viniper UI.",
   "main": "main.js",

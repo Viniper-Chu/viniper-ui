@@ -168,12 +168,11 @@ function applyLanguage(language) {
 
 function getInitialAccent() {
   const savedAccent = storageGet(ACCENT_KEY);
-  if (savedAccent === "husky") return "viniper";
   return ["viniper", "blue", "green", "rose"].includes(savedAccent) ? savedAccent : "viniper";
 }
 
 function applyAccent(accent) {
-  state.accent = accent === "husky" ? "viniper" : (["viniper", "blue", "green", "rose"].includes(accent) ? accent : "viniper");
+  state.accent = ["viniper", "blue", "green", "rose"].includes(accent) ? accent : "viniper";
   document.documentElement.dataset.accent = state.accent;
   storageSet(ACCENT_KEY, state.accent);
 }
