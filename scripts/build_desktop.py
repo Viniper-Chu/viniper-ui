@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DESKTOP = ROOT / "desktop"
+KEEP_RELEASE_VERSIONS = 3
+
+
+def version_tuple(value: str) -> tuple[int, int, int]:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
+    if not match:
+        return (0, 0, 0)
+    return tuple(int(part) for part in match.groups())
 
 
 def tool(name: str) -> str:
@@ -68,7 +77,24 @@ def patch_windows_icon() -> None:
         raise SystemExit(f"missing packaged executable: {exe_path}")
     if not icon_path.exists():
         raise SystemExit(f"missing icon file: {icon_path}")
-    run([str(rcedit_tool()), str(exe_path), "--set-icon", str(icon_path)], timeout=60)
+    run([
+        str(rcedit_tool()),
+        str(exe_path),
+        "--set-icon",
+        str(icon_path),
+        "--set-version-string",
+        "ProductName",
+        "Viniper UI",
+        "--set-version-string",
+        "FileDescription",
+        "Viniper UI",
+        "--set-version-string",
+        "InternalName",
+        "Viniper UI",
+        "--set-version-string",
+        "OriginalFilename",
+        "Viniper UI.exe",
+    ], timeout=60)
 
 
 def prepare_macos_icon() -> None:
@@ -88,6 +114,41 @@ def prepare_macos_icon() -> None:
             retina = iconset / f"icon_{size}x{size}@2x.png"
             run(["sips", "-z", str(size * 2), str(size * 2), str(source), "--out", str(retina)], timeout=60)
     run(["iconutil", "-c", "icns", str(iconset), "-o", str(build_dir / "icon.icns")], timeout=60)
+
+
+def prune_desktop_artifacts(keep: int = KEEP_RELEASE_VERSIONS) -> None:
+    release_dir = DESKTOP / "release"
+    if not release_dir.exists():
+        return
+    versioned: dict[str, list[Path]] = {}
+    for pattern in [
+        "Viniper.UI.Setup.*.exe",
+        "Viniper.UI.Setup.*.exe.blockmap",
+        "Viniper UI Setup *.exe",
+        "Viniper UI Setup *.exe.blockmap",
+        "Viniper.UI.*-mac.zip",
+        "Viniper.UI.*-mac.zip.blockmap",
+    ]:
+        for path in release_dir.glob(pattern):
+            match = re.search(r"(\d+\.\d+\.\d+)", path.name)
+            if match:
+                versioned.setdefault(match.group(1), []).append(path)
+    ordered = sorted(versioned, key=version_tuple, reverse=True)
+    for version, paths in versioned.items():
+        has_stable_windows_name = any(path.name.startswith("Viniper.UI.Setup.") for path in paths)
+        if has_stable_windows_name:
+            for path in paths:
+                if path.name.startswith("Viniper UI Setup "):
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+    for version in ordered[keep:]:
+        for path in versioned.get(version, []):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def main() -> int:
@@ -130,6 +191,7 @@ def main() -> int:
         else:
             run([npm, "run", "pack"], cwd=DESKTOP, timeout=600)
 
+    prune_desktop_artifacts()
     print(f"Desktop artifacts are in {DESKTOP / 'release'}")
     return 0
 

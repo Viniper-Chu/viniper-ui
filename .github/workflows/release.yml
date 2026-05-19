@@ -122,6 +122,46 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
+      - name: Finalize update manifest
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path("release-artifacts")
+          manifest_path = root / "latest.json"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          repo = os.environ["GITHUB_REPOSITORY"]
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def asset(path):
+              return {
+                  "name": path.name,
+                  "url": f"https://github.com/{repo}/releases/latest/download/{path.name}",
+                  "sha256": sha256_file(path),
+                  "size": path.stat().st_size,
+              }
+
+          assets = manifest.setdefault("assets", {})
+          windows = sorted(root.glob("Viniper.UI.Setup.*.exe"))
+          macos = sorted(root.glob("Viniper.UI.*-mac.zip"))
+          if windows:
+              assets["windows"] = asset(windows[-1])
+          if macos:
+              assets["macos"] = asset(macos[-1])
+          manifest["published_at"] = datetime.now(timezone.utc).isoformat()
+          manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          PY
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -130,3 +170,44 @@ jobs:
           body_path: release-artifacts/release-notes.md
           make_latest: true
           overwrite_files: true
+
+      - name: Keep only current and previous two releases
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const keep = 3;
+            const semver = (tag) => {
+              const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(tag || "");
+              return match ? match.slice(1).map(Number) : [0, 0, 0];
+            };
+            const compareDesc = (a, b) => {
+              const av = semver(a.tag_name);
+              const bv = semver(b.tag_name);
+              for (let i = 0; i < 3; i += 1) {
+                if (av[i] !== bv[i]) return bv[i] - av[i];
+              }
+              return new Date(b.created_at) - new Date(a.created_at);
+            };
+            const releases = (await github.paginate(github.rest.repos.listReleases, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            })).filter((release) => /^v?\d+\.\d+\.\d+$/.test(release.tag_name));
+            releases.sort(compareDesc);
+            for (const release of releases.slice(keep)) {
+              core.info(`Deleting old release ${release.tag_name}`);
+              await github.rest.repos.deleteRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: release.id
+              });
+              try {
+                await github.rest.git.deleteRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `tags/${release.tag_name}`
+                });
+              } catch (error) {
+                core.warning(`Could not delete tag ${release.tag_name}: ${error.message}`);
+              }
+            }

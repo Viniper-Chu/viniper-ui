@@ -12,6 +12,7 @@ const ICON_PATH = process.platform === "win32"
   ? path.join(APP_ROOT, "static", "assets", "viniper-icon.ico")
   : path.join(APP_ROOT, "static", "assets", "viniper-icon.png");
 const BUNDLED_VERSION = readBundledVersion();
+const APP_USER_MODEL_ID = "com.viniper.ui.desktop";
 
 let port = Number(process.env.VINIPER_UI_PORT || 17373);
 let mainWindow = null;
@@ -329,7 +330,8 @@ function createApplicationMenu() {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.setAppUserModelId("com.viniper.ui");
+  app.setName("Viniper UI");
+  app.setAppUserModelId(APP_USER_MODEL_ID);
   app.on("second-instance", showMainWindow);
   app.whenReady().then(async () => {
     createApplicationMenu();

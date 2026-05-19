@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 import zipfile
@@ -31,6 +32,14 @@ APP_DIRS = [
     "scripts",
     "desktop",
 ]
+KEEP_RELEASE_VERSIONS = 3
+
+
+def version_tuple(value: str) -> tuple[int, int, int]:
+    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", value)
+    if not match:
+        return (0, 0, 0)
+    return tuple(int(part) for part in match.groups())
 
 
 def sha256_file(path: Path) -> str:
@@ -71,6 +80,22 @@ def make_zip(source_dir: Path, zip_path: Path) -> None:
         for path in sorted(source_dir.rglob("*")):
             if path.is_file():
                 archive.write(path, path.relative_to(source_dir.parent))
+
+
+def prune_dist_versions(keep: int = KEEP_RELEASE_VERSIONS) -> None:
+    versioned: dict[str, list[Path]] = {}
+    for pattern in ["ViniperUI-v*.zip", "ViniperUI-v*.zip.sha256"]:
+        for path in DIST.glob(pattern):
+            match = re.search(r"v(\d+\.\d+\.\d+)", path.name)
+            if match:
+                versioned.setdefault(match.group(1), []).append(path)
+    ordered = sorted(versioned, key=version_tuple, reverse=True)
+    for version in ordered[keep:]:
+        for path in versioned.get(version, []):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def main() -> int:
@@ -140,6 +165,7 @@ def main() -> int:
     }
     write_text(DIST / "latest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     write_text(DIST / f"{zip_path.name}.sha256", f"{digest}  {zip_path.name}\n")
+    prune_dist_versions()
 
     print(f"Built {zip_path}")
     print(f"Built {DIST / 'latest.json'}")

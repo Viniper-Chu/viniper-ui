@@ -180,7 +180,8 @@ button {
 .panel-button,
 .primary-button,
 .send-button,
-.stop-button {
+.stop-button,
+.danger-button {
   border: 1px solid var(--line);
   background: var(--panel-soft);
   border-radius: var(--radius-sm);
@@ -208,7 +209,8 @@ button {
 
 .ghost-button,
 .panel-button,
-.primary-button {
+.primary-button,
+.danger-button {
   padding: 7px 12px;
 }
 
@@ -231,14 +233,16 @@ button {
   background: var(--accent-strong);
 }
 
-.stop-button {
+.stop-button,
+.danger-button {
   background: var(--red);
   border-color: var(--red);
   color: var(--button-on-accent);
   font-weight: 700;
 }
 
-.stop-button:hover {
+.stop-button:hover,
+.danger-button:hover {
   filter: brightness(1.05);
 }
 

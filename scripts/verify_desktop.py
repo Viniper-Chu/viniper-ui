@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +27,29 @@ def require(path: Path) -> None:
         raise SystemExit(f"missing required desktop file: {path.relative_to(ROOT)}")
 
 
+def verify_windows_icon(path: Path) -> None:
+    data = path.read_bytes()
+    if len(data) < 6:
+        raise SystemExit("windows icon file is too small")
+    reserved, icon_type, count = struct.unpack_from("<HHH", data, 0)
+    if reserved != 0 or icon_type != 1:
+        raise SystemExit("windows icon file has an invalid ICO header")
+    if count < 5:
+        raise SystemExit("windows icon must include multiple sizes for shortcut and taskbar rendering")
+    sizes: set[int] = set()
+    offset = 6
+    for _ in range(count):
+        if offset + 16 > len(data):
+            raise SystemExit("windows icon directory is truncated")
+        width = data[offset] or 256
+        height = data[offset + 1] or 256
+        sizes.add(min(width, height))
+        offset += 16
+    required_sizes = {16, 32, 48, 64, 256}
+    if not required_sizes.issubset(sizes):
+        raise SystemExit(f"windows icon missing sizes: {sorted(required_sizes - sizes)}")
+
+
 def main() -> int:
     required = [
         DESKTOP / "package.json",
@@ -38,6 +62,7 @@ def main() -> int:
     ]
     for path in required:
         require(path)
+    verify_windows_icon(ROOT / "static" / "assets" / "viniper-icon.ico")
 
     package = json.loads((DESKTOP / "package.json").read_text(encoding="utf-8"))
     root_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
@@ -45,6 +70,8 @@ def main() -> int:
         raise SystemExit("desktop package version must match VERSION")
     if package.get("build", {}).get("productName") != "Viniper UI":
         raise SystemExit("desktop package productName must be Viniper UI")
+    if package.get("build", {}).get("appId") != "com.viniper.ui.desktop":
+        raise SystemExit("desktop package appId must match the taskbar AppUserModelID")
     if not package.get("build", {}).get("extraResources"):
         raise SystemExit("desktop package must bundle the local Viniper UI service as extraResources")
 

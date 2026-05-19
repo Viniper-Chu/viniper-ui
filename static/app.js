@@ -13,12 +13,14 @@ const state = {
   permissionMode: "ask",
   theme: "light",
   language: "zh-CN",
-  accent: "husky",
+  accent: "viniper",
   settings: null,
   updateInfo: null,
   abortController: null,
   cancelRequested: false,
-  pendingPermissionResolver: null
+  pendingPermissionResolver: null,
+  pendingDeleteResolver: null,
+  pendingRenameResolver: null
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -166,11 +168,12 @@ function applyLanguage(language) {
 
 function getInitialAccent() {
   const savedAccent = storageGet(ACCENT_KEY);
-  return ["husky", "blue", "green", "rose"].includes(savedAccent) ? savedAccent : "husky";
+  if (savedAccent === "husky") return "viniper";
+  return ["viniper", "blue", "green", "rose"].includes(savedAccent) ? savedAccent : "viniper";
 }
 
 function applyAccent(accent) {
-  state.accent = ["husky", "blue", "green", "rose"].includes(accent) ? accent : "husky";
+  state.accent = accent === "husky" ? "viniper" : (["viniper", "blue", "green", "rose"].includes(accent) ? accent : "viniper");
   document.documentElement.dataset.accent = state.accent;
   storageSet(ACCENT_KEY, state.accent);
 }
@@ -282,6 +285,16 @@ function bindEvents() {
   $("#context-compress-btn").addEventListener("click", compressCurrentContext);
   $("#cancel-session-btn").addEventListener("click", closeNewSessionModal);
   $("#create-session-btn").addEventListener("click", createNamedSession);
+  $("#cancel-delete-session-btn").addEventListener("click", () => closeDeleteSessionModal(false));
+  $("#confirm-delete-session-btn").addEventListener("click", () => closeDeleteSessionModal(true));
+  $("#cancel-rename-session-btn").addEventListener("click", () => closeRenameSessionModal(null));
+  $("#confirm-rename-session-btn").addEventListener("click", () => {
+    closeRenameSessionModal($("#rename-session-name").value.trim());
+  });
+  $("#rename-session-name").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") closeRenameSessionModal($("#rename-session-name").value.trim());
+  });
+  $("#create-desktop-shortcut-btn").addEventListener("click", createDesktopShortcut);
   $("#deny-permission-btn").addEventListener("click", () => closePermissionModal(false));
   $("#allow-once-btn").addEventListener("click", () => closePermissionModal(true));
 
@@ -289,6 +302,8 @@ function bindEvents() {
     if (event.key === "Escape") {
       closePermissionModal(false);
       closeNewSessionModal();
+      closeDeleteSessionModal(false);
+      closeRenameSessionModal(null);
       closeSettingsModal();
       $("#skills-panel").classList.add("hidden");
     }
@@ -611,6 +626,31 @@ async function runDiagnostics() {
   }
 }
 
+async function createDesktopShortcut() {
+  const button = $("#create-desktop-shortcut-btn");
+  const panel = $("#diagnostics-panel");
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = "创建中";
+  try {
+    const response = await fetch("/api/desktop/shortcut", { method: "POST" });
+    const data = await response.json();
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.detail || data.message || `HTTP ${response.status}`);
+    }
+    button.textContent = "已创建";
+    panel.innerHTML = `<div class="diagnostic-row ok"><strong>通过</strong><span>${escapeHtml(data.message || "桌面快捷方式已创建")}</span></div>`;
+    setTimeout(() => {
+      button.textContent = oldText;
+      button.disabled = false;
+    }, 1200);
+  } catch (error) {
+    button.textContent = oldText;
+    button.disabled = false;
+    panel.innerHTML = `<div class="diagnostic-row fail"><strong>失败</strong><span>${escapeHtml(error.message)}</span></div>`;
+  }
+}
+
 function renderModelSelect() {
   const select = $("#model-select");
   const models = state.status?.models || [
@@ -776,7 +816,7 @@ async function loadSessionList() {
       const id = button.dataset.deleteSession;
       const item = button.closest(".session-item");
       const title = item?.querySelector(".session-name")?.textContent?.trim() || id;
-      if (!window.confirm(`删除会话“${title}”？`)) return;
+      if (!(await showDeleteSessionModal(title))) return;
       try {
         const resp = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -801,19 +841,29 @@ async function loadSessionList() {
   });
 
   $$("[data-rename-session]").forEach((button) => {
-    button.addEventListener("click", async () => {
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
       const id = button.dataset.renameSession;
-      const currentName = id === state.sessionId ? state.sessionName : "";
-      const nextName = window.prompt("新的会话名称", currentName);
+      const item = button.closest(".session-item");
+      const currentName = item?.querySelector(".session-name")?.textContent?.trim() || (id === state.sessionId ? state.sessionName : "");
+      const nextName = await showRenameSessionModal(currentName);
       if (nextName === null) return;
-      await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: nextName.trim() })
-      });
-      if (id === state.sessionId) state.sessionName = nextName.trim();
-      renderCurrentSession();
-      await loadSessionList();
+      try {
+        const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: nextName || currentName || id })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || data.ok === false) {
+          throw new Error(data.detail || `HTTP ${response.status}`);
+        }
+        if (id === state.sessionId) state.sessionName = data.session?.name || nextName || currentName;
+        renderCurrentSession();
+        await loadSessionList();
+      } catch (err) {
+        alert(`重命名失败：${err.message}`);
+      }
     });
   });
 }
@@ -828,6 +878,48 @@ async function switchSession(sessionId, { quiet = false } = {}) {
   scrollBottom();
   if (!quiet) $("#user-input").focus();
   return true;
+}
+
+function showDeleteSessionModal(title) {
+  const modal = $("#delete-session-modal");
+  $("#delete-session-copy").textContent = `确定删除“${title}”？这个操作只删除该会话的记录和附件，不会影响其他会话。`;
+  modal.classList.remove("hidden");
+  $("#cancel-delete-session-btn").focus();
+  return new Promise((resolve) => {
+    state.pendingDeleteResolver = resolve;
+  });
+}
+
+function closeDeleteSessionModal(confirmed) {
+  const modal = $("#delete-session-modal");
+  if (modal) modal.classList.add("hidden");
+  if (state.pendingDeleteResolver) {
+    const resolve = state.pendingDeleteResolver;
+    state.pendingDeleteResolver = null;
+    resolve(Boolean(confirmed));
+  }
+}
+
+function showRenameSessionModal(currentName) {
+  const modal = $("#rename-session-modal");
+  const input = $("#rename-session-name");
+  input.value = currentName || "";
+  modal.classList.remove("hidden");
+  input.focus();
+  input.select();
+  return new Promise((resolve) => {
+    state.pendingRenameResolver = resolve;
+  });
+}
+
+function closeRenameSessionModal(value) {
+  const modal = $("#rename-session-modal");
+  if (modal) modal.classList.add("hidden");
+  if (state.pendingRenameResolver) {
+    const resolve = state.pendingRenameResolver;
+    state.pendingRenameResolver = null;
+    resolve(value);
+  }
 }
 
 function applySession(sessionId, data) {

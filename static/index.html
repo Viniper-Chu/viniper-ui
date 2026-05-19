@@ -7,7 +7,8 @@
   <script>
     (() => {
       const savedTheme = localStorage.getItem("viniper-ui:theme");
-      const savedAccent = localStorage.getItem("viniper-ui:accent") || "husky";
+      const savedAccentRaw = localStorage.getItem("viniper-ui:accent") || "viniper";
+      const savedAccent = savedAccentRaw === "husky" ? "viniper" : savedAccentRaw;
       const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
       document.documentElement.dataset.theme = savedTheme === "dark" || (savedTheme === "system" && prefersDark) ? "dark" : "light";
       document.documentElement.dataset.accent = savedAccent;
@@ -138,6 +139,29 @@
     </div>
   </div>
 
+  <div id="delete-session-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="delete-session-title">
+    <div class="modal-content">
+      <h2 id="delete-session-title">删除会话</h2>
+      <p id="delete-session-copy" class="modal-copy"></p>
+      <div class="modal-actions">
+        <button id="cancel-delete-session-btn" class="ghost-button" type="button">取消</button>
+        <button id="confirm-delete-session-btn" class="danger-button" type="button">删除</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="rename-session-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="rename-session-title">
+    <div class="modal-content">
+      <h2 id="rename-session-title">重命名会话</h2>
+      <label for="rename-session-name">名称</label>
+      <input id="rename-session-name" type="text">
+      <div class="modal-actions">
+        <button id="cancel-rename-session-btn" class="ghost-button" type="button">取消</button>
+        <button id="confirm-rename-session-btn" class="primary-button" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
   <div id="permission-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="permission-title">
     <div class="modal-content permission-modal-content">
       <h2 id="permission-title">允许本次 Viniper UI 调用 Claude Code 执行？</h2>
@@ -193,6 +217,8 @@
           <label for="settings-shell">壳</label>
           <select id="settings-shell"></select>
           <p class="settings-help">当前生产通道使用 Claude Code。自定义 CLI 入口已预留，后续可以接入 Codex、Aider 或其他本地 Agent。</p>
+          <button id="create-desktop-shortcut-btn" class="panel-button" type="button">创建桌面快捷方式</button>
+          <p class="settings-help">快捷方式会指向已安装的软件版 Viniper UI，而不是网页启动脚本。</p>
         </section>
 
         <section class="settings-section">

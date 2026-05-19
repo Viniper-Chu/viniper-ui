@@ -1,6 +1,6 @@
 {
   "name": "viniper-ui-desktop",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "description": "Desktop shell for Viniper UI.",
   "main": "main.js",
@@ -18,7 +18,7 @@
     "rcedit": "^5.0.2"
   },
   "build": {
-    "appId": "com.viniper.ui",
+    "appId": "com.viniper.ui.desktop",
     "productName": "Viniper UI",
     "directories": {
       "output": "release"
@@ -55,22 +55,28 @@
     "win": {
       "target": "nsis",
       "icon": "../static/assets/viniper-icon.ico",
+      "artifactName": "Viniper.UI.Setup.${version}.${ext}",
+      "legalTrademarks": "Viniper UI",
       "signAndEditExecutable": false,
       "verifyUpdateCodeSignature": false
     },
     "mac": {
       "target": [
-        "zip"
+      "zip"
       ],
       "category": "public.app-category.productivity",
-      "icon": "build/icon.icns"
+      "icon": "build/icon.icns",
+      "artifactName": "Viniper.UI.${version}-${arch}-mac.${ext}"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Viniper UI"
+      "shortcutName": "Viniper UI",
+      "installerIcon": "../static/assets/viniper-icon.ico",
+      "uninstallerIcon": "../static/assets/viniper-icon.ico",
+      "installerHeaderIcon": "../static/assets/viniper-icon.ico"
     }
   }
 }

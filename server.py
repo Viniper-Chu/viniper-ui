@@ -128,7 +128,7 @@ THEME_OPTIONS = [
     {"id": "dark", "label": "深色"},
 ]
 ACCENT_OPTIONS = [
-    {"id": "husky", "label": "Husky"},
+    {"id": "viniper", "label": "Viniper"},
     {"id": "blue", "label": "Ocean"},
     {"id": "green", "label": "Forest"},
     {"id": "rose", "label": "Rose"},
@@ -288,7 +288,7 @@ def default_settings() -> dict[str, Any]:
         "appearance": {
             "language": "zh-CN",
             "theme": "system",
-            "accent": "husky",
+            "accent": "viniper",
         },
         "shell": {
             "id": "claude-code",
@@ -354,8 +354,10 @@ def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
         appearance["language"] = "zh-CN"
     if appearance.get("theme") not in {item["id"] for item in THEME_OPTIONS}:
         appearance["theme"] = "system"
+    if appearance.get("accent") == "husky":
+        appearance["accent"] = "viniper"
     if appearance.get("accent") not in {item["id"] for item in ACCENT_OPTIONS}:
-        appearance["accent"] = "husky"
+        appearance["accent"] = "viniper"
 
     shell = settings["shell"]
     if shell.get("id") not in {item["id"] for item in SHELL_OPTIONS}:
@@ -610,14 +612,14 @@ def choose_update_asset(manifest: dict[str, Any], requested_asset: str | None = 
         if requested_asset and isinstance(assets.get(requested_asset), dict):
             return dict(assets[requested_asset])
         system_name = platform.system().lower()
-        preferred = ["app"]
+        preferred: list[str] = []
         if "darwin" in system_name:
             preferred.extend(["macos", "darwin"])
         elif "windows" in system_name:
             preferred.extend(["windows", "win"])
         elif "linux" in system_name:
             preferred.append("linux")
-        preferred.extend(["source", "zip"])
+        preferred.extend(["app", "source", "zip"])
         for key in preferred:
             item = assets.get(key)
             if isinstance(item, dict) and item.get("url"):
@@ -701,6 +703,21 @@ def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str 
         actual_sha = sha256_file(package_path)
         if expected_sha and actual_sha.lower() != expected_sha:
             raise ValueError("downloaded update checksum does not match manifest")
+
+        asset_name = str(asset.get("name") or package_path.name)
+        if os.name == "nt" and asset_name.lower().endswith(".exe"):
+            updates_dir = DATA_DIR / "updates"
+            updates_dir.mkdir(parents=True, exist_ok=True)
+            installer_path = updates_dir / safe_attachment_filename(asset_name)
+            shutil.copy2(package_path, installer_path)
+            subprocess.Popen([str(installer_path)], cwd=str(updates_dir), close_fds=True)
+            return {
+                "asset": asset,
+                "sha256": asset.get("sha256") or "",
+                "installer": str(installer_path),
+                "installer_opened": True,
+                "dependencies": "",
+            }
 
         extract_dir = tmp_dir / "extract"
         extract_dir.mkdir()
@@ -903,31 +920,42 @@ def refresh_windows_shortcuts() -> None:
     if not target_path.exists():
         return
 
-    desktop = Path.home() / "Desktop"
-    if not desktop.exists():
-        return
-
     icon_location = f"{target_path},0" if installed_exe.exists() else (f"{icon},0" if icon.exists() else "")
+    desktop = Path.home() / "Desktop"
+    start_menu = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    taskbar = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Internet Explorer" / "Quick Launch" / "User Pinned" / "TaskBar"
     ps = rf"""
 $shell = New-Object -ComObject WScript.Shell
 $target = '{str(target_path).replace("'", "''")}'
 $workdir = '{str(target_path.parent).replace("'", "''")}'
 $icon = '{icon_location.replace("'", "''")}'
 $desktop = '{str(desktop).replace("'", "''")}'
-$links = @(Get-ChildItem -LiteralPath $desktop -Filter 'Viniper UI*.lnk' -ErrorAction SilentlyContinue)
-if ($links.Count -eq 0) {{
-  $links = @([pscustomobject]@{{ FullName = (Join-Path $desktop 'Viniper UI.lnk') }})
-}}
-$links | ForEach-Object {{
+$startMenu = '{str(start_menu).replace("'", "''")}'
+$taskbar = '{str(taskbar).replace("'", "''")}'
+function Update-ViniperShortcut($path) {{
   try {{
-    $shortcut = $shell.CreateShortcut($_.FullName)
+    $shortcut = $shell.CreateShortcut($path)
     $shortcut.TargetPath = $target
     $shortcut.WorkingDirectory = $workdir
-    if ($icon) {{
-      $shortcut.IconLocation = $icon
-    }}
+    if ($icon) {{ $shortcut.IconLocation = $icon }}
     $shortcut.Save()
   }} catch {{}}
+}}
+if (Test-Path -LiteralPath $desktop) {{
+  $desktopLinks = @(Get-ChildItem -LiteralPath $desktop -Filter 'Viniper UI*.lnk' -ErrorAction SilentlyContinue)
+  if ($desktopLinks.Count -eq 0) {{
+    Update-ViniperShortcut (Join-Path $desktop 'Viniper UI.lnk')
+  }} else {{
+    $desktopLinks | ForEach-Object {{ Update-ViniperShortcut $_.FullName }}
+  }}
+}}
+if (Test-Path -LiteralPath $startMenu) {{
+  Update-ViniperShortcut (Join-Path $startMenu 'Viniper UI.lnk')
+}}
+if (Test-Path -LiteralPath $taskbar) {{
+  Get-ChildItem -LiteralPath $taskbar -Filter '*.lnk' -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.Name -like 'Viniper UI*.lnk' }} |
+    ForEach-Object {{ Update-ViniperShortcut $_.FullName }}
 }}
 """
     try:
@@ -1905,6 +1933,14 @@ async def diagnostics():
     }
 
 
+@app.post("/api/desktop/shortcut")
+async def create_desktop_shortcut():
+    if os.name != "nt":
+        return {"ok": False, "message": "当前系统不需要 Windows 桌面快捷方式。"}
+    await asyncio.to_thread(refresh_windows_shortcuts)
+    return {"ok": True, "message": "桌面和开始菜单快捷方式已指向软件版 Viniper UI。"}
+
+
 @app.post("/api/update/check")
 async def check_update(request: Request):
     body: dict[str, Any] = {}
@@ -1984,14 +2020,23 @@ async def install_update(request: Request):
                 "message": "当前已经是最新版本。",
             }
         result = await asyncio.to_thread(install_update_from_manifest, manifest, body.get("asset"))
+        if result.get("installer_opened"):
+            message = (
+                "新版桌面安装器已下载并打开。请按安装器提示完成安装；"
+                "安装后桌面快捷方式会指向软件版 Viniper UI，历史会话不会被清空。"
+            )
+        else:
+            message = "更新已安装到磁盘。请关闭当前浏览器窗口并重新双击 Viniper UI；启动器会自动停止旧服务并打开新版。"
         return {
             "ok": True,
             "updated": True,
             "previous_version": APP_VERSION,
             "latest_version": latest_version,
             "restart_required": True,
-            "message": "更新已安装到磁盘。请关闭当前浏览器窗口并重新双击 Viniper UI；启动器会自动停止旧服务并打开新版。",
+            "installer_opened": bool(result.get("installer_opened")),
+            "message": message,
             "asset": result.get("asset", {}),
+            "sha256": result.get("sha256", ""),
             "dependencies": result.get("dependencies", ""),
         }
     except HTTPException:
