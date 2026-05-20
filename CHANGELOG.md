@@ -1,3 +1,15 @@
+## v1.0.2 (2026-05-20)
+
+### 修复
+- **快捷方式目标**：源代码目录自检或开发启动时，也会优先把桌面和开始菜单快捷方式指向已安装的软件入口 `D:\Viniper UI\Viniper UI.exe`，避免再次退回 `start.bat` 网页入口。
+- **更新清单**：桌面构建后会把 Windows 安装包写入 `latest.json` 的 `assets.windows`，低版本可收到完整桌面安装包更新。
+
+### 验证
+- `python scripts/verify_app.py`
+- `python scripts/verify_release.py`
+- `python scripts/build_desktop.py --target win --skip-install`
+- 本机桌面和开始菜单快捷方式目标校验为 `D:\Viniper UI\Viniper UI.exe`。
+
 ## v1.0.1 (2026-05-20)
 
 ### 修复

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -15,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DESKTOP = ROOT / "desktop"
 KEEP_RELEASE_VERSIONS = 2
+DIST = ROOT / "dist"
 
 
 def version_tuple(value: str) -> tuple[int, int, int]:
@@ -51,6 +54,50 @@ def run(command: list[str], cwd: Path = ROOT, timeout: int | None = None) -> Non
             sys.stdout.buffer.write(b"\n")
     if completed.returncode != 0:
         raise SystemExit(f"command failed: {' '.join(command)}")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_version() -> str:
+    return (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+
+
+def release_download_url(manifest: dict, asset_name: str) -> str:
+    app_url = str(manifest.get("assets", {}).get("app", {}).get("url", ""))
+    marker = "/download/"
+    if marker in app_url:
+        return app_url.split(marker, 1)[0] + marker + asset_name
+    return asset_name
+
+
+def update_latest_manifest() -> None:
+    manifest_path = DIST / "latest.json"
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assets = manifest.setdefault("assets", {})
+    version = read_version()
+    release_dir = DESKTOP / "release"
+
+    candidates = {
+        "windows": release_dir / f"Viniper.UI.Setup.{version}.exe",
+        "macos": release_dir / f"Viniper.UI.{version}-arm64-mac.zip",
+    }
+    for key, path in candidates.items():
+        if path.exists():
+            assets[key] = {
+                "name": path.name,
+                "url": release_download_url(manifest, path.name),
+                "sha256": sha256_file(path),
+                "size": path.stat().st_size,
+            }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def rcedit_tool() -> Path:
@@ -192,6 +239,7 @@ def main() -> int:
             run([npm, "run", "pack"], cwd=DESKTOP, timeout=600)
 
     prune_desktop_artifacts()
+    update_latest_manifest()
     print(f"Desktop artifacts are in {DESKTOP / 'release'}")
     return 0
 

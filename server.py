@@ -911,6 +911,7 @@ def refresh_windows_shortcuts() -> None:
         return
     icon = STATIC_DIR / "assets" / "viniper-icon.ico"
     installed_candidates = [
+        BASE_DIR / "Viniper UI.exe",
         BASE_DIR.parent / "Viniper UI.exe",
         Path("C:/Program Files/Viniper UI/Viniper UI.exe"),
         Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Viniper UI" / "Viniper UI.exe",
