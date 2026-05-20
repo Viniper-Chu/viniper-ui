@@ -1,3 +1,16 @@
+## v2.0.4 (2026-05-21)
+
+### 修复
+- **根治 stdout 行长限制**：不再依赖 Python `StreamReader.readline()` 和它的 `limit` 参数读取 Claude Code `stream-json`。Viniper UI 现在按字节块读取 stdout，再自行按换行切分事件，因此不会再因为单条 JSON 行超过 32 MB 或其他固定读取上限而报 `Separator is found, but chunk is longer than limit`。
+- **长任务兼容性**：长工具结果、超长初始化事件、大量 skills 列表和长上下文流式输出会继续被读取；界面展示仍按现有规则截断工具输出，避免 UI 被巨量文本拖垮。
+- **目录选择**：新建会话和切换工作目录不再只能手动输入路径；现在可以浏览磁盘文件夹、进入子文件夹、返回上一级、直接使用当前目录，也可以在设置里的默认新建位置下快速新建文件夹。
+
+### 验证
+- `python -m py_compile server.py`
+- `python scripts/verify_app.py`
+- 使用 40 MB 单行模拟 Claude Code stdout，确认可完整读取并按行解析，不触发 Python readline 限制。
+- 验证 `/api/filesystem/roots`、`/api/filesystem/children`、`/api/filesystem/folders`，以及目录选择弹窗能把路径写回新建会话/切换目录输入框。
+
 ## v2.0.3 (2026-05-20)
 
 ### 修复

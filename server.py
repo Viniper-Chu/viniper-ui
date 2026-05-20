@@ -85,9 +85,9 @@ GUI_COMMAND_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_GUI_COMMAND_TIMEOUT", "0
 ACTION_TASK_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_ACTION_IDLE_TIMEOUT", "0"))
 SAFETY_GUARDS_ENABLED = env_value("VINIPER_UI_SAFETY_GUARDS", "0") == "1"
 TOOL_RESULT_DISPLAY_LIMIT = int(env_value("VINIPER_UI_TOOL_RESULT_LIMIT", "8000"))
-STREAM_READER_LIMIT = max(
-    1024 * 1024,
-    int(env_value("VINIPER_UI_STREAM_READER_LIMIT", str(32 * 1024 * 1024))),
+STREAM_READ_CHUNK_SIZE = max(
+    4096,
+    int(env_value("VINIPER_UI_STREAM_READ_CHUNK_SIZE", str(64 * 1024))),
 )
 MAX_ATTACHMENT_BYTES = int(env_value("VINIPER_UI_MAX_ATTACHMENT_BYTES", str(50 * 1024 * 1024)))
 MAX_ATTACHMENT_TOTAL_BYTES = int(env_value("VINIPER_UI_MAX_ATTACHMENT_TOTAL_BYTES", str(100 * 1024 * 1024)))
@@ -192,6 +192,32 @@ STATIC_DIR = APP_DIR / "static"
 PROJECT_SKILLS_DIR = BASE_DIR / ".claude" / "skills"
 USER_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 LEGACY_DATA_DIR = APP_DIR / "data"
+
+
+def platform_default_workspace_root() -> Path:
+    configured = env_value("VINIPER_UI_DEFAULT_WORKSPACE_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if os.name == "nt":
+        for letter in ("D", "C"):
+            root = Path(f"{letter}:/")
+            if root.exists() and root.is_dir():
+                return root
+    return Path.home()
+
+
+def normalize_existing_dir(value: Any, fallback: Path | None = None) -> str:
+    fallback_path = fallback or platform_default_workspace_root()
+    text = str(value or "").strip()
+    if not text:
+        return str(fallback_path)
+    path = Path(text).expanduser()
+    try:
+        if path.exists() and path.is_dir():
+            return str(path.resolve())
+    except Exception:
+        pass
+    return str(fallback_path)
 
 
 def default_data_dir() -> Path:
@@ -321,6 +347,9 @@ def default_settings() -> dict[str, Any]:
             "open_at_login": False,
             "minimize_to_tray": True,
         },
+        "workspace": {
+            "default_root": str(platform_default_workspace_root()),
+        },
     }
 
 
@@ -383,6 +412,9 @@ def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
     ids = {item["id"] for item in provider["models"]}
     if provider.get("model") not in ids:
         provider["model"] = provider["models"][0]["id"]
+
+    workspace = settings.setdefault("workspace", {})
+    workspace["default_root"] = normalize_existing_dir(workspace.get("default_root"), platform_default_workspace_root())
     return settings
 
 
@@ -1016,6 +1048,51 @@ def existing_workdir(value: str | None) -> Path:
     return BASE_DIR
 
 
+def directory_payload(path: Path) -> dict[str, str]:
+    return {"path": str(path), "name": path.name or str(path)}
+
+
+def filesystem_roots() -> list[dict[str, str]]:
+    roots: list[Path] = []
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.expanduser().resolve()
+            if resolved.exists() and resolved.is_dir() and resolved not in roots:
+                roots.append(resolved)
+        except Exception:
+            pass
+
+    add(Path(load_app_settings().get("workspace", {}).get("default_root") or platform_default_workspace_root()))
+    add(platform_default_workspace_root())
+    add(BASE_DIR)
+    add(Path.home())
+    if os.name == "nt":
+        for code in range(ord("A"), ord("Z") + 1):
+            add(Path(f"{chr(code)}:/"))
+    return [directory_payload(path) for path in roots]
+
+
+def resolve_existing_directory(value: Any | None, fallback: Path | None = None) -> Path:
+    path = Path(str(value or fallback or platform_default_workspace_root())).expanduser()
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    if not resolved.exists() or not resolved.is_dir():
+        raise HTTPException(status_code=400, detail="directory does not exist")
+    return resolved
+
+
+def validate_folder_name(name: Any) -> str:
+    value = str(name or "").strip().strip(". ")
+    if not value:
+        raise HTTPException(status_code=400, detail="folder name is required")
+    if re.search(r'[<>:"/\\|?*\x00-\x1f]', value):
+        raise HTTPException(status_code=400, detail="folder name contains invalid characters")
+    return value[:120]
+
+
 def add_dir_args(session: dict[str, Any], prompt: str, attachments: list[dict[str, Any]] | None = None) -> list[str]:
     paths: list[Path] = [existing_workdir(str(session.get("workdir") or ""))]
     paths.extend(path for path in KNOWN_WORK_DIRS if path.exists())
@@ -1143,6 +1220,37 @@ async def read_stderr(proc: asyncio.subprocess.Process) -> str:
             break
         chunks.append(chunk)
     return clean_stream_text(b"".join(chunks).decode("utf-8", errors="replace").strip())
+
+
+class ChunkedLineReader:
+    """Read newline-delimited subprocess output without StreamReader.readline limits."""
+
+    def __init__(self, stream: asyncio.StreamReader, chunk_size: int = STREAM_READ_CHUNK_SIZE):
+        self.stream = stream
+        self.chunk_size = chunk_size
+        self.buffer = bytearray()
+        self.eof = False
+
+    async def readline(self, timeout: float | None) -> bytes:
+        while True:
+            newline_index = self.buffer.find(b"\n")
+            if newline_index >= 0:
+                line = bytes(self.buffer[: newline_index + 1])
+                del self.buffer[: newline_index + 1]
+                return line
+
+            if self.eof:
+                if not self.buffer:
+                    return b""
+                line = bytes(self.buffer)
+                self.buffer.clear()
+                return line
+
+            chunk = await asyncio.wait_for(self.stream.read(self.chunk_size), timeout=timeout)
+            if chunk:
+                self.buffer.extend(chunk)
+            else:
+                self.eof = True
 
 
 async def kill_process_tree(pid: int | None) -> None:
@@ -1498,7 +1606,6 @@ async def stream_chat_impl(
     external_gui_timeout = False
     action_task = is_action_task_prompt(prompt)
     action_idle_timeout = False
-    stream_read_error = ""
     assistant_message_index: int | None = None
     last_progress_save = 0.0
     finalized = False
@@ -1566,13 +1673,13 @@ async def stream_chat_impl(
             env=build_claude_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            limit=STREAM_READER_LIMIT,
         )
         run_info = {"pid": proc.pid, "started": now_ts(), "prompt": prompt, "cancel_requested": False}
         _active_runs[session_id] = run_info
         stderr_task = asyncio.create_task(read_stderr(proc))
 
         assert proc.stdout is not None
+        stdout_reader = ChunkedLineReader(proc.stdout)
         started = time.monotonic()
         last_heartbeat = started
         last_process_output = started
@@ -1585,7 +1692,7 @@ async def stream_chat_impl(
                 break
             try:
                 read_timeout = 10 if remaining is None else min(10, remaining)
-                raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
+                raw_line = await stdout_reader.readline(read_timeout)
             except asyncio.TimeoutError:
                 now = time.monotonic()
                 if (
@@ -1617,16 +1724,6 @@ async def stream_chat_impl(
                     save_assistant_progress(force=True)
                     last_heartbeat = now
                 continue
-            except ValueError as exc:
-                stream_read_error = (
-                    "Claude Code 单条流式输出超过 Viniper UI 读取上限。"
-                    f"当前上限 {format_bytes(STREAM_READER_LIMIT)}，"
-                    "已停止本次任务，避免界面假死。"
-                )
-                if "Separator is found" not in str(exc) and "chunk is longer" not in str(exc):
-                    stream_read_error = f"Claude Code 流式输出读取失败：{exc}"
-                await kill_process_tree(proc.pid)
-                break
             if not raw_line:
                 break
             last_process_output = time.monotonic()
@@ -1724,13 +1821,6 @@ async def stream_chat_impl(
 
         return_code = await proc.wait()
         stderr_text = await stderr_task
-
-        if stream_read_error:
-            yield sse({"type": "error", "content": stream_read_error})
-            finalize_assistant(f"错误：{stream_read_error}")
-            save_sessions_to_disk()
-            yield sse({"type": "done"})
-            return
 
         if external_gui_timeout:
             detail = (
@@ -2055,6 +2145,61 @@ async def update_settings(request: Request):
         "settings": public_settings(load_app_settings()),
         "models": effective_model_options(),
     }
+
+
+@app.get("/api/filesystem/roots")
+async def get_filesystem_roots():
+    settings = load_app_settings()
+    default_root = resolve_existing_directory(settings.get("workspace", {}).get("default_root"), platform_default_workspace_root())
+    return {
+        "ok": True,
+        "default_root": str(default_root),
+        "roots": filesystem_roots(),
+    }
+
+
+@app.get("/api/filesystem/children")
+async def get_filesystem_children(path: str | None = None):
+    current = resolve_existing_directory(path, platform_default_workspace_root())
+    directories: list[dict[str, Any]] = []
+    try:
+        for item in current.iterdir():
+            try:
+                if item.is_dir():
+                    directories.append({
+                        "path": str(item.resolve()),
+                        "name": item.name,
+                        "hidden": item.name.startswith("."),
+                    })
+            except Exception:
+                continue
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="permission denied")
+    directories.sort(key=lambda item: item["name"].lower())
+    return {
+        "ok": True,
+        "path": str(current),
+        "name": current.name or str(current),
+        "parent": str(current.parent) if current.parent != current else "",
+        "directories": directories[:500],
+    }
+
+
+@app.post("/api/filesystem/folders")
+async def create_filesystem_folder(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="folder body must be an object")
+    parent = resolve_existing_directory(body.get("parent"), platform_default_workspace_root())
+    name = validate_folder_name(body.get("name"))
+    target = parent / name
+    try:
+        target.mkdir(parents=False, exist_ok=True)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="permission denied")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "path": str(target.resolve()), "name": target.name}
 
 
 @app.get("/api/diagnostics")

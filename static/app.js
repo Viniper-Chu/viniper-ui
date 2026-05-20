@@ -18,6 +18,13 @@ const state = {
   updateInfo: null,
   abortController: null,
   cancelRequested: false,
+  folderPicker: {
+    targetSelector: "",
+    currentPath: "",
+    parentPath: "",
+    defaultRoot: "",
+    roots: []
+  },
   pendingPermissionResolver: null,
   pendingDeleteResolver: null,
   pendingRenameResolver: null
@@ -288,6 +295,18 @@ function bindEvents() {
   $("#confirm-delete-session-btn").addEventListener("click", () => closeDeleteSessionModal(true));
   $("#cancel-workdir-btn").addEventListener("click", () => $("#workdir-modal").classList.add("hidden"));
   $("#save-workdir-btn").addEventListener("click", saveWorkdir);
+  $("#browse-workdir-btn").addEventListener("click", () => openFolderPicker("#workdir-input", $("#workdir-input").value || state.workdir));
+  $("#create-workdir-btn").addEventListener("click", () => createDefaultFolderForInput("#workdir-input"));
+  $("#browse-new-session-workdir-btn").addEventListener("click", () => openFolderPicker("#new-session-workdir", $("#new-session-workdir").value));
+  $("#create-new-session-workdir-btn").addEventListener("click", () => createDefaultFolderForInput("#new-session-workdir"));
+  $("#browse-settings-default-root-btn").addEventListener("click", () => openFolderPicker("#settings-default-root", $("#settings-default-root").value));
+  $("#folder-picker-parent-btn").addEventListener("click", () => {
+    if (state.folderPicker.parentPath) loadFolderPickerPath(state.folderPicker.parentPath);
+  });
+  $("#folder-picker-refresh-btn").addEventListener("click", () => loadFolderPickerPath(state.folderPicker.currentPath));
+  $("#folder-picker-new-btn").addEventListener("click", createFolderInPicker);
+  $("#folder-picker-cancel-btn").addEventListener("click", closeFolderPicker);
+  $("#folder-picker-use-btn").addEventListener("click", usePickedFolder);
   $("#workdir-input").addEventListener("keydown", (event) => {
     if (event.key === "Enter") saveWorkdir();
   });
@@ -313,6 +332,7 @@ function bindEvents() {
     }
     if (event.key === "Escape") {
       closePermissionModal(false);
+      closeFolderPicker();
       closeNewSessionModal();
       closeDeleteSessionModal(false);
       closeRenameSessionModal(null);
@@ -571,6 +591,7 @@ async function openSettingsModal() {
   const appearance = settings.appearance || {};
   const shell = settings.shell || {};
   const provider = settings.provider || {};
+  const workspace = settings.workspace || {};
 
   $("#settings-display-name").value = account.display_name || "";
   $("#settings-signed-in").checked = Boolean(account.signed_in);
@@ -578,6 +599,7 @@ async function openSettingsModal() {
   renderSettingsOptions($("#settings-theme"), state.status?.themes || [], appearance.theme || state.theme);
   renderSettingsOptions($("#settings-accent"), state.status?.accents || [], appearance.accent || state.accent);
   renderSettingsOptions($("#settings-shell"), state.status?.shells || [], shell.id || "claude-code");
+  $("#settings-default-root").value = workspace.default_root || "";
   $("#settings-provider-label").value = provider.label || "DeepSeek";
   $("#settings-base-url").value = provider.base_url || "";
   $("#settings-api-key").value = "";
@@ -610,6 +632,9 @@ async function saveSettings() {
     },
     shell: {
       id: $("#settings-shell").value
+    },
+    workspace: {
+      default_root: $("#settings-default-root").value.trim()
     },
     provider: {
       label: $("#settings-provider-label").value.trim() || "DeepSeek",
@@ -648,6 +673,119 @@ async function saveSettings() {
   } finally {
     button.disabled = false;
     button.textContent = oldText;
+  }
+}
+
+function workspaceDefaultRoot() {
+  return state.settings?.workspace?.default_root
+    || state.status?.settings?.workspace?.default_root
+    || state.workdir
+    || "";
+}
+
+async function fetchFolderRoots() {
+  const response = await fetch("/api/filesystem/roots");
+  const data = await response.json();
+  if (!response.ok || data.ok === false) throw new Error(data.detail || "无法读取磁盘列表");
+  state.folderPicker.roots = data.roots || [];
+  state.folderPicker.defaultRoot = data.default_root || workspaceDefaultRoot();
+  return data;
+}
+
+function renderFolderRoots() {
+  const container = $("#folder-picker-roots");
+  const roots = state.folderPicker.roots || [];
+  container.innerHTML = roots.map((root) => `
+    <button class="ghost-button" type="button" title="${escapeAttr(root.path)}" data-folder-root="${escapeAttr(root.path)}">
+      ${escapeHtml(root.name || root.path)}
+    </button>
+  `).join("");
+  container.querySelectorAll("[data-folder-root]").forEach((button) => {
+    button.addEventListener("click", () => loadFolderPickerPath(button.dataset.folderRoot || ""));
+  });
+}
+
+async function openFolderPicker(targetSelector, startPath = "") {
+  state.folderPicker.targetSelector = targetSelector;
+  $("#folder-picker-modal").classList.remove("hidden");
+  $("#folder-picker-list").innerHTML = `<div class="folder-empty">正在读取文件夹</div>`;
+  try {
+    await fetchFolderRoots();
+    renderFolderRoots();
+    await loadFolderPickerPath(startPath || workspaceDefaultRoot() || state.folderPicker.defaultRoot);
+  } catch (error) {
+    $("#folder-picker-list").innerHTML = `<div class="folder-empty">读取失败：${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function closeFolderPicker() {
+  $("#folder-picker-modal").classList.add("hidden");
+  state.folderPicker.targetSelector = "";
+}
+
+async function loadFolderPickerPath(path) {
+  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  $("#folder-picker-list").innerHTML = `<div class="folder-empty">正在读取文件夹</div>`;
+  const response = await fetch(`/api/filesystem/children${query}`);
+  const data = await response.json();
+  if (!response.ok || data.ok === false) throw new Error(data.detail || "无法读取文件夹");
+  state.folderPicker.currentPath = data.path || "";
+  state.folderPicker.parentPath = data.parent || "";
+  $("#folder-picker-current").textContent = state.folderPicker.currentPath || "当前目录";
+  $("#folder-picker-parent-btn").disabled = !state.folderPicker.parentPath;
+
+  const directories = data.directories || [];
+  $("#folder-picker-list").innerHTML = directories.length
+    ? directories.map((item) => `
+        <button class="folder-item" type="button" title="${escapeAttr(item.path)}" data-folder-path="${escapeAttr(item.path)}">
+          <span>${escapeHtml(item.name || item.path)}</span>
+          <span class="subtle">打开</span>
+        </button>
+      `).join("")
+    : `<div class="folder-empty">这个目录下没有子文件夹</div>`;
+  $("#folder-picker-list").querySelectorAll("[data-folder-path]").forEach((button) => {
+    button.addEventListener("click", () => loadFolderPickerPath(button.dataset.folderPath || ""));
+  });
+}
+
+function usePickedFolder() {
+  const target = state.folderPicker.targetSelector ? $(state.folderPicker.targetSelector) : null;
+  if (target) target.value = state.folderPicker.currentPath || "";
+  closeFolderPicker();
+}
+
+async function createFolder(parent, name) {
+  const response = await fetch("/api/filesystem/folders", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ parent, name })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.ok === false) throw new Error(data.detail || "新建文件夹失败");
+  return data.path || "";
+}
+
+async function createFolderInPicker() {
+  const name = prompt("新建文件夹名称");
+  if (!name) return;
+  try {
+    const path = await createFolder(state.folderPicker.currentPath || state.folderPicker.defaultRoot, name);
+    await loadFolderPickerPath(path);
+  } catch (error) {
+    alert(`新建文件夹失败：${error.message}`);
+  }
+}
+
+async function createDefaultFolderForInput(targetSelector) {
+  const name = prompt("新建文件夹名称");
+  if (!name) return;
+  try {
+    const data = await fetchFolderRoots();
+    const path = await createFolder(data.default_root || workspaceDefaultRoot(), name);
+    const target = $(targetSelector);
+    if (target) target.value = path;
+  } catch (error) {
+    alert(`新建文件夹失败：${error.message}`);
   }
 }
 

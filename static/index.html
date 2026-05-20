@@ -115,7 +115,11 @@
       <label for="new-session-name">名称</label>
       <input id="new-session-name" type="text" placeholder="例如：网页修复">
       <label for="new-session-workdir">工作目录</label>
-      <input id="new-session-workdir" type="text" placeholder="留空使用默认目录">
+      <div class="path-input-row">
+        <input id="new-session-workdir" type="text" placeholder="留空使用默认目录">
+        <button id="browse-new-session-workdir-btn" class="ghost-button" type="button">浏览</button>
+        <button id="create-new-session-workdir-btn" class="ghost-button" type="button">新建</button>
+      </div>
       <div class="modal-actions">
         <button id="cancel-session-btn" class="ghost-button" type="button">取消</button>
         <button id="create-session-btn" class="primary-button" type="button">创建</button>
@@ -128,7 +132,11 @@
       <h2 id="workdir-title">工作目录</h2>
       <p class="modal-copy">Claude Code 将在该目录下执行命令。留空使用默认目录。</p>
       <label for="workdir-input">路径</label>
-      <input id="workdir-input" type="text">
+      <div class="path-input-row">
+        <input id="workdir-input" type="text">
+        <button id="browse-workdir-btn" class="ghost-button" type="button">浏览</button>
+        <button id="create-workdir-btn" class="ghost-button" type="button">新建</button>
+      </div>
       <div class="modal-actions">
         <button id="cancel-workdir-btn" class="ghost-button" type="button">取消</button>
         <button id="save-workdir-btn" class="primary-button" type="button">保存</button>
@@ -144,6 +152,24 @@
       <div class="modal-actions">
         <button id="cancel-update-btn" class="ghost-button" type="button">稍后</button>
         <button id="install-update-btn" class="primary-button" type="button">立即更新</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="folder-picker-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="folder-picker-title">
+    <div class="modal-content folder-picker-content">
+      <h2 id="folder-picker-title">选择文件夹</h2>
+      <p id="folder-picker-current" class="modal-copy"></p>
+      <div id="folder-picker-roots" class="folder-root-row"></div>
+      <div class="folder-picker-toolbar">
+        <button id="folder-picker-parent-btn" class="ghost-button" type="button">上一级</button>
+        <button id="folder-picker-new-btn" class="ghost-button" type="button">新建文件夹</button>
+        <button id="folder-picker-refresh-btn" class="ghost-button" type="button">刷新</button>
+      </div>
+      <div id="folder-picker-list" class="folder-picker-list"></div>
+      <div class="modal-actions">
+        <button id="folder-picker-cancel-btn" class="ghost-button" type="button">取消</button>
+        <button id="folder-picker-use-btn" class="primary-button" type="button">使用此目录</button>
       </div>
     </div>
   </div>
@@ -228,6 +254,16 @@
           <p class="settings-help">当前生产通道使用 Claude Code。自定义 CLI 入口已预留，后续可以接入 Codex、Aider 或其他本地 Agent。</p>
           <button id="create-desktop-shortcut-btn" class="panel-button" type="button">创建桌面快捷方式</button>
           <p class="settings-help">快捷方式会指向已安装的软件版 Viniper UI，而不是网页启动脚本。</p>
+        </section>
+
+        <section class="settings-section">
+          <h3>工作目录</h3>
+          <label for="settings-default-root">默认新建位置</label>
+          <div class="path-input-row">
+            <input id="settings-default-root" type="text" placeholder="例如：D:\">
+            <button id="browse-settings-default-root-btn" class="ghost-button" type="button">浏览</button>
+          </div>
+          <p class="settings-help">新建会话或切换目录时点击“新建”，会默认在这里创建文件夹。</p>
         </section>
 
         <section class="settings-section">
