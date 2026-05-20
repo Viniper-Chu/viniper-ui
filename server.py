@@ -85,6 +85,10 @@ GUI_COMMAND_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_GUI_COMMAND_TIMEOUT", "0
 ACTION_TASK_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_ACTION_IDLE_TIMEOUT", "0"))
 SAFETY_GUARDS_ENABLED = env_value("VINIPER_UI_SAFETY_GUARDS", "0") == "1"
 TOOL_RESULT_DISPLAY_LIMIT = int(env_value("VINIPER_UI_TOOL_RESULT_LIMIT", "8000"))
+STREAM_READER_LIMIT = max(
+    1024 * 1024,
+    int(env_value("VINIPER_UI_STREAM_READER_LIMIT", str(32 * 1024 * 1024))),
+)
 MAX_ATTACHMENT_BYTES = int(env_value("VINIPER_UI_MAX_ATTACHMENT_BYTES", str(50 * 1024 * 1024)))
 MAX_ATTACHMENT_TOTAL_BYTES = int(env_value("VINIPER_UI_MAX_ATTACHMENT_TOTAL_BYTES", str(100 * 1024 * 1024)))
 UPDATE_SOURCE_FILE = VERSION_FILE.with_name("update_source.json")
@@ -1494,6 +1498,7 @@ async def stream_chat_impl(
     external_gui_timeout = False
     action_task = is_action_task_prompt(prompt)
     action_idle_timeout = False
+    stream_read_error = ""
     assistant_message_index: int | None = None
     last_progress_save = 0.0
     finalized = False
@@ -1561,6 +1566,7 @@ async def stream_chat_impl(
             env=build_claude_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=STREAM_READER_LIMIT,
         )
         run_info = {"pid": proc.pid, "started": now_ts(), "prompt": prompt, "cancel_requested": False}
         _active_runs[session_id] = run_info
@@ -1611,6 +1617,16 @@ async def stream_chat_impl(
                     save_assistant_progress(force=True)
                     last_heartbeat = now
                 continue
+            except ValueError as exc:
+                stream_read_error = (
+                    "Claude Code 单条流式输出超过 Viniper UI 读取上限。"
+                    f"当前上限 {format_bytes(STREAM_READER_LIMIT)}，"
+                    "已停止本次任务，避免界面假死。"
+                )
+                if "Separator is found" not in str(exc) and "chunk is longer" not in str(exc):
+                    stream_read_error = f"Claude Code 流式输出读取失败：{exc}"
+                await kill_process_tree(proc.pid)
+                break
             if not raw_line:
                 break
             last_process_output = time.monotonic()
@@ -1708,6 +1724,13 @@ async def stream_chat_impl(
 
         return_code = await proc.wait()
         stderr_text = await stderr_task
+
+        if stream_read_error:
+            yield sse({"type": "error", "content": stream_read_error})
+            finalize_assistant(f"错误：{stream_read_error}")
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
 
         if external_gui_timeout:
             detail = (

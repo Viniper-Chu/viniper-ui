@@ -1,3 +1,14 @@
+## v2.0.3 (2026-05-20)
+
+### 修复
+- **Claude Code 启动失败**：修复 `stream-json` 单行输出超过 Python 默认读取上限时出现的 `Separator is found, but chunk is longer than limit`。Viniper UI 现在把 Claude Code 子进程 stdout/stderr 读取上限提高到 32 MB，避免长工具结果、超长 system init 或大量 skills 列表导致界面误报启动失败。
+- **错误提示**：如果未来仍有极端单条输出超过上限，会显示明确的流式输出读取错误，并停止本次任务，不再误报为 Claude Code 安装或启动问题。
+
+### 验证
+- `python -m py_compile server.py`
+- `python scripts/verify_app.py`
+- 使用已有历史会话触发 Claude Code 启动，确认不再出现 `chunk is longer than limit`。
+
 ## v2.0.2 (2026-05-20)
 
 ### 修复
