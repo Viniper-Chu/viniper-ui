@@ -849,8 +849,11 @@ def allowed_model(model: str | None) -> str:
     ids = {item["id"] for item in models}
     if model in ids:
         return str(model)
-    configured = merged_env().get("ANTHROPIC_MODEL", models[0]["id"])
-    return configured if configured in ids else models[0]["id"]
+    app_model = str(load_app_settings().get("provider", {}).get("model") or "").strip()
+    if app_model in ids:
+        return app_model
+    env_model = str(merged_env(include_app_settings=False).get("ANTHROPIC_MODEL") or "").strip()
+    return env_model if env_model in ids else models[0]["id"]
 
 
 def allowed_permission_mode(permission_mode: str | None) -> str:
@@ -1375,6 +1378,7 @@ async def stream_chat_impl(
     cfg = deepseek_config(model)
     if not cfg["api_key"]:
         yield sse({"type": "error", "content": "未找到 DeepSeek API key，请先配置 ANTHROPIC_AUTH_TOKEN。"})
+        yield sse({"type": "done"})
         return
 
     session = safe_session(session_id)
@@ -1634,6 +1638,7 @@ async def stream_chat_impl(
             session["updated"] = now_ts()
             sessions[session_id] = session
             save_sessions_to_disk()
+            yield sse({"type": "done"})
             return
 
         if duplicate_open_command:
@@ -1671,6 +1676,7 @@ async def stream_chat_impl(
             yield sse({"type": "error", "content": detail})
             session["messages"].append({"role": "assistant", "content": f"错误：{detail}", "model": selected_model})
             save_sessions_to_disk()
+            yield sse({"type": "done"})
             return
 
         if timed_out:
@@ -1678,6 +1684,7 @@ async def stream_chat_impl(
             yield sse({"type": "error", "content": detail})
             session["messages"].append({"role": "assistant", "content": f"错误：{detail}", "model": selected_model})
             save_sessions_to_disk()
+            yield sse({"type": "done"})
             return
 
         if _active_runs.get(session_id, {}).get("cancel_requested"):
@@ -1697,6 +1704,7 @@ async def stream_chat_impl(
                 {"role": "assistant", "content": f"错误：{detail}", "model": selected_model}
             )
             save_sessions_to_disk()
+            yield sse({"type": "done"})
             return
 
         if not assistant_text and final_result:
@@ -1724,8 +1732,10 @@ async def stream_chat_impl(
         raise
     except FileNotFoundError:
         yield sse({"type": "error", "content": "找不到 claude 命令，请确认 Claude Code 已安装并在 PATH 中。"})
+        yield sse({"type": "done"})
     except Exception as exc:
         yield sse({"type": "error", "content": f"Claude Code 启动失败：{exc}"})
+        yield sse({"type": "done"})
     finally:
         _active_runs.pop(session_id, None)
 

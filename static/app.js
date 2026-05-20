@@ -33,6 +33,7 @@ const THEME_KEY = `${STORAGE_PREFIX}theme`;
 const LANGUAGE_KEY = `${STORAGE_PREFIX}language`;
 const ACCENT_KEY = `${STORAGE_PREFIX}accent`;
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+let modelPersistTimer = null;
 
 function storageGet(key) {
   return localStorage.getItem(key);
@@ -274,6 +275,7 @@ function bindEvents() {
     updateModelLabels();
     renderCurrentSession();
     updateContextMeter();
+    persistSelectedModel();
   });
   $("#permission-select").addEventListener("change", (event) => {
     state.permissionMode = sanitizePermissionMode(event.target.value);
@@ -286,6 +288,9 @@ function bindEvents() {
   $("#confirm-delete-session-btn").addEventListener("click", () => closeDeleteSessionModal(true));
   $("#cancel-workdir-btn").addEventListener("click", () => $("#workdir-modal").classList.add("hidden"));
   $("#save-workdir-btn").addEventListener("click", saveWorkdir);
+  $("#workdir-input").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") saveWorkdir();
+  });
   $("#cancel-rename-session-btn").addEventListener("click", () => closeRenameSessionModal(null));
   $("#confirm-rename-session-btn").addEventListener("click", () => {
     closeRenameSessionModal($("#rename-session-name").value.trim());
@@ -698,6 +703,31 @@ function renderModelSelect() {
   select.value = state.selectedModel;
 }
 
+function persistSelectedModel() {
+  clearTimeout(modelPersistTimer);
+  modelPersistTimer = setTimeout(async () => {
+    try {
+      const response = await fetch("/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: { provider: { model: state.selectedModel } } })
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || data.ok === false) return;
+      if (data.settings) {
+        state.settings = data.settings;
+        state.status = {
+          ...(state.status || {}),
+          models: data.models || state.status?.models || [],
+          settings: data.settings
+        };
+      }
+    } catch {
+      // The current send still uses the selected model; persistence retries on the next change.
+    }
+  }, 250);
+}
+
 function permissionModeOptions() {
   return PERMISSION_MODES;
 }
@@ -957,15 +987,23 @@ function changeWorkdir() {
 async function saveWorkdir() {
   const next = $("#workdir-input").value.trim();
   $("#workdir-modal").classList.add("hidden");
-  state.workdir = next;
   if (!state.sessionId) return;
-  await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ workdir: state.workdir })
-  });
-  renderCurrentSession();
-  await loadSessionList();
+  try {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workdir: next })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.detail || `HTTP ${response.status}`);
+    }
+    state.workdir = data.session?.workdir || next;
+    renderCurrentSession();
+    await loadSessionList();
+  } catch (error) {
+    alert(`目录切换失败：${error.message}`);
+  }
 }
 
 function renderCurrentSession() {
