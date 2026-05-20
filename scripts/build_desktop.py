@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DESKTOP = ROOT / "desktop"
-KEEP_RELEASE_VERSIONS = 3
+KEEP_RELEASE_VERSIONS = 2
 
 
 def version_tuple(value: str) -> tuple[int, int, int]:

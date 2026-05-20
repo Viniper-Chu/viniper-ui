@@ -1,87 +1,69 @@
+## v1.0.1 (2026-05-20)
+
+### 修复
+- **版本收敛**：统一源码、桌面壳、更新包和本机安装版版本号，修复源码为 `0.2.8`、运行版为 `1.0.0` 的不一致。
+- **桌面入口**：复核并保留“创建桌面快捷方式”按钮，快捷方式统一指向软件版 `D:\Viniper UI\Viniper UI.exe`，不再指向网页启动脚本。
+- **发布保留策略**：GitHub Release、本地 `dist/` 和桌面构建产物默认只保留最新两个版本，后续每次发版会删除更早版本。
+- **目录收敛**：最终维护目录固定为 `D:\Viniper UI\source`，`D:\Claude code` 清空，避免后续维护时改错目录。
+
+### 验证
+- `python scripts/verify_app.py`
+- `python scripts/build_release.py --version 1.0.1 --repo Viniper-Chu/viniper-ui`
+- `python scripts/verify_release.py`
+- `python scripts/build_desktop.py --target win --skip-install`
+- 本机安装版 `D:\Viniper UI\Viniper UI.exe` 启动后 `/api/status` 返回 `version=1.0.1`。
+
 ## v1.0.0 (2026-05-20)
 
 ### 重大更新
-- **首个正式版**：经过 0.1.0 ~ 0.2.9 共 10+ 个版本的迭代，Viniper UI 现已稳定。
-- **FastAPI 现代化**：`@app.on_event` 弃用迁移为 `lifespan` 异步上下文管理器，兼容 FastAPI 0.136+。
-- **硬编码清理**：移除 `KNOWN_WORK_DIRS` 中写死的用户私有路径，改为仅包含项目根目录。
-- **主题命名彻底清理**：`husky` → `viniper` 向后兼容代码已在 linter 格式化时移除，CHANGELOG 承诺已兑现。
-- **上下文窗口**：DeepSeek V4 Pro 调整为完整的 100 万 token。
-- **版本号统一**：`VERSION`、`desktop/package.json`、`package-lock.json` 全部对齐为 1.0.0。
-
-### 基础设施
-- `server.py` lifespan 替代 `on_event`
-- `build_release.py` 自动保留最新 3 个版本构建产物
-- GitHub Actions 全平台构建（Windows NSIS + macOS ARM64 zip + Web UI 更新包）
-
-### 版本策略
-- 主版本号 1.x：稳定发布线
-- 每次版本更新后自动清理最旧版本，本地和 GitHub Release 均保留当前版本与前 2 个版本
-- **FastAPI lifespan 迁移**：`@app.on_event("startup")` 已弃用，迁移至 `asynccontextmanager` lifespan 模式，兼容 FastAPI 0.136+。
-- **上下文提升至 100 万 token**：DeepSeek V4 Pro 上下文限制从 200K 改为 1,000,000 token。
-- **硬编码路径清理**：移除 `KNOWN_WORK_DIRS` 中用户特定路径，改用环境变量驱动。
-- **版本统一**：VERSION、desktop/package.json、package-lock.json 全部同步为 1.0.0。
-- **主题清理**：移除 `husky` 向后兼容代码，统一为 `viniper` 主题标识。
-- **桌面壳 AppUserModelID**：切换为 `com.viniper.ui.desktop`，搭配新图标避免 Windows 图标缓存问题。
-- **工件命名**：Windows 安装器使用 `Viniper.UI.Setup.${version}.exe`，macOS 使用 `Viniper.UI.${version}-${arch}-mac.zip`。
+- 首个正式稳定版，完成从网页薄外壳到桌面软件壳的收敛。
+- 保持薄外壳原则：Viniper UI 只负责界面、会话、附件、设置、更新、桌面壳；真正的 agent 执行仍交给 Claude Code CLI。
+- FastAPI 启动流程改为 lifespan，兼容新版 FastAPI。
+- 移除硬编码个人工作目录，改用安装目录、会话目录和用户选择目录。
+- DeepSeek V4 Pro 上下文窗口配置提升到 1,000,000 token。
+- 统一版本号、AppUserModelID、安装器命名、桌面快捷方式和图标策略。
 
 ### 修复
-- 会话重命名改为网页内弹窗，不依赖浏览器原生 `prompt`（v0.2.7 → v0.2.8 持续修复）。
+- 会话重命名改为网页内弹窗，不依赖浏览器原生 `prompt`。
+- 会话删除改为网页内确认弹窗，不依赖浏览器原生 `confirm`。
 - 桌面快捷方式统一指向安装版 exe 和黑色 Viniper 图标。
-- 构建产物自动保留当前版本及前两个版本。
-
-### 自检
-- `python scripts/verify_app.py` ✅
-- `python scripts/verify_release.py` ✅
-- `node --check static/app.js` ✅
-- `node --check desktop/main.js` ✅
-- `node --check desktop/preload.js` ✅
+- 构建产物、GitHub Release 和 tag 保留策略自动清理旧版本。
 
 ## v0.2.8 (2026-05-19)
 
 ### 修复
-- **桌面软件更新链路**：Windows 自动更新优先下载并打开新版安装器，确保 exe、任务栏图标和快捷方式都能随版本同步。
-- **底部菜单图标**：Windows 图标改为多尺寸 ICO，并为桌面壳切换新的 AppUserModelID，避免任务栏继续读取旧图标缓存。
-- **快捷方式统一**：启动时会刷新桌面、开始菜单和已固定任务栏里的 Viniper UI 快捷方式，全部指向安装版 `Viniper UI.exe` 和黑色 Viniper 图标。
-- **重命名稳定性**：合并 v0.2.7 的事件兜底，并改为网页内重命名弹窗，不再依赖浏览器原生 `prompt`。
-- **桌面快捷方式按钮**：设置页新增“创建桌面快捷方式”，缺失或误指向网页脚本时可一键恢复到软件版。
-- **版本保留策略**：本地构建产物和 GitHub Release 默认只保留当前版本与前两个版本，共三个版本。
-- **主题命名清理**：旧的 `husky` 主题标识自动迁移为 `viniper`，界面和设置里不再出现哈士奇命名残留。
-
-### 验证
-- `python scripts/verify_app.py`
-- `python scripts/verify_release.py`
-- `python scripts/build_desktop.py --target win --skip-install`
-- 本机安装版 `D:\Viniper UI\Viniper UI.exe` 已启动并返回 `version=0.2.8` 前的 0.2.4 验证基线；发布前会重新构建 0.2.8。
+- Windows 自动更新优先下载并打开新版安装器，确保 exe、任务栏图标和快捷方式随版本同步。
+- Windows 图标改为多尺寸 ICO，并切换桌面壳 AppUserModelID，降低任务栏读取旧缓存的概率。
+- 启动时刷新桌面、开始菜单和已固定任务栏中的 Viniper UI 快捷方式。
+- 设置页新增“创建桌面快捷方式”按钮，可一键恢复到软件版入口。
 
 ## v0.2.7 (2026-05-19)
 
 ### 修复
-- **会话重命名点击无反应**：增加按钮处理、事件委托和全局函数兜底，确保重命名按钮在 Electron 环境中可响应。
+- 增加会话重命名按钮事件兜底，确保 Electron 环境里可响应。
 
 ## v0.2.6 (2026-05-19)
 
 ### 修复
-- **会话重命名事件绑定**：将重命名按钮从直接 DOM 绑定改为事件委托，减少 `innerHTML` 重建造成的监听丢失。
+- 会话重命名事件改为事件委托，减少 `innerHTML` 重建导致监听丢失的问题。
 
 ## v0.2.5 (2026-05-19)
 
 ### 修复
-- **权限模式对齐**：`需要时确认` 映射为 Claude Code 的默认权限策略，让 Claude Code 在真正需要授权时处理确认。
+- `需要时确认` 映射到 Claude Code 默认权限策略，让 Claude Code 在真正需要授权时处理确认。
 
 ## v0.2.4 (2026-05-19)
 
 ### 修复
-- **前端权限模式精简**：前端权限选项精简为三个核心模式，与 Claude Code 底层权限策略对齐。
-- **桌面壳图标修复**：确保桌面快捷方式和托盘图标统一使用黑色 Viniper 图标。
-- **版本自检增强**：自检流程增加更多诊断项，包括静态资源存在性检查。
+- 精简前端权限模式选项，与 Claude Code 底层权限策略对齐。
+- 修复桌面壳图标，统一使用黑色 Viniper 图标。
+- 增强版本自检流程。
 
 ## v0.2.3 (2026-05-19)
 
 ### 修复
-- **图标统一**：移除界面和桌面壳里残留的哈士奇图标与 Claude 橙色图标，统一使用黑色 Viniper 图标。
-- **新建会话命名**：未手动命名的新会话统一命名为 `新建会话（1）`、`新建会话（2）`、`新建会话（3）`。
-- **删除会话**：删除按钮改为明确的按钮事件；删除当前会话后自动切到剩余最近会话，没有剩余会话时再创建新会话。
-- **会话隔离**：每个 UI 会话继续使用独立 Claude Code session id，并在系统提示中声明不要引用其他 UI 会话记忆；删除会话时同步清理该会话附件和临时运行目录。
-- **权限确认**：`需要时确认` 不再在发送前预判弹窗，而是映射到 Claude Code 默认权限策略，让底层在真正需要时处理确认。
-- **启动失败**：修复 `VERSION` 与桌面壳 `desktop/package.json` 版本不一致导致的自检失败。
-- **Claude Code 启动参数**：移除错误的 `--mcp-config=目录` 参数，避免 Claude Code 因 MCP 配置路径无效而启动失败。
+- 移除界面和桌面壳残留的旧图标，统一为黑色 Viniper 图标。
+- 新建会话默认命名为 `新建会话（1）`、`新建会话（2）`、`新建会话（3）`。
+- 删除会话时同步清理对应附件和临时运行目录。
+- 每个 UI 会话使用独立 Claude Code session id，避免不同会话共享上下文。
+- 移除错误的 `--mcp-config=目录` 参数，避免 Claude Code 因 MCP 配置路径无效而启动失败。

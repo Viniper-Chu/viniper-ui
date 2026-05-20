@@ -32,7 +32,7 @@ APP_DIRS = [
     "scripts",
     "desktop",
 ]
-KEEP_RELEASE_VERSIONS = 3
+KEEP_RELEASE_VERSIONS = 2
 
 
 def version_tuple(value: str) -> tuple[int, int, int]:
