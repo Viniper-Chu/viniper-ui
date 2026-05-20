@@ -56,7 +56,7 @@ const PERMISSION_MODES = [
   {
     id: "ask",
     label: "需要时确认",
-    description: "交给 Claude Code 在真正需要授权时确认；网页端不预先弹窗"
+    description: "涉及本地文件、命令、程序、附件等操作时先在网页端确认"
   },
   {
     id: "auto",
@@ -69,9 +69,9 @@ const PERMISSION_MODES = [
     description: "已信任环境下跳过权限确认"
   }
 ];
-const PERMISSION_ACTION_RE = /(打开|运行|执行|安装|删除|修改|修复|编辑|写入|新建|创建|转换|导出|保存|移动|复制|重命名|启动|停止|读取|扫描|部署|提交|克隆|下载)/i;
-const PERMISSION_TARGET_RE = /(文件|目录|文件夹|项目|仓库|网页|网站|浏览器|桌面|快捷方式|程序|应用|服务|word|excel|pdf|docx|xlsx|ppt|pptx|powershell|cmd|bash|npm|pnpm|yarn|pip|python|node|git|github|skill|app|端口|服务器)/i;
-const PERMISSION_DIRECT_RE = /([a-z]:[\\/]|\\\\|\\.(docx|xlsx|pptx|pdf|zip|exe|bat|cmd|ps1|html|css|json|md)\\b|powershell\\s+-|cmd\\.exe|npm\\s+|pnpm\\s+|yarn\\s+|pip\\s+|git\\s+(clone|pull|push|commit|status|checkout|merge|fetch)|github|skill)/i;
+const PERMISSION_ACTION_RE = /(打开|运行|执行|安装|删除|修改|修复|编辑|写入|新建|创建|转换|导出|保存|移动|复制|重命名|启动|停止|读取|扫描|部署|提交|克隆|下载|生成|制作|整理|处理|编译|跑)/i;
+const PERMISSION_TARGET_RE = /(文件|目录|文件夹|项目|仓库|网页|网站|浏览器|桌面|快捷方式|程序|应用|服务|文档|资料|试卷|图片|截图|附件|压缩包|word|excel|pdf|docx|xlsx|ppt|pptx|powershell|cmd|bash|npm|pnpm|yarn|pip|python|node|git|github|skill|app|端口|服务器)/i;
+const PERMISSION_DIRECT_RE = /([a-z]:[\\/]|\\\\|\\.(txt|tex|csv|docx|xlsx|pptx|pdf|zip|tar\\.gz|7z|rar|exe|bat|cmd|ps1|html|css|js|jsx|ts|tsx|json|md|py|png|jpe?g|webp)\\b|powershell\\s+-|cmd\\.exe|npm\\s+|pnpm\\s+|yarn\\s+|pip\\s+|git\\s+(clone|pull|push|commit|status|checkout|merge|fetch)|github|skill)/i;
 const I18N = {
   "zh-CN": {
     newChat: "新建会话",
@@ -303,6 +303,14 @@ function bindEvents() {
   $("#allow-once-btn").addEventListener("click", () => closePermissionModal(true));
 
   document.addEventListener("keydown", (event) => {
+    const permissionModal = $("#permission-modal");
+    if (permissionModal && !permissionModal.classList.contains("hidden")) {
+      if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+        event.preventDefault();
+        closePermissionModal(true);
+        return;
+      }
+    }
     if (event.key === "Escape") {
       closePermissionModal(false);
       closeNewSessionModal();
@@ -1074,9 +1082,11 @@ function messageTemplate(roleClass, label, content, thinking = "") {
 }
 
 function needsPermissionForPrompt(text, files = []) {
-  // Command-level permission is handled by Claude Code itself. The web UI should
-  // not ask before the run starts; "需要时确认" means "ask when Claude Code needs it".
-  return false;
+  if (files.length) return true;
+  const value = String(text || "").trim();
+  if (!value) return false;
+  if (PERMISSION_DIRECT_RE.test(value)) return true;
+  return PERMISSION_ACTION_RE.test(value) && PERMISSION_TARGET_RE.test(value);
 }
 
 async function resolvePermissionMode(text, files = []) {

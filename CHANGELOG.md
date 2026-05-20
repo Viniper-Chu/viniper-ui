@@ -1,3 +1,17 @@
+## v2.0.2 (2026-05-20)
+
+### 修复
+- **断显但任务仍在跑**：流式输出期间会把助手草稿和工具过程持续写入会话；如果 UI 连接中断，会停止底层 Claude Code 进程，避免任务在后台继续幽灵运行。
+- **重复任务残留**：启动同一会话的新任务前，会清理该会话遗留的 Claude Code 进程，避免同一会话同时跑多个 `claude.exe`。
+- **权限确认**：`需要时确认` 模式会在请求明显涉及本地文件、命令、程序、桌面、附件等操作时弹出确认框；按 Enter 允许本次操作，按 Esc 取消。确认后只对本次请求使用 `bypassPermissions`。
+
+### 验证
+- `node --check static/app.js`
+- `python -m py_compile server.py`
+- `python scripts/verify_app.py`
+- 验证权限弹窗 Enter 允许、Esc 取消，且允许后本次请求真实传入 `bypassPermissions`。
+- 验证同一会话残留 `claude.exe` 会在新任务前被清理，断开流时不会继续后台执行。
+
 ## v2.0.1 (2026-05-20)
 
 ### 修复

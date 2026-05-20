@@ -1170,6 +1170,50 @@ async def kill_process_tree(pid: int | None) -> None:
             pass
 
 
+async def kill_orphaned_claude_session(claude_session_id: str) -> None:
+    session_token = str(claude_session_id or "").strip()
+    if not session_token:
+        return
+    if os.name == "nt":
+        ps = rf"""
+$sid = '{session_token.replace("'", "''")}'
+Get-CimInstance Win32_Process |
+  Where-Object {{
+    $_.Name -like 'claude*' -and
+    $_.CommandLine -and
+    $_.CommandLine -match [regex]::Escape($sid)
+  }} |
+  ForEach-Object {{
+    try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} catch {{}}
+  }}
+"""
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+        except Exception:
+            pass
+        return
+
+    if shutil.which("pkill"):
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["pkill", "-f", session_token],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+        except Exception:
+            pass
+
+
 def tool_command(block: dict[str, Any]) -> str:
     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
     return str(tool_input.get("command") or "")
@@ -1450,6 +1494,52 @@ async def stream_chat_impl(
     external_gui_timeout = False
     action_task = is_action_task_prompt(prompt)
     action_idle_timeout = False
+    assistant_message_index: int | None = None
+    last_progress_save = 0.0
+    finalized = False
+
+    def ensure_assistant_message() -> dict[str, Any]:
+        nonlocal assistant_message_index
+        if (
+            assistant_message_index is not None
+            and assistant_message_index < len(session.get("messages", []))
+            and isinstance(session["messages"][assistant_message_index], dict)
+            and session["messages"][assistant_message_index].get("role") == "assistant"
+        ):
+            return session["messages"][assistant_message_index]
+        session.setdefault("messages", []).append({"role": "assistant", "content": "", "model": selected_model, "pending": True})
+        assistant_message_index = len(session["messages"]) - 1
+        return session["messages"][assistant_message_index]
+
+    def save_assistant_progress(force: bool = False) -> None:
+        nonlocal last_progress_save
+        now = time.monotonic()
+        if not force and now - last_progress_save < 1.0:
+            return
+        last_progress_save = now
+        message = ensure_assistant_message()
+        message["content"] = assistant_text
+        message["model"] = selected_model
+        if thinking_text:
+            message["thinking"] = thinking_text
+        message["pending"] = True
+        session["updated"] = now_ts()
+        sessions[session_id] = session
+        save_sessions_to_disk()
+
+    def finalize_assistant(content: str | None = None, thinking: str | None = None) -> None:
+        nonlocal finalized
+        message = ensure_assistant_message()
+        message["content"] = assistant_text if content is None else content
+        message["model"] = selected_model
+        final_thinking = thinking_text if thinking is None else thinking
+        if final_thinking:
+            message["thinking"] = final_thinking
+        message.pop("pending", None)
+        session["updated"] = now_ts()
+        sessions[session_id] = session
+        save_sessions_to_disk()
+        finalized = True
 
     yield sse({
         "type": "assistant_start",
@@ -1458,11 +1548,13 @@ async def stream_chat_impl(
         "permission_mode": selected_permission_mode,
     })
     thinking_text = "正在通过 Claude Code 分析请求...\n"
+    save_assistant_progress(force=True)
     yield sse({"type": "thinking", "content": thinking_text})
 
     proc = None
     stderr_task = None
     try:
+        await kill_orphaned_claude_session(claude_session_id)
         proc = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(cwd),
@@ -1516,6 +1608,7 @@ async def stream_chat_impl(
                         "elapsed": round(now - started),
                         "action_task": action_task,
                     })
+                    save_assistant_progress(force=True)
                     last_heartbeat = now
                 continue
             if not raw_line:
@@ -1535,6 +1628,7 @@ async def stream_chat_impl(
                     continue
                 text = f"{clean_stream_text(line)}\n"
                 assistant_text += text
+                save_assistant_progress()
                 yield sse({"type": "text", "content": text})
                 continue
 
@@ -1567,11 +1661,13 @@ async def stream_chat_impl(
                                     delta = ("\n" if assistant_text else "") + full_text
                                 if delta:
                                     assistant_text += delta
+                                    save_assistant_progress()
                                     yield sse({"type": "text", "content": delta})
                         elif block.get("type") == "tool_use":
                             command_text = tool_command(block)
                             text = tool_use_text(block)
                             thinking_text += text
+                            save_assistant_progress()
                             yield sse({"type": "thinking", "content": text})
                             if SAFETY_GUARDS_ENABLED:
                                 if is_external_gui_command(command_text):
@@ -1594,6 +1690,7 @@ async def stream_chat_impl(
                 text = tool_result_text(message)
                 if text:
                     thinking_text += text
+                    save_assistant_progress()
                     yield sse({"type": "thinking", "content": text})
                 if external_gui_command:
                     external_gui_command = ""
@@ -1623,14 +1720,7 @@ async def stream_chat_impl(
             else:
                 assistant_text = f"{assistant_text}\n\n{detail}"
                 yield sse({"type": "text", "content": f"\n\n{detail}"})
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": assistant_text,
-                "model": selected_model,
-            }
-            if thinking_text:
-                assistant_message["thinking"] = thinking_text
-            session["messages"].append(assistant_message)
+            finalize_assistant()
             session["updated"] = now_ts()
             session["claude_initialized"] = True
             sessions[session_id] = session
@@ -1646,7 +1736,7 @@ async def stream_chat_impl(
                 "你可以把任务拆小一点再发，例如先让我只定位第 21 讲资料，再让我单独转换 PDF。"
             )
             yield sse({"type": "error", "content": detail})
-            session["messages"].append({"role": "assistant", "content": f"错误：{detail}", "model": selected_model})
+            finalize_assistant(f"错误：{detail}")
             session["updated"] = now_ts()
             sessions[session_id] = session
             save_sessions_to_disk()
@@ -1664,14 +1754,7 @@ async def stream_chat_impl(
             else:
                 assistant_text = f"{assistant_text}\n\n{detail}"
                 yield sse({"type": "text", "content": f"\n\n{detail}"})
-            assistant_message: dict[str, Any] = {
-                "role": "assistant",
-                "content": assistant_text,
-                "model": selected_model,
-            }
-            if thinking_text:
-                assistant_message["thinking"] = thinking_text
-            session["messages"].append(assistant_message)
+            finalize_assistant()
             session["updated"] = now_ts()
             session["claude_initialized"] = True
             sessions[session_id] = session
@@ -1686,7 +1769,7 @@ async def stream_chat_impl(
                 "打开本地网页时应该后台启动服务，或者服务已运行时直接打开 URL。"
             )
             yield sse({"type": "error", "content": detail})
-            session["messages"].append({"role": "assistant", "content": f"错误：{detail}", "model": selected_model})
+            finalize_assistant(f"错误：{detail}")
             save_sessions_to_disk()
             yield sse({"type": "done"})
             return
@@ -1694,7 +1777,7 @@ async def stream_chat_impl(
         if timed_out:
             detail = f"Claude Code 执行超过 {RUN_TIMEOUT_SECONDS} 秒，我已停止这次任务，避免网页无限等待。"
             yield sse({"type": "error", "content": detail})
-            session["messages"].append({"role": "assistant", "content": f"错误：{detail}", "model": selected_model})
+            finalize_assistant(f"错误：{detail}")
             save_sessions_to_disk()
             yield sse({"type": "done"})
             return
@@ -1702,7 +1785,7 @@ async def stream_chat_impl(
         if _active_runs.get(session_id, {}).get("cancel_requested"):
             assistant_text = "已停止当前任务，输入已恢复。"
             yield sse({"type": "text", "content": assistant_text})
-            session["messages"].append({"role": "assistant", "content": assistant_text, "model": selected_model})
+            finalize_assistant(assistant_text)
             session["updated"] = now_ts()
             sessions[session_id] = session
             save_sessions_to_disk()
@@ -1713,6 +1796,12 @@ async def stream_chat_impl(
             detail = stderr_text or final_result or f"claude exited with code {return_code}"
             if is_missing_claude_session_error(detail) and not retry_missing_session:
                 current_messages = list(session.get("messages", []))
+                if (
+                    current_messages
+                    and current_messages[-1].get("role") == "assistant"
+                    and current_messages[-1].get("pending")
+                ):
+                    current_messages.pop()
                 if (
                     current_messages
                     and current_messages[-1].get("role") == "user"
@@ -1741,9 +1830,7 @@ async def stream_chat_impl(
                     yield chunk
                 return
             yield sse({"type": "error", "content": detail[:3000]})
-            session["messages"].append(
-                {"role": "assistant", "content": f"错误：{detail}", "model": selected_model}
-            )
+            finalize_assistant(f"错误：{detail}")
             save_sessions_to_disk()
             yield sse({"type": "done"})
             return
@@ -1752,14 +1839,7 @@ async def stream_chat_impl(
             assistant_text = final_result
             yield sse({"type": "text", "content": final_result})
 
-        assistant_message: dict[str, Any] = {
-            "role": "assistant",
-            "content": assistant_text,
-            "model": selected_model,
-        }
-        if thinking_text:
-            assistant_message["thinking"] = thinking_text
-        session["messages"].append(assistant_message)
+        finalize_assistant()
         session["updated"] = now_ts()
         session["claude_initialized"] = True
         sessions[session_id] = session
@@ -1772,12 +1852,24 @@ async def stream_chat_impl(
             stderr_task.cancel()
         raise
     except FileNotFoundError:
-        yield sse({"type": "error", "content": "找不到 claude 命令，请确认 Claude Code 已安装并在 PATH 中。"})
+        detail = "找不到 claude 命令，请确认 Claude Code 已安装并在 PATH 中。"
+        finalize_assistant(f"错误：{detail}")
+        yield sse({"type": "error", "content": detail})
         yield sse({"type": "done"})
     except Exception as exc:
-        yield sse({"type": "error", "content": f"Claude Code 启动失败：{exc}"})
+        detail = f"Claude Code 启动失败：{exc}"
+        finalize_assistant(f"错误：{detail}")
+        yield sse({"type": "error", "content": detail})
         yield sse({"type": "done"})
     finally:
+        if proc and proc.returncode is None:
+            await kill_process_tree(proc.pid)
+            if not finalized:
+                interruption_note = "连接中断，已停止底层 Claude Code 进程，避免任务在后台继续运行。"
+                final_content = f"{assistant_text}\n\n{interruption_note}".strip() if assistant_text else interruption_note
+                finalize_assistant(final_content)
+        elif not finalized:
+            save_assistant_progress(force=True)
         _active_runs.pop(session_id, None)
 
 
