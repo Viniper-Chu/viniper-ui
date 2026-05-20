@@ -7,8 +7,7 @@
   <script>
     (() => {
       const savedTheme = localStorage.getItem("viniper-ui:theme");
-      const savedAccentRaw = localStorage.getItem("viniper-ui:accent") || "viniper";
-      const savedAccent = savedAccentRaw;
+      const savedAccent = localStorage.getItem("viniper-ui:accent") || "viniper";
       const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
       document.documentElement.dataset.theme = savedTheme === "dark" || (savedTheme === "system" && prefersDark) ? "dark" : "light";
       document.documentElement.dataset.accent = savedAccent;
@@ -20,6 +19,8 @@
 <body>
   <div id="app">
     <aside id="sidebar" aria-label="会话">
+      <button id="toggle-skills-btn" class="panel-button" type="button">技能库</button>
+
       <header class="sidebar-header">
         <div class="brand-wrap">
           <img class="brand-icon" src="/static/assets/viniper-icon.png?v=__APP_VERSION__" alt="" aria-hidden="true">
@@ -34,7 +35,7 @@
       <nav id="session-list" aria-label="会话列表"></nav>
 
       <footer class="sidebar-footer">
-        <button id="toggle-skills-btn" class="panel-button" type="button">技能库</button>
+        <button id="settings-btn" class="panel-button" type="button">设置</button>
       </footer>
     </aside>
 
@@ -56,11 +57,6 @@
         </div>
         <div class="topbar-actions">
           <button id="update-btn" class="ghost-button update-button" type="button" title="检查更新">更新</button>
-          <button id="theme-toggle-btn" class="theme-toggle-btn" type="button" title="切换主题" aria-label="切换主题">
-            <span id="theme-toggle-icon" aria-hidden="true">☀</span>
-            <span id="theme-toggle-text">浅色</span>
-          </button>
-          <button id="settings-btn" class="ghost-button" type="button">设置</button>
           <label class="model-picker" for="model-select">
             <span>模型</span>
             <select id="model-select" aria-label="选择模型"></select>
@@ -123,6 +119,19 @@
       <div class="modal-actions">
         <button id="cancel-session-btn" class="ghost-button" type="button">取消</button>
         <button id="create-session-btn" class="primary-button" type="button">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="workdir-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="workdir-title">
+    <div class="modal-content">
+      <h2 id="workdir-title">工作目录</h2>
+      <p class="modal-copy">Claude Code 将在该目录下执行命令。留空使用默认目录。</p>
+      <label for="workdir-input">路径</label>
+      <input id="workdir-input" type="text">
+      <div class="modal-actions">
+        <button id="cancel-workdir-btn" class="ghost-button" type="button">取消</button>
+        <button id="save-workdir-btn" class="primary-button" type="button">保存</button>
       </div>
     </div>
   </div>

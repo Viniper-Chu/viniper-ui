@@ -262,7 +262,6 @@ function bindEvents() {
   $("#update-btn").addEventListener("click", () => checkForUpdates({ silent: false }));
   $("#cancel-update-btn").addEventListener("click", closeUpdateModal);
   $("#install-update-btn").addEventListener("click", installUpdate);
-  $("#theme-toggle-btn").addEventListener("click", toggleTheme);
   $("#settings-btn").addEventListener("click", openSettingsModal);
   $("#close-settings-btn").addEventListener("click", closeSettingsModal);
   $("#cancel-settings-btn").addEventListener("click", closeSettingsModal);
@@ -279,13 +278,14 @@ function bindEvents() {
   $("#permission-select").addEventListener("change", (event) => {
     state.permissionMode = sanitizePermissionMode(event.target.value);
     storageSet(PERMISSION_KEY, state.permissionMode);
-    renderPermissionSelect();
   });
   $("#context-compress-btn").addEventListener("click", compressCurrentContext);
   $("#cancel-session-btn").addEventListener("click", closeNewSessionModal);
   $("#create-session-btn").addEventListener("click", createNamedSession);
   $("#cancel-delete-session-btn").addEventListener("click", () => closeDeleteSessionModal(false));
   $("#confirm-delete-session-btn").addEventListener("click", () => closeDeleteSessionModal(true));
+  $("#cancel-workdir-btn").addEventListener("click", () => $("#workdir-modal").classList.add("hidden"));
+  $("#save-workdir-btn").addEventListener("click", saveWorkdir);
   $("#cancel-rename-session-btn").addEventListener("click", () => closeRenameSessionModal(null));
   $("#confirm-rename-session-btn").addEventListener("click", () => {
     closeRenameSessionModal($("#rename-session-name").value.trim());
@@ -624,7 +624,6 @@ async function saveSettings() {
     state.settings = data.settings;
     state.status = { ...(state.status || {}), models: data.models, settings: data.settings };
     applySettingsFromServer(data.settings);
-    renderModelSelect();
     state.selectedModel = data.settings.provider?.model || state.selectedModel;
     storageSet(MODEL_KEY, state.selectedModel);
     renderModelSelect();
@@ -949,10 +948,17 @@ function rememberSession(sessionId) {
   if (sessionId) storageSet(LAST_SESSION_KEY, sessionId);
 }
 
-async function changeWorkdir() {
-  const next = window.prompt("工作目录", state.workdir || "");
-  if (next === null) return;
-  state.workdir = next.trim();
+function changeWorkdir() {
+  $("#workdir-input").value = state.workdir || "";
+  $("#workdir-modal").classList.remove("hidden");
+  $("#workdir-input").focus();
+}
+
+async function saveWorkdir() {
+  const next = $("#workdir-input").value.trim();
+  $("#workdir-modal").classList.add("hidden");
+  state.workdir = next;
+  if (!state.sessionId) return;
   await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
@@ -965,9 +971,6 @@ async function changeWorkdir() {
 function renderCurrentSession() {
   $("#session-title").textContent = state.sessionName || "新会话";
   $("#workdir-display").textContent = shortenPath(state.workdir);
-  if ($("#model-select").value !== state.selectedModel) {
-    $("#model-select").value = state.selectedModel;
-  }
   updateContextMeter();
 }
 

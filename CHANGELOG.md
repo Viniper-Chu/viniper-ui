@@ -1,3 +1,16 @@
+## v1.1.0 (2026-05-20)
+
+### 修复
+- **模型选择器偶发无响应**：移除 `saveSettings` 中重复的 `renderModelSelect()` 调用，消除连续两次 innerHTML 重建导致的交互中断。同时移除 `renderCurrentSession` 中强制同步 select.value 的逻辑。
+- **权限选择器点击无效**：从 `change` 事件处理器中移除 `renderPermissionSelect()` 调用，避免事件期间 DOM 被销毁导致焦点丢失。
+- **目录按钮无效**：`changeWorkdir` 不再使用原生 `window.prompt`，改为网页内 modal 弹窗。
+
+### UI 重构
+- **布局调整**：技能库移至侧边栏顶部，设置移至侧边栏底部，主题切换并入设置面板。
+- **iOS 风格设计**：毛玻璃侧边栏与顶栏（`backdrop-filter`）、圆角卡片、微阴影立体感、平滑过渡动画。
+- **暗色主题优化**：accent 色切换为橙黄暖色系，更配合深色背景。
+- **按钮交互增强**：hover 时微上浮 + 阴影加深（`translateY(-1px)`），点击时下沉回弹。
+
 ## v1.0.2 (2026-05-20)
 
 ### 修复
