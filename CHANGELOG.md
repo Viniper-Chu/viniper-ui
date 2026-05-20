@@ -1,3 +1,15 @@
+## v2.0.1 (2026-05-20)
+
+### 修复
+- **发消息报错**：当历史会话保存的 Claude Code 底层会话 ID 已失效时，不再直接报 `No conversation found with session ID`，会自动重建底层 Claude Code 会话并重试当前消息一次。
+- **历史保护**：重试前只回滚本次刚追加的用户消息，不清空历史对话、不删除附件和本地设置。
+
+### 验证
+- `node --check static/app.js`
+- `python -m py_compile server.py`
+- `python scripts/verify_app.py`
+- 使用已损坏的历史会话触发发送，确认 UI 能自动恢复并继续回复。
+
 ## v2.0.0 (2026-05-20)
 
 ### 修复

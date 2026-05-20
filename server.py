@@ -243,6 +243,15 @@ def new_claude_session_id(value: Any = None) -> str:
         return str(uuid.uuid4())
 
 
+def is_missing_claude_session_error(detail: str) -> bool:
+    value = str(detail or "").lower()
+    return (
+        "no conversation found with session id" in value
+        or "conversation not found" in value
+        or "session not found" in value
+    )
+
+
 def normalize_session(session_id: str, raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(raw.get("id") or session_id),
@@ -1374,6 +1383,7 @@ async def stream_chat_impl(
     model: str | None = None,
     permission_mode: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    retry_missing_session: bool = False,
 ):
     cfg = deepseek_config(model)
     if not cfg["api_key"]:
@@ -1594,7 +1604,9 @@ async def stream_chat_impl(
                 final_result = clean_stream_text(str(data.get("result") or ""))
                 if data.get("is_error"):
                     error_text = final_result or clean_stream_text(str(data))
-                    yield sse({"type": "error", "content": error_text})
+                    final_result = error_text
+                    if not (is_missing_claude_session_error(error_text) and not retry_missing_session):
+                        yield sse({"type": "error", "content": error_text})
                 continue
 
         return_code = await proc.wait()
@@ -1699,6 +1711,35 @@ async def stream_chat_impl(
 
         if return_code != 0:
             detail = stderr_text or final_result or f"claude exited with code {return_code}"
+            if is_missing_claude_session_error(detail) and not retry_missing_session:
+                current_messages = list(session.get("messages", []))
+                if (
+                    current_messages
+                    and current_messages[-1].get("role") == "user"
+                    and current_messages[-1].get("content") == display_prompt
+                ):
+                    current_messages.pop()
+                session["messages"] = current_messages
+                session["claude_session_id"] = str(uuid.uuid4())
+                session["claude_initialized"] = False
+                session["updated"] = now_ts()
+                sessions[session_id] = session
+                save_sessions_to_disk()
+                yield sse({
+                    "type": "thinking",
+                    "content": "\n底层 Claude Code 会话已失效，正在重建会话并重试当前消息...\n",
+                })
+                async for chunk in stream_chat_impl(
+                    session_id,
+                    user_msg,
+                    is_guidance,
+                    model,
+                    permission_mode,
+                    attachments,
+                    retry_missing_session=True,
+                ):
+                    yield chunk
+                return
             yield sse({"type": "error", "content": detail[:3000]})
             session["messages"].append(
                 {"role": "assistant", "content": f"错误：{detail}", "model": selected_model}
