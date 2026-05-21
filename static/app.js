@@ -1432,9 +1432,10 @@ async function sendMessage() {
         showThinking(false);
         if (!fullText) {
           const minutes = Math.max(1, Math.round((Number(payload.elapsed) || 0) / 60));
+          const stage = payload.waiting_for === "model" ? "正在等待模型/API 响应" : "正在等待本地工具返回";
           const note = payload.action_task
-            ? `动作任务仍在运行，已等待约 ${minutes} 分钟。我会继续等；如果你判断它卡住，可以点停止按钮。`
-            : `长任务仍在运行，已等待约 ${minutes} 分钟。我会保持连接，不会提前打断。`;
+            ? `动作任务仍在运行，已等待约 ${minutes} 分钟，${stage}。我会继续等；如果你判断它卡住，可以点停止按钮。`
+            : `长任务仍在运行，已等待约 ${minutes} 分钟，${stage}。我会保持连接，不会提前打断。`;
           assistantContent.innerHTML = renderMarkdown(`(${note})`);
         }
       } else if (payload.type === "done") {

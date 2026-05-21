@@ -81,6 +81,9 @@ if DEFAULT_PERMISSION_MODE not in PERMISSION_MODE_IDS:
     DEFAULT_PERMISSION_MODE = "default"
 RUN_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_RUN_TIMEOUT", "0"))
 HEARTBEAT_INTERVAL_SECONDS = int(env_value("VINIPER_UI_HEARTBEAT_INTERVAL", "15"))
+NO_OUTPUT_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_NO_OUTPUT_TIMEOUT", str(20 * 60)))
+MODEL_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_MODEL_IDLE_TIMEOUT", str(12 * 60)))
+MODEL_STALL_RECOVERY_ATTEMPTS = int(env_value("VINIPER_UI_MODEL_STALL_RECOVERY_ATTEMPTS", "1"))
 GUI_COMMAND_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_GUI_COMMAND_TIMEOUT", "0"))
 ACTION_TASK_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_ACTION_IDLE_TIMEOUT", "0"))
 SAFETY_GUARDS_ENABLED = env_value("VINIPER_UI_SAFETY_GUARDS", "0") == "1"
@@ -1035,9 +1038,14 @@ def build_system_append(session: dict[str, Any]) -> str:
         "当前 Viniper UI 会话与其他会话隔离。只把本会话传入的历史摘要、当前工作目录和用户消息"
         "作为连续上下文；不要主动引用其他 UI 会话的记忆。"
     )
+    stability_note = (
+        "稳定性要求：遇到 docx、pdf、图片很多或输出很长的任务时，不要把完整文件内容、完整图片清单、"
+        "大段日志或二进制内容直接打印到聊天里；优先用脚本在工作目录生成中间文件或最终文件，"
+        "聊天里只返回简短摘要、关键路径和下一步。这样可以避免第三方模型网关在工具结果后卡住。"
+    )
     if not summary:
-        return isolation_note
-    return f"{isolation_note}\n\n以下是网页端压缩后的历史摘要，请在回答时保持连续性：{summary}"
+        return f"{isolation_note}\n\n{stability_note}"
+    return f"{isolation_note}\n\n{stability_note}\n\n以下是网页端压缩后的历史摘要，请在回答时保持连续性：{summary}"
 
 
 def existing_workdir(value: str | None) -> Path:
@@ -1540,6 +1548,8 @@ async def stream_chat_impl(
     permission_mode: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
     retry_missing_session: bool = False,
+    suppress_user_message: bool = False,
+    stall_recovery_count: int = 0,
 ):
     cfg = deepseek_config(model)
     if not cfg["api_key"]:
@@ -1561,7 +1571,10 @@ async def stream_chat_impl(
     claude_session_id = new_claude_session_id(session.get("claude_session_id"))
     resume_existing = bool(session.get("claude_initialized"))
     session["claude_session_id"] = claude_session_id
-    session["messages"] = list(session.get("messages", [])) + [{"role": "user", "content": display_prompt}]
+    if not suppress_user_message:
+        session["messages"] = list(session.get("messages", [])) + [{"role": "user", "content": display_prompt}]
+    else:
+        session["messages"] = list(session.get("messages", []))
     session["updated"] = now_ts()
     sessions[session_id] = session
     save_sessions_to_disk()
@@ -1569,6 +1582,7 @@ async def stream_chat_impl(
     context_prompt = append_attachment_prompt(expand_skill_prompt(prompt), attachments)
 
     session_args = ["--resume", claude_session_id] if resume_existing else ["--session-id", claude_session_id]
+    fallback_model = "deepseek-v4-flash" if selected_model != "deepseek-v4-flash" else ""
 
     command = [
         *claude_launcher(),
@@ -1585,6 +1599,8 @@ async def stream_chat_impl(
         selected_permission_mode,
         *add_dir_args(session, prompt, attachments),
     ]
+    if fallback_model:
+        command.extend(["--fallback-model", fallback_model])
     session_name = str(session.get("name") or "").strip()
     if session_name:
         command.extend(["--name", session_name])
@@ -1606,6 +1622,9 @@ async def stream_chat_impl(
     external_gui_timeout = False
     action_task = is_action_task_prompt(prompt)
     action_idle_timeout = False
+    no_output_timeout = False
+    no_output_stage = ""
+    waiting_for = "model"
     assistant_message_index: int | None = None
     last_progress_save = 0.0
     finalized = False
@@ -1706,6 +1725,20 @@ async def stream_chat_impl(
                     await kill_process_tree(proc.pid)
                     break
                 if (
+                    waiting_for == "model"
+                    and MODEL_IDLE_TIMEOUT_SECONDS > 0
+                    and now - last_process_output >= MODEL_IDLE_TIMEOUT_SECONDS
+                ):
+                    no_output_timeout = True
+                    no_output_stage = "model"
+                    await kill_process_tree(proc.pid)
+                    break
+                if NO_OUTPUT_TIMEOUT_SECONDS > 0 and now - last_process_output >= NO_OUTPUT_TIMEOUT_SECONDS:
+                    no_output_timeout = True
+                    no_output_stage = waiting_for
+                    await kill_process_tree(proc.pid)
+                    break
+                if (
                     SAFETY_GUARDS_ENABLED
                     and
                     external_gui_command
@@ -1720,6 +1753,7 @@ async def stream_chat_impl(
                         "type": "heartbeat",
                         "elapsed": round(now - started),
                         "action_task": action_task,
+                        "waiting_for": waiting_for,
                     })
                     save_assistant_progress(force=True)
                     last_heartbeat = now
@@ -1747,20 +1781,27 @@ async def stream_chat_impl(
 
             event_type = data.get("type")
             if event_type == "stream_event":
+                waiting_for = "model"
                 event = data.get("event") if isinstance(data.get("event"), dict) else {}
                 if event.get("type") == "content_block_delta":
                     delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
                     if delta.get("type") == "thinking_delta":
                         text = clean_stream_text(str(delta.get("thinking") or ""))
+                        if text:
+                            thinking_text += text
+                            save_assistant_progress()
+                            yield sse({"type": "thinking", "content": text})
                     elif delta.get("type") == "text_delta":
                         text = clean_stream_text(str(delta.get("text") or ""))
                         assistant_text += text
+                        save_assistant_progress()
                         yield sse({"type": "text", "content": text})
                 continue
 
             if event_type == "assistant":
                 message = data.get("message") if isinstance(data.get("message"), dict) else {}
                 content = message.get("content")
+                saw_tool_use = False
                 if isinstance(content, list):
                     for block in content:
                         if not isinstance(block, dict):
@@ -1777,6 +1818,7 @@ async def stream_chat_impl(
                                     save_assistant_progress()
                                     yield sse({"type": "text", "content": delta})
                         elif block.get("type") == "tool_use":
+                            saw_tool_use = True
                             command_text = tool_command(block)
                             text = tool_use_text(block)
                             thinking_text += text
@@ -1796,9 +1838,11 @@ async def stream_chat_impl(
                                     blocked_command = command_text
                                     await kill_process_tree(proc.pid)
                                     break
+                    waiting_for = "tool" if saw_tool_use else "model"
                 continue
 
             if event_type == "user":
+                waiting_for = "model"
                 message = data.get("message") if isinstance(data.get("message"), dict) else {}
                 text = tool_result_text(message)
                 if text:
@@ -1811,6 +1855,7 @@ async def stream_chat_impl(
                 continue
 
             if event_type == "result":
+                waiting_for = "done"
                 final_result = clean_stream_text(str(data.get("result") or ""))
                 if data.get("is_error"):
                     error_text = final_result or clean_stream_text(str(data))
@@ -1847,6 +1892,58 @@ async def stream_chat_impl(
                 "我已自动停止底层等待并恢复输入，避免界面一直卡住。"
                 "这通常是 Claude Code 在等待模型响应、文件转换工具或外部程序时没有返回。"
                 "你可以把任务拆小一点再发，例如先让我只定位第 21 讲资料，再让我单独转换 PDF。"
+            )
+            yield sse({"type": "error", "content": detail})
+            finalize_assistant(f"错误：{detail}")
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if no_output_timeout:
+            if no_output_stage == "model" and stall_recovery_count < MODEL_STALL_RECOVERY_ATTEMPTS:
+                detail = (
+                    f"底层 Claude Code 在等待模型/API 响应时连续 {MODEL_IDLE_TIMEOUT_SECONDS} 秒没有输出。"
+                    "这不是本地工具还在执行，而是模型请求无响应；我已停止该进程，并用同一个 Claude Code 会话自动恢复一次。"
+                )
+                thinking_text += f"\n{detail}\n"
+                yield sse({"type": "thinking", "content": f"\n{detail}\n"})
+                if not assistant_text:
+                    assistant_text = "正在恢复底层 Claude Code 会话，请稍等。"
+                    yield sse({"type": "text", "content": assistant_text})
+                finalize_assistant()
+                session["updated"] = now_ts()
+                session["claude_initialized"] = True
+                sessions[session_id] = session
+                save_sessions_to_disk()
+                recovery_prompt = (
+                    "继续完成上一项任务。上一轮底层模型/API 在工具结果返回后长时间没有输出，"
+                    "Viniper UI 已经重启 Claude Code 进程并恢复同一个会话。"
+                    "请先检查当前工作目录里已经生成或已经读取过的内容，避免重复执行已完成步骤；"
+                    "如果需要继续处理大文件、图片很多的 docx/pdf 或长日志，请用脚本生成文件，"
+                    "聊天里只返回简短摘要、关键路径和最终结果。"
+                )
+                async for chunk in stream_chat_impl(
+                    session_id,
+                    recovery_prompt,
+                    True,
+                    model,
+                    permission_mode,
+                    [],
+                    retry_missing_session=True,
+                    suppress_user_message=True,
+                    stall_recovery_count=stall_recovery_count + 1,
+                ):
+                    yield chunk
+                return
+
+            detail = (
+                f"Claude Code 已连续 {MODEL_IDLE_TIMEOUT_SECONDS if no_output_stage == 'model' else NO_OUTPUT_TIMEOUT_SECONDS} 秒没有任何输出，"
+                "我已自动停止这次任务并恢复输入。"
+                f"最后等待阶段：{no_output_stage or 'unknown'}。"
+                "这通常表示底层模型请求、网络连接或外部工具进入了无响应状态；"
+                "已完成的文件会保留，你可以缩小任务范围后继续。"
             )
             yield sse({"type": "error", "content": detail})
             finalize_assistant(f"错误：{detail}")
