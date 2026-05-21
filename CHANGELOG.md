@@ -1,3 +1,14 @@
+## v2.1.1 (2026-05-22)
+
+### 修复
+- **切换会话时主进程弹错**：修复 Electron 主进程在打包环境中继续向已断开的 stdout/stderr 管道写日志导致的 `EPIPE: broken pipe, write`。现在 server 日志会通过安全写入函数输出，遇到断管会停止写控制台，不再弹出 JavaScript error。
+
+### 验证
+- `node --check desktop/main.js`
+- `npm run check`
+- `python scripts/verify_app.py`
+- 使用 Node `Writable` 模拟 `EPIPE` 断管，确认安全日志函数不会抛出未捕获异常。
+
 ## v2.1.0 (2026-05-21)
 
 ### 修复

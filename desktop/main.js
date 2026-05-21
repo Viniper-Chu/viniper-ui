@@ -19,6 +19,18 @@ let mainWindow = null;
 let tray = null;
 let serverProcess = null;
 let isQuitting = false;
+let stdioBroken = false;
+
+function handleStdioError(error) {
+  if (error && error.code === "EPIPE") {
+    stdioBroken = true;
+    return;
+  }
+  throw error;
+}
+
+process.stdout?.on?.("error", handleStdioError);
+process.stderr?.on?.("error", handleStdioError);
 
 function localUrl() {
   return `http://127.0.0.1:${port}`;
@@ -36,6 +48,28 @@ function readBundledVersion() {
   } catch {
     return "";
   }
+}
+
+function safeMainLog(level, message) {
+  if (stdioBroken) return;
+  const output = `${message}\n`;
+  const stream = level === "error" ? process.stderr : process.stdout;
+  try {
+    if (!stream || stream.destroyed || !stream.writable) return;
+    stream.write(output);
+  } catch (error) {
+    if (error && error.code === "EPIPE") {
+      stdioBroken = true;
+      return;
+    }
+    throw error;
+  }
+}
+
+function logServerChunk(level, chunk) {
+  const text = chunk.toString().trim();
+  if (!text) return;
+  safeMainLog(level, `[Viniper UI] ${text}`);
 }
 
 function requestJson(urlPath, timeoutMs = 1500) {
@@ -154,12 +188,8 @@ function startServerProcess() {
     stdio: ["ignore", "pipe", "pipe"]
   });
 
-  serverProcess.stdout.on("data", (chunk) => {
-    console.log(`[Viniper UI] ${chunk.toString().trim()}`);
-  });
-  serverProcess.stderr.on("data", (chunk) => {
-    console.error(`[Viniper UI] ${chunk.toString().trim()}`);
-  });
+  serverProcess.stdout.on("data", (chunk) => logServerChunk("log", chunk));
+  serverProcess.stderr.on("data", (chunk) => logServerChunk("error", chunk));
   serverProcess.on("exit", () => {
     serverProcess = null;
   });
