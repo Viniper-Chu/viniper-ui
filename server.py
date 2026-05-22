@@ -2169,9 +2169,6 @@ async def favicon():
     icon = STATIC_DIR / "assets" / "viniper-icon.ico"
     if icon.exists():
         return FileResponse(icon)
-    icon = BASE_DIR / "viniper.ico"
-    if icon.exists():
-        return FileResponse(icon)
     raise HTTPException(status_code=404, detail="favicon not found")
 
 

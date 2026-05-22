@@ -1,3 +1,17 @@
+## v2.1.2 (2026-05-22)
+
+### 配置
+- **统一图标来源**：网页左上角品牌图标改为直接读取 `/favicon.ico`，与 Windows 桌面快捷方式使用同一个 `static/assets/viniper-icon.ico` 来源。
+- **移除旧图标兜底**：删除 `BASE_DIR/viniper.ico` 旧路径兜底，避免未来误放旧图标后被应用加载。
+- **资源保留原则**：源码中只保留 `viniper-icon.ico` 和 `viniper-icon.png` 两个当前图标资源；其中 `.ico` 用于 Windows 快捷方式、favicon、安装器和 exe，`.png` 用于 macOS `.icns` 生成，删除会影响跨平台构建。
+
+### 验证
+- 扫描源码图标资源，确认 tracked 图标仅有 `static/assets/viniper-icon.ico` 和 `static/assets/viniper-icon.png`。
+- 清理本机安装目录 `resources/viniper-ui` 中历史残留的 `.git`、`desktop`、`dist`、`__pycache__`，确认安装目录内图标资源也只剩当前图标。
+- `node --check static/app.js`
+- `python -m py_compile server.py`
+- `python scripts/verify_app.py`
+
 ## v2.1.1 (2026-05-22)
 
 ### 修复
