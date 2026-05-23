@@ -1,3 +1,15 @@
+## v2.1.3 (2026-05-22)
+
+### 修复
+- **Claude Code session 锁占用**：修复 `Error: Session ID ... is already in use`。当底层 Claude Code 报告同一 session 仍被占用时，Viniper UI 会清理同 session 的残留 Claude/Node 进程，等待锁释放，并自动重试当前消息一次，不再让用户连续看到同一个错误。
+- **残留进程清理增强**：Windows 上清理逻辑不再只匹配 `claude*` 进程名，也会清理命令行中包含 Claude Code 和目标 session id 的宿主进程。
+
+### 验证
+- 使用模拟 Claude Code 子进程复现第一次返回 `Session ID ... is already in use`、第二次成功，确认 Viniper UI 会自动重试并返回结果。
+- `python -m py_compile server.py`
+- `node --check static/app.js`
+- `python scripts/verify_app.py`
+
 ## v2.1.2 (2026-05-22)
 
 ### 配置

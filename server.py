@@ -285,6 +285,11 @@ def is_missing_claude_session_error(detail: str) -> bool:
     )
 
 
+def is_claude_session_in_use_error(detail: str) -> bool:
+    value = str(detail or "").lower()
+    return "session id" in value and "already in use" in value
+
+
 def normalize_session(session_id: str, raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(raw.get("id") or session_id),
@@ -952,7 +957,7 @@ def claude_launcher() -> list[str]:
 
 def claude_available() -> bool:
     try:
-        return bool(claude_launcher())
+        return bool(shutil.which("claude"))
     except Exception:
         return False
 
@@ -1297,11 +1302,16 @@ async def kill_orphaned_claude_session(claude_session_id: str) -> None:
     if os.name == "nt":
         ps = rf"""
 $sid = '{session_token.replace("'", "''")}'
+$selfPid = $PID
 Get-CimInstance Win32_Process |
   Where-Object {{
-    $_.Name -like 'claude*' -and
+    $_.ProcessId -ne $selfPid -and
     $_.CommandLine -and
-    $_.CommandLine -match [regex]::Escape($sid)
+    $_.CommandLine -match [regex]::Escape($sid) -and
+    (
+      $_.Name -like 'claude*' -or
+      $_.CommandLine -match '(?i)claude'
+    )
   }} |
   ForEach-Object {{
     try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} catch {{}}
@@ -1332,6 +1342,23 @@ Get-CimInstance Win32_Process |
             )
         except Exception:
             pass
+
+
+def remove_last_attempt_messages(session: dict[str, Any], display_prompt: str) -> None:
+    current_messages = list(session.get("messages", []))
+    if (
+        current_messages
+        and current_messages[-1].get("role") == "assistant"
+        and current_messages[-1].get("pending")
+    ):
+        current_messages.pop()
+    if (
+        current_messages
+        and current_messages[-1].get("role") == "user"
+        and current_messages[-1].get("content") == display_prompt
+    ):
+        current_messages.pop()
+    session["messages"] = current_messages
 
 
 def tool_command(block: dict[str, Any]) -> str:
@@ -1548,6 +1575,7 @@ async def stream_chat_impl(
     permission_mode: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
     retry_missing_session: bool = False,
+    retry_session_in_use: bool = False,
     suppress_user_message: bool = False,
     stall_recovery_count: int = 0,
 ):
@@ -1860,7 +1888,10 @@ async def stream_chat_impl(
                 if data.get("is_error"):
                     error_text = final_result or clean_stream_text(str(data))
                     final_result = error_text
-                    if not (is_missing_claude_session_error(error_text) and not retry_missing_session):
+                    if not (
+                        (is_missing_claude_session_error(error_text) and not retry_missing_session)
+                        or (is_claude_session_in_use_error(error_text) and not retry_session_in_use)
+                    ):
                         yield sse({"type": "error", "content": error_text})
                 continue
 
@@ -2004,21 +2035,32 @@ async def stream_chat_impl(
 
         if return_code != 0:
             detail = stderr_text or final_result or f"claude exited with code {return_code}"
+            if is_claude_session_in_use_error(detail) and not retry_session_in_use:
+                remove_last_attempt_messages(session, display_prompt)
+                session["updated"] = now_ts()
+                sessions[session_id] = session
+                save_sessions_to_disk()
+                await kill_orphaned_claude_session(claude_session_id)
+                await asyncio.sleep(2)
+                yield sse({
+                    "type": "thinking",
+                    "content": "\n底层 Claude Code 会话锁仍被占用，已清理残留进程并自动重试当前消息...\n",
+                })
+                async for chunk in stream_chat_impl(
+                    session_id,
+                    user_msg,
+                    is_guidance,
+                    model,
+                    permission_mode,
+                    attachments,
+                    retry_missing_session,
+                    retry_session_in_use=True,
+                ):
+                    yield chunk
+                return
+
             if is_missing_claude_session_error(detail) and not retry_missing_session:
-                current_messages = list(session.get("messages", []))
-                if (
-                    current_messages
-                    and current_messages[-1].get("role") == "assistant"
-                    and current_messages[-1].get("pending")
-                ):
-                    current_messages.pop()
-                if (
-                    current_messages
-                    and current_messages[-1].get("role") == "user"
-                    and current_messages[-1].get("content") == display_prompt
-                ):
-                    current_messages.pop()
-                session["messages"] = current_messages
+                remove_last_attempt_messages(session, display_prompt)
                 session["claude_session_id"] = str(uuid.uuid4())
                 session["claude_initialized"] = False
                 session["updated"] = now_ts()
