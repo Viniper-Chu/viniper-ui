@@ -794,11 +794,40 @@ def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str 
         except Exception as exc:
             deps_output = f"dependency install skipped: {exc}"
 
+    if os.name == "nt":
+        refresh_windows_shortcuts()
+
     return {
         "asset": asset,
         "sha256": asset.get("sha256") or "",
         "dependencies": deps_output,
+        "restarting": True,
     }
+
+
+def _schedule_restart() -> None:
+    """Schedule a delayed restart of the server after the HTTP response is sent."""
+    if os.name != "nt":
+        return
+
+    async def _restart():
+        await asyncio.sleep(0.5)
+        try:
+            start_script = APP_DIR / "start.bat"
+            if start_script.exists():
+                subprocess.Popen(
+                    ["cmd.exe", "/c", "start", "", "cmd", "/c", str(start_script)],
+                    cwd=str(APP_DIR),
+                    close_fds=True,
+                )
+        except Exception:
+            pass
+        os._exit(0)
+
+    try:
+        asyncio.create_task(_restart())
+    except Exception:
+        pass
 
 
 migrate_legacy_data_dir()
@@ -2472,13 +2501,17 @@ async def install_update(request: Request):
                 "安装后桌面快捷方式会指向软件版 Viniper UI，历史会话不会被清空。"
             )
         else:
-            message = "更新已安装到磁盘。请关闭当前浏览器窗口并重新双击 Viniper UI；启动器会自动停止旧服务并打开新版。"
+            message = (
+                "更新完成！服务器即将自动重启，新版将在几秒后可用。"
+            )
+            _schedule_restart()
         return {
             "ok": True,
             "updated": True,
             "previous_version": APP_VERSION,
             "latest_version": latest_version,
             "restart_required": True,
+            "restarting": bool(result.get("restarting")) and not bool(result.get("installer_opened")),
             "installer_opened": bool(result.get("installer_opened")),
             "message": message,
             "asset": result.get("asset", {}),

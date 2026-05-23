@@ -507,8 +507,16 @@ async function installUpdate() {
     }
     $("#update-notes").textContent = data.message || "更新已安装，请重启 UI。";
     button.textContent = "已安装";
+    if (data.restarting) {
+      button.textContent = "服务重启中...";
+      setTimeout(() => {
+        location.reload();
+      }, 5000);
+    }
     renderUpdateButton();
-    alert(data.message || "更新已安装，请重新打开 Viniper UI。");
+    if (!data.restarting) {
+      alert(data.message || "更新已安装，请重新打开 Viniper UI。");
+    }
   } catch (error) {
     $("#update-notes").textContent = `更新失败：${error.message}`;
     button.textContent = oldText;
