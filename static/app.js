@@ -27,7 +27,8 @@ const state = {
   },
   pendingPermissionResolver: null,
   pendingDeleteResolver: null,
-  pendingRenameResolver: null
+  pendingRenameResolver: null,
+  retrySend: { count: 0, max: 3, delayMs: 3000 },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -1354,6 +1355,8 @@ async function sendMessage() {
   state.isStreaming = true;
   state.cancelRequested = false;
   state.abortController = new AbortController();
+  state.retrySend.count = 0;
+  state.retrySend.context = { text, permissionMode, attachments };
   setInputEnabled(false);
   showStopButton(true);
   showThinking(true);
@@ -1431,6 +1434,21 @@ async function sendMessage() {
         if (state.cancelRequested) {
           fullText = "已停止当前任务，输入已恢复。";
           assistantContent.innerHTML = renderMarkdown(fullText);
+        } else if (
+          state.retrySend.count < state.retrySend.max &&
+          state.retrySend.context &&
+          /上一个任务还在运行/.test(payload.content || "")
+        ) {
+          state.retrySend.count++;
+          const ctx = state.retrySend.context;
+          assistantContent.innerHTML = renderMarkdown(`(上个任务刚结束，${state.retrySend.delayMs / 1000} 秒后自动重试…)`);
+          setTimeout(() => {
+            if (!state.isStreaming) return;
+            // Mark streaming as done so retry can proceed
+            state.isStreaming = false;
+            state.abortController = null;
+            doRetrySend(ctx.text, ctx.permissionMode, ctx.attachments);
+          }, state.retrySend.delayMs);
         } else {
           fullText = `错误：${payload.content || ""}`;
           assistantContent.innerHTML = renderMarkdown(fullText);
@@ -1504,6 +1522,106 @@ async function sendMessage() {
       // Session refresh failed — input is already re-enabled, proceed
     }
 
+    updateContextMeter({ announce: true });
+  }
+}
+
+async function doRetrySend(text, permissionMode, attachments = []) {
+  if (!state.sessionId) return;
+
+  state.isStreaming = true;
+  state.cancelRequested = false;
+  state.abortController = new AbortController();
+  setInputEnabled(false);
+  showStopButton(true);
+
+  // Remove the retry-notice bubble
+  const lastMsg = document.querySelector(".message:last-of-type");
+  if (lastMsg && lastMsg.dataset.role === "assistant") {
+    lastMsg.remove();
+  }
+
+  const assistantContent = addMessage("assistant", "");
+  const assistantArticle = assistantContent.closest(".message");
+  let fullText = "";
+  let receivedDone = false;
+
+  const safetyTimer = setTimeout(() => {
+    if (state.isStreaming && !fullText) {
+      assistantContent.innerHTML = renderMarkdown("(任务仍在运行，我会继续等待；为避免重复执行，先不要再次提交同一条指令。)");
+    }
+  }, 120000);
+
+  try {
+    const response = await fetch(`/api/chat/${encodeURIComponent(state.sessionId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, model: state.selectedModel, permission_mode: permissionMode, attachments }),
+      signal: state.abortController.signal
+    });
+
+    if (!response.ok || !response.body) {
+      throw new Error(`请求失败: ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    const handleSsePart = (part) => {
+      const line = part.split("\n").find((item) => item.startsWith("data: "));
+      if (!line) return;
+      let payload = null;
+      try { payload = JSON.parse(line.slice(6)); } catch { return; }
+      if (typeof payload.content === "string") {
+        payload.content = repairTextForDisplay(payload.content);
+      }
+      if (payload.type === "text") {
+        fullText += payload.content || "";
+        assistantContent.innerHTML = renderMarkdown(fullText);
+        scrollBottom();
+      } else if (payload.type === "error") {
+        if (state.cancelRequested) {
+          fullText = "已停止当前任务，输入已恢复。";
+        } else {
+          fullText = `错误：${payload.content || ""}`;
+          assistantContent.closest(".message").classList.add("error");
+        }
+        assistantContent.innerHTML = renderMarkdown(fullText);
+      } else if (payload.type === "done") {
+        receivedDone = true;
+      }
+    };
+
+    const consumeSseBuffer = (final = false) => {
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() || "";
+      if (final && buffer.trim()) { parts.push(buffer); buffer = ""; }
+      for (const part of parts) handleSsePart(part);
+    };
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) { buffer += decoder.decode(); consumeSseBuffer(true); break; }
+      buffer += decoder.decode(value, { stream: true });
+      consumeSseBuffer();
+    }
+  } catch (error) {
+    if (error.name !== "AbortError" && !state.cancelRequested) {
+      fullText = `连接失败：${error.message}`;
+      assistantContent.innerHTML = renderMarkdown(fullText);
+      assistantContent.closest(".message").classList.add("error");
+    }
+  } finally {
+    clearTimeout(safetyTimer);
+    state.isStreaming = false;
+    state.abortController = null;
+    state.cancelRequested = false;
+    showStopButton(false);
+    setInputEnabled(true);
+    showThinking(false);
+    $("#user-input").focus();
+    try { await switchSession(state.sessionId); } catch {}
     updateContextMeter({ announce: true });
   }
 }

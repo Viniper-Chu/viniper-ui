@@ -81,9 +81,9 @@ if DEFAULT_PERMISSION_MODE not in PERMISSION_MODE_IDS:
     DEFAULT_PERMISSION_MODE = "default"
 RUN_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_RUN_TIMEOUT", "0"))
 HEARTBEAT_INTERVAL_SECONDS = int(env_value("VINIPER_UI_HEARTBEAT_INTERVAL", "15"))
-NO_OUTPUT_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_NO_OUTPUT_TIMEOUT", str(20 * 60)))
-MODEL_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_MODEL_IDLE_TIMEOUT", str(12 * 60)))
-MODEL_STALL_RECOVERY_ATTEMPTS = int(env_value("VINIPER_UI_MODEL_STALL_RECOVERY_ATTEMPTS", "1"))
+NO_OUTPUT_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_NO_OUTPUT_TIMEOUT", str(40 * 60)))
+MODEL_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_MODEL_IDLE_TIMEOUT", str(25 * 60)))
+MODEL_STALL_RECOVERY_ATTEMPTS = int(env_value("VINIPER_UI_MODEL_STALL_RECOVERY_ATTEMPTS", "2"))
 GUI_COMMAND_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_GUI_COMMAND_TIMEOUT", "0"))
 ACTION_TASK_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_ACTION_IDLE_TIMEOUT", "0"))
 SAFETY_GUARDS_ENABLED = env_value("VINIPER_UI_SAFETY_GUARDS", "0") == "1"
@@ -267,6 +267,13 @@ def session_lock(session_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _session_locks[session_id] = lock
     return lock
+
+
+def force_release_session_lock(session_id: str) -> None:
+    """Replace a held session lock so stuck waiters can proceed."""
+    old = _session_locks.pop(session_id, None)
+    if old is not None and old.locked():
+        _session_locks[session_id] = asyncio.Lock()
 
 
 def new_claude_session_id(value: Any = None) -> str:
@@ -1335,11 +1342,11 @@ Get-CimInstance Win32_Process |
   Where-Object {{
     $_.ProcessId -ne $selfPid -and
     $_.CommandLine -and
-    $_.CommandLine -match [regex]::Escape($sid) -and
     (
       $_.Name -like 'claude*' -or
-      $_.CommandLine -match '(?i)claude'
-    )
+      $_.Name -like 'node*'
+    ) -and
+    $_.CommandLine -match ('(--session-id|--resume)\s+' + [regex]::Escape($sid))
   }} |
   ForEach-Object {{
     try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} catch {{}}
@@ -1579,20 +1586,23 @@ async def stream_chat(
     attachments: list[dict[str, Any]] | None = None,
 ):
     lock = session_lock(session_id)
-    if lock.locked():
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=6)
+    except asyncio.TimeoutError:
         yield sse({
             "type": "error",
-            "content": "上一个任务还在运行，我已拦截这次重复提交。请等当前回复结束后再发送，避免重复打开网页或重复执行命令。",
+            "content": "上一个任务还在运行，已拦截这次重复提交。如果刚才点了停止按钮，等几秒钟再发即可。",
         })
         yield sse({"type": "done"})
         return
-
-    await lock.acquire()
     try:
         async for chunk in stream_chat_impl(session_id, user_msg, is_guidance, model, permission_mode, attachments or []):
             yield chunk
     finally:
-        lock.release()
+        try:
+            lock.release()
+        except RuntimeError:
+            pass
 
 
 async def stream_chat_impl(
@@ -1624,8 +1634,11 @@ async def stream_chat_impl(
     if attachments:
         display_prompt = f"{display_prompt}\n\n" + "\n".join(attachment_display_lines(attachments))
 
-    claude_session_id = new_claude_session_id(session.get("claude_session_id"))
     resume_existing = bool(session.get("claude_initialized"))
+    if resume_existing:
+        claude_session_id = new_claude_session_id(session.get("claude_session_id"))
+    else:
+        claude_session_id = str(uuid.uuid4())
     session["claude_session_id"] = claude_session_id
     if not suppress_user_message:
         session["messages"] = list(session.get("messages", [])) + [{"role": "user", "content": display_prompt}]
@@ -2065,11 +2078,15 @@ async def stream_chat_impl(
             detail = stderr_text or final_result or f"claude exited with code {return_code}"
             if is_claude_session_in_use_error(detail) and not retry_session_in_use:
                 remove_last_attempt_messages(session, display_prompt)
+                was_initialized = bool(session.get("claude_initialized"))
+                if not was_initialized:
+                    session["claude_session_id"] = str(uuid.uuid4())
+                session["claude_initialized"] = was_initialized
                 session["updated"] = now_ts()
                 sessions[session_id] = session
                 save_sessions_to_disk()
                 await kill_orphaned_claude_session(claude_session_id)
-                await asyncio.sleep(2)
+                await asyncio.sleep(2 if not was_initialized else 5)
                 yield sse({
                     "type": "thinking",
                     "content": "\n底层 Claude Code 会话锁仍被占用，已清理残留进程并自动重试当前消息...\n",
@@ -2130,6 +2147,7 @@ async def stream_chat_impl(
             await kill_process_tree(proc.pid)
         if stderr_task:
             stderr_task.cancel()
+        force_release_session_lock(session_id)
         raise
     except FileNotFoundError:
         detail = "找不到 claude 命令，请确认 Claude Code 已安装并在 PATH 中。"
@@ -2547,10 +2565,12 @@ async def chat(session_id: str, request: Request):
 async def cancel_chat(session_id: str):
     run = _active_runs.get(session_id)
     if not run:
+        force_release_session_lock(session_id)
         return {"ok": True, "cancelled": False}
 
     run["cancel_requested"] = True
     await kill_process_tree(int(run.get("pid") or 0))
+    force_release_session_lock(session_id)
     return {"ok": True, "cancelled": True}
 
 
@@ -2793,10 +2813,25 @@ async def compress_context(session_id: str, request: Request):
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
+def _startup_cleanup() -> None:
+    """Clear stale pending flags and force-release any held session locks."""
+    load_sessions_from_disk()
+    for sid, session in sessions.items():
+        for msg in session.get("messages", []):
+            msg.pop("pending", None)
+        if session.get("messages"):
+            session["updated"] = now_ts()
+    save_sessions_to_disk()
+    _session_locks.clear()
+    print(f"  Startup cleanup: {len(sessions)} sessions normalized.")
+
+
 if __name__ == "__main__":
     import webbrowser
 
     import uvicorn
+
+    _startup_cleanup()
 
     port = int(env_value("VINIPER_UI_PORT", "17373"))
     url = f"http://127.0.0.1:{port}"

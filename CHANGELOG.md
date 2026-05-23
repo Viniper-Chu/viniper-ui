@@ -1,3 +1,29 @@
+## v2.1.5 (2026-05-24)
+
+### 修复
+- **Session ID 复用导致持续占锁**：未初始化会话每次发送消息时使用 `--session-id <旧 UUID>`，即使重试也不换新 ID，导致 `Error: Session ID ... is already in use` 反复出现。现改为未初始化会话每次生成新 UUID，已初始化会话重试时保留原 UUID 以维持上下文。
+- **长任务超时自动掉线**：模型空闲超时从 12 分钟延长到 25 分钟，整体无输出超时从 20 分钟延长到 40 分钟，停滞后恢复尝试从 1 次增加到 2 次，适应长时间思考场景。
+- **服务器退出后自动重启**：Electron 主进程在 Python 服务退出时自动等待 2 秒后重启并刷新窗口，不再需要手动重启。
+- **进程清理精确匹配**：`kill_orphaned_claude_session` 改为精确匹配 `--session-id <uuid>` 或 `--resume <uuid>` 命令行参数，避免误杀提示文本中包含 session ID 的正常进程，同时清理 node 辅助进程。
+
+### 验证
+- `python -m py_compile server.py`
+- `node --check static/app.js`
+- `python scripts/verify_app.py`
+- 实际测试 session-in-use 重试恢复、20s 短超时模拟长任务掉线自动恢复
+
+## v2.1.4 (2026-05-23)
+
+### 修复
+- **会话锁占用拦截**：`stream_chat` 不再立即拒绝锁占用的请求，改为等待 6 秒；取消任务时通过 `force_release_session_lock` 强制释放锁，新请求无需等待旧进程退出。
+- **启动时自动清理**：服务启动时自动清除所有会话的残留 `pending` 标记并重置会话锁，避免重启后残留状态导致发消息被拦。
+- **客户端自动重试**：收到锁占用错误时，前端自动等待 3 秒后重试（最多 3 次），用户不再需要手动重发。
+
+### 验证
+- `python -m py_compile server.py`
+- `node --check static/app.js`
+- `python scripts/verify_app.py`
+
 ## v2.1.3 (2026-05-22)
 
 ### 修复

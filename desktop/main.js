@@ -190,8 +190,20 @@ function startServerProcess() {
 
   serverProcess.stdout.on("data", (chunk) => logServerChunk("log", chunk));
   serverProcess.stderr.on("data", (chunk) => logServerChunk("error", chunk));
-  serverProcess.on("exit", () => {
+  serverProcess.on("exit", (code) => {
     serverProcess = null;
+    if (isQuitting) return;
+    safeMainLog("log", `[Viniper UI] Server exited (code=${code}), restarting in 2s...`);
+    setTimeout(async () => {
+      if (isQuitting || serverProcess) return;
+      try {
+        startServerProcess();
+        await waitForServer(30000);
+        if (mainWindow) mainWindow.loadURL(localUrl());
+      } catch {
+        safeMainLog("error", "[Viniper UI] Server auto-restart failed.");
+      }
+    }, 2000);
   });
 }
 
