@@ -820,13 +820,16 @@ def _schedule_restart() -> None:
     async def _restart():
         await asyncio.sleep(0.5)
         try:
-            start_script = APP_DIR / "start.bat"
-            if start_script.exists():
-                subprocess.Popen(
-                    ["cmd.exe", "/c", "start", "", "cmd", "/c", str(start_script)],
-                    cwd=str(APP_DIR),
-                    close_fds=True,
-                )
+            if env_value("VINIPER_UI_DESKTOP", "") == "1":
+                pass
+            else:
+                start_script = APP_DIR / "start.bat"
+                if start_script.exists():
+                    subprocess.Popen(
+                        ["cmd.exe", "/c", "start", "", "cmd", "/c", str(start_script)],
+                        cwd=str(APP_DIR),
+                        close_fds=True,
+                    )
         except Exception:
             pass
         os._exit(0)
@@ -1680,6 +1683,7 @@ async def stream_chat_impl(
     cwd = existing_workdir(str(session.get("workdir") or ""))
     assistant_text = ""
     thinking_text = ""
+    assistant_segments: list[dict[str, str]] = []
     final_result = ""
     stderr_text = ""
     timed_out = False
@@ -1697,6 +1701,15 @@ async def stream_chat_impl(
     assistant_message_index: int | None = None
     last_progress_save = 0.0
     finalized = False
+
+    def append_assistant_segment(kind: str, text: str) -> None:
+        if not text:
+            return
+        segment_type = "thinking" if kind == "thinking" else "text"
+        if assistant_segments and assistant_segments[-1].get("type") == segment_type:
+            assistant_segments[-1]["content"] = str(assistant_segments[-1].get("content") or "") + text
+        else:
+            assistant_segments.append({"type": segment_type, "content": text})
 
     def ensure_assistant_message() -> dict[str, Any]:
         nonlocal assistant_message_index
@@ -1720,6 +1733,7 @@ async def stream_chat_impl(
         message = ensure_assistant_message()
         message["content"] = assistant_text
         message["model"] = selected_model
+        message["segments"] = assistant_segments
         if thinking_text:
             message["thinking"] = thinking_text
         message["pending"] = True
@@ -1729,9 +1743,12 @@ async def stream_chat_impl(
 
     def finalize_assistant(content: str | None = None, thinking: str | None = None) -> None:
         nonlocal finalized
+        if content is not None and content != assistant_text and not assistant_segments:
+            append_assistant_segment("text", content)
         message = ensure_assistant_message()
         message["content"] = assistant_text if content is None else content
         message["model"] = selected_model
+        message["segments"] = assistant_segments
         final_thinking = thinking_text if thinking is None else thinking
         if final_thinking:
             message["thinking"] = final_thinking
@@ -1748,6 +1765,7 @@ async def stream_chat_impl(
         "permission_mode": selected_permission_mode,
     })
     thinking_text = "正在通过 Claude Code 分析请求...\n"
+    append_assistant_segment("thinking", thinking_text)
     save_assistant_progress(force=True)
     yield sse({"type": "thinking", "content": thinking_text})
 
@@ -1844,6 +1862,7 @@ async def stream_chat_impl(
                     continue
                 text = f"{clean_stream_text(line)}\n"
                 assistant_text += text
+                append_assistant_segment("text", text)
                 save_assistant_progress()
                 yield sse({"type": "text", "content": text})
                 continue
@@ -1858,11 +1877,13 @@ async def stream_chat_impl(
                         text = clean_stream_text(str(delta.get("thinking") or ""))
                         if text:
                             thinking_text += text
+                            append_assistant_segment("thinking", text)
                             save_assistant_progress()
                             yield sse({"type": "thinking", "content": text})
                     elif delta.get("type") == "text_delta":
                         text = clean_stream_text(str(delta.get("text") or ""))
                         assistant_text += text
+                        append_assistant_segment("text", text)
                         save_assistant_progress()
                         yield sse({"type": "text", "content": text})
                 continue
@@ -1884,6 +1905,7 @@ async def stream_chat_impl(
                                     delta = ("\n" if assistant_text else "") + full_text
                                 if delta:
                                     assistant_text += delta
+                                    append_assistant_segment("text", delta)
                                     save_assistant_progress()
                                     yield sse({"type": "text", "content": delta})
                         elif block.get("type") == "tool_use":
@@ -1891,6 +1913,7 @@ async def stream_chat_impl(
                             command_text = tool_command(block)
                             text = tool_use_text(block)
                             thinking_text += text
+                            append_assistant_segment("thinking", text)
                             save_assistant_progress()
                             yield sse({"type": "thinking", "content": text})
                             if SAFETY_GUARDS_ENABLED:
@@ -1916,6 +1939,7 @@ async def stream_chat_impl(
                 text = tool_result_text(message)
                 if text:
                     thinking_text += text
+                    append_assistant_segment("thinking", text)
                     save_assistant_progress()
                     yield sse({"type": "thinking", "content": text})
                 if external_gui_command:
@@ -1946,9 +1970,11 @@ async def stream_chat_impl(
             )
             if not assistant_text:
                 assistant_text = detail
+                append_assistant_segment("text", detail)
                 yield sse({"type": "text", "content": detail})
             else:
                 assistant_text = f"{assistant_text}\n\n{detail}"
+                append_assistant_segment("text", f"\n\n{detail}")
                 yield sse({"type": "text", "content": f"\n\n{detail}"})
             finalize_assistant()
             session["updated"] = now_ts()
@@ -1980,9 +2006,11 @@ async def stream_chat_impl(
                     "这不是本地工具还在执行，而是模型请求无响应；我已停止该进程，并用同一个 Claude Code 会话自动恢复一次。"
                 )
                 thinking_text += f"\n{detail}\n"
+                append_assistant_segment("thinking", f"\n{detail}\n")
                 yield sse({"type": "thinking", "content": f"\n{detail}\n"})
                 if not assistant_text:
                     assistant_text = "正在恢复底层 Claude Code 会话，请稍等。"
+                    append_assistant_segment("text", assistant_text)
                     yield sse({"type": "text", "content": assistant_text})
                 finalize_assistant()
                 session["updated"] = now_ts()
@@ -2032,9 +2060,11 @@ async def stream_chat_impl(
             )
             if not assistant_text:
                 assistant_text = detail
+                append_assistant_segment("text", detail)
                 yield sse({"type": "text", "content": detail})
             else:
                 assistant_text = f"{assistant_text}\n\n{detail}"
+                append_assistant_segment("text", f"\n\n{detail}")
                 yield sse({"type": "text", "content": f"\n\n{detail}"})
             finalize_assistant()
             session["updated"] = now_ts()
@@ -2066,6 +2096,7 @@ async def stream_chat_impl(
 
         if _active_runs.get(session_id, {}).get("cancel_requested"):
             assistant_text = "已停止当前任务，输入已恢复。"
+            append_assistant_segment("text", assistant_text)
             yield sse({"type": "text", "content": assistant_text})
             finalize_assistant(assistant_text)
             session["updated"] = now_ts()
@@ -2134,6 +2165,7 @@ async def stream_chat_impl(
 
         if not assistant_text and final_result:
             assistant_text = final_result
+            append_assistant_segment("text", final_result)
             yield sse({"type": "text", "content": final_result})
 
         finalize_assistant()
@@ -2382,6 +2414,53 @@ async def create_filesystem_folder(request: Request):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "path": str(target.resolve()), "name": target.name}
+
+
+def resolve_local_artifact_path(value: Any) -> Path:
+    raw = str(value or "").strip().strip("\"'`")
+    if not raw:
+        raise HTTPException(status_code=400, detail="file path is required")
+    if os.name == "nt":
+        match = re.match(r"^/mnt/([a-zA-Z])/(.+)$", raw)
+        if match:
+            raw = f"{match.group(1).upper()}:/{match.group(2)}"
+    path = Path(raw).expanduser()
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    if not resolved.exists():
+        raise HTTPException(status_code=404, detail="file does not exist")
+    return resolved
+
+
+@app.post("/api/files/open")
+async def open_local_artifact(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="file body must be an object")
+    path = resolve_local_artifact_path(body.get("path"))
+    action = str(body.get("action") or "open")
+    try:
+        if os.name == "nt":
+            if action == "reveal":
+                if path.is_dir():
+                    subprocess.Popen(["explorer.exe", str(path)], close_fds=True)
+                else:
+                    subprocess.Popen(["explorer.exe", "/select,", str(path)], close_fds=True)
+            else:
+                os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            if action == "reveal":
+                subprocess.Popen(["open", "-R", str(path)], close_fds=True)
+            else:
+                subprocess.Popen(["open", str(path)], close_fds=True)
+        else:
+            target = str(path.parent if action == "reveal" and path.is_file() else path)
+            subprocess.Popen(["xdg-open", target], close_fds=True)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"open file failed: {exc}") from exc
+    return {"ok": True, "path": str(path), "action": action}
 
 
 @app.get("/api/diagnostics")

@@ -178,6 +178,7 @@ function startServerProcess() {
   const env = {
     ...process.env,
     VINIPER_UI_OPEN_BROWSER: "0",
+    VINIPER_UI_DESKTOP: "1",
     VINIPER_UI_PORT: String(port)
   };
 

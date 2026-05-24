@@ -325,8 +325,29 @@ button { color: inherit; }
   border: 1px solid var(--line); border-radius: 6px;
   background: var(--panel); color: var(--text-soft);
   cursor: pointer; font-size: 12px; transition: all 0.15s ease;
+  opacity: 0; pointer-events: none;
+}
+.msg-content pre:hover .copy-btn,
+.copy-btn:focus-visible {
+  opacity: 1; pointer-events: auto;
 }
 .copy-btn:hover { background: var(--panel-soft); border-color: var(--accent); }
+.msg-text-segment { margin-bottom: 10px; }
+.msg-text-segment:last-child { margin-bottom: 0; }
+.artifact-list { display: grid; gap: 8px; margin: 12px 0 4px; }
+.artifact-card {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--panel); box-shadow: var(--shadow-sm);
+}
+.artifact-main { min-width: 0; display: grid; gap: 3px; }
+.artifact-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-main code {
+  display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 520px; color: var(--muted); background: transparent; border: 0; padding: 0;
+}
+.artifact-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.artifact-button { min-height: 30px; padding: 4px 10px; font-size: 12px; }
 .msg-content ul { margin: 10px 0; padding-left: 24px; }
 .msg-content blockquote { margin: 10px 0; padding-left: 14px; border-left: 3px solid var(--accent); color: var(--text-soft); }
 .msg-content a { color: var(--link); }

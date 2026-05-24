@@ -19,8 +19,6 @@
 <body>
   <div id="app">
     <aside id="sidebar" aria-label="会话">
-      <button id="toggle-skills-btn" class="panel-button" type="button">技能库</button>
-
       <header class="sidebar-header">
         <div class="brand-wrap">
           <img class="brand-icon" src="/favicon.ico?v=__APP_VERSION__" alt="" aria-hidden="true">
@@ -91,22 +89,6 @@
       </section>
     </main>
 
-    <aside id="skills-panel" class="hidden" aria-label="技能库">
-      <header class="skills-header">
-        <strong>技能库</strong>
-        <button id="close-skills-btn" class="icon-button" title="关闭" aria-label="关闭">×</button>
-      </header>
-      <div class="skills-search">
-        <input id="skill-search" type="search" placeholder="搜索技能">
-      </div>
-      <div id="skills-categories"></div>
-      <div id="skills-list"></div>
-      <div id="skill-detail" class="hidden">
-        <button id="back-to-skills" class="ghost-button" type="button">返回</button>
-        <article id="skill-detail-content"></article>
-        <button id="use-skill-btn" class="primary-button" type="button">插入技能</button>
-      </div>
-    </aside>
   </div>
 
   <div id="new-session-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="new-session-title">

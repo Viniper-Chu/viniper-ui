@@ -18,6 +18,7 @@ const state = {
   updateInfo: null,
   abortController: null,
   cancelRequested: false,
+  followOutput: true,
   folderPicker: {
     targetSelector: "",
     currentPath: "",
@@ -193,7 +194,7 @@ function t(key) {
 function translateChrome() {
   $("#new-chat-btn").title = t("newChat");
   $("#new-chat-btn").setAttribute("aria-label", t("newChat"));
-  $("#toggle-skills-btn").textContent = t("skills");
+  if ($("#toggle-skills-btn")) $("#toggle-skills-btn").textContent = t("skills");
   $("#settings-btn").textContent = t("settings");
   $(".model-picker span").textContent = t("model");
   $(".permission-picker span").textContent = t("permission");
@@ -236,7 +237,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   applyLanguage(getInitialLanguage());
   bindEvents();
   await loadStatus();
-  await loadSkills();
+  if ($("#skills-panel")) await loadSkills();
   await restoreLastSession();
   checkForUpdates({ silent: true });
 });
@@ -256,17 +257,20 @@ function bindEvents() {
   });
 
   input.addEventListener("input", () => autoResize(input));
+  $("#chat-container").addEventListener("scroll", () => {
+    if (state.isStreaming) state.followOutput = isNearChatBottom();
+  });
 
   $("#send-btn").addEventListener("click", () => sendMessage());
   $("#stop-btn").addEventListener("click", cancelCurrentTask);
   $("#file-btn").addEventListener("click", () => $("#file-input").click());
   $("#file-input").addEventListener("change", handleFileAttach);
   $("#new-chat-btn").addEventListener("click", openNewSessionModal);
-  $("#toggle-skills-btn").addEventListener("click", toggleSkillsPanel);
-  $("#close-skills-btn").addEventListener("click", () => $("#skills-panel").classList.add("hidden"));
-  $("#skill-search").addEventListener("input", renderSkillList);
-  $("#back-to-skills").addEventListener("click", showSkillList);
-  $("#use-skill-btn").addEventListener("click", useSkill);
+  if ($("#toggle-skills-btn")) $("#toggle-skills-btn").addEventListener("click", toggleSkillsPanel);
+  if ($("#close-skills-btn")) $("#close-skills-btn").addEventListener("click", () => $("#skills-panel").classList.add("hidden"));
+  if ($("#skill-search")) $("#skill-search").addEventListener("input", renderSkillList);
+  if ($("#back-to-skills")) $("#back-to-skills").addEventListener("click", showSkillList);
+  if ($("#use-skill-btn")) $("#use-skill-btn").addEventListener("click", useSkill);
   $("#change-workdir-btn").addEventListener("click", changeWorkdir);
   $("#update-btn").addEventListener("click", () => checkForUpdates({ silent: false }));
   $("#cancel-update-btn").addEventListener("click", closeUpdateModal);
@@ -338,7 +342,7 @@ function bindEvents() {
       closeDeleteSessionModal(false);
       closeRenameSessionModal(null);
       closeSettingsModal();
-      $("#skills-panel").classList.add("hidden");
+      if ($("#skills-panel")) $("#skills-panel").classList.add("hidden");
     }
   });
 
@@ -379,6 +383,16 @@ function bindEvents() {
   });
 
   document.addEventListener("click", async (event) => {
+    const fileButton = event.target.closest("[data-file-action]");
+    if (fileButton) {
+      try {
+        await openArtifactPath(fileButton.dataset.filePath || "", fileButton.dataset.fileAction || "open");
+      } catch (error) {
+        alert(`打开文件失败：${error.message}`);
+      }
+      return;
+    }
+
     const copyButton = event.target.closest("[data-copy]");
     if (copyButton) {
       navigator.clipboard.writeText(copyButton.dataset.copy || "").then(() => {
@@ -509,10 +523,9 @@ async function installUpdate() {
     $("#update-notes").textContent = data.message || "更新已安装，请重启 UI。";
     button.textContent = "已安装";
     if (data.restarting) {
-      button.textContent = "服务重启中...";
-      setTimeout(() => {
-        location.reload();
-      }, 5000);
+      button.textContent = "正在重启...";
+      await waitForAppRestart(info.latest_version || data.version || "");
+      return;
     }
     renderUpdateButton();
     if (!data.restarting) {
@@ -524,6 +537,28 @@ async function installUpdate() {
     button.disabled = false;
     $("#cancel-update-btn").disabled = false;
   }
+}
+
+async function waitForAppRestart(expectedVersion = "") {
+  const started = Date.now();
+  const deadline = started + 90000;
+  $("#update-notes").textContent = "更新已安装，正在自动关闭旧服务并重启窗口。";
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1800));
+    try {
+      const response = await fetch(`/api/status?restart_probe=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) continue;
+      const status = await response.json();
+      if (!expectedVersion || status.version === expectedVersion) {
+        location.reload();
+        return;
+      }
+      $("#update-notes").textContent = `服务已恢复，等待新版本生效：当前 v${status.version}，目标 v${expectedVersion}`;
+    } catch {
+      $("#update-notes").textContent = "旧服务已关闭，等待新服务启动。";
+    }
+  }
+  $("#update-notes").textContent = "更新已安装，但自动刷新超时。请手动重新打开 Viniper UI。";
 }
 
 function modelsToText(models = []) {
@@ -1193,7 +1228,7 @@ function renderAllMessages() {
       ? "你"
       : (message.role === "system" ? "上下文摘要" : assistantLabel(message.model));
     const content = message.content;
-    return messageTemplate(roleClass, label, content, message.thinking || "");
+    return messageTemplate(roleClass, label, content, message.thinking || "", message.segments || []);
   }).join("");
 }
 
@@ -1213,19 +1248,138 @@ function assistantLabel(modelId) {
   return option ? `小伍 · ${option.label}` : "小伍";
 }
 
-function messageTemplate(roleClass, label, content, thinking = "") {
+function messageTemplate(roleClass, label, content, thinking = "", segments = []) {
   const displayContent = repairTextForDisplay(content);
   const displayThinking = repairTextForDisplay(thinking);
-  const body = roleClass === "assistant" || roleClass === "error"
-    ? renderMarkdown(displayContent)
-    : escapeHtml(displayContent);
+  const displaySegments = Array.isArray(segments) ? segments : [];
+  const body = roleClass === "assistant" && displaySegments.length
+    ? renderMessageSegments(displaySegments)
+    : (roleClass === "assistant" || roleClass === "error"
+      ? renderAssistantContentHtml(displayContent)
+      : escapeHtml(displayContent));
   return `
-    <article class="message ${roleClass}">
+    <article class="message ${roleClass}" data-role="${escapeAttr(roleClass)}">
       <header class="msg-header">${escapeHtml(label)}</header>
-      ${displayThinking && roleClass === "assistant" ? renderThinkingPanel(displayThinking) : ""}
+      ${displayThinking && roleClass === "assistant" && !displaySegments.length ? renderThinkingPanel(displayThinking) : ""}
       <div class="msg-content">${body}</div>
     </article>
   `;
+}
+
+function renderMessageSegments(segments = []) {
+  return segments.map((segment) => {
+    const type = segment?.type === "thinking" ? "thinking" : "text";
+    const content = repairTextForDisplay(segment?.content || "");
+    if (!content.trim()) return "";
+    return type === "thinking"
+      ? renderThinkingPanel(content)
+      : `<div class="msg-text-segment">${renderAssistantContentHtml(content)}</div>`;
+  }).join("");
+}
+
+function renderAssistantContentHtml(text) {
+  const value = repairTextForDisplay(text || "");
+  return `${renderMarkdown(value)}${renderArtifactCards(value)}`;
+}
+
+function createStreamRenderer(article) {
+  const container = article.querySelector(".msg-content");
+  const segments = [];
+
+  const sync = () => {
+    container.innerHTML = renderMessageSegments(segments);
+    scrollBottom();
+  };
+
+  return {
+    append(type, content) {
+      const normalizedType = type === "thinking" ? "thinking" : "text";
+      const value = repairTextForDisplay(content || "");
+      if (!value) return;
+      const last = segments[segments.length - 1];
+      if (last && last.type === normalizedType) {
+        last.content += value;
+      } else {
+        segments.push({ type: normalizedType, content: value });
+      }
+      sync();
+    },
+    replaceWithText(content) {
+      segments.length = 0;
+      if (content) segments.push({ type: "text", content: repairTextForDisplay(content) });
+      sync();
+    }
+  };
+}
+
+const ARTIFACT_EXTENSIONS = "pdf|docx|xlsx|pptx|txt|md|csv|tex|html|png|jpe?g|webp|zip|tar\\.gz";
+
+function normalizeArtifactPath(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/[，。；、,;:)）\]]+$/g, "");
+}
+
+function extractArtifactPaths(text) {
+  const source = String(text || "").replace(/```[\s\S]*?```/g, "");
+  const patterns = [
+    new RegExp(String.raw`[A-Za-z]:[\\/][^\n\r"'<>|?*]+?\.(?:${ARTIFACT_EXTENSIONS})`, "gi"),
+    new RegExp(String.raw`/mnt/[a-z]/[^\n\r"'<>]+?\.(?:${ARTIFACT_EXTENSIONS})`, "gi"),
+    new RegExp(String.raw`~?/[^\n\r"'<>]+?\.(?:${ARTIFACT_EXTENSIONS})`, "gi")
+  ];
+  const seen = new Set();
+  const paths = [];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const path = normalizeArtifactPath(match[0]);
+      const key = path.toLowerCase();
+      if (path && !seen.has(key)) {
+        seen.add(key);
+        paths.push(path);
+      }
+      if (paths.length >= 8) return paths;
+    }
+  }
+  return paths;
+}
+
+function artifactName(path) {
+  const normalized = String(path || "").replaceAll("\\", "/");
+  return normalized.split("/").filter(Boolean).pop() || normalized || "文件";
+}
+
+function renderArtifactCards(text) {
+  const paths = extractArtifactPaths(text);
+  if (!paths.length) return "";
+  return `
+    <div class="artifact-list">
+      ${paths.map((path) => `
+        <div class="artifact-card">
+          <div class="artifact-main">
+            <strong>${escapeHtml(artifactName(path))}</strong>
+            <code>${escapeHtml(shortenPath(path))}</code>
+          </div>
+          <div class="artifact-actions">
+            <button class="ghost-button artifact-button" type="button" data-file-action="open" data-file-path="${escapeAttr(path)}">打开</button>
+            <button class="ghost-button artifact-button" type="button" data-file-action="reveal" data-file-path="${escapeAttr(path)}">位置</button>
+          </div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+async function openArtifactPath(path, action = "open") {
+  const response = await fetch("/api/files/open", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, action })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.ok === false) {
+    throw new Error(data.detail || data.message || `HTTP ${response.status}`);
+  }
 }
 
 function needsPermissionForPrompt(text, files = []) {
@@ -1354,6 +1508,7 @@ async function sendMessage() {
   autoResize(input);
   state.isStreaming = true;
   state.cancelRequested = false;
+  state.followOutput = true;
   state.abortController = new AbortController();
   state.retrySend.count = 0;
   state.retrySend.context = { text, permissionMode, attachments };
@@ -1364,10 +1519,9 @@ async function sendMessage() {
   addMessage("user", attachmentDisplayText(text, attachments));
   const assistantContent = addMessage("assistant", "");
   const assistantArticle = assistantContent.closest(".message");
+  const streamRenderer = createStreamRenderer(assistantArticle);
   let fullText = "";
   let thinkingText = "";
-  let thinkingBody = null;
-  let thinkingPreview = null;
   let receivedDone = false;  // track whether we got a "done" SSE event
 
   // Long-running notice: keep the input locked while the backend task is alive.
@@ -1375,7 +1529,7 @@ async function sendMessage() {
     if (state.isStreaming) {
       showThinking(false);
       if (!fullText) {
-        assistantContent.innerHTML = renderMarkdown("(任务仍在运行，我会继续等待；为避免重复执行，先不要再次提交同一条指令。)");
+        streamRenderer.replaceWithText("(任务仍在运行，我会继续等待；为避免重复执行，先不要再次提交同一条指令。)");
       }
     }
   }, 120000);  // 2 minutes: show a notice, but do not allow duplicate sends
@@ -1414,26 +1568,16 @@ async function sendMessage() {
       if (payload.type === "thinking") {
         showThinking(false);
         thinkingText += payload.content || "";
-        if (!thinkingBody || !thinkingPreview) {
-          const wrapper = document.createElement("div");
-          wrapper.innerHTML = renderThinkingPanel("");
-          assistantArticle.insertBefore(wrapper.firstElementChild, assistantContent);
-          thinkingBody = assistantArticle.querySelector(".thinking-body");
-          thinkingPreview = assistantArticle.querySelector(".thinking-preview");
-        }
-        thinkingPreview.textContent = previewThinking(thinkingText);
-        thinkingBody.innerHTML = renderMarkdown(thinkingText);
-        scrollBottom();
+        streamRenderer.append("thinking", payload.content || "");
       } else if (payload.type === "text") {
         showThinking(false);
         fullText += payload.content || "";
-        assistantContent.innerHTML = renderMarkdown(fullText);
-        scrollBottom();
+        streamRenderer.append("text", payload.content || "");
       } else if (payload.type === "error") {
         showThinking(false);
         if (state.cancelRequested) {
           fullText = "已停止当前任务，输入已恢复。";
-          assistantContent.innerHTML = renderMarkdown(fullText);
+          streamRenderer.replaceWithText(fullText);
         } else if (
           state.retrySend.count < state.retrySend.max &&
           state.retrySend.context &&
@@ -1441,7 +1585,7 @@ async function sendMessage() {
         ) {
           state.retrySend.count++;
           const ctx = state.retrySend.context;
-          assistantContent.innerHTML = renderMarkdown(`(上个任务刚结束，${state.retrySend.delayMs / 1000} 秒后自动重试…)`);
+          streamRenderer.replaceWithText(`(上个任务刚结束，${state.retrySend.delayMs / 1000} 秒后自动重试…)`);
           setTimeout(() => {
             if (!state.isStreaming) return;
             // Mark streaming as done so retry can proceed
@@ -1451,7 +1595,7 @@ async function sendMessage() {
           }, state.retrySend.delayMs);
         } else {
           fullText = `错误：${payload.content || ""}`;
-          assistantContent.innerHTML = renderMarkdown(fullText);
+          streamRenderer.replaceWithText(fullText);
           assistantContent.closest(".message").classList.add("error");
         }
       } else if (payload.type === "heartbeat") {
@@ -1462,7 +1606,7 @@ async function sendMessage() {
           const note = payload.action_task
             ? `动作任务仍在运行，已等待约 ${minutes} 分钟，${stage}。我会继续等；如果你判断它卡住，可以点停止按钮。`
             : `长任务仍在运行，已等待约 ${minutes} 分钟，${stage}。我会保持连接，不会提前打断。`;
-          assistantContent.innerHTML = renderMarkdown(`(${note})`);
+          streamRenderer.replaceWithText(`(${note})`);
         }
       } else if (payload.type === "done") {
         receivedDone = true;
@@ -1498,10 +1642,10 @@ async function sendMessage() {
     showThinking(false);
     if (error.name === "AbortError" || state.cancelRequested) {
       fullText = fullText || "已停止当前任务，输入已恢复。";
-      assistantContent.innerHTML = renderMarkdown(fullText);
+      streamRenderer.replaceWithText(fullText);
     } else {
       fullText = `连接失败：${error.message}`;
-      assistantContent.innerHTML = renderMarkdown(fullText);
+      streamRenderer.replaceWithText(fullText);
       assistantContent.closest(".message").classList.add("error");
     }
   } finally {
@@ -1531,6 +1675,7 @@ async function doRetrySend(text, permissionMode, attachments = []) {
 
   state.isStreaming = true;
   state.cancelRequested = false;
+  state.followOutput = true;
   state.abortController = new AbortController();
   setInputEnabled(false);
   showStopButton(true);
@@ -1543,12 +1688,13 @@ async function doRetrySend(text, permissionMode, attachments = []) {
 
   const assistantContent = addMessage("assistant", "");
   const assistantArticle = assistantContent.closest(".message");
+  const streamRenderer = createStreamRenderer(assistantArticle);
   let fullText = "";
   let receivedDone = false;
 
   const safetyTimer = setTimeout(() => {
     if (state.isStreaming && !fullText) {
-      assistantContent.innerHTML = renderMarkdown("(任务仍在运行，我会继续等待；为避免重复执行，先不要再次提交同一条指令。)");
+      streamRenderer.replaceWithText("(任务仍在运行，我会继续等待；为避免重复执行，先不要再次提交同一条指令。)");
     }
   }, 120000);
 
@@ -1576,10 +1722,11 @@ async function doRetrySend(text, permissionMode, attachments = []) {
       if (typeof payload.content === "string") {
         payload.content = repairTextForDisplay(payload.content);
       }
-      if (payload.type === "text") {
+      if (payload.type === "thinking") {
+        streamRenderer.append("thinking", payload.content || "");
+      } else if (payload.type === "text") {
         fullText += payload.content || "";
-        assistantContent.innerHTML = renderMarkdown(fullText);
-        scrollBottom();
+        streamRenderer.append("text", payload.content || "");
       } else if (payload.type === "error") {
         if (state.cancelRequested) {
           fullText = "已停止当前任务，输入已恢复。";
@@ -1587,7 +1734,7 @@ async function doRetrySend(text, permissionMode, attachments = []) {
           fullText = `错误：${payload.content || ""}`;
           assistantContent.closest(".message").classList.add("error");
         }
-        assistantContent.innerHTML = renderMarkdown(fullText);
+        streamRenderer.replaceWithText(fullText);
       } else if (payload.type === "done") {
         receivedDone = true;
       }
@@ -1609,7 +1756,7 @@ async function doRetrySend(text, permissionMode, attachments = []) {
   } catch (error) {
     if (error.name !== "AbortError" && !state.cancelRequested) {
       fullText = `连接失败：${error.message}`;
-      assistantContent.innerHTML = renderMarkdown(fullText);
+      streamRenderer.replaceWithText(fullText);
       assistantContent.closest(".message").classList.add("error");
     }
   } finally {
@@ -2009,9 +2156,17 @@ function shortenPath(path) {
   return display.length > 56 ? `...${display.slice(-53)}` : display;
 }
 
-function scrollBottom() {
+function isNearChatBottom(threshold = 120) {
+  const container = $("#chat-container");
+  if (!container) return true;
+  return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+}
+
+function scrollBottom({ force = false } = {}) {
   requestAnimationFrame(() => {
     const container = $("#chat-container");
+    if (!container) return;
+    if (!force && state.isStreaming && !state.followOutput) return;
     container.scrollTop = container.scrollHeight;
   });
 }
