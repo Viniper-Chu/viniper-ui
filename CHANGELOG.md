@@ -1,3 +1,13 @@
+## v3.0.2 (2026-05-25)
+
+### 调整
+- **启动动画简化**：移除启动动画里的外框、玻璃卡片和 V 描线，仅保留居中的 Viniper 图标呼吸闪烁，随后淡出进入软件。
+
+### 验证
+- `node --check static/app.js`
+- `npm run check`
+- `python scripts/verify_app.py`
+
 ## v3.0.1 (2026-05-25)
 
 ### 新增
