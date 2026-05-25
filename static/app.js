@@ -42,6 +42,8 @@ const THEME_KEY = `${STORAGE_PREFIX}theme`;
 const LANGUAGE_KEY = `${STORAGE_PREFIX}language`;
 const ACCENT_KEY = `${STORAGE_PREFIX}accent`;
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const LAUNCH_SPLASH_MIN_MS = 1450;
+const launchSplashStarted = performance.now();
 let modelPersistTimer = null;
 
 function storageGet(key) {
@@ -232,15 +234,29 @@ function toggleTheme() {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
-  applyAccent(getInitialAccent());
-  applyTheme(getInitialTheme());
-  applyLanguage(getInitialLanguage());
-  bindEvents();
-  await loadStatus();
-  if ($("#skills-panel")) await loadSkills();
-  await restoreLastSession();
-  checkForUpdates({ silent: true });
+  try {
+    applyAccent(getInitialAccent());
+    applyTheme(getInitialTheme());
+    applyLanguage(getInitialLanguage());
+    bindEvents();
+    await loadStatus();
+    if ($("#skills-panel")) await loadSkills();
+    await restoreLastSession();
+    checkForUpdates({ silent: true });
+  } finally {
+    hideLaunchSplash();
+  }
 });
+
+function hideLaunchSplash() {
+  const splash = $("#launch-splash");
+  if (!splash) return;
+  const remaining = Math.max(0, LAUNCH_SPLASH_MIN_MS - (performance.now() - launchSplashStarted));
+  setTimeout(() => {
+    splash.classList.add("is-hiding");
+    setTimeout(() => splash.remove(), 620);
+  }, remaining);
+}
 
 function bindEvents() {
   const input = $("#user-input");

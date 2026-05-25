@@ -104,6 +104,77 @@ body {
 button, input, textarea { font: inherit; }
 button { color: inherit; }
 
+#launch-splash {
+  position: fixed; inset: 0; z-index: 9999;
+  display: flex; align-items: center; justify-content: center;
+  background:
+    radial-gradient(circle at 50% 42%, rgba(0,122,255,0.14), transparent 32%),
+    var(--bg);
+  opacity: 1; transform: scale(1);
+  transition: opacity 0.52s ease, transform 0.52s ease, visibility 0.52s ease;
+  pointer-events: auto;
+}
+
+#launch-splash.is-hiding {
+  opacity: 0; transform: scale(1.018);
+  visibility: hidden; pointer-events: none;
+}
+
+.launch-mark {
+  width: 112px; height: 112px;
+  display: grid; place-items: center;
+  border-radius: 30px;
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line) 84%, transparent);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(22px) saturate(180%);
+  -webkit-backdrop-filter: blur(22px) saturate(180%);
+  animation: launchFloat 1.7s ease both;
+}
+
+.launch-v { width: 78px; height: 78px; overflow: visible; }
+.launch-v-glow,
+.launch-v-stroke {
+  fill: none; stroke-linecap: round; stroke-linejoin: round;
+}
+.launch-v-glow {
+  stroke: var(--accent); stroke-width: 15;
+  opacity: 0.18; filter: blur(9px);
+  stroke-dasharray: 170; stroke-dashoffset: 170;
+  animation: drawLaunchV 1.35s cubic-bezier(.2,.72,.18,1) forwards;
+}
+.launch-v-stroke {
+  stroke: var(--text); stroke-width: 10.5;
+  stroke-dasharray: 170; stroke-dashoffset: 170;
+  animation: drawLaunchV 1.35s cubic-bezier(.2,.72,.18,1) 0.08s forwards,
+    settleLaunchV 0.46s ease 1.26s forwards;
+}
+
+@keyframes drawLaunchV {
+  to { stroke-dashoffset: 0; }
+}
+
+@keyframes settleLaunchV {
+  0% { filter: drop-shadow(0 0 0 rgba(0,122,255,0)); }
+  100% { filter: drop-shadow(0 8px 16px rgba(0,0,0,0.16)); }
+}
+
+@keyframes launchFloat {
+  0% { opacity: 0; transform: translateY(10px) scale(0.96); }
+  22% { opacity: 1; }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #launch-splash { transition-duration: 0.12s; }
+  .launch-mark,
+  .launch-v-glow,
+  .launch-v-stroke {
+    animation-duration: 0.01ms;
+    animation-delay: 0s;
+  }
+}
+
 #app {
   display: flex; height: 100vh; min-width: 0;
 }

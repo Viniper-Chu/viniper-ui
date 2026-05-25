@@ -1,3 +1,13 @@
+## v3.0.1 (2026-05-25)
+
+### 新增
+- **启动动画**：软件启动时显示 Viniper UI 的 V 字描边动画，V 会缓缓呈现后自动淡出进入主界面。
+
+### 验证
+- `node --check static/app.js`
+- `npm run check`
+- `python scripts/verify_app.py`
+
 ## v3.0.0 (2026-05-24)
 
 ### 重点
