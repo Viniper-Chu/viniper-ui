@@ -1,3 +1,15 @@
+## v3.0.3 (2026-05-26)
+
+### 调整
+- **启动动画升级**：把启动页替换为单个居中的 Viniper V 图标动效，参考数研桥的浅色数学网格、青绿/蓝色桥形几何和柔和显现节奏；V 字会先描边显现，再有内部光扫和轻微呼吸。
+- **启动节奏**：延长最短启动展示时间到 1.85 秒，保证 V 的显现过程完整可见后再进入主界面。
+
+### 验证
+- `node --check static/app.js`
+- `python scripts/verify_app.py`
+- `python scripts/build_release.py --version 3.0.3 --repo Viniper-Chu/viniper-ui`
+- `python scripts/verify_release.py`
+
 ## v3.0.2 (2026-05-25)
 
 ### 调整

@@ -42,7 +42,7 @@ const THEME_KEY = `${STORAGE_PREFIX}theme`;
 const LANGUAGE_KEY = `${STORAGE_PREFIX}language`;
 const ACCENT_KEY = `${STORAGE_PREFIX}accent`;
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-const LAUNCH_SPLASH_MIN_MS = 1150;
+const LAUNCH_SPLASH_MIN_MS = 1850;
 const launchSplashStarted = performance.now();
 let modelPersistTimer = null;
 
