@@ -87,10 +87,11 @@ def main() -> int:
     if not manifest_path.exists():
         raise SystemExit("dist/latest.json missing; run scripts/build_release.py first")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    asset = manifest.get("assets", {}).get("app", {})
+    assets = manifest.get("assets", {})
+    asset = assets.get("app") or assets.get("portable") or {}
     zip_name = asset.get("name")
     if not zip_name:
-        raise SystemExit("latest.json missing assets.app.name")
+        raise SystemExit("latest.json missing assets.app.name or assets.portable.name")
     zip_path = DIST / zip_name
     if not zip_path.exists():
         raise SystemExit(f"release zip missing: {zip_path}")
@@ -109,7 +110,8 @@ def main() -> int:
             raise SystemExit("latest.json missing matching assets.macos package")
         if not mac_asset.get("sha256"):
             raise SystemExit("latest.json missing assets.macos.sha256")
-    verify_zip(zip_path)
+    if zip_path.suffix.lower() == ".zip":
+        verify_zip(zip_path)
     print("Viniper UI release verification passed.")
     return 0
 

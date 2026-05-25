@@ -672,13 +672,14 @@ def choose_update_asset(manifest: dict[str, Any], requested_asset: str | None = 
         if requested_asset and isinstance(assets.get(requested_asset), dict):
             return dict(assets[requested_asset])
         system_name = platform.system().lower()
-        preferred: list[str] = ["app", "source", "zip"]
+        preferred: list[str] = []
         if "darwin" in system_name:
             preferred.extend(["macos", "darwin"])
         elif "windows" in system_name:
             preferred.extend(["windows", "win"])
         elif "linux" in system_name:
             preferred.append("linux")
+        preferred.extend(["app", "source", "zip"])
         for key in preferred:
             item = assets.get(key)
             if isinstance(item, dict) and item.get("url"):

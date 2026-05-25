@@ -69,7 +69,14 @@ def read_version() -> str:
 
 
 def release_download_url(manifest: dict, asset_name: str) -> str:
-    app_url = str(manifest.get("assets", {}).get("app", {}).get("url", ""))
+    assets = manifest.get("assets", {})
+    app_url = ""
+    if isinstance(assets, dict):
+        for key in ("app", "portable", "source", "zip"):
+            item = assets.get(key)
+            if isinstance(item, dict) and item.get("url"):
+                app_url = str(item.get("url") or "")
+                break
     marker = "/download/"
     if marker in app_url:
         return app_url.split(marker, 1)[0] + marker + asset_name
@@ -89,6 +96,11 @@ def update_latest_manifest() -> None:
         "windows": release_dir / f"Viniper.UI.Setup.{version}.exe",
         "macos": release_dir / f"Viniper.UI.{version}-arm64-mac.zip",
     }
+    has_platform_installer = any(path.exists() for path in candidates.values())
+    if has_platform_installer and "app" in assets and "portable" not in assets:
+        # Older Viniper UI updaters prefer assets.app before platform installers.
+        # Desktop-shell releases need the installer so app.asar/main-process code is replaced too.
+        assets["portable"] = assets.pop("app")
     for key, path in candidates.items():
         if path.exists():
             assets[key] = {

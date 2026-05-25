@@ -14,6 +14,8 @@ const state = {
   theme: "light",
   language: "zh-CN",
   accent: "viniper",
+  sidebarVisible: true,
+  alwaysOnTop: false,
   settings: null,
   updateInfo: null,
   abortController: null,
@@ -41,6 +43,7 @@ const PERMISSION_KEY = `${STORAGE_PREFIX}permission-mode`;
 const THEME_KEY = `${STORAGE_PREFIX}theme`;
 const LANGUAGE_KEY = `${STORAGE_PREFIX}language`;
 const ACCENT_KEY = `${STORAGE_PREFIX}accent`;
+const SIDEBAR_KEY = `${STORAGE_PREFIX}sidebar-visible`;
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const LAUNCH_SPLASH_MIN_MS = 1850;
 const launchSplashStarted = performance.now();
@@ -95,6 +98,10 @@ const I18N = {
     attach: "添加附件",
     stop: "停止当前任务",
     send: "发送",
+    sidebar: "显示/隐藏边栏",
+    pin: "置顶",
+    unpin: "取消置顶",
+    skillsWeb: "Skills",
     themeLight: "浅色",
     themeDark: "深色",
     themeSystem: "系统",
@@ -114,6 +121,10 @@ const I18N = {
     attach: "Attach file",
     stop: "Stop current task",
     send: "Send",
+    sidebar: "Toggle sidebar",
+    pin: "Pin",
+    unpin: "Unpin",
+    skillsWeb: "Skills",
     themeLight: "Light",
     themeDark: "Dark",
     themeSystem: "System",
@@ -189,6 +200,35 @@ function applyAccent(accent) {
   storageSet(ACCENT_KEY, state.accent);
 }
 
+function getInitialSidebarVisible() {
+  return storageGet(SIDEBAR_KEY) !== "0";
+}
+
+function setSidebarVisible(visible) {
+  state.sidebarVisible = Boolean(visible);
+  document.body.classList.toggle("sidebar-collapsed", !state.sidebarVisible);
+  storageSet(SIDEBAR_KEY, state.sidebarVisible ? "1" : "0");
+  const button = $("#toggle-sidebar-btn");
+  if (button) {
+    button.classList.toggle("active", state.sidebarVisible);
+    button.title = t("sidebar");
+    button.setAttribute("aria-label", t("sidebar"));
+  }
+}
+
+function toggleSidebar() {
+  setSidebarVisible(!state.sidebarVisible);
+}
+
+function updatePinButton() {
+  const button = $("#always-on-top-btn");
+  if (!button) return;
+  button.classList.toggle("active", state.alwaysOnTop);
+  button.textContent = state.alwaysOnTop ? t("unpin") : t("pin");
+  button.title = state.alwaysOnTop ? "取消置顶聊天窗口" : "置顶聊天窗口";
+  button.setAttribute("aria-label", button.title);
+}
+
 function t(key) {
   return (I18N[state.language] || I18N["zh-CN"])[key] || I18N["zh-CN"][key] || key;
 }
@@ -208,8 +248,13 @@ function translateChrome() {
   $("#stop-btn").setAttribute("aria-label", t("stop"));
   $("#send-btn").title = t("send");
   $("#send-btn").setAttribute("aria-label", t("send"));
+  $("#toggle-sidebar-btn").title = t("sidebar");
+  $("#toggle-sidebar-btn").setAttribute("aria-label", t("sidebar"));
+  $("#skills-web-btn").textContent = t("skillsWeb");
+  $("#skills-web-btn").title = "打开 skills.sh";
   $("#thinking span:last-child").textContent = t("thinking");
   updateThemeButton();
+  updatePinButton();
   updateModelLabels();
   renderUpdateButton();
 }
@@ -238,7 +283,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     applyAccent(getInitialAccent());
     applyTheme(getInitialTheme());
     applyLanguage(getInitialLanguage());
+    setSidebarVisible(getInitialSidebarVisible());
     bindEvents();
+    setupDesktopBridge();
     await loadStatus();
     if ($("#skills-panel")) await loadSkills();
     await restoreLastSession();
@@ -281,6 +328,9 @@ function bindEvents() {
   $("#stop-btn").addEventListener("click", cancelCurrentTask);
   $("#file-btn").addEventListener("click", () => $("#file-input").click());
   $("#file-input").addEventListener("change", handleFileAttach);
+  $("#toggle-sidebar-btn").addEventListener("click", toggleSidebar);
+  $("#always-on-top-btn").addEventListener("click", toggleAlwaysOnTop);
+  $("#skills-web-btn").addEventListener("click", openSkillsWeb);
   $("#new-chat-btn").addEventListener("click", openNewSessionModal);
   if ($("#toggle-skills-btn")) $("#toggle-skills-btn").addEventListener("click", toggleSkillsPanel);
   if ($("#close-skills-btn")) $("#close-skills-btn").addEventListener("click", () => $("#skills-panel").classList.add("hidden"));
@@ -341,6 +391,7 @@ function bindEvents() {
   $("#create-desktop-shortcut-btn").addEventListener("click", createDesktopShortcut);
   $("#deny-permission-btn").addEventListener("click", () => closePermissionModal(false));
   $("#allow-once-btn").addEventListener("click", () => closePermissionModal(true));
+  bindFileDrop();
 
   document.addEventListener("keydown", (event) => {
     const permissionModal = $("#permission-modal");
@@ -429,6 +480,79 @@ function bindEvents() {
     }
 
   });
+}
+
+function setupDesktopBridge() {
+  const desktop = window.viniperDesktop;
+  if (!desktop) {
+    updatePinButton();
+    return;
+  }
+
+  desktop.getWindowState?.().then((statePayload) => {
+    state.alwaysOnTop = Boolean(statePayload?.alwaysOnTop);
+    updatePinButton();
+  }).catch(() => {});
+
+  desktop.onWindowState?.((statePayload) => {
+    state.alwaysOnTop = Boolean(statePayload?.alwaysOnTop);
+    updatePinButton();
+  });
+
+  desktop.onCommand?.((payload) => {
+    handleDesktopCommand(payload?.command, payload?.payload || {});
+  });
+}
+
+function handleDesktopCommand(command) {
+  switch (command) {
+    case "new-chat":
+      openNewSessionModal();
+      break;
+    case "attach-file":
+      $("#file-input").click();
+      break;
+    case "change-workdir":
+      changeWorkdir();
+      break;
+    case "toggle-sidebar":
+      toggleSidebar();
+      break;
+    case "open-settings":
+      openSettingsModal();
+      break;
+    case "run-diagnostics":
+      openSettingsModal().then(() => runDiagnostics()).catch(() => {});
+      break;
+    default:
+      break;
+  }
+}
+
+async function toggleAlwaysOnTop() {
+  const desktop = window.viniperDesktop;
+  if (!desktop?.setAlwaysOnTop) {
+    state.alwaysOnTop = !state.alwaysOnTop;
+    updatePinButton();
+    return;
+  }
+  try {
+    const next = !state.alwaysOnTop;
+    const result = await desktop.setAlwaysOnTop(next);
+    state.alwaysOnTop = Boolean(result?.alwaysOnTop);
+  } catch {
+    state.alwaysOnTop = false;
+  }
+  updatePinButton();
+}
+
+async function openSkillsWeb() {
+  const desktop = window.viniperDesktop;
+  if (desktop?.openSkills) {
+    await desktop.openSkills();
+    return;
+  }
+  window.open("https://www.skills.sh", "_blank", "noopener,noreferrer");
 }
 
 async function loadStatus() {
@@ -1931,9 +2055,49 @@ function autoResize(element) {
 }
 
 function handleFileAttach() {
-  state.contextFiles.push(...Array.from($("#file-input").files || []));
+  attachFiles($("#file-input").files || []);
   $("#file-input").value = "";
+}
+
+function attachFiles(fileList) {
+  const files = Array.from(fileList || []).filter((file) => file && typeof file.name === "string");
+  if (!files.length) return;
+  state.contextFiles.push(...files);
   renderContextFiles();
+  $("#user-input").focus();
+}
+
+function bindFileDrop() {
+  const hasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
+  let dragDepth = 0;
+
+  window.addEventListener("dragenter", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    dragDepth += 1;
+    document.body.classList.add("drag-over");
+  });
+
+  window.addEventListener("dragover", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+  });
+
+  window.addEventListener("dragleave", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) document.body.classList.remove("drag-over");
+  });
+
+  window.addEventListener("drop", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove("drag-over");
+    attachFiles(event.dataTransfer?.files || []);
+  });
 }
 
 function renderContextFiles() {

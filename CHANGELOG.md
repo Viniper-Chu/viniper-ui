@@ -1,3 +1,25 @@
+## v4.0.0 (2026-05-26)
+
+### 新增
+- **桌面窗口能力**：新增原生顶部菜单（文件、编辑、查看、窗口）、窗口置顶、边栏显隐、边栏/顶栏拖拽区域和托盘右键菜单。
+- **附件拖拽**：支持把本地文件直接拖入 Viniper UI，松开后自动加入聊天附件区，发送时仍按原来的附件解析流程交给 Claude Code。
+- **skills.sh 内置窗口**：在桌面端内置打开 `www.skills.sh` 的子窗口，外链仍交给系统浏览器。
+- **桌面壳升级更新**：Windows 更新包优先选择安装器资产，保证菜单、托盘、置顶等 Electron 壳层能力可以通过应用内更新真正升级。
+
+### 调整
+- **按钮交互升级**：主要按钮、面板按钮、快捷按钮和列表按钮改为悬停时显示液态渐变边框，默认状态保持克制。
+- **启动动画延续**：保留并继续使用数研桥风格的单图标 V 显现启动动画。
+
+### 验证
+- `node --check desktop/main.js`
+- `node --check desktop/preload.js`
+- `node --check static/app.js`
+- `npm run check`
+- `python scripts/verify_app.py`
+- `python scripts/build_release.py --version 4.0.0 --repo Viniper-Chu/viniper-ui`
+- `python scripts/build_desktop.py --target win --skip-install`
+- `python scripts/verify_release.py`
+
 ## v3.0.3 (2026-05-26)
 
 ### 调整

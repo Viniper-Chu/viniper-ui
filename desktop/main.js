@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Tray, dialog, nativeImage, shell } = require("electron");
+const { app, BrowserWindow, Menu, Tray, dialog, nativeImage, shell, ipcMain } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
@@ -16,10 +16,12 @@ const APP_USER_MODEL_ID = "com.viniper.ui.desktop";
 
 let port = Number(process.env.VINIPER_UI_PORT || 17373);
 let mainWindow = null;
+let skillsWindow = null;
 let tray = null;
 let serverProcess = null;
 let isQuitting = false;
 let stdioBroken = false;
+let alwaysOnTop = false;
 
 function handleStdioError(error) {
   if (error && error.code === "EPIPE") {
@@ -70,6 +72,80 @@ function logServerChunk(level, chunk) {
   const text = chunk.toString().trim();
   if (!text) return;
   safeMainLog(level, `[Viniper UI] ${text}`);
+}
+
+function sendRendererCommand(command, payload = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  showMainWindow();
+  mainWindow.webContents.send("viniper-command", { command, payload });
+}
+
+function sendWindowState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("viniper-window-state", { alwaysOnTop });
+}
+
+function setAlwaysOnTop(enabled) {
+  alwaysOnTop = Boolean(enabled);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setAlwaysOnTop(alwaysOnTop, "floating");
+  }
+  updateTrayMenu();
+  createApplicationMenu();
+  sendWindowState();
+  return { alwaysOnTop };
+}
+
+function toggleAlwaysOnTop() {
+  return setAlwaysOnTop(!alwaysOnTop);
+}
+
+function openSettingsWindow() {
+  sendRendererCommand("open-settings");
+}
+
+function openSkillsWindow() {
+  if (skillsWindow && !skillsWindow.isDestroyed()) {
+    if (skillsWindow.isMinimized()) skillsWindow.restore();
+    skillsWindow.show();
+    skillsWindow.focus();
+    return;
+  }
+
+  skillsWindow = new BrowserWindow({
+    width: 1180,
+    height: 820,
+    minWidth: 860,
+    minHeight: 640,
+    title: "Viniper UI - skills.sh",
+    icon: appIcon(),
+    show: false,
+    parent: mainWindow || undefined,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+  skillsWindow.setIcon(appIcon());
+  skillsWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith("https://www.skills.sh") || url.startsWith("https://skills.sh")) {
+      return { action: "allow" };
+    }
+    shell.openExternal(url);
+    return { action: "deny" };
+  });
+  skillsWindow.webContents.on("will-navigate", (event, url) => {
+    if (!url.startsWith("https://www.skills.sh") && !url.startsWith("https://skills.sh")) {
+      event.preventDefault();
+      shell.openExternal(url);
+    }
+  });
+  skillsWindow.once("ready-to-show", () => skillsWindow.show());
+  skillsWindow.on("closed", () => {
+    skillsWindow = null;
+  });
+  skillsWindow.loadURL("https://www.skills.sh");
 }
 
 function requestJson(urlPath, timeoutMs = 1500) {
@@ -220,30 +296,6 @@ async function ensureServer() {
   return Boolean(await waitForServer(30000));
 }
 
-function createTray() {
-  if (tray) return;
-  const image = appIcon(process.platform === "win32" ? 16 : 22);
-  tray = new Tray(image.isEmpty() ? nativeImage.createEmpty() : image);
-  tray.setToolTip("Viniper UI");
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "打开 Viniper UI", click: showMainWindow },
-    { label: "在浏览器打开", click: () => shell.openExternal(localUrl()) },
-    { type: "separator" },
-    { label: "运行自检", click: runDiagnosticsDialog },
-    { label: "打开数据目录", click: () => shell.openPath(app.getPath("userData")) },
-    { label: "重启本地服务", click: restartServer },
-    { type: "separator" },
-    {
-      label: "退出",
-      click: () => {
-        isQuitting = true;
-        app.quit();
-      }
-    }
-  ]));
-  tray.on("click", showMainWindow);
-}
-
 async function createMainWindow() {
   const ready = await ensureServer();
   if (!ready) {
@@ -261,7 +313,9 @@ async function createMainWindow() {
     minHeight: 680,
     title: "Viniper UI",
     icon: appIcon(),
+    backgroundColor: "#f6fbff",
     show: false,
+    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -286,12 +340,15 @@ async function createMainWindow() {
   mainWindow.loadURL(localUrl());
   mainWindow.once("ready-to-show", () => {
     mainWindow.setIcon(appIcon());
+    mainWindow.setAlwaysOnTop(alwaysOnTop, "floating");
+    sendWindowState();
     mainWindow.show();
   });
   mainWindow.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault();
       mainWindow.hide();
+      updateTrayMenu();
     }
   });
 }
@@ -304,6 +361,8 @@ function showMainWindow() {
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
+  updateTrayMenu();
+  sendWindowState();
 }
 
 async function restartServer() {
@@ -339,13 +398,59 @@ async function runDiagnosticsDialog() {
   });
 }
 
+function createTray() {
+  if (tray) return;
+  const image = appIcon(process.platform === "win32" ? 16 : 22);
+  tray = new Tray(image.isEmpty() ? nativeImage.createEmpty() : image);
+  tray.setToolTip("Viniper UI");
+  updateTrayMenu();
+  tray.on("click", showMainWindow);
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: "打开 Viniper UI", click: showMainWindow },
+    {
+      label: mainWindow?.isVisible() ? "隐藏窗口" : "显示窗口",
+      click: () => {
+        if (mainWindow?.isVisible()) mainWindow.hide();
+        else showMainWindow();
+        updateTrayMenu();
+      }
+    },
+    { label: "置顶聊天窗口", type: "checkbox", checked: alwaysOnTop, click: toggleAlwaysOnTop },
+    { label: "切换边栏", click: () => sendRendererCommand("toggle-sidebar") },
+    { type: "separator" },
+    { label: "设置", click: openSettingsWindow },
+    { label: "打开 skills.sh", click: openSkillsWindow },
+    { label: "在浏览器打开", click: () => shell.openExternal(localUrl()) },
+    { type: "separator" },
+    { label: "运行自检", click: runDiagnosticsDialog },
+    { label: "打开数据目录", click: () => shell.openPath(app.getPath("userData")) },
+    { label: "重启本地服务", click: restartServer },
+    { type: "separator" },
+    {
+      label: "退出",
+      click: () => {
+        isQuitting = true;
+        app.quit();
+      }
+    }
+  ]));
+}
+
 function createApplicationMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     {
-      label: "Viniper UI",
+      label: "文件",
       submenu: [
-        { label: "打开 Viniper UI", click: showMainWindow },
-        { label: "运行自检", click: runDiagnosticsDialog },
+        { label: "新建会话", accelerator: "CmdOrCtrl+N", click: () => sendRendererCommand("new-chat") },
+        { label: "添加附件", accelerator: "CmdOrCtrl+O", click: () => sendRendererCommand("attach-file") },
+        { label: "选择目录", accelerator: "CmdOrCtrl+Shift+O", click: () => sendRendererCommand("change-workdir") },
+        { type: "separator" },
+        { label: "打开 skills.sh", click: openSkillsWindow },
+        { label: "在浏览器打开 Viniper UI", click: () => shell.openExternal(localUrl()) },
         { type: "separator" },
         { role: "quit", label: "退出" }
       ]
@@ -363,14 +468,42 @@ function createApplicationMenu() {
       ]
     },
     {
+      label: "查看",
+      submenu: [
+        { label: "显示/隐藏边栏", accelerator: "CmdOrCtrl+B", click: () => sendRendererCommand("toggle-sidebar") },
+        { label: "设置", accelerator: "CmdOrCtrl+,", click: openSettingsWindow },
+        { type: "separator" },
+        { role: "reload", label: "刷新" },
+        { role: "forceReload", label: "强制刷新" },
+        { role: "toggleDevTools", label: "开发者工具" },
+        { type: "separator" },
+        { role: "resetZoom", label: "实际大小" },
+        { role: "zoomIn", label: "放大" },
+        { role: "zoomOut", label: "缩小" }
+      ]
+    },
+    {
       label: "窗口",
       submenu: [
         { role: "minimize", label: "最小化" },
-        { role: "togglefullscreen", label: "全屏" }
+        { role: "togglefullscreen", label: "全屏" },
+        { label: "置顶聊天窗口", type: "checkbox", checked: alwaysOnTop, click: toggleAlwaysOnTop },
+        { type: "separator" },
+        { label: "显示主窗口", click: showMainWindow },
+        { label: "打开 settings", click: openSettingsWindow },
+        { label: "打开 skills.sh", click: openSkillsWindow }
       ]
     }
   ]));
 }
+
+ipcMain.handle("viniper:get-window-state", () => ({ alwaysOnTop }));
+ipcMain.handle("viniper:set-always-on-top", (_event, enabled) => setAlwaysOnTop(Boolean(enabled)));
+ipcMain.handle("viniper:toggle-always-on-top", () => toggleAlwaysOnTop());
+ipcMain.handle("viniper:open-skills", () => {
+  openSkillsWindow();
+  return { ok: true };
+});
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
