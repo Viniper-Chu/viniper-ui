@@ -1855,7 +1855,7 @@ async def stream_chat_impl(
     before_file_state = snapshot_watch_files(watched_file_roots)
     assistant_text = ""
     thinking_text = ""
-    assistant_segments: list[dict[str, str]] = []
+    assistant_segments: list[dict[str, Any]] = []
     final_result = ""
     stderr_text = ""
     timed_out = False
@@ -1873,6 +1873,7 @@ async def stream_chat_impl(
     assistant_message_index: int | None = None
     last_progress_save = 0.0
     finalized = False
+    run_started_at: float | None = None
 
     def append_assistant_segment(kind: str, text: str) -> None:
         if not text:
@@ -1882,6 +1883,16 @@ async def stream_chat_impl(
             assistant_segments[-1]["content"] = str(assistant_segments[-1].get("content") or "") + text
         else:
             assistant_segments.append({"type": segment_type, "content": text})
+
+    def mark_thinking_elapsed(seconds: float | None = None) -> None:
+        if seconds is None:
+            if run_started_at is None:
+                return
+            seconds = time.monotonic() - run_started_at
+        elapsed_seconds = max(0, int(round(seconds)))
+        for segment in assistant_segments:
+            if segment.get("type") == "thinking":
+                segment["elapsed_seconds"] = elapsed_seconds
 
     def ensure_assistant_message() -> dict[str, Any]:
         nonlocal assistant_message_index
@@ -1915,6 +1926,7 @@ async def stream_chat_impl(
 
     def finalize_assistant(content: str | None = None, thinking: str | None = None) -> None:
         nonlocal finalized
+        mark_thinking_elapsed()
         if content is not None and content != assistant_text and not assistant_segments:
             append_assistant_segment("text", content)
         message = ensure_assistant_message()
@@ -1958,7 +1970,8 @@ async def stream_chat_impl(
 
         assert proc.stdout is not None
         stdout_reader = ChunkedLineReader(proc.stdout)
-        started = time.monotonic()
+        run_started_at = time.monotonic()
+        started = run_started_at
         last_heartbeat = started
         last_process_output = started
         while True:

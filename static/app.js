@@ -1376,7 +1376,7 @@ function renderAllMessages() {
   $("#messages").innerHTML = state.messages.map((message) => {
     const roleClass = message.role === "system" ? "system" : message.role;
     const label = message.role === "user"
-      ? "你"
+      ? ""
       : (message.role === "system" ? "上下文摘要" : assistantLabel(message.model));
     const content = message.content;
     return messageTemplate(roleClass, label, content, message.thinking || "", message.segments || []);
@@ -1388,7 +1388,7 @@ function addMessage(role, content) {
   if (welcome) welcome.remove();
 
   const roleClass = role;
-  const label = role === "user" ? "你" : assistantLabel(state.selectedModel);
+  const label = role === "user" ? "" : assistantLabel(state.selectedModel);
   $("#messages").insertAdjacentHTML("beforeend", messageTemplate(roleClass, label, content));
   scrollBottom();
   return $("#messages .message:last-child .msg-content");
@@ -1396,7 +1396,7 @@ function addMessage(role, content) {
 
 function assistantLabel(modelId) {
   const option = (state.status?.models || []).find((model) => model.id === modelId);
-  return option ? `小伍 · ${option.label}` : "小伍";
+  return option ? (option.label || option.id || modelId || "") : (modelId || "");
 }
 
 function messageTemplate(roleClass, label, content, thinking = "", segments = []) {
@@ -1408,9 +1408,10 @@ function messageTemplate(roleClass, label, content, thinking = "", segments = []
     : (roleClass === "assistant" || roleClass === "error"
       ? renderAssistantContentHtml(displayContent)
       : escapeHtml(displayContent));
+  const header = label ? `<header class="msg-header">${escapeHtml(label)}</header>` : "";
   return `
     <article class="message ${roleClass}" data-role="${escapeAttr(roleClass)}">
-      <header class="msg-header">${escapeHtml(label)}</header>
+      ${header}
       ${displayThinking && roleClass === "assistant" && !displaySegments.length ? renderThinkingPanel(displayThinking) : ""}
       <div class="msg-content">${body}</div>
     </article>
@@ -1422,8 +1423,12 @@ function renderMessageSegments(segments = [], options = {}) {
     const type = segment?.type === "thinking" ? "thinking" : "text";
     const content = repairTextForDisplay(segment?.content || "");
     if (!content.trim()) return "";
+    const segmentElapsed = Number(segment?.elapsed_seconds ?? segment?.elapsedSeconds);
+    const segmentOptions = Number.isFinite(segmentElapsed)
+      ? { ...options, elapsedSeconds: segmentElapsed }
+      : options;
     return type === "thinking"
-      ? renderThinkingPanel(content, options)
+      ? renderThinkingPanel(content, segmentOptions)
       : `<div class="msg-text-segment">${renderAssistantContentHtml(content)}</div>`;
   }).join("");
 }
@@ -1488,9 +1493,15 @@ function createStreamRenderer(article) {
     finish() {
       completed = true;
       window.clearInterval(timer);
+      const finalElapsed = elapsedSeconds();
+      segments.forEach((segment) => {
+        if (segment.type === "thinking") {
+          segment.elapsedSeconds = finalElapsed;
+        }
+      });
       container.innerHTML = renderMessageSegments(segments, {
         activeThinking: false,
-        elapsedSeconds: elapsedSeconds()
+        elapsedSeconds: finalElapsed
       });
     }
   };

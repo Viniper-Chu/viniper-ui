@@ -1,3 +1,22 @@
+## v4.0.3 (2026-05-27)
+
+### 调整
+- **消息标签收敛**：用户消息不再显示“你”，助手消息不再固定显示“小伍”，只显示当前模型名称。
+- **更新入口防重叠**：更新按钮从固定悬浮角落改为输入区下方的独立行，窗口缩小时不会压到消息框或输入框。
+- **圆角一致性**：模型、权限、悬停液态按钮、代码复制等交互框统一为更圆润的视觉样式。
+
+### 修复
+- **思考用时保留**：思考过程完成后继续显示总用时，并把用时写入会话数据，刷新或切换会话后仍可查看。
+
+### 验证
+- `python -m py_compile server.py`
+- `node --check static/app.js`
+- `node --check desktop/main.js`
+- `node --check desktop/preload.js`
+- `python scripts/verify_app.py`
+- `python scripts/build_release.py --version 4.0.3 --repo Viniper-Chu/viniper-ui`
+- `python scripts/verify_release.py`
+
 ## v4.0.2 (2026-05-26)
 
 ### 修复

@@ -21,9 +21,9 @@
   --scrollbar: #c8c8ce;
   --button-on-accent: #ffffff;
   --liquid-border: conic-gradient(from 180deg, transparent 0deg, rgba(255,255,255,0.92) 46deg, var(--accent) 112deg, var(--link) 184deg, var(--green) 252deg, transparent 328deg);
-  --radius: 22px;
-  --radius-sm: 16px;
-  --radius-xs: 12px;
+  --radius: 26px;
+  --radius-sm: 20px;
+  --radius-xs: 16px;
   --shadow-sm: 0 5px 14px rgba(31,35,41,0.08), 0 1px 2px rgba(31,35,41,0.04);
   --shadow: 0 12px 28px rgba(31,35,41,0.12), 0 3px 8px rgba(31,35,41,0.06);
   --shadow-lg: 0 24px 60px rgba(31,35,41,0.16), 0 8px 20px rgba(31,35,41,0.08);
@@ -582,10 +582,8 @@ button:disabled::before { opacity: 0 !important; animation: none !important; }
   font-weight: 700;
 }
 .version-corner {
-  position: fixed;
-  right: 16px;
-  bottom: 12px;
-  z-index: 50;
+  position: static;
+  z-index: auto;
   min-width: 0;
   min-height: 28px;
   padding: 3px 9px;
@@ -601,7 +599,7 @@ button:disabled::before { opacity: 0 !important; animation: none !important; }
   display: flex; align-items: center; gap: 7px; min-height: 36px;
   padding: 0 10px; background: color-mix(in srgb, var(--panel) 66%, transparent);
   border: 1px solid transparent;
-  border-radius: var(--radius-sm); color: var(--text-soft); font-size: 13px;
+  border-radius: var(--radius); color: var(--text-soft); font-size: 13px;
   box-shadow: none; transition: all 0.15s ease;
   position: relative;
   isolation: isolate;
@@ -743,7 +741,7 @@ button:disabled::before { opacity: 0 !important; animation: none !important; }
 .msg-content h3 { font-size: 17px; }
 .msg-content code {
   font-family: var(--font-mono); background: var(--panel-soft);
-  border: 1px solid var(--line); border-radius: 6px;
+  border: 1px solid var(--line); border-radius: var(--radius-xs);
   padding: 2px 6px; font-size: 13px;
 }
 .msg-content pre {
@@ -758,7 +756,7 @@ button:disabled::before { opacity: 0 !important; animation: none !important; }
 }
 .copy-btn {
   position: absolute; top: 8px; right: 10px; padding: 4px 10px;
-  border: 1px solid var(--line); border-radius: 6px;
+  border: 1px solid var(--line); border-radius: var(--radius-xs);
   background: var(--panel); color: var(--text-soft);
   cursor: pointer; font-size: 12px; transition: all 0.15s ease;
   opacity: 0; pointer-events: none;
@@ -799,7 +797,7 @@ button:disabled::before { opacity: 0 !important; animation: none !important; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 #input-area {
-  flex: 0 0 auto; padding: 14px 24px 18px;
+  flex: 0 0 auto; padding: 14px 24px 12px;
   background: var(--panel-glass); backdrop-filter: blur(24px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border-top: 1px solid var(--line);
@@ -853,6 +851,13 @@ body.drag-over #drop-overlay {
 }
 #user-input::placeholder { color: var(--muted); }
 #input-actions { position: absolute; right: 12px; bottom: 12px; display: flex; gap: 6px; flex: 0 0 auto; }
+.input-footer-row {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  min-height: 30px;
+  margin-top: 6px;
+}
 
 /* --- SKILLS PANEL --- */
 #skills-panel {
