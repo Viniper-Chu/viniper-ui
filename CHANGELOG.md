@@ -1,3 +1,23 @@
+## v4.0.1 (2026-05-26)
+
+### 调整
+- **液态悬停按钮**：顶栏按钮、思考过程、设置入口等默认收敛成文字或图标，鼠标悬停时才显示液态渐变边框。
+- **侧边栏排版优化**：置顶按钮移到会话重命名/删除附近，skills.sh 入口移到设置旁边并改为小图标，设置入口改为简约齿轮。
+- **版本号弱化**：版本更新入口移到右下角，默认弱化显示，避免占用主操作区。
+- **景深界面**：整体界面调整为更圆润、有层次的浅色玻璃和阴影风格。
+
+### 新增
+- **思考计时**：流式思考过程显示“思考/用时”计时，运行中会变浅并闪烁。
+- **完成后文件摘要**：任务正常结束后自动扫描当前工作目录和桌面，列出本次修改/生成的文件，并继续生成可打开的文件卡片。
+
+### 验证
+- `python -m py_compile server.py`
+- `node --check static/app.js`
+- `python scripts/verify_app.py`
+- `python scripts/build_release.py --version 4.0.1 --repo Viniper-Chu/viniper-ui`
+- `python scripts/verify_release.py`
+- `python scripts/build_desktop.py --target win --skip-install`
+
 ## v4.0.0 (2026-05-26)
 
 ### 新增

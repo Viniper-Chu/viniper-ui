@@ -221,12 +221,13 @@ function toggleSidebar() {
 }
 
 function updatePinButton() {
-  const button = $("#always-on-top-btn");
-  if (!button) return;
-  button.classList.toggle("active", state.alwaysOnTop);
-  button.textContent = state.alwaysOnTop ? t("unpin") : t("pin");
-  button.title = state.alwaysOnTop ? "取消置顶聊天窗口" : "置顶聊天窗口";
-  button.setAttribute("aria-label", button.title);
+  const title = state.alwaysOnTop ? "取消置顶聊天窗口" : "置顶聊天窗口";
+  $$("[data-window-pin], #always-on-top-btn").forEach((button) => {
+    button.classList.toggle("active", state.alwaysOnTop);
+    button.textContent = state.alwaysOnTop ? "●" : "○";
+    button.title = title;
+    button.setAttribute("aria-label", title);
+  });
 }
 
 function t(key) {
@@ -237,7 +238,8 @@ function translateChrome() {
   $("#new-chat-btn").title = t("newChat");
   $("#new-chat-btn").setAttribute("aria-label", t("newChat"));
   if ($("#toggle-skills-btn")) $("#toggle-skills-btn").textContent = t("skills");
-  $("#settings-btn").textContent = t("settings");
+  $("#settings-btn").title = t("settings");
+  $("#settings-btn").setAttribute("aria-label", t("settings"));
   $(".model-picker span").textContent = t("model");
   $(".permission-picker span").textContent = t("permission");
   $("#change-workdir-btn").textContent = t("directory");
@@ -250,8 +252,8 @@ function translateChrome() {
   $("#send-btn").setAttribute("aria-label", t("send"));
   $("#toggle-sidebar-btn").title = t("sidebar");
   $("#toggle-sidebar-btn").setAttribute("aria-label", t("sidebar"));
-  $("#skills-web-btn").textContent = t("skillsWeb");
   $("#skills-web-btn").title = "打开 skills.sh";
+  $("#skills-web-btn").setAttribute("aria-label", t("skillsWeb"));
   $("#thinking span:last-child").textContent = t("thinking");
   updateThemeButton();
   updatePinButton();
@@ -329,7 +331,8 @@ function bindEvents() {
   $("#file-btn").addEventListener("click", () => $("#file-input").click());
   $("#file-input").addEventListener("change", handleFileAttach);
   $("#toggle-sidebar-btn").addEventListener("click", toggleSidebar);
-  $("#always-on-top-btn").addEventListener("click", toggleAlwaysOnTop);
+  const topbarPinButton = $("#always-on-top-btn");
+  if (topbarPinButton) topbarPinButton.addEventListener("click", toggleAlwaysOnTop);
   $("#skills-web-btn").addEventListener("click", openSkillsWeb);
   $("#new-chat-btn").addEventListener("click", openNewSessionModal);
   if ($("#toggle-skills-btn")) $("#toggle-skills-btn").addEventListener("click", toggleSkillsPanel);
@@ -450,6 +453,13 @@ function bindEvents() {
   });
 
   document.addEventListener("click", async (event) => {
+    const pinButton = event.target.closest("[data-window-pin]");
+    if (pinButton) {
+      event.stopPropagation();
+      await toggleAlwaysOnTop();
+      return;
+    }
+
     const fileButton = event.target.closest("[data-file-action]");
     if (fileButton) {
       try {
@@ -1195,6 +1205,7 @@ async function loadSessionList() {
           <span class="session-meta">${escapeHtml(meta)}</span>
         </button>
         <button class="mini-button" type="button" title="重命名" data-rename-session="${escapeAttr(session.id)}">✎</button>
+        <button class="mini-button pin-mini-button${state.alwaysOnTop ? " active" : ""}" type="button" data-window-pin title="置顶聊天窗口" aria-label="置顶聊天窗口">${state.alwaysOnTop ? "●" : "○"}</button>
         <button class="mini-button danger" type="button" title="删除" data-delete-session="${escapeAttr(session.id)}">×</button>
       </div>
     `;
@@ -1406,13 +1417,13 @@ function messageTemplate(roleClass, label, content, thinking = "", segments = []
   `;
 }
 
-function renderMessageSegments(segments = []) {
+function renderMessageSegments(segments = [], options = {}) {
   return segments.map((segment) => {
     const type = segment?.type === "thinking" ? "thinking" : "text";
     const content = repairTextForDisplay(segment?.content || "");
     if (!content.trim()) return "";
     return type === "thinking"
-      ? renderThinkingPanel(content)
+      ? renderThinkingPanel(content, options)
       : `<div class="msg-text-segment">${renderAssistantContentHtml(content)}</div>`;
   }).join("");
 }
@@ -1425,11 +1436,29 @@ function renderAssistantContentHtml(text) {
 function createStreamRenderer(article) {
   const container = article.querySelector(".msg-content");
   const segments = [];
+  const startedAt = performance.now();
+  let elapsedOverride = null;
+  let completed = false;
+
+  const elapsedSeconds = () => {
+    if (Number.isFinite(elapsedOverride)) return Math.max(0, Number(elapsedOverride));
+    return Math.max(0, Math.round((performance.now() - startedAt) / 1000));
+  };
 
   const sync = () => {
-    container.innerHTML = renderMessageSegments(segments);
+    container.innerHTML = renderMessageSegments(segments, {
+      activeThinking: !completed,
+      elapsedSeconds: elapsedSeconds()
+    });
     scrollBottom();
   };
+
+  const timer = window.setInterval(() => {
+    if (completed) return;
+    container.querySelectorAll("[data-thinking-time]").forEach((node) => {
+      node.textContent = `思考 ${formatDuration(elapsedSeconds())}`;
+    });
+  }, 1000);
 
   return {
     append(type, content) {
@@ -1444,10 +1473,25 @@ function createStreamRenderer(article) {
       }
       sync();
     },
+    setElapsed(seconds) {
+      const value = Number(seconds);
+      if (Number.isFinite(value)) elapsedOverride = value;
+      container.querySelectorAll("[data-thinking-time]").forEach((node) => {
+        node.textContent = `思考 ${formatDuration(elapsedSeconds())}`;
+      });
+    },
     replaceWithText(content) {
       segments.length = 0;
       if (content) segments.push({ type: "text", content: repairTextForDisplay(content) });
       sync();
+    },
+    finish() {
+      completed = true;
+      window.clearInterval(timer);
+      container.innerHTML = renderMessageSegments(segments, {
+        activeThinking: false,
+        elapsedSeconds: elapsedSeconds()
+      });
     }
   };
 }
@@ -1740,7 +1784,8 @@ async function sendMessage() {
         }
       } else if (payload.type === "heartbeat") {
         showThinking(false);
-        if (!fullText) {
+        streamRenderer.setElapsed(payload.elapsed);
+        if (!fullText && !thinkingText) {
           const minutes = Math.max(1, Math.round((Number(payload.elapsed) || 0) / 60));
           const stage = payload.waiting_for === "model" ? "正在等待模型/API 响应" : "正在等待本地工具返回";
           const note = payload.action_task
@@ -1751,6 +1796,7 @@ async function sendMessage() {
       } else if (payload.type === "done") {
         receivedDone = true;
         showThinking(false);
+        streamRenderer.finish();
       }
     };
 
@@ -1790,6 +1836,7 @@ async function sendMessage() {
     }
   } finally {
     clearTimeout(safetyTimer);
+    streamRenderer.finish();
     // Always re-enable input first, regardless of what happens next
     state.isStreaming = false;
     state.abortController = null;
@@ -1877,6 +1924,9 @@ async function doRetrySend(text, permissionMode, attachments = []) {
         streamRenderer.replaceWithText(fullText);
       } else if (payload.type === "done") {
         receivedDone = true;
+        streamRenderer.finish();
+      } else if (payload.type === "heartbeat") {
+        streamRenderer.setElapsed(payload.elapsed);
       }
     };
 
@@ -1901,6 +1951,7 @@ async function doRetrySend(text, permissionMode, attachments = []) {
     }
   } finally {
     clearTimeout(safetyTimer);
+    streamRenderer.finish();
     state.isStreaming = false;
     state.abortController = null;
     state.cancelRequested = false;
@@ -2002,12 +2053,25 @@ async function compressCurrentContext() {
   }
 }
 
-function renderThinkingPanel(thinking) {
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const minutes = Math.floor(total / 60);
+  const secs = total % 60;
+  return minutes > 0 ? `${minutes}分${String(secs).padStart(2, "0")}秒` : `${secs}秒`;
+}
+
+function renderThinkingPanel(thinking, options = {}) {
+  const hasTime = Number.isFinite(Number(options.elapsedSeconds));
+  const timeLabel = hasTime
+    ? `${options.activeThinking ? "思考" : "用时"} ${formatDuration(options.elapsedSeconds)}`
+    : "";
+  const stateClass = options.activeThinking ? " streaming" : "";
   return `
-    <details class="thinking-panel">
+    <details class="thinking-panel${stateClass}">
       <summary>
         <span>思考过程</span>
         <span class="thinking-preview">${escapeHtml(previewThinking(thinking))}</span>
+        ${timeLabel ? `<span class="thinking-time" data-thinking-time>${escapeHtml(timeLabel)}</span>` : ""}
       </summary>
       <div class="thinking-body">${renderMarkdown(thinking)}</div>
     </details>

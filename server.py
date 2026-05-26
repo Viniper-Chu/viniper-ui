@@ -1100,6 +1100,119 @@ def existing_workdir(value: str | None) -> Path:
     return BASE_DIR
 
 
+FILE_CHANGE_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".cache",
+    "update-backups",
+}
+FILE_CHANGE_SKIP_SUFFIXES = {".pyc", ".pyo", ".tmp", ".temp", ".log"}
+FILE_CHANGE_SCAN_LIMIT = 8000
+FILE_CHANGE_RESULT_LIMIT = 12
+
+
+def safe_resolve_path(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve()
+    except Exception:
+        return path.expanduser()
+
+
+def should_watch_file_root(path: Path) -> bool:
+    root = safe_resolve_path(path)
+    try:
+        if not root.exists() or not root.is_dir():
+            return False
+        # Avoid scanning an entire drive such as D:\.
+        if root.parent == root:
+            return False
+        if os.name == "nt" and re.fullmatch(r"[A-Za-z]:\\?", str(root)):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def file_change_watch_roots(workdir: Path) -> list[Path]:
+    roots: list[Path] = []
+
+    def add(path: Path) -> None:
+        root = safe_resolve_path(path)
+        if should_watch_file_root(root) and root not in roots:
+            roots.append(root)
+
+    add(workdir)
+    add(Path.home() / "Desktop")
+    return roots
+
+
+def iter_watch_files(root: Path, limit: int = FILE_CHANGE_SCAN_LIMIT):
+    count = 0
+    stack = [root]
+    while stack and count < limit:
+        current = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except Exception:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    if entry.name not in FILE_CHANGE_SKIP_DIRS:
+                        stack.append(entry)
+                    continue
+                if not entry.is_file() or entry.suffix.lower() in FILE_CHANGE_SKIP_SUFFIXES:
+                    continue
+                stat = entry.stat()
+            except Exception:
+                continue
+            count += 1
+            yield safe_resolve_path(entry), stat
+            if count >= limit:
+                break
+
+
+def snapshot_watch_files(roots: list[Path]) -> dict[str, tuple[int, int]]:
+    snapshot: dict[str, tuple[int, int]] = {}
+    for root in roots:
+        for path, stat in iter_watch_files(root):
+            snapshot[str(path).lower()] = (int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))), int(stat.st_size))
+    return snapshot
+
+
+def changed_watch_files(before: dict[str, tuple[int, int]], roots: list[Path]) -> list[str]:
+    changed: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for root in roots:
+        for path, stat in iter_watch_files(root):
+            key = str(path).lower()
+            current = (int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))), int(stat.st_size))
+            if key in seen or before.get(key) == current:
+                continue
+            seen.add(key)
+            changed.append((current[0], str(path)))
+    changed.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in changed[:FILE_CHANGE_RESULT_LIMIT]]
+
+
+def changed_files_summary(before: dict[str, tuple[int, int]], roots: list[Path]) -> str:
+    files = changed_watch_files(before, roots)
+    if not files:
+        return ""
+    return "\n\n修改的文件：\n" + "\n".join(files)
+
+
 def directory_payload(path: Path) -> dict[str, str]:
     return {"path": str(path), "name": path.name or str(path)}
 
@@ -1682,6 +1795,8 @@ async def stream_chat_impl(
         command.extend(["--append-system-prompt", system_append])
 
     cwd = existing_workdir(str(session.get("workdir") or ""))
+    watched_file_roots = file_change_watch_roots(cwd)
+    before_file_state = snapshot_watch_files(watched_file_roots)
     assistant_text = ""
     thinking_text = ""
     assistant_segments: list[dict[str, str]] = []
@@ -2168,6 +2283,12 @@ async def stream_chat_impl(
             assistant_text = final_result
             append_assistant_segment("text", final_result)
             yield sse({"type": "text", "content": final_result})
+
+        changed_summary = changed_files_summary(before_file_state, watched_file_roots)
+        if changed_summary:
+            assistant_text += changed_summary
+            append_assistant_segment("text", changed_summary)
+            yield sse({"type": "text", "content": changed_summary})
 
         finalize_assistant()
         session["updated"] = now_ts()

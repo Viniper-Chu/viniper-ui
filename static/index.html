@@ -81,7 +81,12 @@
       <nav id="session-list" aria-label="会话列表"></nav>
 
       <footer class="sidebar-footer">
-        <button id="settings-btn" class="panel-button" type="button">设置</button>
+        <button id="skills-web-btn" class="panel-button footer-icon-button" type="button" title="打开 skills.sh" aria-label="打开 skills.sh">
+          <span aria-hidden="true">✦</span>
+        </button>
+        <button id="settings-btn" class="panel-button settings-button" type="button" title="设置" aria-label="设置">
+          <span class="gear-icon" aria-hidden="true"></span>
+        </button>
       </footer>
     </aside>
 
@@ -105,9 +110,6 @@
           <button id="context-compress-btn" class="context-compress-btn hidden" type="button">压缩</button>
         </div>
         <div class="topbar-actions">
-          <button id="always-on-top-btn" class="ghost-button pin-button" type="button" title="置顶聊天窗口" aria-label="置顶聊天窗口">置顶</button>
-          <button id="skills-web-btn" class="ghost-button skills-web-button" type="button" title="打开 skills.sh">Skills</button>
-          <button id="update-btn" class="ghost-button update-button" type="button" title="检查更新">更新</button>
           <label class="model-picker" for="model-select">
             <span>模型</span>
             <select id="model-select" aria-label="选择模型"></select>
@@ -143,6 +145,8 @@
     </main>
 
   </div>
+
+  <button id="update-btn" class="ghost-button update-button version-corner" type="button" title="检查更新">更新</button>
 
   <div id="drop-overlay" aria-hidden="true">
     <div class="drop-card">松开后添加到聊天附件</div>
