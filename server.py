@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -98,6 +99,8 @@ UPDATE_SOURCE_FILE = VERSION_FILE.with_name("update_source.json")
 UPDATE_MANIFEST_URL_ENV = env_value("VINIPER_UI_UPDATE_MANIFEST_URL", "").strip()
 UPDATE_REPOSITORY_ENV = env_value("VINIPER_UI_UPDATE_REPO", "").strip()
 UPDATE_HTTP_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_UPDATE_TIMEOUT", "45"))
+UPDATE_DOWNLOAD_RETRIES = int(env_value("VINIPER_UI_UPDATE_RETRIES", "5"))
+UPDATE_DOWNLOAD_CHUNK_SIZE = max(64 * 1024, int(env_value("VINIPER_UI_UPDATE_CHUNK_SIZE", str(1024 * 1024))))
 DEFAULT_CONTEXT_LIMIT = 128000
 MODEL_OPTIONS = [
     {
@@ -671,6 +674,15 @@ def choose_update_asset(manifest: dict[str, Any], requested_asset: str | None = 
     if isinstance(assets, dict):
         if requested_asset and isinstance(assets.get(requested_asset), dict):
             return dict(assets[requested_asset])
+        # In-app updates should prefer the small portable package. Full platform
+        # installers are still published for manual downloads, but they are large
+        # enough to fail more often on flaky GitHub/proxy connections.
+        for key in ("app", "portable", "source", "zip"):
+            item = assets.get(key)
+            if isinstance(item, dict) and item.get("url"):
+                item = dict(item)
+                item["key"] = key
+                return item
         system_name = platform.system().lower()
         preferred: list[str] = []
         if "darwin" in system_name:
@@ -679,7 +691,6 @@ def choose_update_asset(manifest: dict[str, Any], requested_asset: str | None = 
             preferred.extend(["windows", "win"])
         elif "linux" in system_name:
             preferred.append("linux")
-        preferred.extend(["app", "source", "zip"])
         for key in preferred:
             item = assets.get(key)
             if isinstance(item, dict) and item.get("url"):
@@ -696,6 +707,53 @@ def choose_update_asset(manifest: dict[str, Any], requested_asset: str | None = 
             if isinstance(item, dict) and item.get("url"):
                 return dict(item)
     raise ValueError("update manifest has no downloadable asset")
+
+
+def download_update_asset(asset: dict[str, Any], target_path: Path) -> None:
+    url = str(asset.get("url") or "")
+    if not url:
+        raise ValueError("selected update asset has no url")
+
+    expected_size = int(asset.get("size") or 0)
+    part_path = target_path.with_name(f"{target_path.name}.part")
+    last_error: Exception | None = None
+
+    for attempt in range(max(1, UPDATE_DOWNLOAD_RETRIES)):
+        downloaded = part_path.stat().st_size if part_path.exists() else 0
+        headers = {"User-Agent": f"ViniperUI/{APP_VERSION}"}
+        if downloaded > 0:
+            headers["Range"] = f"bytes={downloaded}-"
+        request = urllib.request.Request(url, headers=headers)
+
+        try:
+            with urllib.request.urlopen(request, timeout=UPDATE_HTTP_TIMEOUT_SECONDS) as response:
+                status = int(getattr(response, "status", response.getcode() or 200))
+                if downloaded > 0 and status != 206:
+                    downloaded = 0
+                mode = "ab" if downloaded > 0 else "wb"
+                with part_path.open(mode) as handle:
+                    while True:
+                        try:
+                            chunk = response.read(UPDATE_DOWNLOAD_CHUNK_SIZE)
+                        except http.client.IncompleteRead as exc:
+                            if exc.partial:
+                                handle.write(exc.partial)
+                            raise
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+
+            actual_size = part_path.stat().st_size
+            if expected_size and actual_size != expected_size:
+                raise ValueError(f"incomplete update download: {actual_size} of {expected_size} bytes")
+            part_path.replace(target_path)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < UPDATE_DOWNLOAD_RETRIES - 1:
+                time.sleep(min(2 ** attempt, 8))
+
+    raise ValueError(f"download update failed after {UPDATE_DOWNLOAD_RETRIES} attempts: {last_error}")
 
 
 def safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
@@ -755,9 +813,7 @@ def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str 
     with tempfile.TemporaryDirectory(prefix="viniper-ui-update-") as tmp:
         tmp_dir = Path(tmp)
         package_path = tmp_dir / "update.zip"
-        request = urllib.request.Request(url, headers={"User-Agent": f"ViniperUI/{APP_VERSION}"})
-        with urllib.request.urlopen(request, timeout=UPDATE_HTTP_TIMEOUT_SECONDS) as response:
-            package_path.write_bytes(response.read())
+        download_update_asset(asset, package_path)
 
         expected_sha = str(asset.get("sha256") or "").strip().lower()
         actual_sha = sha256_file(package_path)

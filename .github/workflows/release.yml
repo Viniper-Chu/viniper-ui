@@ -155,9 +155,9 @@ jobs:
           windows = sorted(root.glob("Viniper.UI.Setup.*.exe"))
           macos = sorted(root.glob("Viniper.UI.*-mac.zip"))
           if windows:
-              assets["windows"] = asset(windows[-1])
+              assets["installer_windows"] = asset(windows[-1])
           if macos:
-              assets["macos"] = asset(macos[-1])
+              assets["installer_macos"] = asset(macos[-1])
           manifest["published_at"] = datetime.now(timezone.utc).isoformat()
           manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           PY

@@ -98,18 +98,18 @@ def main() -> int:
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     windows_installer = ROOT / "desktop" / "release" / f"Viniper.UI.Setup.{version}.exe"
     if windows_installer.exists():
-        windows_asset = manifest.get("assets", {}).get("windows", {})
+        windows_asset = manifest.get("assets", {}).get("installer_windows", {}) or manifest.get("assets", {}).get("windows", {})
         if windows_asset.get("name") != windows_installer.name:
-            raise SystemExit("latest.json missing matching assets.windows installer")
+            raise SystemExit("latest.json missing matching installer_windows asset")
         if not windows_asset.get("sha256"):
-            raise SystemExit("latest.json missing assets.windows.sha256")
+            raise SystemExit("latest.json missing installer_windows.sha256")
     mac_installer = ROOT / "desktop" / "release" / f"Viniper.UI.{version}-arm64-mac.zip"
     if mac_installer.exists():
-        mac_asset = manifest.get("assets", {}).get("macos", {})
+        mac_asset = manifest.get("assets", {}).get("installer_macos", {}) or manifest.get("assets", {}).get("macos", {})
         if mac_asset.get("name") != mac_installer.name:
-            raise SystemExit("latest.json missing matching assets.macos package")
+            raise SystemExit("latest.json missing matching installer_macos asset")
         if not mac_asset.get("sha256"):
-            raise SystemExit("latest.json missing assets.macos.sha256")
+            raise SystemExit("latest.json missing installer_macos.sha256")
     if zip_path.suffix.lower() == ".zip":
         verify_zip(zip_path)
     print("Viniper UI release verification passed.")

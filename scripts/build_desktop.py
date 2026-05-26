@@ -97,13 +97,12 @@ def update_latest_manifest() -> None:
         "macos": release_dir / f"Viniper.UI.{version}-arm64-mac.zip",
     }
     has_platform_installer = any(path.exists() for path in candidates.values())
-    if has_platform_installer and "app" in assets and "portable" not in assets:
-        # Older Viniper UI updaters prefer assets.app before platform installers.
-        # Desktop-shell releases need the installer so app.asar/main-process code is replaced too.
-        assets["portable"] = assets.pop("app")
     for key, path in candidates.items():
         if path.exists():
-            assets[key] = {
+            # Keep the small app package as the default in-app update target.
+            # Installers stay in the manifest under non-preferred keys for
+            # manual download surfaces and future explicit installer updates.
+            assets[f"installer_{key}"] = {
                 "name": path.name,
                 "url": release_download_url(manifest, path.name),
                 "sha256": sha256_file(path),

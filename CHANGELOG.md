@@ -1,3 +1,19 @@
+## v4.0.2 (2026-05-26)
+
+### 修复
+- **应用内更新下载中断**：旧版会优先下载 100MB 级 Windows 安装器，网络或代理断流时会出现 `IncompleteRead`。现在应用内更新默认选择小体积更新包，Windows/macOS 安装器仍保留在 GitHub Release 中供手动下载安装。
+- **更新下载稳定性**：新版更新器改为分块下载，失败后自动重试并尽量续传，避免一次连接中断导致整个更新失败。
+
+### 验证
+- `python -m py_compile server.py`
+- `node --check static/app.js`
+- `node --check desktop/main.js`
+- `node --check desktop/preload.js`
+- `python scripts/verify_app.py`
+- `python scripts/build_release.py --version 4.0.2 --repo Viniper-Chu/viniper-ui`
+- `python scripts/verify_release.py`
+- `python scripts/build_desktop.py --target win --skip-install`
+
 ## v4.0.1 (2026-05-26)
 
 ### 调整
