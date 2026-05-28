@@ -209,11 +209,30 @@ def prune_desktop_artifacts(keep: int = KEEP_RELEASE_VERSIONS) -> None:
                 pass
 
 
+def ensure_update_source() -> None:
+    """Write update_source.json from env or repo slug so the desktop shell can auto-update."""
+    source_path = ROOT / "update_source.json"
+    if source_path.exists():
+        return
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not repo:
+        repo = "Viniper-Chu/viniper-ui"
+    config = {
+        "repository": repo,
+        "manifest_url": f"https://github.com/{repo}/releases/latest/download/latest.json",
+        "channel": "stable",
+    }
+    source_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Generated {source_path}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build Viniper UI desktop package.")
     parser.add_argument("--target", choices=["current", "win", "mac", "dir"], default="current")
     parser.add_argument("--skip-install", action="store_true", help="Skip npm install.")
     args = parser.parse_args()
+
+    ensure_update_source()
 
     npm = tool("npm")
     os.environ.setdefault("ELECTRON_MIRROR", "https://npmmirror.com/mirrors/electron/")
