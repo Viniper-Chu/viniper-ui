@@ -15,6 +15,28 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CLAUDE_REQUIRED_OPTIONS = [
+    "-p",
+    "--output-format",
+    "--include-partial-messages",
+    "--model",
+    "--session-id",
+    "--resume",
+    "--permission-mode",
+    "--fallback-model",
+    "--name",
+    "--append-system-prompt",
+    "--add-dir",
+    "--verbose",
+]
+CLAUDE_REQUIRED_PERMISSION_MODES = [
+    "default",
+    "acceptEdits",
+    "auto",
+    "bypassPermissions",
+    "dontAsk",
+    "plan",
+]
 
 
 def run(command: list[str], cwd: Path = ROOT, timeout: int | None = None) -> None:
@@ -67,6 +89,32 @@ def verify_local_api() -> None:
         shutil.rmtree(data_dir, ignore_errors=True)
 
 
+def verify_claude_cli_if_available() -> None:
+    claude = shutil.which("claude")
+    if not claude:
+        return
+    completed = subprocess.run(
+        [claude, "--help"],
+        cwd=str(ROOT),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=20,
+    )
+    if completed.returncode != 0:
+        raise SystemExit("claude --help failed")
+    help_text = completed.stdout or ""
+    missing = [item for item in CLAUDE_REQUIRED_OPTIONS if item not in help_text]
+    missing_modes = [item for item in CLAUDE_REQUIRED_PERMISSION_MODES if item not in help_text]
+    if missing or missing_modes:
+        detail = []
+        if missing:
+            detail.append(f"missing options: {', '.join(missing)}")
+        if missing_modes:
+            detail.append(f"missing permission modes: {', '.join(missing_modes)}")
+        raise SystemExit("Claude Code CLI compatibility check failed: " + "; ".join(detail))
+
+
 def main() -> int:
     run([sys.executable, "-m", "py_compile", "server.py", "scripts/build_release.py", "scripts/verify_release.py", "scripts/verify_desktop.py", "scripts/build_desktop.py", "scripts/verify_app.py"])
     if shutil.which("node"):
@@ -74,6 +122,7 @@ def main() -> int:
         run(["node", "--check", "desktop/main.js"])
         run(["node", "--check", "desktop/preload.js"])
     run([sys.executable, "scripts/verify_desktop.py"])
+    verify_claude_cli_if_available()
     verify_local_api()
     print("Viniper UI full verification passed.")
     return 0

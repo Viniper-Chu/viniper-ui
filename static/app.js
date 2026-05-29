@@ -47,6 +47,7 @@ const SIDEBAR_KEY = `${STORAGE_PREFIX}sidebar-visible`;
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const LAUNCH_SPLASH_MIN_MS = 1850;
 const launchSplashStarted = performance.now();
+const filePreviewUrls = new WeakMap();
 let modelPersistTimer = null;
 
 function storageGet(key) {
@@ -300,9 +301,17 @@ document.addEventListener("DOMContentLoaded", async () => {
 function hideLaunchSplash() {
   const splash = $("#launch-splash");
   if (!splash) return;
+  if (document.documentElement.dataset.skipSplash === "true") {
+    splash.remove();
+    return;
+  }
   const remaining = Math.max(0, LAUNCH_SPLASH_MIN_MS - (performance.now() - launchSplashStarted));
   setTimeout(() => {
     splash.classList.add("is-hiding");
+    try {
+      sessionStorage.setItem("viniper-ui:launch-splash-seen", "1");
+      document.documentElement.dataset.skipSplash = "true";
+    } catch {}
     setTimeout(() => splash.remove(), 620);
   }, remaining);
 }
@@ -395,6 +404,7 @@ function bindEvents() {
   $("#deny-permission-btn").addEventListener("click", () => closePermissionModal(false));
   $("#allow-once-btn").addEventListener("click", () => closePermissionModal(true));
   bindFileDrop();
+  bindClipboardPaste();
 
   document.addEventListener("keydown", (event) => {
     const permissionModal = $("#permission-modal");
@@ -1125,10 +1135,9 @@ async function createSession({ silent = false, name = "", workdir = "" } = {}) {
   state.sessionName = data.name || "";
   state.workdir = data.workdir || "";
   state.messages = [];
-  state.contextFiles = [];
+  clearContextFiles();
   renderCurrentSession();
   renderWelcome();
-  renderContextFiles();
   updateContextMeter();
   rememberSession(state.sessionId);
   await loadSessionList();
@@ -1379,7 +1388,7 @@ function renderAllMessages() {
       ? ""
       : (message.role === "system" ? "上下文摘要" : assistantLabel(message.model));
     const content = message.content;
-    return messageTemplate(roleClass, label, content, message.thinking || "", message.segments || []);
+    return messageTemplate(roleClass, label, content, message.thinking || "", message.segments || [], message);
   }).join("");
 }
 
@@ -1399,12 +1408,12 @@ function assistantLabel(modelId) {
   return option ? (option.label || option.id || modelId || "") : (modelId || "");
 }
 
-function messageTemplate(roleClass, label, content, thinking = "", segments = []) {
+function messageTemplate(roleClass, label, content, thinking = "", segments = [], meta = {}) {
   const displayContent = repairTextForDisplay(content);
   const displayThinking = repairTextForDisplay(thinking);
   const displaySegments = Array.isArray(segments) ? segments : [];
   const body = roleClass === "assistant" && displaySegments.length
-    ? renderMessageSegments(displaySegments)
+    ? renderMessageSegments(displaySegments, { totalElapsedSeconds: meta?.elapsed_seconds ?? meta?.elapsedSeconds })
     : (roleClass === "assistant" || roleClass === "error"
       ? renderAssistantContentHtml(displayContent)
       : escapeHtml(displayContent));
@@ -1419,23 +1428,38 @@ function messageTemplate(roleClass, label, content, thinking = "", segments = []
 }
 
 function renderMessageSegments(segments = [], options = {}) {
-  return segments.map((segment) => {
+  const explicitTotalElapsed = Number(options.totalElapsedSeconds);
+  const derivedTotalElapsed = segments.reduce((sum, segment) => {
+    const elapsed = Number(segment?.elapsed_seconds ?? segment?.elapsedSeconds);
+    return Number.isFinite(elapsed) ? sum + Math.max(0, elapsed) : sum;
+  }, 0);
+  const totalElapsed = Number.isFinite(explicitTotalElapsed)
+    ? explicitTotalElapsed
+    : (derivedTotalElapsed > 0 ? derivedTotalElapsed : NaN);
+  const totalTime = Number.isFinite(totalElapsed)
+    ? `<div class="message-total-time" data-total-time>${options.activeThinking ? "总计" : "总用时"} ${escapeHtml(formatDuration(totalElapsed))}</div>`
+    : "";
+  const body = segments.map((segment, index) => {
     const type = segment?.type === "thinking" ? "thinking" : "text";
     const content = repairTextForDisplay(segment?.content || "");
     if (!content.trim()) return "";
     const segmentElapsed = Number(segment?.elapsed_seconds ?? segment?.elapsedSeconds);
-    const segmentOptions = Number.isFinite(segmentElapsed)
-      ? { ...options, elapsedSeconds: segmentElapsed }
-      : options;
+    const segmentOptions = {
+      ...options,
+      segmentIndex: index,
+      activeThinking: Boolean(segment.activeThinking)
+    };
+    if (Number.isFinite(segmentElapsed)) segmentOptions.elapsedSeconds = segmentElapsed;
     return type === "thinking"
       ? renderThinkingPanel(content, segmentOptions)
-      : `<div class="msg-text-segment">${renderAssistantContentHtml(content)}</div>`;
+      : `<div class="msg-text-segment" data-segment-index="${index}">${renderAssistantContentHtml(content)}</div>`;
   }).join("");
+  return `${totalTime}${body}`;
 }
 
 function renderAssistantContentHtml(text) {
   const value = repairTextForDisplay(text || "");
-  return `${renderMarkdown(value)}${renderArtifactCards(value)}`;
+  return `${renderMarkdown(stripChangedFilesSummary(value))}${renderArtifactCards(value)}`;
 }
 
 function createStreamRenderer(article) {
@@ -1445,24 +1469,84 @@ function createStreamRenderer(article) {
   let elapsedOverride = null;
   let completed = false;
 
-  const elapsedSeconds = () => {
+  const totalElapsedSeconds = () => {
     if (Number.isFinite(elapsedOverride)) return Math.max(0, Number(elapsedOverride));
     return Math.max(0, Math.round((performance.now() - startedAt) / 1000));
   };
 
+  const segmentElapsedSeconds = (segment) => {
+    if (segment.activeThinking && Number.isFinite(segment.startedAt)) {
+      return Math.max(0, Math.round((performance.now() - segment.startedAt) / 1000));
+    }
+    if (Number.isFinite(Number(segment.elapsedSeconds))) return Math.max(0, Number(segment.elapsedSeconds));
+    if (Number.isFinite(Number(segment.elapsed_seconds))) return Math.max(0, Number(segment.elapsed_seconds));
+    return null;
+  };
+
+  const renderableSegments = () => segments.map((segment) => {
+    if (segment.type !== "thinking") return segment;
+    const elapsed = segmentElapsedSeconds(segment);
+    return {
+      ...segment,
+      elapsedSeconds: Number.isFinite(elapsed) ? elapsed : undefined,
+      activeThinking: Boolean(segment.activeThinking && !completed)
+    };
+  });
+
   const sync = () => {
-    container.innerHTML = renderMessageSegments(segments, {
+    container.innerHTML = renderMessageSegments(renderableSegments(), {
       activeThinking: !completed,
-      elapsedSeconds: elapsedSeconds()
+      totalElapsedSeconds: totalElapsedSeconds()
     });
     scrollBottom();
   };
 
+  const updateTimers = () => {
+    const totalNode = container.querySelector("[data-total-time]");
+    if (totalNode) {
+      totalNode.textContent = `${completed ? "总用时" : "总计"} ${formatDuration(totalElapsedSeconds())}`;
+    }
+    segments.forEach((segment, index) => {
+      if (segment.type !== "thinking") return;
+      const node = container.querySelector(`[data-segment-index="${index}"] [data-thinking-time]`);
+      const elapsed = segmentElapsedSeconds(segment);
+      if (node && Number.isFinite(elapsed)) {
+        node.textContent = `${segment.activeThinking && !completed ? "思考" : "用时"} ${formatDuration(elapsed)}`;
+      }
+    });
+  };
+
+  const updateSegmentDom = (index) => {
+    const segment = segments[index];
+    const node = container.querySelector(`[data-segment-index="${index}"]`);
+    if (!segment || !node) {
+      sync();
+      return;
+    }
+    if (segment.type === "thinking") {
+      const preview = node.querySelector(".thinking-preview");
+      const body = node.querySelector(".thinking-body");
+      if (preview) preview.textContent = previewThinking(segment.content);
+      if (body) body.innerHTML = renderMarkdown(segment.content);
+      node.classList.toggle("streaming", Boolean(segment.activeThinking && !completed));
+    } else {
+      node.innerHTML = renderAssistantContentHtml(segment.content);
+    }
+    updateTimers();
+    scrollBottom();
+  };
+
+  const closeActiveThinking = () => {
+    const last = segments[segments.length - 1];
+    if (!last || last.type !== "thinking" || !last.activeThinking) return;
+    last.elapsedSeconds = segmentElapsedSeconds(last) ?? 0;
+    last.activeThinking = false;
+    updateSegmentDom(segments.length - 1);
+  };
+
   const timer = window.setInterval(() => {
     if (completed) return;
-    container.querySelectorAll("[data-thinking-time]").forEach((node) => {
-      node.textContent = `思考 ${formatDuration(elapsedSeconds())}`;
-    });
+    updateTimers();
   }, 1000);
 
   return {
@@ -1473,17 +1557,19 @@ function createStreamRenderer(article) {
       const last = segments[segments.length - 1];
       if (last && last.type === normalizedType) {
         last.content += value;
+        updateSegmentDom(segments.length - 1);
       } else {
-        segments.push({ type: normalizedType, content: value });
+        if (normalizedType === "text") closeActiveThinking();
+        segments.push(normalizedType === "thinking"
+          ? { type: normalizedType, content: value, startedAt: performance.now(), activeThinking: true }
+          : { type: normalizedType, content: value });
+        sync();
       }
-      sync();
     },
     setElapsed(seconds) {
       const value = Number(seconds);
       if (Number.isFinite(value)) elapsedOverride = value;
-      container.querySelectorAll("[data-thinking-time]").forEach((node) => {
-        node.textContent = `思考 ${formatDuration(elapsedSeconds())}`;
-      });
+      updateTimers();
     },
     replaceWithText(content) {
       segments.length = 0;
@@ -1493,21 +1579,35 @@ function createStreamRenderer(article) {
     finish() {
       completed = true;
       window.clearInterval(timer);
-      const finalElapsed = elapsedSeconds();
-      segments.forEach((segment) => {
-        if (segment.type === "thinking") {
-          segment.elapsedSeconds = finalElapsed;
-        }
-      });
-      container.innerHTML = renderMessageSegments(segments, {
+      closeActiveThinking();
+      const finalElapsed = totalElapsedSeconds();
+      container.innerHTML = renderMessageSegments(renderableSegments(), {
         activeThinking: false,
-        elapsedSeconds: finalElapsed
+        totalElapsedSeconds: finalElapsed
       });
     }
   };
 }
 
-const ARTIFACT_EXTENSIONS = "pdf|docx|xlsx|pptx|txt|md|csv|tex|html|png|jpe?g|webp|zip|tar\\.gz";
+const ARTIFACT_EXTENSIONS = "pdf|docx|xlsx|pptx|txt|md|csv|tex|html|png|jpe?g|webp|zip|tar\\.gz|js|jsx|ts|tsx|py|css|json|ya?ml|toml|rs|go|java|c|cpp|h|hpp|sh|bat|ps1|xml|svg";
+const ARTIFACT_LINE_RE = new RegExp(String.raw`^\s*(?:[A-Za-z]:[\\/]|/mnt/[a-z]/|~?/).+?\.(?:${ARTIFACT_EXTENSIONS})\s*$`, "i");
+
+function stripChangedFilesSummary(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const kept = [];
+  for (let index = 0; index < lines.length;) {
+    if (/^\s*修改的文件[:：]\s*$/.test(lines[index])) {
+      index += 1;
+      while (index < lines.length && (!lines[index].trim() || ARTIFACT_LINE_RE.test(lines[index]))) {
+        index += 1;
+      }
+      continue;
+    }
+    kept.push(lines[index]);
+    index += 1;
+  }
+  return kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
 
 function normalizeArtifactPath(value) {
   return String(value || "")
@@ -1695,8 +1795,7 @@ async function sendMessage() {
   }
 
   if (files.length) {
-    state.contextFiles = [];
-    renderContextFiles();
+    clearContextFiles();
   }
 
   input.value = "";
@@ -1995,12 +2094,17 @@ function updateContextMeter({ announce = false } = {}) {
 
   const stats = contextStats();
   $("#context-percent").textContent = `${stats.percent}%`;
-  $("#context-fill").style.width = `${stats.percent}%`;
+  const ring = meter.querySelector(".context-ring");
+  if (ring) {
+    ring.style.setProperty("--context-percent", `${stats.percent}%`);
+    ring.title = `${stats.shouldCompress ? "上下文接近上限" : "上下文"} ${stats.percent}%`;
+  }
   $("#context-label").textContent = stats.shouldCompress ? "上下文接近上限" : "上下文";
+  meter.title = `${stats.shouldCompress ? "上下文接近上限" : "上下文"} ${stats.percent}%`;
 
   meter.classList.toggle("warn", stats.shouldCompress && !stats.critical);
   meter.classList.toggle("critical", stats.critical);
-  $("#context-compress-btn").classList.toggle("hidden", !stats.shouldCompress);
+  meter.classList.toggle("compressable", stats.shouldCompress);
 
   if (announce && stats.shouldCompress) {
     showContextNotice(stats);
@@ -2077,8 +2181,9 @@ function renderThinkingPanel(thinking, options = {}) {
     ? `${options.activeThinking ? "思考" : "用时"} ${formatDuration(options.elapsedSeconds)}`
     : "";
   const stateClass = options.activeThinking ? " streaming" : "";
+  const indexAttr = Number.isInteger(options.segmentIndex) ? ` data-segment-index="${options.segmentIndex}"` : "";
   return `
-    <details class="thinking-panel${stateClass}">
+    <details class="thinking-panel${stateClass}"${indexAttr}>
       <summary>
         <span>思考过程</span>
         <span class="thinking-preview">${escapeHtml(previewThinking(thinking))}</span>
@@ -2134,8 +2239,34 @@ function handleFileAttach() {
   $("#file-input").value = "";
 }
 
+function normalizeAttachedFile(file, fallbackName = "clipboard-file") {
+  if (!file || typeof file.name !== "string") return file;
+  if (file.name) return file;
+  const extension = file.type?.split("/")?.[1]?.replace(/[^a-z0-9.+-]/gi, "") || "bin";
+  return new File([file], `${fallbackName}-${Date.now()}.${extension}`, {
+    type: file.type || "application/octet-stream",
+    lastModified: file.lastModified || Date.now()
+  });
+}
+
+function revokeFilePreview(file) {
+  const url = filePreviewUrls.get(file);
+  if (url) {
+    URL.revokeObjectURL(url);
+    filePreviewUrls.delete(file);
+  }
+}
+
+function clearContextFiles() {
+  state.contextFiles.forEach(revokeFilePreview);
+  state.contextFiles = [];
+  renderContextFiles();
+}
+
 function attachFiles(fileList) {
-  const files = Array.from(fileList || []).filter((file) => file && typeof file.name === "string");
+  const files = Array.from(fileList || [])
+    .map((file) => normalizeAttachedFile(file, "clipboard-image"))
+    .filter((file) => file && typeof file.name === "string");
   if (!files.length) return;
   state.contextFiles.push(...files);
   renderContextFiles();
@@ -2175,17 +2306,54 @@ function bindFileDrop() {
   });
 }
 
+function bindClipboardPaste() {
+  window.addEventListener("paste", (event) => {
+    const clipboard = event.clipboardData;
+    if (!clipboard) return;
+    const files = [];
+    for (const file of Array.from(clipboard.files || [])) {
+      files.push(normalizeAttachedFile(file, "clipboard-file"));
+    }
+    for (const item of Array.from(clipboard.items || [])) {
+      if (item.kind !== "file") continue;
+      const file = item.getAsFile();
+      if (file) {
+        const normalized = normalizeAttachedFile(file, item.type?.startsWith("image/") ? "clipboard-image" : "clipboard-file");
+        if (!files.some((candidate) => candidate.name === normalized.name && candidate.size === normalized.size && candidate.type === normalized.type)) {
+          files.push(normalized);
+        }
+      }
+    }
+    if (!files.length) return;
+    event.preventDefault();
+    attachFiles(files);
+  });
+}
+
+function filePreviewHtml(file) {
+  if (!file?.type?.startsWith("image/")) return "";
+  if (!filePreviewUrls.has(file)) {
+    filePreviewUrls.set(file, URL.createObjectURL(file));
+  }
+  return `<img class="ctx-file-preview" src="${escapeAttr(filePreviewUrls.get(file))}" alt="">`;
+}
+
 function renderContextFiles() {
   $("#context-files").innerHTML = state.contextFiles.map((file, index) => `
     <span class="ctx-file">
-      ${escapeHtml(file.name)} <span class="ctx-file-size">${escapeHtml(formatBytes(file.size))}</span>
+      ${filePreviewHtml(file)}
+      <span class="ctx-file-info">
+        <span class="ctx-file-name">${escapeHtml(file.name)}</span>
+        <span class="ctx-file-size">${escapeHtml(formatBytes(file.size))}</span>
+      </span>
       <button type="button" data-remove-file="${index}" aria-label="移除">×</button>
     </span>
   `).join("");
 
   $$("[data-remove-file]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.contextFiles.splice(Number(button.dataset.removeFile), 1);
+      const [removed] = state.contextFiles.splice(Number(button.dataset.removeFile), 1);
+      if (removed) revokeFilePreview(removed);
       renderContextFiles();
     });
   });

@@ -1,3 +1,24 @@
+## v4.0.4 (2026-05-29)
+
+### 调整
+- **上下文圆环**：输入框旁的上下文圆环改为更细的 18px 小圆环，默认不显示百分比，悬停时再显示占用比例。
+- **启动动画触发**：启动动画继续保持只显示居中的 Viniper 图标；新启动应用时播放，托盘恢复旧窗口时不重新播放。
+
+### 修复
+- **旧版一键更新兼容**：启动动画逻辑不再依赖桌面壳参数，旧版本通过应用内更新只替换网页层文件后也能获得正确行为。
+- **Claude Code 升级兼容检查**：诊断和自检现在会检查本机 Claude Code CLI 是否仍支持 Viniper UI 使用的 `stream-json`、session、权限、fallback model 等参数。
+
+### 验证
+- `claude --version` -> `2.1.156 (Claude Code)`
+- `claude --help` 参数兼容检查通过
+- `python -m py_compile server.py`
+- `node --check static/app.js`
+- `node --check desktop/main.js`
+- `node --check desktop/preload.js`
+- `python scripts/verify_app.py`
+- `python scripts/build_release.py --version 4.0.4 --repo Viniper-Chu/viniper-ui`
+- `python scripts/verify_release.py`
+
 ## v4.0.3 (2026-05-27)
 
 ### 调整

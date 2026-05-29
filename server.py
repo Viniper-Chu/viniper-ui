@@ -80,6 +80,28 @@ PERMISSION_MODE_IDS = {item["id"] for item in PERMISSION_MODE_OPTIONS}
 DEFAULT_PERMISSION_MODE = env_value("VINIPER_UI_PERMISSION_MODE", "default")
 if DEFAULT_PERMISSION_MODE not in PERMISSION_MODE_IDS:
     DEFAULT_PERMISSION_MODE = "default"
+CLAUDE_REQUIRED_OPTIONS = [
+    "-p",
+    "--output-format",
+    "--include-partial-messages",
+    "--model",
+    "--session-id",
+    "--resume",
+    "--permission-mode",
+    "--fallback-model",
+    "--name",
+    "--append-system-prompt",
+    "--add-dir",
+    "--verbose",
+]
+CLAUDE_REQUIRED_PERMISSION_MODES = [
+    "default",
+    "acceptEdits",
+    "auto",
+    "bypassPermissions",
+    "dontAsk",
+    "plan",
+]
 RUN_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_RUN_TIMEOUT", "0"))
 HEARTBEAT_INTERVAL_SECONDS = int(env_value("VINIPER_UI_HEARTBEAT_INTERVAL", "15"))
 NO_OUTPUT_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_NO_OUTPUT_TIMEOUT", str(40 * 60)))
@@ -1052,9 +1074,57 @@ def claude_launcher() -> list[str]:
 
 def claude_available() -> bool:
     try:
-        return bool(shutil.which("claude"))
+        if shutil.which("claude"):
+            return True
+        candidates = [
+            Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe",
+            Path.home() / "AppData" / "Roaming" / "npm" / "claude",
+            Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd",
+            Path.home() / "AppData" / "Roaming" / "npm" / "claude.ps1",
+        ]
+        return any(path.exists() for path in candidates)
     except Exception:
         return False
+
+
+def claude_cli_compatibility() -> dict[str, Any]:
+    if not claude_available():
+        return {"ok": False, "detail": "not found on PATH"}
+    command = claude_launcher()
+    try:
+        version_result = subprocess.run(
+            [*command, "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=15,
+            check=False,
+        )
+        help_result = subprocess.run(
+            [*command, "--help"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=20,
+            check=False,
+        )
+    except Exception as exc:
+        return {"ok": False, "detail": f"failed to inspect Claude Code CLI: {exc}"}
+
+    help_text = help_result.stdout or ""
+    version_text = (version_result.stdout or "").strip().splitlines()[0] if version_result.stdout else ""
+    missing = [item for item in CLAUDE_REQUIRED_OPTIONS if item not in help_text]
+    missing_modes = [item for item in CLAUDE_REQUIRED_PERMISSION_MODES if item not in help_text]
+    if missing or missing_modes:
+        detail = []
+        if version_text:
+            detail.append(version_text)
+        if missing:
+            detail.append(f"missing options: {', '.join(missing)}")
+        if missing_modes:
+            detail.append(f"missing permission modes: {', '.join(missing_modes)}")
+        return {"ok": False, "detail": "; ".join(detail)}
+    return {"ok": True, "detail": version_text or "compatible"}
 
 
 def refresh_windows_shortcuts() -> None:
@@ -1856,6 +1926,7 @@ async def stream_chat_impl(
     assistant_text = ""
     thinking_text = ""
     assistant_segments: list[dict[str, Any]] = []
+    message_started_at = time.monotonic()
     final_result = ""
     stderr_text = ""
     timed_out = False
@@ -1874,25 +1945,47 @@ async def stream_chat_impl(
     last_progress_save = 0.0
     finalized = False
     run_started_at: float | None = None
+    active_thinking_started_at: float | None = None
+    active_thinking_segment_index: int | None = None
+
+    def elapsed_seconds_since(started_at: float) -> int:
+        return max(0, int(round(time.monotonic() - started_at)))
+
+    def total_elapsed_seconds() -> int:
+        return elapsed_seconds_since(message_started_at)
+
+    def refresh_active_thinking_elapsed() -> None:
+        if active_thinking_started_at is None or active_thinking_segment_index is None:
+            return
+        if active_thinking_segment_index >= len(assistant_segments):
+            return
+        segment = assistant_segments[active_thinking_segment_index]
+        if segment.get("type") == "thinking":
+            segment["elapsed_seconds"] = elapsed_seconds_since(active_thinking_started_at)
+
+    def close_active_thinking() -> None:
+        nonlocal active_thinking_started_at, active_thinking_segment_index
+        refresh_active_thinking_elapsed()
+        active_thinking_started_at = None
+        active_thinking_segment_index = None
 
     def append_assistant_segment(kind: str, text: str) -> None:
+        nonlocal active_thinking_started_at, active_thinking_segment_index
         if not text:
             return
         segment_type = "thinking" if kind == "thinking" else "text"
+        if segment_type != "thinking":
+            close_active_thinking()
         if assistant_segments and assistant_segments[-1].get("type") == segment_type:
             assistant_segments[-1]["content"] = str(assistant_segments[-1].get("content") or "") + text
         else:
             assistant_segments.append({"type": segment_type, "content": text})
-
-    def mark_thinking_elapsed(seconds: float | None = None) -> None:
-        if seconds is None:
-            if run_started_at is None:
-                return
-            seconds = time.monotonic() - run_started_at
-        elapsed_seconds = max(0, int(round(seconds)))
-        for segment in assistant_segments:
-            if segment.get("type") == "thinking":
-                segment["elapsed_seconds"] = elapsed_seconds
+        if segment_type == "thinking":
+            if active_thinking_segment_index != len(assistant_segments) - 1:
+                active_thinking_started_at = time.monotonic()
+                active_thinking_segment_index = len(assistant_segments) - 1
+                assistant_segments[active_thinking_segment_index]["elapsed_seconds"] = 0
+            refresh_active_thinking_elapsed()
 
     def ensure_assistant_message() -> dict[str, Any]:
         nonlocal assistant_message_index
@@ -1917,6 +2010,7 @@ async def stream_chat_impl(
         message["content"] = assistant_text
         message["model"] = selected_model
         message["segments"] = assistant_segments
+        message["elapsed_seconds"] = total_elapsed_seconds()
         if thinking_text:
             message["thinking"] = thinking_text
         message["pending"] = True
@@ -1926,13 +2020,14 @@ async def stream_chat_impl(
 
     def finalize_assistant(content: str | None = None, thinking: str | None = None) -> None:
         nonlocal finalized
-        mark_thinking_elapsed()
+        close_active_thinking()
         if content is not None and content != assistant_text and not assistant_segments:
             append_assistant_segment("text", content)
         message = ensure_assistant_message()
         message["content"] = assistant_text if content is None else content
         message["model"] = selected_model
         message["segments"] = assistant_segments
+        message["elapsed_seconds"] = total_elapsed_seconds()
         final_thinking = thinking_text if thinking is None else thinking
         if final_thinking:
             message["thinking"] = final_thinking
@@ -2657,6 +2752,7 @@ async def open_local_artifact(request: Request):
 @app.get("/api/diagnostics")
 async def diagnostics():
     cfg = deepseek_config()
+    claude_compat = claude_cli_compatibility()
     checks = [
         {
             "id": "python",
@@ -2669,6 +2765,12 @@ async def diagnostics():
             "label": "Claude Code CLI",
             "ok": claude_available(),
             "detail": "available" if claude_available() else "not found on PATH",
+        },
+        {
+            "id": "claude_compatibility",
+            "label": "Claude Code compatibility",
+            "ok": bool(claude_compat["ok"]),
+            "detail": str(claude_compat["detail"]),
         },
         {
             "id": "provider",

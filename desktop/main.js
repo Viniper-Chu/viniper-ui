@@ -34,8 +34,9 @@ function handleStdioError(error) {
 process.stdout?.on?.("error", handleStdioError);
 process.stderr?.on?.("error", handleStdioError);
 
-function localUrl() {
-  return `http://127.0.0.1:${port}`;
+function localUrl(options = {}) {
+  const baseUrl = `http://127.0.0.1:${port}`;
+  return options.launch ? `${baseUrl}/?launch=1` : baseUrl;
 }
 
 function appIcon(size = 0) {
@@ -337,7 +338,7 @@ async function createMainWindow() {
     }
   });
 
-  mainWindow.loadURL(localUrl());
+  mainWindow.loadURL(localUrl({ launch: true }));
   mainWindow.once("ready-to-show", () => {
     mainWindow.setIcon(appIcon());
     mainWindow.setAlwaysOnTop(alwaysOnTop, "floating");

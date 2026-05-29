@@ -8,9 +8,14 @@
     (() => {
       const savedTheme = localStorage.getItem("viniper-ui:theme");
       const savedAccent = localStorage.getItem("viniper-ui:accent") || "viniper";
+      const params = new URLSearchParams(window.location.search);
+      const forceSplash = params.get("forceSplash") === "1";
+      const skipSplash = !forceSplash
+        && sessionStorage.getItem("viniper-ui:launch-splash-seen") === "1";
       const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
       document.documentElement.dataset.theme = savedTheme === "dark" || (savedTheme === "system" && prefersDark) ? "dark" : "light";
       document.documentElement.dataset.accent = savedAccent;
+      if (skipSplash) document.documentElement.dataset.skipSplash = "true";
     })();
   </script>
   <link rel="icon" href="/favicon.ico?v=__APP_VERSION__">
@@ -19,49 +24,7 @@
 <body>
   <div id="launch-splash" aria-hidden="true">
     <div class="launch-mark" role="img" aria-label="Viniper UI">
-      <svg class="launch-icon" viewBox="0 0 1024 1024" aria-hidden="true">
-        <defs>
-          <linearGradient id="launch-wash" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0%" stop-color="#1d2b34" />
-            <stop offset="52%" stop-color="#101820" />
-            <stop offset="100%" stop-color="#05100d" />
-          </linearGradient>
-          <linearGradient id="launch-shine" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0%" stop-color="rgba(255,255,255,0)" />
-            <stop offset="50%" stop-color="rgba(255,255,255,0.88)" />
-            <stop offset="100%" stop-color="rgba(255,255,255,0)" />
-          </linearGradient>
-          <clipPath id="launch-icon-clip">
-            <rect x="78" y="78" width="868" height="868" rx="210" />
-          </clipPath>
-          <clipPath id="launch-v-clip">
-            <path d="M286 260 473 742 738 238" />
-          </clipPath>
-        </defs>
-        <rect class="launch-icon-shell" x="78" y="78" width="868" height="868" rx="210" />
-        <g clip-path="url(#launch-icon-clip)">
-          <rect class="launch-inner-wash" x="78" y="78" width="868" height="868" />
-          <g class="launch-math-grid">
-            <line x1="154" y1="270" x2="870" y2="270" />
-            <line x1="154" y1="512" x2="870" y2="512" />
-            <line x1="154" y1="754" x2="870" y2="754" />
-            <line x1="274" y1="154" x2="274" y2="870" />
-            <line x1="512" y1="154" x2="512" y2="870" />
-            <line x1="750" y1="154" x2="750" y2="870" />
-            <path d="M174 682C284 432 390 404 512 538C626 664 734 532 850 306" />
-          </g>
-          <path class="launch-bridge-path launch-bridge-top" d="M512 180 842 716 182 716Z" />
-          <path class="launch-bridge-path launch-bridge-bottom" d="M512 850 182 314 842 314Z" />
-          <circle class="launch-node launch-node-a" cx="286" cy="260" r="22" />
-          <circle class="launch-node launch-node-b" cx="473" cy="742" r="22" />
-          <circle class="launch-node launch-node-c" cx="738" cy="238" r="22" />
-          <path class="launch-v-core" d="M286 260 473 742 738 238" />
-          <path class="launch-v-accent" d="M286 260 473 742 738 238" />
-          <g clip-path="url(#launch-v-clip)">
-            <rect class="launch-v-shine" x="324" y="140" width="120" height="760" rx="60" />
-          </g>
-        </g>
-      </svg>
+      <img class="launch-icon-image" src="/static/assets/viniper-icon.png?v=__APP_VERSION__" alt="">
     </div>
   </div>
 
@@ -99,16 +62,6 @@
             <div id="workdir-display" class="subtle"></div>
           </div>
         </div>
-        <div id="context-meter" class="context-meter" aria-label="上下文占用">
-          <div class="context-meter-head">
-            <span id="context-label">上下文</span>
-            <span id="context-percent">0%</span>
-          </div>
-          <div class="context-track" aria-hidden="true">
-            <div id="context-fill" class="context-fill"></div>
-          </div>
-          <button id="context-compress-btn" class="context-compress-btn hidden" type="button">压缩</button>
-        </div>
         <div class="topbar-actions">
           <label class="model-picker" for="model-select">
             <span>模型</span>
@@ -135,6 +88,12 @@
         <div id="composer">
           <textarea id="user-input" rows="1" placeholder="输入消息" autofocus></textarea>
           <div id="input-actions">
+            <div id="context-meter" class="context-meter" aria-label="上下文占用" title="上下文 0%">
+              <button id="context-compress-btn" class="context-ring" type="button" title="上下文 0%">
+                <span id="context-percent" class="context-tooltip">0%</span>
+                <span id="context-label" class="sr-only">上下文</span>
+              </button>
+            </div>
             <button id="file-btn" class="icon-button" title="附加文件" aria-label="附加文件">＋</button>
             <input id="file-input" type="file" hidden multiple>
             <button id="stop-btn" class="stop-button hidden" type="button" title="停止当前任务" aria-label="停止当前任务">■</button>
