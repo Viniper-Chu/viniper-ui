@@ -1,3 +1,18 @@
+## v4.2.0 (2026-06-01)
+
+### 调整
+- **岛屿式主界面**：外层应用、侧边栏、顶部栏和底部输入区改为更扎实的大圆角岛屿结构，减少尖锐边框感。
+- **内部浮动卡片**：会话项、消息气泡、思考过程、附件卡、代码块和设置分区统一为更圆润的浮动卡片样式。
+- **移动端圆角适配**：窄窗口下保留岛屿布局，缩小外边距，避免按钮和输入区重叠。
+
+### 验证
+- `node --check static/app.js`
+- `node --check desktop/main.js`
+- `node --check desktop/preload.js`
+- `python -m py_compile server.py scripts/build_preview.py scripts/verify_app.py`
+- `python scripts/verify_app.py`
+- `python scripts/verify_desktop.py`
+
 ## v4.1.0 (2026-06-01)
 
 ### 调整
