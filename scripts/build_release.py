@@ -67,6 +67,7 @@ def copy_clean_tree(source: Path, target: Path) -> None:
             "dist",
             "node_modules",
             "release",
+            "release-preview",
         }
         return {name for name in names if name in ignored or name.endswith(".pyc")}
 
