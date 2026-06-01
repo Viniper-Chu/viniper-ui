@@ -1,6 +1,6 @@
 {
   "name": "viniper-ui-desktop",
-  "version": "4.0.4",
+  "version": "4.1.0",
   "private": true,
   "description": "Desktop shell for Viniper UI.",
   "main": "main.js",
@@ -36,6 +36,7 @@
           "server.py",
           "requirements.txt",
           "VERSION",
+          "PREVIEW",
           "README.md",
           "LICENSE",
           "start.bat",

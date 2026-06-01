@@ -1,3 +1,21 @@
+## v4.1.0 (2026-06-01)
+
+### 调整
+- **侧边拖拽线跟随主题色**：会话侧边栏拖拽线新增独立 `--sidebar-line` 颜色变量，跟随设置中的整体强调色同步变化。
+- **独立预览版构建**：新增 `scripts/build_preview.py`，可生成与正式版隔离的预览应用，使用独立 appId、端口、用户数据目录和会话数据目录。
+- **预览版标识与缓存隔离**：预览模式会在界面显示“预览版”，并使用独立静态资源版本避免 Electron 缓存造成旧界面误判。
+
+### 修复
+- **会话栏拖拽手柄尺寸**：将可见拖拽线收细，保留可拖拽热区，避免视觉上出现过宽的竖条。
+
+### 验证
+- `node --check static/app.js`
+- `node --check desktop/main.js`
+- `node --check desktop/preload.js`
+- `python -m py_compile server.py scripts/build_preview.py scripts/verify_app.py`
+- `python scripts/verify_app.py`
+- `python scripts/verify_desktop.py`
+
 ## v4.0.4 (2026-05-29)
 
 ### 调整

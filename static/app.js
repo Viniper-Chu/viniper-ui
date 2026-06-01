@@ -14,9 +14,13 @@ const state = {
   theme: "light",
   language: "zh-CN",
   accent: "viniper",
+  fontSize: "normal",
   sidebarVisible: true,
+  sidebarWidth: 280,
+  sidebarResizing: false,
   alwaysOnTop: false,
   settings: null,
+  previewMode: false,
   updateInfo: null,
   abortController: null,
   cancelRequested: false,
@@ -43,7 +47,9 @@ const PERMISSION_KEY = `${STORAGE_PREFIX}permission-mode`;
 const THEME_KEY = `${STORAGE_PREFIX}theme`;
 const LANGUAGE_KEY = `${STORAGE_PREFIX}language`;
 const ACCENT_KEY = `${STORAGE_PREFIX}accent`;
+const FONT_SIZE_KEY = `${STORAGE_PREFIX}font-size`;
 const SIDEBAR_KEY = `${STORAGE_PREFIX}sidebar-visible`;
+const SIDEBAR_WIDTH_KEY = `${STORAGE_PREFIX}sidebar-width`;
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const LAUNCH_SPLASH_MIN_MS = 1850;
 const launchSplashStarted = performance.now();
@@ -87,6 +93,16 @@ const PERMISSION_MODES = [
 const PERMISSION_ACTION_RE = /(打开|运行|执行|安装|删除|修改|修复|编辑|写入|新建|创建|转换|导出|保存|移动|复制|重命名|启动|停止|读取|扫描|部署|提交|克隆|下载|生成|制作|整理|处理|编译|跑)/i;
 const PERMISSION_TARGET_RE = /(文件|目录|文件夹|项目|仓库|网页|网站|浏览器|桌面|快捷方式|程序|应用|服务|文档|资料|试卷|图片|截图|附件|压缩包|word|excel|pdf|docx|xlsx|ppt|pptx|powershell|cmd|bash|npm|pnpm|yarn|pip|python|node|git|github|skill|app|端口|服务器)/i;
 const PERMISSION_DIRECT_RE = /([a-z]:[\\/]|\\\\|\\.(txt|tex|csv|docx|xlsx|pptx|pdf|zip|tar\\.gz|7z|rar|exe|bat|cmd|ps1|html|css|js|jsx|ts|tsx|json|md|py|png|jpe?g|webp)\\b|powershell\\s+-|cmd\\.exe|npm\\s+|pnpm\\s+|yarn\\s+|pip\\s+|git\\s+(clone|pull|push|commit|status|checkout|merge|fetch)|github|skill)/i;
+const FONT_SIZE_OPTIONS = [
+  { id: "xs", label: "更小" },
+  { id: "sm", label: "小" },
+  { id: "normal", label: "标准" },
+  { id: "lg", label: "大" },
+  { id: "xl", label: "更大" }
+];
+const SIDEBAR_MIN_WIDTH = 220;
+const SIDEBAR_MAX_WIDTH = 760;
+const SIDEBAR_EDGE_HIT_WIDTH = 28;
 const I18N = {
   "zh-CN": {
     newChat: "新建会话",
@@ -160,6 +176,7 @@ function applySettingsFromServer(settings) {
   const appearance = settings.appearance || {};
   applyLanguage(appearance.language || state.language);
   applyAccent(appearance.accent || state.accent);
+  applyFontSize(appearance.font_size || state.fontSize);
   applyTheme(appearance.theme || state.theme);
 }
 
@@ -201,8 +218,40 @@ function applyAccent(accent) {
   storageSet(ACCENT_KEY, state.accent);
 }
 
+function getInitialFontSize() {
+  const savedFontSize = storageGet(FONT_SIZE_KEY);
+  return FONT_SIZE_OPTIONS.some((item) => item.id === savedFontSize) ? savedFontSize : "normal";
+}
+
+function applyFontSize(fontSize) {
+  state.fontSize = FONT_SIZE_OPTIONS.some((item) => item.id === fontSize) ? fontSize : "normal";
+  document.documentElement.dataset.fontSize = state.fontSize;
+  storageSet(FONT_SIZE_KEY, state.fontSize);
+}
+
 function getInitialSidebarVisible() {
-  return storageGet(SIDEBAR_KEY) !== "0";
+  const saved = storageGet(SIDEBAR_KEY);
+  if (saved !== null) return saved !== "0";
+  return !(window.matchMedia && window.matchMedia("(max-width: 720px)").matches);
+}
+
+function getInitialSidebarWidth() {
+  const raw = Number(storageGet(SIDEBAR_WIDTH_KEY));
+  return Number.isFinite(raw) && raw > 0 ? clampSidebarWidth(raw) : 280;
+}
+
+function clampSidebarWidth(width) {
+  const narrow = window.matchMedia && window.matchMedia("(max-width: 720px)").matches;
+  const viewportLimit = narrow
+    ? Math.max(SIDEBAR_MIN_WIDTH, window.innerWidth - 56)
+    : Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, Math.round(window.innerWidth * 0.65)));
+  return Math.min(viewportLimit, Math.max(SIDEBAR_MIN_WIDTH, Math.round(Number(width) || 280)));
+}
+
+function setSidebarWidth(width, { persist = true } = {}) {
+  state.sidebarWidth = clampSidebarWidth(width);
+  document.documentElement.style.setProperty("--sidebar-width", `${state.sidebarWidth}px`);
+  if (persist) storageSet(SIDEBAR_WIDTH_KEY, String(state.sidebarWidth));
 }
 
 function setSidebarVisible(visible) {
@@ -284,10 +333,13 @@ function toggleTheme() {
 document.addEventListener("DOMContentLoaded", async () => {
   try {
     applyAccent(getInitialAccent());
+    applyFontSize(getInitialFontSize());
     applyTheme(getInitialTheme());
     applyLanguage(getInitialLanguage());
+    setSidebarWidth(getInitialSidebarWidth(), { persist: false });
     setSidebarVisible(getInitialSidebarVisible());
     bindEvents();
+    bindSidebarResize();
     setupDesktopBridge();
     await loadStatus();
     if ($("#skills-panel")) await loadSkills();
@@ -502,6 +554,98 @@ function bindEvents() {
   });
 }
 
+function bindSidebarResize() {
+  const resizer = $("#sidebar-resizer");
+  const sidebar = $("#sidebar");
+  if (!resizer || !sidebar) return;
+
+  const eventClientX = (event) => {
+    if (event.touches && event.touches[0]) return event.touches[0].clientX;
+    if (event.changedTouches && event.changedTouches[0]) return event.changedTouches[0].clientX;
+    return event.clientX;
+  };
+
+  const stopResize = () => {
+    if (!state.sidebarResizing) return;
+    state.sidebarResizing = false;
+    document.body.classList.remove("sidebar-resizing");
+  };
+
+  const moveResize = (event) => {
+    if (!state.sidebarResizing) return;
+    const clientX = eventClientX(event);
+    if (Number.isFinite(clientX)) setSidebarWidth(clientX);
+    event.preventDefault?.();
+  };
+
+  const isResizeHit = (event) => {
+    if (!state.sidebarVisible) return false;
+    const clientX = eventClientX(event);
+    const clientY = event.touches?.[0]?.clientY ?? event.changedTouches?.[0]?.clientY ?? event.clientY;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
+
+    const sidebarRect = sidebar.getBoundingClientRect();
+    if (clientY < sidebarRect.top || clientY > sidebarRect.bottom) return false;
+    if (clientX >= sidebarRect.right - SIDEBAR_EDGE_HIT_WIDTH && clientX <= sidebarRect.right + SIDEBAR_EDGE_HIT_WIDTH) {
+      return true;
+    }
+
+    const resizerRect = resizer.getBoundingClientRect();
+    return (
+      clientX >= resizerRect.left - 4
+      && clientX <= resizerRect.right + 4
+      && clientY >= resizerRect.top
+      && clientY <= resizerRect.bottom
+    );
+  };
+
+  const startResize = (event) => {
+    if (!state.sidebarVisible) return;
+    if (state.sidebarResizing) return;
+    event.preventDefault();
+    event.stopPropagation?.();
+    state.sidebarResizing = true;
+    document.body.classList.add("sidebar-resizing");
+    if (event.pointerId !== undefined) {
+      event.currentTarget?.setPointerCapture?.(event.pointerId);
+    }
+  };
+
+  resizer.addEventListener("pointerdown", startResize);
+  resizer.addEventListener("mousedown", startResize);
+  resizer.addEventListener("touchstart", startResize, { passive: false });
+  sidebar.addEventListener("pointerdown", (event) => {
+    if (!state.sidebarVisible) return;
+    const rect = sidebar.getBoundingClientRect();
+    if (Math.abs(rect.right - event.clientX) > SIDEBAR_EDGE_HIT_WIDTH) return;
+    startResize(event);
+  });
+  sidebar.addEventListener("mousedown", (event) => {
+    if (!state.sidebarVisible) return;
+    const rect = sidebar.getBoundingClientRect();
+    if (Math.abs(rect.right - event.clientX) > SIDEBAR_EDGE_HIT_WIDTH) return;
+    startResize(event);
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (isResizeHit(event)) startResize(event);
+  }, true);
+  document.addEventListener("mousedown", (event) => {
+    if (isResizeHit(event)) startResize(event);
+  }, true);
+  document.addEventListener("touchstart", (event) => {
+    if (isResizeHit(event)) startResize(event);
+  }, { capture: true, passive: false });
+  window.addEventListener("pointermove", moveResize);
+  window.addEventListener("pointerup", stopResize);
+  window.addEventListener("pointercancel", stopResize);
+  window.addEventListener("mousemove", moveResize);
+  window.addEventListener("mouseup", stopResize);
+  window.addEventListener("touchmove", moveResize, { passive: false });
+  window.addEventListener("touchend", stopResize);
+  window.addEventListener("touchcancel", stopResize);
+  window.addEventListener("resize", () => setSidebarWidth(state.sidebarWidth));
+}
+
 function setupDesktopBridge() {
   const desktop = window.viniperDesktop;
   if (!desktop) {
@@ -522,6 +666,12 @@ function setupDesktopBridge() {
   desktop.onCommand?.((payload) => {
     handleDesktopCommand(payload?.command, payload?.payload || {});
   });
+}
+
+function notifyDesktopConversationCompleted() {
+  try {
+    window.viniperDesktop?.conversationCompleted?.();
+  } catch {}
 }
 
 function handleDesktopCommand(command) {
@@ -579,6 +729,9 @@ async function loadStatus() {
   try {
     const response = await fetch("/api/status");
     state.status = await response.json();
+    state.previewMode =
+      Boolean(state.status?.preview) || new URLSearchParams(window.location.search).get("preview") === "1";
+    document.body.classList.toggle("preview-mode", state.previewMode);
     applySettingsFromServer(state.status.settings);
     const rememberedModel = storageGet(MODEL_KEY);
     const available = (state.status.models || []).map((model) => model.id);
@@ -785,6 +938,7 @@ async function openSettingsModal() {
         languages: data.languages,
         themes: data.themes,
         accents: data.accents,
+        font_sizes: data.font_sizes,
         models: data.models
       };
     }
@@ -802,12 +956,18 @@ async function openSettingsModal() {
   renderSettingsOptions($("#settings-language"), state.status?.languages || [], appearance.language || state.language);
   renderSettingsOptions($("#settings-theme"), state.status?.themes || [], appearance.theme || state.theme);
   renderSettingsOptions($("#settings-accent"), state.status?.accents || [], appearance.accent || state.accent);
+  renderSettingsOptions($("#settings-font-size"), state.status?.font_sizes || FONT_SIZE_OPTIONS, appearance.font_size || state.fontSize);
   renderSettingsOptions($("#settings-shell"), state.status?.shells || [], shell.id || "claude-code");
+  $("#settings-custom-command").value = shell.custom_command || "";
+  $("#settings-custom-env").value = shell.custom_env || "";
   $("#settings-default-root").value = workspace.default_root || "";
   $("#settings-provider-label").value = provider.label || "DeepSeek";
   $("#settings-base-url").value = provider.base_url || "";
   $("#settings-api-key").value = "";
   $("#settings-api-key").placeholder = provider.api_key_configured ? "已保存，留空保持不变" : "输入 API Key";
+  $("#settings-api-key-env").value = provider.api_key_env || "ANTHROPIC_AUTH_TOKEN";
+  $("#settings-base-url-env").value = provider.base_url_env || "ANTHROPIC_BASE_URL";
+  $("#settings-model-env").value = provider.model_env || "ANTHROPIC_MODEL";
   $("#settings-models").value = modelsToText(provider.models || state.status?.models || []);
   renderSettingsModelSelect();
   $("#settings-provider-model").value = provider.model || state.selectedModel;
@@ -832,10 +992,13 @@ async function saveSettings() {
     appearance: {
       language: $("#settings-language").value,
       theme: $("#settings-theme").value,
-      accent: $("#settings-accent").value
+      accent: $("#settings-accent").value,
+      font_size: $("#settings-font-size").value
     },
     shell: {
-      id: $("#settings-shell").value
+      id: $("#settings-shell").value,
+      custom_command: $("#settings-custom-command").value.trim(),
+      custom_env: $("#settings-custom-env").value.trim()
     },
     workspace: {
       default_root: $("#settings-default-root").value.trim()
@@ -843,6 +1006,9 @@ async function saveSettings() {
     provider: {
       label: $("#settings-provider-label").value.trim() || "DeepSeek",
       base_url: $("#settings-base-url").value.trim(),
+      api_key_env: $("#settings-api-key-env").value.trim() || "ANTHROPIC_AUTH_TOKEN",
+      base_url_env: $("#settings-base-url-env").value.trim() || "ANTHROPIC_BASE_URL",
+      model_env: $("#settings-model-env").value.trim() || "ANTHROPIC_MODEL",
       model: $("#settings-provider-model").value || models[0].id,
       models
     }
@@ -1110,9 +1276,10 @@ function storageRemove(key) {
 
 function updateModelLabels() {
   const option = getSelectedModelOption();
+  const previewSuffix = state.previewMode ? " · 预览版" : "";
   $("#status-line").textContent = state.status?.configured
-    ? `${option.label} ${t("connected")}`
-    : t("waitingKey");
+    ? `${option.label} ${t("connected")}${previewSuffix}`
+    : `${t("waitingKey")}${previewSuffix}`;
 }
 
 function getSelectedModelOption() {
@@ -1817,6 +1984,8 @@ async function sendMessage() {
   let fullText = "";
   let thinkingText = "";
   let receivedDone = false;  // track whether we got a "done" SSE event
+  let hadError = false;
+  let completedNormally = false;
 
   // Long-running notice: keep the input locked while the backend task is alive.
   const safetyTimer = setTimeout(() => {
@@ -1868,6 +2037,7 @@ async function sendMessage() {
         fullText += payload.content || "";
         streamRenderer.append("text", payload.content || "");
       } else if (payload.type === "error") {
+        hadError = true;
         showThinking(false);
         if (state.cancelRequested) {
           fullText = "已停止当前任务，输入已恢复。";
@@ -1905,6 +2075,7 @@ async function sendMessage() {
         }
       } else if (payload.type === "done") {
         receivedDone = true;
+        completedNormally = !hadError && !state.cancelRequested;
         showThinking(false);
         streamRenderer.finish();
       }
@@ -1936,6 +2107,7 @@ async function sendMessage() {
     }
   } catch (error) {
     showThinking(false);
+    hadError = true;
     if (error.name === "AbortError" || state.cancelRequested) {
       fullText = fullText || "已停止当前任务，输入已恢复。";
       streamRenderer.replaceWithText(fullText);
@@ -1964,6 +2136,7 @@ async function sendMessage() {
     }
 
     updateContextMeter({ announce: true });
+    if (completedNormally) notifyDesktopConversationCompleted();
   }
 }
 
@@ -1988,6 +2161,8 @@ async function doRetrySend(text, permissionMode, attachments = []) {
   const streamRenderer = createStreamRenderer(assistantArticle);
   let fullText = "";
   let receivedDone = false;
+  let hadError = false;
+  let completedNormally = false;
 
   const safetyTimer = setTimeout(() => {
     if (state.isStreaming && !fullText) {
@@ -2025,6 +2200,7 @@ async function doRetrySend(text, permissionMode, attachments = []) {
         fullText += payload.content || "";
         streamRenderer.append("text", payload.content || "");
       } else if (payload.type === "error") {
+        hadError = true;
         if (state.cancelRequested) {
           fullText = "已停止当前任务，输入已恢复。";
         } else {
@@ -2034,6 +2210,7 @@ async function doRetrySend(text, permissionMode, attachments = []) {
         streamRenderer.replaceWithText(fullText);
       } else if (payload.type === "done") {
         receivedDone = true;
+        completedNormally = !hadError && !state.cancelRequested;
         streamRenderer.finish();
       } else if (payload.type === "heartbeat") {
         streamRenderer.setElapsed(payload.elapsed);
@@ -2054,6 +2231,7 @@ async function doRetrySend(text, permissionMode, attachments = []) {
       consumeSseBuffer();
     }
   } catch (error) {
+    hadError = true;
     if (error.name !== "AbortError" && !state.cancelRequested) {
       fullText = `连接失败：${error.message}`;
       streamRenderer.replaceWithText(fullText);
@@ -2071,6 +2249,7 @@ async function doRetrySend(text, permissionMode, attachments = []) {
     $("#user-input").focus();
     try { await switchSession(state.sessionId); } catch {}
     updateContextMeter({ announce: true });
+    if (completedNormally) notifyDesktopConversationCompleted();
   }
 }
 

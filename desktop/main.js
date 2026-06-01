@@ -3,6 +3,7 @@ const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
 const net = require("net");
+const os = require("os");
 const path = require("path");
 
 const APP_ROOT = app.isPackaged
@@ -11,10 +12,12 @@ const APP_ROOT = app.isPackaged
 const ICON_PATH = process.platform === "win32"
   ? path.join(APP_ROOT, "static", "assets", "viniper-icon.ico")
   : path.join(APP_ROOT, "static", "assets", "viniper-icon.png");
+const BADGE_ICON_PATH = path.join(APP_ROOT, "static", "assets", "viniper-icon-badge-1.png");
 const BUNDLED_VERSION = readBundledVersion();
-const APP_USER_MODEL_ID = "com.viniper.ui.desktop";
+const IS_PREVIEW = process.env.VINIPER_UI_PREVIEW === "1" || fs.existsSync(path.join(APP_ROOT, "PREVIEW"));
+const APP_USER_MODEL_ID = IS_PREVIEW ? "com.viniper.ui.desktop.preview" : "com.viniper.ui.desktop";
 
-let port = Number(process.env.VINIPER_UI_PORT || 17373);
+let port = Number(process.env.VINIPER_UI_PORT || (IS_PREVIEW ? 17946 : 17373));
 let mainWindow = null;
 let skillsWindow = null;
 let tray = null;
@@ -22,6 +25,7 @@ let serverProcess = null;
 let isQuitting = false;
 let stdioBroken = false;
 let alwaysOnTop = false;
+let trayBadgeCount = 0;
 
 function handleStdioError(error) {
   if (error && error.code === "EPIPE") {
@@ -36,13 +40,54 @@ process.stderr?.on?.("error", handleStdioError);
 
 function localUrl(options = {}) {
   const baseUrl = `http://127.0.0.1:${port}`;
-  return options.launch ? `${baseUrl}/?launch=1` : baseUrl;
+  const params = new URLSearchParams();
+  if (options.launch) params.set("launch", "1");
+  if (IS_PREVIEW && options.launch) {
+    params.set("preview", "1");
+    params.set("cache", String(Date.now()));
+  }
+  const query = params.toString();
+  return query ? `${baseUrl}/?${query}` : baseUrl;
 }
 
 function appIcon(size = 0) {
   const image = nativeImage.createFromPath(ICON_PATH);
   if (image.isEmpty() || !size) return image;
   return image.resize({ width: size, height: size, quality: "best" });
+}
+
+function trayIcon(size = 0) {
+  const useBadge = trayBadgeCount > 0 && fs.existsSync(BADGE_ICON_PATH);
+  let image = nativeImage.createFromPath(useBadge ? BADGE_ICON_PATH : ICON_PATH);
+  if (image.isEmpty() && useBadge) image = nativeImage.createFromPath(ICON_PATH);
+  if (image.isEmpty() || !size) return image;
+  return image.resize({ width: size, height: size, quality: "best" });
+}
+
+function updateTrayVisuals() {
+  if (!tray) return;
+  const size = process.platform === "win32" ? 16 : 22;
+  const image = trayIcon(size);
+  if (!image.isEmpty()) tray.setImage(image);
+  tray.setToolTip(trayBadgeCount > 0 ? `Viniper UI - ${trayBadgeCount} 条新回复` : "Viniper UI");
+  try {
+    app.setBadgeCount(trayBadgeCount);
+  } catch {}
+}
+
+function setTrayBadge(count) {
+  trayBadgeCount = Math.max(0, Math.min(99, Number(count) || 0));
+  updateTrayVisuals();
+  updateTrayMenu();
+}
+
+function clearTrayBadge() {
+  if (trayBadgeCount > 0) setTrayBadge(0);
+}
+
+function markConversationCompleted() {
+  const shouldBadge = !mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible() || !mainWindow.isFocused();
+  if (shouldBadge) setTrayBadge(1);
 }
 
 function readBundledVersion() {
@@ -73,6 +118,16 @@ function logServerChunk(level, chunk) {
   const text = chunk.toString().trim();
   if (!text) return;
   safeMainLog(level, `[Viniper UI] ${text}`);
+}
+
+function previewUserDataDir() {
+  if (process.platform === "win32") {
+    return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Viniper UI Preview");
+  }
+  if (process.platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Viniper UI Preview");
+  }
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "Viniper UI Preview");
 }
 
 function sendRendererCommand(command, payload = {}) {
@@ -258,6 +313,11 @@ function startServerProcess() {
     VINIPER_UI_DESKTOP: "1",
     VINIPER_UI_PORT: String(port)
   };
+  if (IS_PREVIEW) {
+    env.VINIPER_UI_PREVIEW = "1";
+    env.VINIPER_UI_DATA_DIR = path.join(app.getPath("userData"), "data");
+    env.VINIPER_UI_ASSET_VERSION = `${BUNDLED_VERSION || "dev"}-preview-${Date.now()}`;
+  }
 
   serverProcess = spawn(python.command, [...python.args, script], {
     cwd: APP_ROOT,
@@ -312,7 +372,7 @@ async function createMainWindow() {
     height: 900,
     minWidth: 960,
     minHeight: 680,
-    title: "Viniper UI",
+    title: IS_PREVIEW ? "Viniper UI Preview" : "Viniper UI",
     icon: appIcon(),
     backgroundColor: "#f6fbff",
     show: false,
@@ -352,6 +412,8 @@ async function createMainWindow() {
       updateTrayMenu();
     }
   });
+  mainWindow.on("focus", clearTrayBadge);
+  mainWindow.on("show", clearTrayBadge);
 }
 
 function showMainWindow() {
@@ -362,6 +424,7 @@ function showMainWindow() {
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
+  clearTrayBadge();
   updateTrayMenu();
   sendWindowState();
 }
@@ -401,15 +464,16 @@ async function runDiagnosticsDialog() {
 
 function createTray() {
   if (tray) return;
-  const image = appIcon(process.platform === "win32" ? 16 : 22);
+  const image = trayIcon(process.platform === "win32" ? 16 : 22);
   tray = new Tray(image.isEmpty() ? nativeImage.createEmpty() : image);
-  tray.setToolTip("Viniper UI");
+  updateTrayVisuals();
   updateTrayMenu();
   tray.on("click", showMainWindow);
 }
 
 function updateTrayMenu() {
   if (!tray) return;
+  tray.setToolTip(trayBadgeCount > 0 ? `Viniper UI - ${trayBadgeCount} 条新回复` : "Viniper UI");
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "打开 Viniper UI", click: showMainWindow },
     {
@@ -505,11 +569,16 @@ ipcMain.handle("viniper:open-skills", () => {
   openSkillsWindow();
   return { ok: true };
 });
+ipcMain.on("viniper:conversation-completed", markConversationCompleted);
+
+if (IS_PREVIEW) {
+  app.setPath("userData", previewUserDataDir());
+}
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.setName("Viniper UI");
+  app.setName(IS_PREVIEW ? "Viniper UI Preview" : "Viniper UI");
   app.setAppUserModelId(APP_USER_MODEL_ID);
   app.on("second-instance", showMainWindow);
   app.whenReady().then(async () => {

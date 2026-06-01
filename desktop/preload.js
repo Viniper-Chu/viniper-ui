@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld("viniperDesktop", {
   setAlwaysOnTop: (enabled) => ipcRenderer.invoke("viniper:set-always-on-top", Boolean(enabled)),
   toggleAlwaysOnTop: () => ipcRenderer.invoke("viniper:toggle-always-on-top"),
   openSkills: () => ipcRenderer.invoke("viniper:open-skills"),
+  conversationCompleted: () => ipcRenderer.send("viniper:conversation-completed"),
   onCommand: (callback) => {
     if (typeof callback !== "function") return () => {};
     const listener = (_event, payload) => callback(payload || {});

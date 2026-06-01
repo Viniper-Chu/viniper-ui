@@ -15,6 +15,7 @@ venv/
 dist/
 desktop/node_modules/
 desktop/release/
+desktop/release-preview/
 *.zip
 *.tar.gz
 
