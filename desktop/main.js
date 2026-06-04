@@ -19,10 +19,12 @@ const APP_USER_MODEL_ID = IS_PREVIEW ? "com.viniper.ui.desktop.preview" : "com.v
 
 let port = Number(process.env.VINIPER_UI_PORT || (IS_PREVIEW ? 17946 : 17373));
 let mainWindow = null;
+let splashWindow = null;
 let skillsWindow = null;
 let tray = null;
 let serverProcess = null;
 let isQuitting = false;
+let isStarting = false;
 let stdioBroken = false;
 let alwaysOnTop = false;
 let trayBadgeCount = 0;
@@ -42,7 +44,7 @@ function localUrl(options = {}) {
   const baseUrl = `http://127.0.0.1:${port}`;
   const params = new URLSearchParams();
   if (options.launch) params.set("launch", "1");
-  if (IS_PREVIEW && options.launch) {
+  if (IS_PREVIEW && (options.launch || options.cache)) {
     params.set("preview", "1");
     params.set("cache", String(Date.now()));
   }
@@ -54,6 +56,144 @@ function appIcon(size = 0) {
   const image = nativeImage.createFromPath(ICON_PATH);
   if (image.isEmpty() || !size) return image;
   return image.resize({ width: size, height: size, quality: "best" });
+}
+
+function splashIconDataUrl() {
+  const iconPath = path.join(APP_ROOT, "static", "assets", "viniper-icon.png");
+  if (!fs.existsSync(iconPath)) return "";
+  return `data:image/png;base64,${fs.readFileSync(iconPath).toString("base64")}`;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function createSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) return splashWindow;
+
+  const splashIcon = splashIconDataUrl();
+  const splashHtml = `<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: transparent;
+      user-select: none;
+    }
+    body {
+      display: grid;
+      place-items: center;
+    }
+    .boot-mark {
+      width: 154px;
+      height: 154px;
+      display: grid;
+      place-items: center;
+      filter: drop-shadow(0 20px 34px rgba(0, 18, 22, 0.32));
+      animation: mark-breathe 1.7s ease-in-out 1.05s infinite;
+    }
+    .boot-icon {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      clip-path: inset(0 100% 0 0 round 22px);
+      opacity: 0;
+      transform: scale(0.94);
+      animation: v-reveal 1.05s cubic-bezier(0.18, 0.86, 0.24, 1) both;
+    }
+    .boot-mark::after {
+      content: "";
+      position: absolute;
+      width: 150px;
+      height: 150px;
+      border-radius: 30px;
+      background: linear-gradient(105deg, transparent 26%, rgba(255,255,255,0.58) 45%, transparent 64%);
+      mix-blend-mode: screen;
+      opacity: 0;
+      transform: translateX(-88px) skewX(-16deg);
+      animation: v-shine 1.05s ease-out 0.18s both;
+      pointer-events: none;
+    }
+    @keyframes v-reveal {
+      0% {
+        opacity: 0;
+        clip-path: inset(0 100% 0 0 round 22px);
+        filter: blur(10px) saturate(0.7);
+        transform: scale(0.9);
+      }
+      58% {
+        opacity: 1;
+        clip-path: inset(0 18% 0 0 round 22px);
+        filter: blur(0) saturate(1.08);
+        transform: scale(1.045);
+      }
+      100% {
+        opacity: 1;
+        clip-path: inset(0 0 0 0 round 22px);
+        filter: blur(0) saturate(1);
+        transform: scale(1);
+      }
+    }
+    @keyframes v-shine {
+      0% { opacity: 0; transform: translateX(-96px) skewX(-16deg); }
+      38% { opacity: 0.72; }
+      100% { opacity: 0; transform: translateX(96px) skewX(-16deg); }
+    }
+    @keyframes mark-breathe {
+      0%, 100% { transform: scale(1); filter: drop-shadow(0 20px 34px rgba(0,18,22,0.28)); }
+      50% { transform: scale(1.025); filter: drop-shadow(0 24px 42px rgba(0,18,22,0.36)); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .boot-mark, .boot-icon, .boot-mark::after { animation: none !important; opacity: 1; clip-path: none; transform: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="boot-mark">
+    <img class="boot-icon" src="${splashIcon}" alt="">
+  </div>
+</body>
+</html>`;
+
+  splashWindow = new BrowserWindow({
+    width: 260,
+    height: 260,
+    resizable: false,
+    frame: false,
+    transparent: true,
+    hasShadow: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    focusable: false,
+    title: "Viniper UI",
+    icon: appIcon(),
+    show: false,
+    backgroundColor: "#00000000",
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
+    }
+  });
+  splashWindow.setMenuBarVisibility(false);
+  splashWindow.center();
+  const splashB64 = Buffer.from(splashHtml, "utf8").toString("base64");
+  await splashWindow.loadURL(`data:text/html;base64,${splashB64}`);
+  splashWindow.showInactive();
+  return splashWindow;
+}
+
+function closeSplashWindow() {
+  if (splashWindow && !splashWindow.isDestroyed()) {
+    splashWindow.destroy();
+  }
+  splashWindow = null;
 }
 
 function trayIcon(size = 0) {
@@ -358,8 +498,20 @@ async function ensureServer() {
 }
 
 async function createMainWindow() {
+  if (isStarting) return;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    showMainWindow();
+    return;
+  }
+
+  isStarting = true;
+  const splashStartedAt = Date.now();
+  await createSplashWindow();
+
   const ready = await ensureServer();
   if (!ready) {
+    closeSplashWindow();
+    isStarting = false;
     dialog.showErrorBox(
       "Viniper UI 启动失败",
       `本地服务没有在 ${port} 端口就绪。请确认 Python 3、requirements.txt 依赖和 Claude Code 已安装。`
@@ -398,13 +550,25 @@ async function createMainWindow() {
     }
   });
 
-  mainWindow.loadURL(localUrl({ launch: true }));
-  mainWindow.once("ready-to-show", () => {
-    mainWindow.setIcon(appIcon());
-    mainWindow.setAlwaysOnTop(alwaysOnTop, "floating");
-    sendWindowState();
-    mainWindow.show();
-  });
+  try {
+    await mainWindow.loadURL(localUrl({ cache: true }));
+  } catch (error) {
+    closeSplashWindow();
+    isStarting = false;
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
+    mainWindow = null;
+    dialog.showErrorBox("Viniper UI 启动失败", error.message || String(error));
+    return;
+  }
+  const remainingSplashMs = Math.max(0, 1450 - (Date.now() - splashStartedAt));
+  if (remainingSplashMs > 0) await delay(remainingSplashMs);
+  mainWindow.setIcon(appIcon());
+  mainWindow.setAlwaysOnTop(alwaysOnTop, "floating");
+  sendWindowState();
+  mainWindow.show();
+  closeSplashWindow();
+  isStarting = false;
+
   mainWindow.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault();
@@ -417,8 +581,8 @@ async function createMainWindow() {
 }
 
 function showMainWindow() {
-  if (!mainWindow) {
-    createMainWindow();
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    if (!isStarting) createMainWindow();
     return;
   }
   if (mainWindow.isMinimized()) mainWindow.restore();

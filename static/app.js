@@ -1559,13 +1559,13 @@ function renderAllMessages() {
   }).join("");
 }
 
-function addMessage(role, content) {
+function addMessage(role, content, meta = {}) {
   const welcome = $(".welcome");
   if (welcome) welcome.remove();
 
   const roleClass = role;
   const label = role === "user" ? "" : assistantLabel(state.selectedModel);
-  $("#messages").insertAdjacentHTML("beforeend", messageTemplate(roleClass, label, content));
+  $("#messages").insertAdjacentHTML("beforeend", messageTemplate(roleClass, label, content, "", [], meta));
   scrollBottom();
   return $("#messages .message:last-child .msg-content");
 }
@@ -1583,7 +1583,7 @@ function messageTemplate(roleClass, label, content, thinking = "", segments = []
     ? renderMessageSegments(displaySegments, { totalElapsedSeconds: meta?.elapsed_seconds ?? meta?.elapsedSeconds })
     : (roleClass === "assistant" || roleClass === "error"
       ? renderAssistantContentHtml(displayContent)
-      : escapeHtml(displayContent));
+      : renderUserContentHtml(displayContent, meta?.attachments || []));
   const header = label ? `<header class="msg-header">${escapeHtml(label)}</header>` : "";
   return `
     <article class="message ${roleClass}" data-role="${escapeAttr(roleClass)}">
@@ -1592,6 +1592,64 @@ function messageTemplate(roleClass, label, content, thinking = "", segments = []
       <div class="msg-content">${body}</div>
     </article>
   `;
+}
+
+function attachmentKind(item = {}) {
+  const type = String(item.type || "").toLowerCase();
+  const name = String(item.name || "");
+  const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+  if (type.startsWith("image/") || ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"].includes(ext)) return "IMG";
+  if (type.includes("pdf") || ext === "pdf") return "PDF";
+  if (["doc", "docx"].includes(ext)) return "DOC";
+  if (["xls", "xlsx", "csv"].includes(ext)) return "XLS";
+  if (["ppt", "pptx"].includes(ext)) return "PPT";
+  if (["zip", "rar", "7z", "gz", "tgz"].includes(ext)) return "ZIP";
+  if (["js", "ts", "tsx", "jsx", "py", "css", "html", "json", "md", "txt"].includes(ext)) return "TXT";
+  return "FILE";
+}
+
+function isImageAttachment(item = {}) {
+  return attachmentKind(item) === "IMG";
+}
+
+function attachmentPreviewSrc(item = {}) {
+  if (!isImageAttachment(item)) return "";
+  if (item.url) return String(item.url);
+  const data = String(item.data || "");
+  if (!data) return "";
+  if (data.startsWith("data:")) return data;
+  return `data:${item.type || "image/png"};base64,${data}`;
+}
+
+function renderMessageAttachments(attachments = []) {
+  const safeItems = Array.isArray(attachments) ? attachments : [];
+  if (!safeItems.length) return "";
+  const items = safeItems.map((item) => {
+    const previewSrc = attachmentPreviewSrc(item);
+    const imagePreview = previewSrc
+      ? `<img class="message-attachment-thumb" src="${escapeAttr(previewSrc)}" alt="${escapeAttr(item.name || "image")}">`
+      : "";
+    const kind = attachmentKind(item);
+    return (
+      `<span class="message-attachment-card${previewSrc ? " is-image" : ""}" title="${escapeAttr(item.name || "attachment")}">` +
+        imagePreview +
+        `<span class="message-attachment-row">` +
+          `<span class="message-attachment-icon">${escapeHtml(kind)}</span>` +
+          `<span class="message-attachment-main">` +
+            `<span class="message-attachment-name">${escapeHtml(item.name || "attachment")}</span>` +
+            `<span class="message-attachment-meta">${escapeHtml(formatBytes(item.size || 0))}</span>` +
+          `</span>` +
+        `</span>` +
+      `</span>`
+    );
+  }).join("");
+  return `<div class="message-attachments" aria-label="附件">${items}</div>`;
+}
+
+function renderUserContentHtml(content, attachments = []) {
+  const text = repairTextForDisplay(content || "").trim();
+  const textHtml = text ? `<div class="user-text">${escapeHtml(text)}</div>` : "";
+  return `${textHtml}${renderMessageAttachments(attachments)}`;
 }
 
 function renderMessageSegments(segments = [], options = {}) {
@@ -1604,7 +1662,7 @@ function renderMessageSegments(segments = [], options = {}) {
     ? explicitTotalElapsed
     : (derivedTotalElapsed > 0 ? derivedTotalElapsed : NaN);
   const totalTime = Number.isFinite(totalElapsed)
-    ? `<div class="message-total-time" data-total-time>${options.activeThinking ? "总计" : "总用时"} ${escapeHtml(formatDuration(totalElapsed))}</div>`
+    ? `<div class="message-total-time" data-total-time>${options.activeThinking ? "Total" : "Done in"} ${escapeHtml(formatDuration(totalElapsed))}</div>`
     : "";
   const body = segments.map((segment, index) => {
     const type = segment?.type === "thinking" ? "thinking" : "text";
@@ -1636,9 +1694,12 @@ function createStreamRenderer(article) {
   let elapsedOverride = null;
   let completed = false;
 
+  const localElapsedSeconds = () => Math.max(0, Math.round((performance.now() - startedAt) / 1000));
+
   const totalElapsedSeconds = () => {
-    if (Number.isFinite(elapsedOverride)) return Math.max(0, Number(elapsedOverride));
-    return Math.max(0, Math.round((performance.now() - startedAt) / 1000));
+    const localElapsed = localElapsedSeconds();
+    if (!Number.isFinite(elapsedOverride)) return localElapsed;
+    return Math.max(localElapsed, Math.max(0, Number(elapsedOverride)));
   };
 
   const segmentElapsedSeconds = (segment) => {
@@ -1671,14 +1732,14 @@ function createStreamRenderer(article) {
   const updateTimers = () => {
     const totalNode = container.querySelector("[data-total-time]");
     if (totalNode) {
-      totalNode.textContent = `${completed ? "总用时" : "总计"} ${formatDuration(totalElapsedSeconds())}`;
+      totalNode.textContent = `${completed ? "Done in" : "Total"} ${formatDuration(totalElapsedSeconds())}`;
     }
     segments.forEach((segment, index) => {
       if (segment.type !== "thinking") return;
       const node = container.querySelector(`[data-segment-index="${index}"] [data-thinking-time]`);
       const elapsed = segmentElapsedSeconds(segment);
       if (node && Number.isFinite(elapsed)) {
-        node.textContent = `${segment.activeThinking && !completed ? "思考" : "用时"} ${formatDuration(elapsed)}`;
+        node.textContent = `${segment.activeThinking && !completed ? "Thinking" : "Thought for"} ${formatDuration(elapsed)}`;
       }
     });
   };
@@ -1735,7 +1796,9 @@ function createStreamRenderer(article) {
     },
     setElapsed(seconds) {
       const value = Number(seconds);
-      if (Number.isFinite(value)) elapsedOverride = value;
+      if (Number.isFinite(value)) {
+        elapsedOverride = Math.max(Math.max(0, value), Number.isFinite(elapsedOverride) ? elapsedOverride : 0);
+      }
       updateTimers();
     },
     replaceWithText(content) {
@@ -1744,10 +1807,11 @@ function createStreamRenderer(article) {
       sync();
     },
     finish() {
+      elapsedOverride = totalElapsedSeconds();
       completed = true;
       window.clearInterval(timer);
       closeActiveThinking();
-      const finalElapsed = totalElapsedSeconds();
+      const finalElapsed = Math.max(0, Number(elapsedOverride) || 0);
       container.innerHTML = renderMessageSegments(renderableSegments(), {
         activeThinking: false,
         totalElapsedSeconds: finalElapsed
@@ -1932,7 +1996,7 @@ async function fileToAttachment(file) {
 
 function attachmentDisplayText(text, attachments) {
   if (!attachments.length) return text;
-  const lines = attachments.map((item) => `[附件: ${item.name} · ${formatBytes(item.size)} · ${item.type || "application/octet-stream"}]`);
+  const lines = attachments.map((item) => `[Attachment: ${item.name} · ${formatBytes(item.size)} · ${item.type || "application/octet-stream"}]`);
   return `${text}\n\n${lines.join("\n")}`;
 }
 
@@ -1977,7 +2041,7 @@ async function sendMessage() {
   showStopButton(true);
   showThinking(true);
 
-  addMessage("user", attachmentDisplayText(text, attachments));
+  addMessage("user", text, { attachments });
   const assistantContent = addMessage("assistant", "");
   const assistantArticle = assistantContent.closest(".message");
   const streamRenderer = createStreamRenderer(assistantArticle);
@@ -2349,22 +2413,25 @@ async function compressCurrentContext() {
 
 function formatDuration(seconds) {
   const total = Math.max(0, Math.round(Number(seconds) || 0));
-  const minutes = Math.floor(total / 60);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
   const secs = total % 60;
-  return minutes > 0 ? `${minutes}分${String(secs).padStart(2, "0")}秒` : `${secs}秒`;
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(secs).padStart(2, "0")}s`;
+  if (minutes > 0) return `${minutes}m ${String(secs).padStart(2, "0")}s`;
+  return `${secs}s`;
 }
 
 function renderThinkingPanel(thinking, options = {}) {
   const hasTime = Number.isFinite(Number(options.elapsedSeconds));
   const timeLabel = hasTime
-    ? `${options.activeThinking ? "思考" : "用时"} ${formatDuration(options.elapsedSeconds)}`
+    ? `${options.activeThinking ? "Thinking" : "Thought for"} ${formatDuration(options.elapsedSeconds)}`
     : "";
   const stateClass = options.activeThinking ? " streaming" : "";
   const indexAttr = Number.isInteger(options.segmentIndex) ? ` data-segment-index="${options.segmentIndex}"` : "";
   return `
     <details class="thinking-panel${stateClass}"${indexAttr}>
       <summary>
-        <span>思考过程</span>
+        <span>Thinking</span>
         <span class="thinking-preview">${escapeHtml(previewThinking(thinking))}</span>
         ${timeLabel ? `<span class="thinking-time" data-thinking-time>${escapeHtml(timeLabel)}</span>` : ""}
       </summary>
@@ -2375,7 +2442,7 @@ function renderThinkingPanel(thinking, options = {}) {
 
 function previewThinking(thinking) {
   const clean = repairTextForDisplay(thinking).replace(/\s+/g, " ").trim();
-  if (!clean) return "正在梳理...";
+  if (!clean) return "Working...";
   return clean.length > 140 ? `${clean.slice(0, 140)}...` : clean;
 }
 

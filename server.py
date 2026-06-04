@@ -640,6 +640,7 @@ def save_chat_attachments(session_id: str, raw_items: Any) -> list[dict[str, Any
             "name": original_name,
             "type": mime_type,
             "size": len(content),
+            "filename": filename,
             "path": str(path.resolve()),
         })
 
@@ -651,6 +652,22 @@ def attachment_display_lines(attachments: list[dict[str, Any]]) -> list[str]:
         f"[附件: {item.get('name')} · {format_bytes(int(item.get('size') or 0))} · {item.get('type') or 'application/octet-stream'}]"
         for item in attachments
     ]
+
+
+def attachment_message_items(attachments: list[dict[str, Any]], session_id: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    safe_id = safe_attachment_filename(session_id)
+    for item in attachments:
+        message_item = {
+            "name": item.get("name") or "attachment",
+            "type": item.get("type") or "application/octet-stream",
+            "size": int(item.get("size") or 0),
+        }
+        filename = str(item.get("filename") or "")
+        if filename:
+            message_item["url"] = f"/api/attachments/{safe_id}/{safe_attachment_filename(filename)}"
+        items.append(message_item)
+    return items
 
 
 def append_attachment_prompt(prompt: str, attachments: list[dict[str, Any]]) -> str:
@@ -2043,10 +2060,11 @@ async def stream_custom_cli_impl(
     if is_guidance:
         prompt = f"[GUIDANCE] {prompt}"
     display_prompt = prompt
-    if attachments:
-        display_prompt = f"{display_prompt}\n\n" + "\n".join(attachment_display_lines(attachments))
     if not suppress_user_message:
-        session["messages"] = list(session.get("messages", [])) + [{"role": "user", "content": display_prompt}]
+        user_message = {"role": "user", "content": display_prompt}
+        if attachments:
+            user_message["attachments"] = attachment_message_items(attachments, session_id)
+        session["messages"] = list(session.get("messages", [])) + [user_message]
     session["updated"] = now_ts()
     sessions[session_id] = session
     save_sessions_to_disk()
@@ -2197,8 +2215,6 @@ async def stream_chat_impl(
     if is_guidance:
         prompt = f"[GUIDANCE] {prompt}"
     display_prompt = prompt
-    if attachments:
-        display_prompt = f"{display_prompt}\n\n" + "\n".join(attachment_display_lines(attachments))
 
     resume_existing = bool(session.get("claude_initialized"))
     if resume_existing:
@@ -2207,7 +2223,10 @@ async def stream_chat_impl(
         claude_session_id = str(uuid.uuid4())
     session["claude_session_id"] = claude_session_id
     if not suppress_user_message:
-        session["messages"] = list(session.get("messages", [])) + [{"role": "user", "content": display_prompt}]
+        user_message = {"role": "user", "content": display_prompt}
+        if attachments:
+            user_message["attachments"] = attachment_message_items(attachments, session_id)
+        session["messages"] = list(session.get("messages", [])) + [user_message]
     else:
         session["messages"] = list(session.get("messages", []))
     session["updated"] = now_ts()
@@ -2899,6 +2918,17 @@ async def favicon():
     if icon.exists():
         return FileResponse(icon)
     raise HTTPException(status_code=404, detail="favicon not found")
+
+
+@app.get("/api/attachments/{session_id}/{filename}")
+async def attachment_file(session_id: str, filename: str):
+    safe_id = safe_attachment_filename(session_id)
+    safe_name = safe_attachment_filename(Path(filename).name)
+    target = (ATTACHMENTS_DIR / safe_id / safe_name).resolve()
+    root = (ATTACHMENTS_DIR / safe_id).resolve()
+    if root not in target.parents or not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="attachment not found")
+    return FileResponse(target)
 
 
 @app.get("/api/status")

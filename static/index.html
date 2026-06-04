@@ -12,8 +12,9 @@
       const savedSidebarWidth = Number(localStorage.getItem("viniper-ui:sidebar-width") || "");
       const params = new URLSearchParams(window.location.search);
       const forceSplash = params.get("forceSplash") === "1";
-      const skipSplash = !forceSplash
-        && sessionStorage.getItem("viniper-ui:launch-splash-seen") === "1";
+      const launchSplash = forceSplash || params.get("launch") === "1";
+      const skipSplash = !launchSplash || (!forceSplash
+        && sessionStorage.getItem("viniper-ui:launch-splash-seen") === "1");
       const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
       document.documentElement.dataset.theme = savedTheme === "dark" || (savedTheme === "system" && prefersDark) ? "dark" : "light";
       document.documentElement.dataset.accent = savedAccent;

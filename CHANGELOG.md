@@ -1,3 +1,23 @@
+## v4.2.1 (2026-06-05)
+
+### 调整
+- **启动动画独立化**：桌面启动改为独立透明小窗，只显示 Viniper V 图标的显现动画，不再先显示完整软件框。
+- **附件消息显示**：发送后的附件改为轻量文件标记，文件名、大小和图片缩略图在用户气泡内部靠右显示；输入框里的待发送附件继续靠左。
+- **思考计时英文化**：思考和总用时改为 `Thinking`、`Thought for`、`Total`、`Done in`，避免界面编码混乱。
+
+### 修复
+- **总计时卡住/回退**：总思考时间改为单调递增，不再被后端心跳覆盖为较小旧值。
+- **附件撑大气泡**：修复用户气泡 `white-space` 导致附件模板缩进被渲染成大块空白的问题。
+- **图片附件预览**：新增只读附件预览地址，新发送的图片附件刷新会话后仍可显示缩略图。
+
+### 验证
+- `node --check static/app.js`
+- `node --check desktop/main.js`
+- `node --check desktop/preload.js`
+- `python -m py_compile server.py`
+- `python scripts/build_preview.py --skip-install --install-dir D:\Viniper UI Preview`
+- 预览版 `/api/status` 返回 `ok=true`
+
 ## v4.2.0 (2026-06-01)
 
 ### 调整

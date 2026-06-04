@@ -779,7 +779,97 @@ button:disabled::before { opacity: 0 !important; animation: none !important; }
   border-radius: var(--radius); padding: 12px 14px;
   white-space: pre-wrap; box-shadow: var(--shadow);
 }
+.message.user .msg-content {
+  white-space: normal;
+}
 .message.guidance .msg-content { border-color: rgba(255,159,10,0.45); }
+.user-text { white-space: pre-wrap; }
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+  white-space: normal;
+}
+.message.user .message-attachments {
+  justify-content: flex-end;
+}
+.message-attachment-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: min(300px, 100%);
+  padding: 2px 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.message-attachment-row {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+.message-attachment-card.is-image {
+  display: inline-grid;
+  justify-items: end;
+  gap: 5px;
+  max-width: min(220px, 100%);
+}
+.message-attachment-thumb {
+  display: block;
+  max-width: min(190px, 100%);
+  max-height: 132px;
+  object-fit: cover;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--line) 82%, transparent);
+  background: var(--panel-soft);
+  box-shadow: var(--shadow-sm);
+}
+.message-attachment-icon {
+  flex: 0 0 auto;
+  min-width: 26px;
+  height: 22px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+.message-attachment-main {
+  min-width: 0;
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: 5px;
+  text-align: right;
+}
+.message-attachment-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-sm);
+  font-weight: 650;
+  max-width: 220px;
+}
+.message-attachment-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  max-width: 72px;
+}
 .msg-content p { margin: 0 0 10px; }
 .msg-content p:last-child { margin-bottom: 0; }
 .msg-content h1, .msg-content h2, .msg-content h3 { margin: 18px 0 8px; line-height: 1.3; }
