@@ -116,12 +116,13 @@ def verify_claude_cli_if_available() -> None:
 
 
 def main() -> int:
-    run([sys.executable, "-m", "py_compile", "server.py", "scripts/build_release.py", "scripts/verify_release.py", "scripts/verify_desktop.py", "scripts/build_desktop.py", "scripts/verify_app.py"])
+    run([sys.executable, "-m", "py_compile", "server.py", "scripts/build_release.py", "scripts/verify_release.py", "scripts/verify_desktop.py", "scripts/build_desktop.py", "scripts/verify_app.py", "scripts/verify_goal_mode.py"])
     if shutil.which("node"):
         run(["node", "--check", "static/app.js"])
         run(["node", "--check", "desktop/main.js"])
         run(["node", "--check", "desktop/preload.js"])
     run([sys.executable, "scripts/verify_desktop.py"])
+    run([sys.executable, "scripts/verify_goal_mode.py"])
     verify_claude_cli_if_available()
     verify_local_api()
     print("Viniper UI full verification passed.")

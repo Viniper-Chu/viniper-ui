@@ -274,6 +274,7 @@ def default_data_dir() -> Path:
 DATA_DIR = default_data_dir()
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
+GOALS_FILE = DATA_DIR / "goals.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 KNOWN_WORK_DIRS = [
     BASE_DIR,
@@ -281,15 +282,18 @@ KNOWN_WORK_DIRS = [
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    await asyncio.to_thread(refresh_windows_shortcuts)
+    if not PREVIEW_MODE:
+        await asyncio.to_thread(refresh_windows_shortcuts)
     yield
 
 
 app = FastAPI(title=APP_TITLE, lifespan=lifespan)
 sessions: dict[str, dict[str, Any]] = {}
+goals: dict[str, dict[str, Any]] = {}
 _skills_cache: dict[str, Any] = {"time": 0.0, "items": []}
 _session_locks: dict[str, asyncio.Lock] = {}
 _active_runs: dict[str, dict[str, Any]] = {}
+_goal_tasks: dict[str, asyncio.Task] = {}
 
 
 def now_ts() -> float:
@@ -368,6 +372,68 @@ def save_sessions_to_disk() -> None:
     tmp_path = SESSIONS_FILE.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(sessions, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(SESSIONS_FILE)
+
+
+GOAL_STATUSES = {"running", "paused", "waiting", "completed", "failed"}
+GOAL_DEFAULT_MAX_TURNS = 12
+GOAL_MAX_TURNS_LIMIT = 100
+GOAL_DONE_MARKER = "[VINIPER_GOAL_DONE]"
+GOAL_CONTINUE_MARKER = "[VINIPER_GOAL_CONTINUE]"
+GOAL_BETWEEN_TURN_DELAY_SECONDS = 2.5
+
+
+def normalize_goal(goal_id: str, raw: dict[str, Any]) -> dict[str, Any]:
+    status = str(raw.get("status") or "paused")
+    if status not in GOAL_STATUSES:
+        status = "paused"
+    max_turns = int(raw.get("max_turns") or GOAL_DEFAULT_MAX_TURNS)
+    max_turns = min(GOAL_MAX_TURNS_LIMIT, max(1, max_turns))
+    return {
+        "id": str(raw.get("id") or goal_id),
+        "session_id": str(raw.get("session_id") or ""),
+        "title": str(raw.get("title") or "目标任务"),
+        "prompt": str(raw.get("prompt") or ""),
+        "status": status,
+        "model": allowed_model(str(raw.get("model") or "")),
+        "permission_mode": allowed_permission_mode(str(raw.get("permission_mode") or DEFAULT_PERMISSION_MODE)),
+        "turn_count": max(0, int(raw.get("turn_count") or 0)),
+        "max_turns": max_turns,
+        "created": float(raw.get("created") or now_ts()),
+        "updated": float(raw.get("updated") or raw.get("created") or now_ts()),
+        "last_run": float(raw.get("last_run") or 0),
+        "last_output": str(raw.get("last_output") or ""),
+        "last_error": str(raw.get("last_error") or ""),
+        "current_step": str(raw.get("current_step") or ""),
+    }
+
+
+def load_goals_from_disk() -> dict[str, dict[str, Any]]:
+    if not GOALS_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(GOALS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    loaded: dict[str, dict[str, Any]] = {}
+    for goal_id, goal in raw.items():
+        if not isinstance(goal, dict):
+            continue
+        normalized = normalize_goal(str(goal_id), goal)
+        if normalized["status"] == "running":
+            normalized["status"] = "paused"
+            normalized["last_error"] = "Viniper UI restarted while this goal was running."
+        loaded[str(goal_id)] = normalized
+    return loaded
+
+
+def save_goals_to_disk() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = GOALS_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(goals, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(GOALS_FILE)
 
 
 def default_settings() -> dict[str, Any]:
@@ -1121,6 +1187,9 @@ def allowed_permission_mode(permission_mode: str | None) -> str:
     return DEFAULT_PERMISSION_MODE
 
 
+goals.update(load_goals_from_disk())
+
+
 def provider_config(model_override: str | None = None) -> dict[str, str]:
     settings = load_app_settings()
     provider = settings.get("provider", {})
@@ -1237,7 +1306,7 @@ def claude_cli_compatibility() -> dict[str, Any]:
 
 
 def refresh_windows_shortcuts() -> None:
-    if os.name != "nt":
+    if os.name != "nt" or PREVIEW_MODE:
         return
     icon = STATIC_DIR / "assets" / "viniper-icon.ico"
     installed_candidates = [
@@ -2004,6 +2073,205 @@ def expand_skill_prompt(prompt: str) -> str:
         "用户请求：\n"
         f"{request}"
     )
+
+
+def public_goal(goal: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": goal.get("id", ""),
+        "session_id": goal.get("session_id", ""),
+        "title": goal.get("title", ""),
+        "prompt": goal.get("prompt", ""),
+        "status": goal.get("status", "paused"),
+        "model": goal.get("model", ""),
+        "permission_mode": goal.get("permission_mode", DEFAULT_PERMISSION_MODE),
+        "turn_count": int(goal.get("turn_count") or 0),
+        "max_turns": int(goal.get("max_turns") or GOAL_DEFAULT_MAX_TURNS),
+        "created": float(goal.get("created") or 0),
+        "updated": float(goal.get("updated") or 0),
+        "last_run": float(goal.get("last_run") or 0),
+        "last_output": str(goal.get("last_output") or "")[-1200:],
+        "last_error": str(goal.get("last_error") or ""),
+        "current_step": str(goal.get("current_step") or ""),
+    }
+
+
+def get_goal_or_404(goal_id: str) -> dict[str, Any]:
+    goal = goals.get(goal_id)
+    if not goal:
+        raise HTTPException(status_code=404, detail="goal not found")
+    normalized = normalize_goal(goal_id, goal)
+    goals[goal_id] = normalized
+    return normalized
+
+
+def sse_payloads(chunk: str) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for part in str(chunk or "").split("\n\n"):
+        for line in part.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+    return payloads
+
+
+def build_goal_turn_prompt(goal: dict[str, Any], turn_number: int) -> str:
+    original = str(goal.get("prompt") or "").strip()
+    last_output = str(goal.get("last_output") or "").strip()
+    last_section = f"\nPrevious goal-mode output:\n{last_output[-2000:]}\n" if last_output else ""
+    return (
+        "Viniper UI Goal Mode is an outer controller for the current conversation. "
+        "Continue working on the user's long-running goal through the configured agent shell. "
+        "Keep the normal answer useful and concise, use tools when needed, and do not invent completed work.\n\n"
+        f"Original goal:\n{original}\n"
+        f"{last_section}\n"
+        f"This is turn {turn_number} of at most {goal.get('max_turns') or GOAL_DEFAULT_MAX_TURNS}.\n"
+        f"If the goal is fully complete, end the final line with {GOAL_DONE_MARKER}. "
+        f"If more work remains and Viniper UI should continue another turn, end the final line with {GOAL_CONTINUE_MARKER}."
+    )
+
+
+def goal_output_is_done(output: str) -> bool:
+    value = str(output or "")
+    if GOAL_DONE_MARKER in value:
+        return True
+    if GOAL_CONTINUE_MARKER in value:
+        return False
+    tail = value[-500:].lower()
+    complete_terms = ["goal complete", "task complete", "completed", "已完成", "完成了", "全部完成"]
+    return any(term in tail for term in complete_terms)
+
+
+def start_goal_task(goal_id: str) -> None:
+    task = _goal_tasks.get(goal_id)
+    if task and not task.done():
+        return
+    _goal_tasks[goal_id] = asyncio.create_task(run_goal_loop(goal_id))
+
+
+async def stop_goal_task(goal_id: str, goal: dict[str, Any] | None = None) -> None:
+    task = _goal_tasks.pop(goal_id, None)
+    if task and not task.done():
+        task.cancel()
+    target_goal = goal or goals.get(goal_id)
+    if target_goal:
+        run = _active_runs.get(str(target_goal.get("session_id") or ""))
+        if run:
+            try:
+                await kill_process_tree(int(run.get("pid") or 0))
+            except Exception:
+                pass
+            force_release_session_lock(str(target_goal.get("session_id") or ""))
+
+
+async def run_goal_loop(goal_id: str) -> None:
+    await asyncio.sleep(0.1)
+    try:
+        while True:
+            goal = goals.get(goal_id)
+            if not goal or goal.get("status") != "running":
+                return
+
+            goal = normalize_goal(goal_id, goal)
+            if goal["turn_count"] >= goal["max_turns"]:
+                goal["status"] = "waiting"
+                goal["current_step"] = "Reached the configured turn limit. Resume to continue."
+                goal["updated"] = now_ts()
+                goals[goal_id] = goal
+                save_goals_to_disk()
+                return
+
+            turn_number = int(goal["turn_count"]) + 1
+            goal["current_step"] = f"Running turn {turn_number}"
+            goal["last_run"] = now_ts()
+            goal["last_error"] = ""
+            goal["updated"] = now_ts()
+            goals[goal_id] = goal
+            save_goals_to_disk()
+
+            output_parts: list[str] = []
+            error_text = ""
+            prompt = build_goal_turn_prompt(goal, turn_number)
+            async for chunk in stream_chat(
+                str(goal.get("session_id") or ""),
+                prompt,
+                True,
+                str(goal.get("model") or ""),
+                str(goal.get("permission_mode") or DEFAULT_PERMISSION_MODE),
+                [],
+            ):
+                for payload in sse_payloads(chunk):
+                    content = str(payload.get("content") or "")
+                    if payload.get("type") in {"text", "thinking"} and content:
+                        output_parts.append(content)
+                    elif payload.get("type") == "error":
+                        error_text = content or "Goal turn failed."
+                        output_parts.append(error_text)
+                current = goals.get(goal_id)
+                if not current or current.get("status") != "running":
+                    return
+
+            goal = goals.get(goal_id)
+            if not goal:
+                return
+            goal = normalize_goal(goal_id, goal)
+            goal["turn_count"] = int(goal.get("turn_count") or 0) + 1
+            output = clean_stream_text("".join(output_parts)).strip()
+            goal["last_output"] = output[-4000:]
+            goal["updated"] = now_ts()
+
+            if error_text:
+                goal["status"] = "failed"
+                goal["last_error"] = error_text[:1200]
+                goal["current_step"] = "Stopped after an error."
+                goals[goal_id] = goal
+                save_goals_to_disk()
+                return
+
+            if goal_output_is_done(output):
+                goal["status"] = "completed"
+                goal["current_step"] = "Completed."
+                goals[goal_id] = goal
+                save_goals_to_disk()
+                return
+
+            if int(goal["turn_count"]) >= int(goal["max_turns"]):
+                goal["status"] = "waiting"
+                goal["current_step"] = "Reached the configured turn limit. Resume to continue."
+                goals[goal_id] = goal
+                save_goals_to_disk()
+                return
+
+            goal["current_step"] = f"Turn {turn_number} finished; starting the next turn shortly."
+            goals[goal_id] = goal
+            save_goals_to_disk()
+            await asyncio.sleep(GOAL_BETWEEN_TURN_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        goal = goals.get(goal_id)
+        if goal and goal.get("status") == "running":
+            goal["status"] = "paused"
+            goal["current_step"] = "Paused."
+            goal["updated"] = now_ts()
+            goals[goal_id] = goal
+            save_goals_to_disk()
+        raise
+    except Exception as exc:
+        goal = goals.get(goal_id)
+        if goal:
+            goal["status"] = "failed"
+            goal["last_error"] = str(exc)[:1200]
+            goal["current_step"] = "Goal runner failed."
+            goal["updated"] = now_ts()
+            goals[goal_id] = goal
+            save_goals_to_disk()
+    finally:
+        task = _goal_tasks.get(goal_id)
+        if task is asyncio.current_task():
+            _goal_tasks.pop(goal_id, None)
 
 
 async def stream_chat(
@@ -3316,6 +3584,102 @@ async def cancel_chat(session_id: str):
     return {"ok": True, "cancelled": True}
 
 
+@app.get("/api/goals")
+async def list_goals(session_id: str | None = None):
+    goal_items = []
+    for goal_id, goal in list(goals.items()):
+        normalized = normalize_goal(goal_id, goal)
+        goals[goal_id] = normalized
+        if session_id and normalized.get("session_id") != session_id:
+            continue
+        goal_items.append(public_goal(normalized))
+    goal_items.sort(key=lambda item: item.get("updated", item.get("created", 0)), reverse=True)
+    return {"ok": True, "goals": goal_items}
+
+
+@app.post("/api/goals")
+async def create_goal(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="goal body must be an object")
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="goal prompt is required")
+    session_id = str(body.get("session_id") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+    safe_session(session_id)
+
+    title = str(body.get("title") or "").strip()
+    if not title:
+        title = prompt.splitlines()[0][:40] or "目标任务"
+
+    goal_id = str(uuid.uuid4())[:8]
+    while goal_id in goals:
+        goal_id = str(uuid.uuid4())[:8]
+    now = now_ts()
+    goal = normalize_goal(goal_id, {
+        "id": goal_id,
+        "session_id": session_id,
+        "title": title,
+        "prompt": prompt,
+        "status": "running" if body.get("auto_start", True) else "paused",
+        "model": allowed_model(str(body.get("model") or "")),
+        "permission_mode": allowed_permission_mode(str(body.get("permission_mode") or DEFAULT_PERMISSION_MODE)),
+        "turn_count": 0,
+        "max_turns": int(body.get("max_turns") or GOAL_DEFAULT_MAX_TURNS),
+        "created": now,
+        "updated": now,
+        "current_step": "Queued." if body.get("auto_start", True) else "Paused before first turn.",
+    })
+    goals[goal_id] = goal
+    save_goals_to_disk()
+    if goal["status"] == "running":
+        start_goal_task(goal_id)
+    return {"ok": True, "goal": public_goal(goal)}
+
+
+@app.get("/api/goals/{goal_id}")
+async def get_goal(goal_id: str):
+    return {"ok": True, "goal": public_goal(get_goal_or_404(goal_id))}
+
+
+@app.post("/api/goals/{goal_id}/resume")
+async def resume_goal(goal_id: str):
+    goal = get_goal_or_404(goal_id)
+    goal["status"] = "running"
+    goal["last_error"] = ""
+    goal["current_step"] = "Queued."
+    goal["updated"] = now_ts()
+    goals[goal_id] = goal
+    save_goals_to_disk()
+    start_goal_task(goal_id)
+    return {"ok": True, "goal": public_goal(goal)}
+
+
+@app.post("/api/goals/{goal_id}/pause")
+async def pause_goal(goal_id: str):
+    goal = get_goal_or_404(goal_id)
+    goal["status"] = "paused"
+    goal["current_step"] = "Paused."
+    goal["updated"] = now_ts()
+    goals[goal_id] = goal
+    save_goals_to_disk()
+    await stop_goal_task(goal_id, goal)
+    return {"ok": True, "goal": public_goal(goal)}
+
+
+@app.delete("/api/goals/{goal_id}")
+async def delete_goal(goal_id: str):
+    goal = goals.get(goal_id)
+    if goal:
+        await stop_goal_task(goal_id, goal)
+    existed = goal_id in goals
+    goals.pop(goal_id, None)
+    save_goals_to_disk()
+    return {"ok": True, "deleted": existed}
+
+
 @app.post("/api/sessions")
 async def new_session(request: Request):
     body: dict[str, Any] = {}
@@ -3563,7 +3927,13 @@ def _startup_cleanup() -> None:
             msg.pop("pending", None)
         if session.get("messages"):
             session["updated"] = now_ts()
+    for goal in goals.values():
+        if goal.get("status") == "running":
+            goal["status"] = "paused"
+            goal["current_step"] = "Paused after Viniper UI restart."
+            goal["updated"] = now_ts()
     save_sessions_to_disk()
+    save_goals_to_disk()
     _session_locks.clear()
     print(f"  Startup cleanup: {len(sessions)} sessions normalized.")
 

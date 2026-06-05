@@ -25,6 +25,10 @@ const state = {
   abortController: null,
   cancelRequested: false,
   followOutput: true,
+  goals: [],
+  goalPollTimer: null,
+  goalSnapshot: new Map(),
+  goalRefreshingSession: false,
   folderPicker: {
     targetSelector: "",
     currentPath: "",
@@ -344,6 +348,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     await loadStatus();
     if ($("#skills-panel")) await loadSkills();
     await restoreLastSession();
+    await loadGoals();
+    startGoalPolling();
     checkForUpdates({ silent: true });
   } finally {
     hideLaunchSplash();
@@ -389,8 +395,20 @@ function bindEvents() {
 
   $("#send-btn").addEventListener("click", () => sendMessage());
   $("#stop-btn").addEventListener("click", cancelCurrentTask);
-  $("#file-btn").addEventListener("click", () => $("#file-input").click());
+  $("#file-btn").addEventListener("click", togglePlusMenu);
   $("#file-input").addEventListener("change", handleFileAttach);
+  $("#plus-menu").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-plus-action]");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    closePlusMenu();
+    if (button.dataset.plusAction === "attach") {
+      $("#file-input").click();
+    } else if (button.dataset.plusAction === "goal") {
+      openGoalModal();
+    }
+  });
   $("#toggle-sidebar-btn").addEventListener("click", toggleSidebar);
   const topbarPinButton = $("#always-on-top-btn");
   if (topbarPinButton) topbarPinButton.addEventListener("click", toggleAlwaysOnTop);
@@ -424,6 +442,8 @@ function bindEvents() {
     storageSet(PERMISSION_KEY, state.permissionMode);
   });
   $("#context-compress-btn").addEventListener("click", compressCurrentContext);
+  $("#cancel-goal-btn").addEventListener("click", closeGoalModal);
+  $("#create-goal-btn").addEventListener("click", createGoalFromModal);
   $("#cancel-session-btn").addEventListener("click", closeNewSessionModal);
   $("#create-session-btn").addEventListener("click", createNamedSession);
   $("#cancel-delete-session-btn").addEventListener("click", () => closeDeleteSessionModal(false));
@@ -470,6 +490,8 @@ function bindEvents() {
     if (event.key === "Escape") {
       closePermissionModal(false);
       closeFolderPicker();
+      closePlusMenu();
+      closeGoalModal();
       closeNewSessionModal();
       closeDeleteSessionModal(false);
       closeRenameSessionModal(null);
@@ -510,6 +532,18 @@ function bindEvents() {
   };
 
   document.addEventListener("click", (event) => {
+    if (!event.target.closest("#plus-menu") && !event.target.closest("#file-btn")) {
+      closePlusMenu();
+    }
+
+    const goalButton = event.target.closest("[data-goal-action]");
+    if (goalButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      handleGoalAction(goalButton.dataset.goalAction, goalButton.dataset.goalId);
+      return;
+    }
+
     const renameButton = event.target.closest("[data-rename-session]");
     if (renameButton) renameSession(renameButton, event);
   });
@@ -723,6 +757,216 @@ async function openSkillsWeb() {
     return;
   }
   window.open("https://www.skills.sh", "_blank", "noopener,noreferrer");
+}
+
+function togglePlusMenu(event) {
+  event?.preventDefault?.();
+  event?.stopPropagation?.();
+  const menu = $("#plus-menu");
+  if (!menu) return;
+  menu.classList.toggle("hidden");
+}
+
+function closePlusMenu() {
+  const menu = $("#plus-menu");
+  if (menu) menu.classList.add("hidden");
+}
+
+function goalPermissionMode() {
+  if (state.permissionMode === "ask") return "default";
+  if (state.permissionMode === "auto") return "auto";
+  if (state.permissionMode === "bypassPermissions") return "bypassPermissions";
+  return state.permissionMode || "default";
+}
+
+function openGoalModal() {
+  if (!state.sessionId) {
+    alert("请先创建或打开一个会话。");
+    return;
+  }
+  const currentText = $("#user-input").value.trim();
+  $("#goal-prompt").value = currentText;
+  $("#goal-max-turns").value = "12";
+  $("#goal-modal").classList.remove("hidden");
+  $("#goal-prompt").focus();
+  if (currentText) $("#goal-prompt").select();
+}
+
+function closeGoalModal() {
+  const modal = $("#goal-modal");
+  if (modal) modal.classList.add("hidden");
+}
+
+async function createGoalFromModal() {
+  if (!state.sessionId) return;
+  const prompt = $("#goal-prompt").value.trim();
+  const maxTurns = Math.max(1, Math.min(100, Number($("#goal-max-turns").value) || 12));
+  if (!prompt) {
+    alert("请先写清楚目标。");
+    $("#goal-prompt").focus();
+    return;
+  }
+
+  const button = $("#create-goal-btn");
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = "创建中";
+  try {
+    const response = await fetch("/api/goals", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: state.sessionId,
+        prompt,
+        model: state.selectedModel,
+        permission_mode: goalPermissionMode(),
+        max_turns: maxTurns,
+        auto_start: true
+      })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.detail || `HTTP ${response.status}`);
+    }
+    closeGoalModal();
+    await loadGoals();
+  } catch (error) {
+    alert(`目标任务创建失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = oldText;
+  }
+}
+
+function goalsChangedForCurrentSession(nextGoals = []) {
+  const nextSnapshot = new Map();
+  let changed = false;
+  for (const goal of nextGoals) {
+    const key = String(goal.id || "");
+    if (!key) continue;
+    const value = [
+      goal.status || "",
+      Number(goal.turn_count || 0),
+      goal.current_step || "",
+      Number(goal.updated || 0)
+    ].join("|");
+    nextSnapshot.set(key, value);
+    if (state.goalSnapshot.get(key) !== value) changed = true;
+  }
+  if (state.goalSnapshot.size !== nextSnapshot.size) changed = true;
+  state.goalSnapshot = nextSnapshot;
+  return changed;
+}
+
+async function refreshCurrentSessionMessages() {
+  if (!state.sessionId || state.goalRefreshingSession || state.isStreaming) return;
+  state.goalRefreshingSession = true;
+  const shouldStick = isNearChatBottom();
+  try {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}`);
+    if (!response.ok) return;
+    const data = await response.json();
+    applySession(state.sessionId, data);
+    if (shouldStick) scrollBottom();
+  } catch {
+  } finally {
+    state.goalRefreshingSession = false;
+  }
+}
+
+async function loadGoals({ refreshMessages = true } = {}) {
+  if (!state.sessionId) {
+    state.goals = [];
+    state.goalSnapshot = new Map();
+    renderGoalPanel();
+    return;
+  }
+  let nextGoals = [];
+  try {
+    const response = await fetch(`/api/goals?session_id=${encodeURIComponent(state.sessionId)}`);
+    const data = await response.json();
+    nextGoals = Array.isArray(data.goals) ? data.goals : [];
+  } catch {
+    nextGoals = [];
+  }
+  const changed = goalsChangedForCurrentSession(nextGoals);
+  state.goals = nextGoals;
+  renderGoalPanel();
+  if (refreshMessages && changed && nextGoals.some((goal) => ["running", "waiting", "completed", "failed"].includes(goal.status))) {
+    await refreshCurrentSessionMessages();
+  }
+}
+
+function startGoalPolling() {
+  if (state.goalPollTimer) return;
+  state.goalPollTimer = window.setInterval(() => {
+    if (!state.sessionId) return;
+    if (!state.goals.length || state.goals.some((goal) => ["running", "waiting"].includes(goal.status))) {
+      loadGoals({ refreshMessages: true });
+    }
+  }, 1600);
+}
+
+function goalStatusLabel(status) {
+  const labels = {
+    running: "运行中",
+    paused: "已暂停",
+    waiting: "待继续",
+    completed: "已完成",
+    failed: "失败"
+  };
+  return labels[status] || status || "未知";
+}
+
+function renderGoalPanel() {
+  const panel = $("#goal-panel");
+  if (!panel) return;
+  const visibleGoals = (state.goals || []).filter(Boolean);
+  panel.classList.toggle("hidden", !visibleGoals.length);
+  if (!visibleGoals.length) {
+    panel.innerHTML = "";
+    return;
+  }
+  panel.innerHTML = visibleGoals.map((goal) => {
+    const canPause = goal.status === "running";
+    const canResume = ["paused", "waiting", "failed"].includes(goal.status);
+    return `
+      <div class="goal-card ${escapeAttr(goal.status || "paused")}">
+        <div class="goal-main">
+          <span class="goal-dot" aria-hidden="true"></span>
+          <span class="goal-title-text">${escapeHtml(goal.prompt || goal.title || "目标任务")}</span>
+          <span class="goal-meta">${escapeHtml(goalStatusLabel(goal.status))} · ${Number(goal.turn_count || 0)}/${Number(goal.max_turns || 0)}</span>
+          ${goal.current_step ? `<span class="goal-step">${escapeHtml(goal.current_step)}</span>` : ""}
+        </div>
+        <div class="goal-actions">
+          ${canPause ? `<button class="mini-button" type="button" data-goal-action="pause" data-goal-id="${escapeAttr(goal.id)}">暂停</button>` : ""}
+          ${canResume ? `<button class="mini-button" type="button" data-goal-action="resume" data-goal-id="${escapeAttr(goal.id)}">继续</button>` : ""}
+          <button class="mini-button danger" type="button" data-goal-action="delete" data-goal-id="${escapeAttr(goal.id)}">删除</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+async function handleGoalAction(action, goalId) {
+  if (!action || !goalId) return;
+  const method = action === "delete" ? "DELETE" : "POST";
+  const url = action === "delete"
+    ? `/api/goals/${encodeURIComponent(goalId)}`
+    : `/api/goals/${encodeURIComponent(goalId)}/${encodeURIComponent(action)}`;
+  try {
+    const response = await fetch(url, { method });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.detail || `HTTP ${response.status}`);
+    }
+    await loadGoals();
+    if (action === "resume") {
+      await switchSession(state.sessionId, { quiet: true });
+    }
+  } catch (error) {
+    alert(`目标任务操作失败：${error.message}`);
+  }
 }
 
 async function loadStatus() {
@@ -1308,6 +1552,7 @@ async function createSession({ silent = false, name = "", workdir = "" } = {}) {
   updateContextMeter();
   rememberSession(state.sessionId);
   await loadSessionList();
+  await loadGoals();
   if (!silent) $("#user-input").focus();
 }
 
@@ -1433,6 +1678,7 @@ async function switchSession(sessionId, { quiet = false } = {}) {
   applySession(sessionId, data);
   rememberSession(sessionId);
   await loadSessionList();
+  await loadGoals();
   scrollBottom();
   if (!quiet) $("#user-input").focus();
   return true;
