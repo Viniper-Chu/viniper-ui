@@ -228,6 +228,13 @@ APP_DIR = Path(__file__).resolve().parent
 BASE_DIR = APP_DIR.parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_SKILLS_DIR = BASE_DIR / ".claude" / "skills"
+PROJECT_SKILLS_DIRS = [
+    PROJECT_SKILLS_DIR,
+    APP_DIR / ".claude" / "skills",
+    APP_DIR / ".agents" / "skills",
+    BASE_DIR / ".agents" / "skills",
+]
+GOAL_SKILL_COMMAND = "dbs-goal"
 USER_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 LEGACY_DATA_DIR = APP_DIR / "data"
 
@@ -2013,7 +2020,7 @@ def is_action_task_prompt(prompt: str) -> bool:
 
 
 def skill_aliases(skill: dict[str, str]) -> set[str]:
-    filename_stem = Path(skill.get("filename", "")).stem
+    filename_stem = str(skill.get("id") or Path(skill.get("filename", "")).stem)
     command = str(skill.get("command") or "")
     display_name = str(skill.get("name") or "")
     aliases = {command, filename_stem, display_name}
@@ -2056,7 +2063,9 @@ def expand_skill_prompt(prompt: str) -> str:
         return prompt
 
     skill, rest = parsed
-    path = PROJECT_SKILLS_DIR / str(skill["filename"])
+    path = skill_file_from_record(skill)
+    if not path:
+        return prompt
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -2119,19 +2128,120 @@ def sse_payloads(chunk: str) -> list[dict[str, Any]]:
     return payloads
 
 
+def unique_skill_dirs() -> list[Path]:
+    seen: set[str] = set()
+    dirs: list[Path] = []
+    for path in PROJECT_SKILLS_DIRS:
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(path)
+    return dirs
+
+
+def skill_id_from_path(path: Path) -> str:
+    return path.parent.name if path.name.lower() == "skill.md" else path.stem
+
+
+def skill_display_path(path: Path) -> str:
+    for root in (APP_DIR, BASE_DIR):
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            continue
+    return str(path)
+
+
+def skill_file_from_record(skill: dict[str, str]) -> Path | None:
+    absolute = str(skill.get("absolute_path") or "").strip()
+    if absolute:
+        path = Path(absolute)
+        if path.exists() and path.is_file():
+            return path
+    filename = str(skill.get("filename") or "").strip()
+    if filename:
+        for directory in unique_skill_dirs():
+            candidates = [
+                directory / filename,
+                directory / skill.get("id", "") / filename,
+                directory / skill.get("id", "") / "SKILL.md",
+            ]
+            for candidate in candidates:
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+    return None
+
+
+def find_skill(command: str) -> dict[str, str] | None:
+    token = command.strip().lstrip("/").lower()
+    if not token:
+        return None
+    for skill in get_skills():
+        if token in skill_aliases(skill):
+            return skill
+    return None
+
+
+def read_skill_content(command: str, limit: int | None = None) -> str:
+    skill = find_skill(command)
+    if not skill:
+        return ""
+    path = skill_file_from_record(skill)
+    if not path:
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+    if limit and len(content) > limit:
+        return content[:limit].rstrip() + "\n\n[skill truncated for goal-mode context]"
+    return content
+
+
+def goal_skill_section() -> str:
+    content = read_skill_content(GOAL_SKILL_COMMAND, limit=18000)
+    if not content:
+        return (
+            "Goal refinement protocol:\n"
+            "- Audit the goal for vague words, missing deliverables, missing failure conditions, and missing next actions.\n"
+            "- Each turn must deepen or verify the previous turn instead of repeating it.\n"
+        )
+    return (
+        f"Embedded goal skill: {GOAL_SKILL_COMMAND}\n"
+        "Use this skill as the goal-refinement protocol, but adapt it to autonomous goal mode: "
+        "when the skill asks to pause for user input, first infer from files, command output, and previous turns; "
+        "ask the user only if the missing information blocks further work.\n"
+        "<goal-skill>\n"
+        f"{content}\n"
+        "</goal-skill>\n"
+    )
+
+
 def build_goal_turn_prompt(goal: dict[str, Any], turn_number: int) -> str:
     original = str(goal.get("prompt") or "").strip()
     last_output = str(goal.get("last_output") or "").strip()
-    last_section = f"\nPrevious goal-mode output:\n{last_output[-2000:]}\n" if last_output else ""
+    last_section = f"\nPrevious goal-mode output to improve, not repeat:\n{last_output[-3500:]}\n" if last_output else ""
+    max_turns = int(goal.get("max_turns") or GOAL_DEFAULT_MAX_TURNS)
+    phase = "初始审计" if turn_number <= 1 else ("递进深化" if turn_number < max_turns else "最终收束")
     return (
-        "Viniper UI Goal Mode is an outer controller for the current conversation. "
-        "Continue working on the user's long-running goal through the configured agent shell. "
-        "Keep the normal answer useful and concise, use tools when needed, and do not invent completed work.\n\n"
+        "Viniper UI Goal Mode is a hidden outer controller for the current conversation. "
+        "Continue the user's long-running goal through the configured agent shell. "
+        "The visible reply should be useful and concise. Use tools when needed. Do not invent completed work.\n\n"
+        f"{goal_skill_section()}\n"
         f"Original goal:\n{original}\n"
         f"{last_section}\n"
-        f"This is turn {turn_number} of at most {goal.get('max_turns') or GOAL_DEFAULT_MAX_TURNS}.\n"
-        f"If the goal is fully complete, end the final line with {GOAL_DONE_MARKER}. "
-        f"If more work remains and Viniper UI should continue another turn, end the final line with {GOAL_CONTINUE_MARKER}."
+        f"Turn: {turn_number} / {max_turns}. Phase: {phase}.\n\n"
+        "Required behavior for this turn:\n"
+        "1. Start from the original goal and the previous output. Identify the single most important ambiguity, risk, or incomplete deliverable that remains.\n"
+        "2. Apply the dbs-goal idea of making every vague word do work: define the checkable artifact, failure condition, next action, and verification evidence for this turn.\n"
+        "3. Execute the next concrete improvement or verification step. Do not merely restate the goal and do not repeat earlier work unless verification shows it was wrong.\n"
+        "4. At the end of the visible answer, briefly report: this turn's finding, this turn's concrete improvement, what remains next.\n"
+        "5. Only mark the goal done when the deliverable is actually complete and verified. If the goal is complete, end the final hidden line with "
+        f"{GOAL_DONE_MARKER}. If further refinement or execution remains, end the final hidden line with {GOAL_CONTINUE_MARKER}."
     )
 
 
@@ -2141,9 +2251,58 @@ def goal_output_is_done(output: str) -> bool:
         return True
     if GOAL_CONTINUE_MARKER in value:
         return False
-    tail = value[-500:].lower()
-    complete_terms = ["goal complete", "task complete", "completed", "已完成", "完成了", "全部完成"]
-    return any(term in tail for term in complete_terms)
+    return False
+
+
+def strip_goal_control_markers(value: str) -> str:
+    return (
+        str(value or "")
+        .replace(GOAL_DONE_MARKER, "")
+        .replace(GOAL_CONTINUE_MARKER, "")
+        .strip()
+    )
+
+
+def is_leaked_goal_control_message(message: dict[str, Any]) -> bool:
+    if message.get("role") != "user":
+        return False
+    content = str(message.get("content") or "")
+    return "[GUIDANCE]" in content and "Viniper UI Goal Mode" in content and "Original goal:" in content
+
+
+def sanitize_goal_session_messages(session_id: str) -> None:
+    session = safe_session(session_id)
+    changed = False
+    messages = []
+    for message in list(session.get("messages", [])):
+        if isinstance(message, dict) and is_leaked_goal_control_message(message):
+            changed = True
+            continue
+        messages.append(message)
+    session["messages"] = messages
+
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for key in ("content", "thinking"):
+            if key in message:
+                cleaned = strip_goal_control_markers(str(message.get(key) or ""))
+                if cleaned != message.get(key):
+                    message[key] = cleaned
+                    changed = True
+        for segment in message.get("segments") or []:
+            if not isinstance(segment, dict) or "content" not in segment:
+                continue
+            cleaned = strip_goal_control_markers(str(segment.get("content") or ""))
+            if cleaned != segment.get("content"):
+                segment["content"] = cleaned
+                changed = True
+        break
+
+    if changed:
+        session["updated"] = now_ts()
+        sessions[session_id] = session
+        save_sessions_to_disk()
 
 
 def start_goal_task(goal_id: str) -> None:
@@ -2203,6 +2362,7 @@ async def run_goal_loop(goal_id: str) -> None:
                 str(goal.get("model") or ""),
                 str(goal.get("permission_mode") or DEFAULT_PERMISSION_MODE),
                 [],
+                suppress_user_message=True,
             ):
                 for payload in sse_payloads(chunk):
                     content = str(payload.get("content") or "")
@@ -2218,9 +2378,10 @@ async def run_goal_loop(goal_id: str) -> None:
             goal = goals.get(goal_id)
             if not goal:
                 return
+            sanitize_goal_session_messages(str(goal.get("session_id") or ""))
             goal = normalize_goal(goal_id, goal)
             goal["turn_count"] = int(goal.get("turn_count") or 0) + 1
-            output = clean_stream_text("".join(output_parts)).strip()
+            output = strip_goal_control_markers(clean_stream_text("".join(output_parts))).strip()
             goal["last_output"] = output[-4000:]
             goal["updated"] = now_ts()
 
@@ -2281,6 +2442,7 @@ async def stream_chat(
     model: str | None = None,
     permission_mode: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
+    suppress_user_message: bool = False,
 ):
     lock = session_lock(session_id)
     try:
@@ -2293,7 +2455,15 @@ async def stream_chat(
         yield sse({"type": "done"})
         return
     try:
-        async for chunk in stream_chat_impl(session_id, user_msg, is_guidance, model, permission_mode, attachments or []):
+        async for chunk in stream_chat_impl(
+            session_id,
+            user_msg,
+            is_guidance,
+            model,
+            permission_mode,
+            attachments or [],
+            suppress_user_message=suppress_user_message,
+        ):
             yield chunk
     finally:
         try:
@@ -3100,9 +3270,25 @@ async def stream_chat_impl(
 
 
 def list_skill_files() -> list[Path]:
-    if not PROJECT_SKILLS_DIR.exists():
-        return []
-    return sorted(p for p in PROJECT_SKILLS_DIR.iterdir() if p.is_file() and p.suffix.lower() == ".md")
+    files: list[Path] = []
+    seen: set[str] = set()
+    for directory in unique_skill_dirs():
+        if not directory.exists():
+            continue
+        candidates = [
+            *(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".md"),
+            *(p for p in directory.glob("*/SKILL.md") if p.is_file()),
+        ]
+        for path in candidates:
+            try:
+                key = str(path.resolve())
+            except Exception:
+                key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(path)
+    return sorted(files, key=lambda item: (skill_id_from_path(item).lower(), str(item).lower()))
 
 
 def skill_metadata(content: str) -> dict[str, str]:
@@ -3133,7 +3319,7 @@ def get_skills() -> list[dict[str, str]]:
 
     skills: list[dict[str, str]] = []
     for path in list_skill_files():
-        name = path.stem
+        name = skill_id_from_path(path)
         category = name.split("_", 1)[0] if "_" in name else "其他"
         title = name
         desc = ""
@@ -3153,12 +3339,14 @@ def get_skills() -> list[dict[str, str]]:
                 break
         skills.append(
             {
+                "id": name,
                 "filename": path.name,
                 "name": title,
                 "command": command,
                 "category": category,
                 "description": desc,
-                "path": str(path.relative_to(BASE_DIR)),
+                "path": skill_display_path(path),
+                "absolute_path": str(path),
             }
         )
 
@@ -3751,6 +3939,7 @@ async def last_session():
 async def get_session(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="session not found")
+    sanitize_goal_session_messages(session_id)
     session = safe_session(session_id)
     return clean_payload_value({
         "session_id": session_id,
@@ -3923,8 +4112,13 @@ def _startup_cleanup() -> None:
     """Clear stale pending flags and force-release any held session locks."""
     load_sessions_from_disk()
     for sid, session in sessions.items():
+        cleaned_messages = []
         for msg in session.get("messages", []):
+            if isinstance(msg, dict) and is_leaked_goal_control_message(msg):
+                continue
             msg.pop("pending", None)
+            cleaned_messages.append(msg)
+        session["messages"] = cleaned_messages
         if session.get("messages"):
             session["updated"] = now_ts()
     for goal in goals.values():

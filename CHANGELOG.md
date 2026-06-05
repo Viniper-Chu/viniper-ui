@@ -1,3 +1,19 @@
+## v4.3.1 (2026-06-05)
+
+### 调整
+- **递进式目标模式**：目标模式默认嵌入 `dbs-goal` 目标清晰化协议，每轮都会基于上一轮产出继续审查模糊词、交付物、失败条件、下一步行动和验证证据，避免重复执行同一条指令。
+- **Skill 兼容路径**：技能扫描同时支持 `.claude/skills` 与 `npx skills add` 生成的 `.agents/skills/*/SKILL.md`，并把 `dbs-goal` 一并打进源码包和桌面更新包。
+
+### 修复
+- **目标模式计时实时显示**：后台目标任务产生的 pending 思考段现在会在前端本地每秒刷新 `Thinking` / `Total` 时间，不再等到思考结束后才突然跳出最终数字。
+
+### 验证
+- `python scripts/verify_goal_mode.py`
+- `node --check static/app.js`
+- `python -m py_compile server.py scripts/verify_goal_mode.py scripts/verify_app.py scripts/build_release.py`
+- `node --check desktop/main.js`
+- `node --check desktop/preload.js`
+
 ## v4.3.0 (2026-06-05)
 
 ### 新增

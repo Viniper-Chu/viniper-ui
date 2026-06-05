@@ -7,6 +7,7 @@ import importlib
 import os
 import sys
 import tempfile
+import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -50,7 +51,65 @@ def main() -> int:
         prompt = server.build_goal_turn_prompt(created, 1)
         assert "Claude Code" not in prompt
         assert "current conversation" in prompt
+        assert "dbs-goal" in prompt
+        assert "Do not merely restate the goal" in prompt
+        assert "single most important ambiguity" in prompt
+        assert any("dbs-goal" in server.skill_aliases(skill) for skill in server.get_skills())
+        next_prompt_goal = dict(created)
+        next_prompt_goal["last_output"] = "First pass found a vague deliverable but did not verify it."
+        next_prompt = server.build_goal_turn_prompt(next_prompt_goal, 2)
+        assert "Previous goal-mode output to improve, not repeat" in next_prompt
+        assert "First pass found a vague deliverable" in next_prompt
         assert server.GOAL_BETWEEN_TURN_DELAY_SECONDS >= 2.0
+        assert server.goal_output_is_done("I will continue improving this.") is False
+        assert server.goal_output_is_done(f"Finished.\n{server.GOAL_DONE_MARKER}") is True
+
+        captured: dict[str, object] = {}
+        original_stream_chat_impl = server.stream_chat_impl
+
+        async def fake_stream_chat_impl(*args, **kwargs):
+            captured["suppress_user_message"] = kwargs.get("suppress_user_message")
+            yield server.sse({"type": "done"})
+
+        server.stream_chat_impl = fake_stream_chat_impl
+        try:
+            async def collect_hidden_guidance() -> None:
+                chunks = []
+                async for chunk in server.stream_chat(
+                    session_id,
+                    "hidden goal controller prompt",
+                    True,
+                    "deepseek-v4-pro[1m]",
+                    "default",
+                    [],
+                    suppress_user_message=True,
+                ):
+                    chunks.append(chunk)
+                assert chunks
+
+            asyncio.run(collect_hidden_guidance())
+        finally:
+            server.stream_chat_impl = original_stream_chat_impl
+
+        assert captured.get("suppress_user_message") is True
+
+        server.sessions[session_id]["messages"] = [
+            {
+                "role": "user",
+                "content": "[GUIDANCE] Viniper UI Goal Mode is an outer controller.\n\nOriginal goal:\nsecret control text",
+            },
+            {
+                "role": "assistant",
+                "content": f"Visible answer {server.GOAL_CONTINUE_MARKER}",
+                "segments": [{"type": "text", "content": f"Visible answer {server.GOAL_CONTINUE_MARKER}"}],
+            },
+        ]
+        server.sanitize_goal_session_messages(session_id)
+        cleaned_messages = server.sessions[session_id]["messages"]
+        assert len(cleaned_messages) == 1
+        assert cleaned_messages[0]["role"] == "assistant"
+        assert server.GOAL_CONTINUE_MARKER not in cleaned_messages[0]["content"]
+        assert server.GOAL_CONTINUE_MARKER not in cleaned_messages[0]["segments"][0]["content"]
 
         list_response = client.get("/api/goals")
         assert list_response.status_code == 200, list_response.text

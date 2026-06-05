@@ -25,9 +25,11 @@ APP_FILES = [
     "README.md",
     "LICENSE",
     "start.bat",
+    "skills-lock.json",
     "update_source.example.json",
 ]
 APP_DIRS = [
+    ".agents",
     "static",
     "scripts",
     "desktop",

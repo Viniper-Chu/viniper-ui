@@ -27,6 +27,7 @@ const state = {
   followOutput: true,
   goals: [],
   goalPollTimer: null,
+  storedThinkingTimer: null,
   goalSnapshot: new Map(),
   goalRefreshingSession: false,
   folderPicker: {
@@ -1792,6 +1793,7 @@ function renderWelcome() {
 function renderAllMessages() {
   if (!state.messages.length) {
     renderWelcome();
+    updateStoredThinkingTimer();
     return;
   }
 
@@ -1803,6 +1805,7 @@ function renderAllMessages() {
     const content = message.content;
     return messageTemplate(roleClass, label, content, message.thinking || "", message.segments || [], message);
   }).join("");
+  updateStoredThinkingTimer();
 }
 
 function addMessage(role, content, meta = {}) {
@@ -1825,14 +1828,19 @@ function messageTemplate(roleClass, label, content, thinking = "", segments = []
   const displayContent = repairTextForDisplay(content);
   const displayThinking = repairTextForDisplay(thinking);
   const displaySegments = Array.isArray(segments) ? segments : [];
+  const isPending = roleClass === "assistant" && Boolean(meta?.pending);
   const body = roleClass === "assistant" && displaySegments.length
-    ? renderMessageSegments(displaySegments, { totalElapsedSeconds: meta?.elapsed_seconds ?? meta?.elapsedSeconds })
+    ? renderMessageSegments(displaySegments, {
+        totalElapsedSeconds: meta?.elapsed_seconds ?? meta?.elapsedSeconds,
+        activeThinking: isPending
+      })
     : (roleClass === "assistant" || roleClass === "error"
       ? renderAssistantContentHtml(displayContent)
       : renderUserContentHtml(displayContent, meta?.attachments || []));
   const header = label ? `<header class="msg-header">${escapeHtml(label)}</header>` : "";
+  const pendingAttr = isPending ? ` data-pending="true"` : "";
   return `
-    <article class="message ${roleClass}" data-role="${escapeAttr(roleClass)}">
+    <article class="message ${roleClass}" data-role="${escapeAttr(roleClass)}"${pendingAttr}>
       ${header}
       ${displayThinking && roleClass === "assistant" && !displaySegments.length ? renderThinkingPanel(displayThinking) : ""}
       <div class="msg-content">${body}</div>
@@ -1898,6 +1906,40 @@ function renderUserContentHtml(content, attachments = []) {
   return `${textHtml}${renderMessageAttachments(attachments)}`;
 }
 
+function liveTimeAttrs(enabled, elapsedSeconds) {
+  if (!enabled || !Number.isFinite(Number(elapsedSeconds))) return "";
+  const base = Math.max(0, Math.round(Number(elapsedSeconds)));
+  return ` data-live-time="true" data-elapsed-base="${base}" data-rendered-at="${Date.now()}"`;
+}
+
+function updateLiveTimeNode(node, prefix) {
+  const base = Math.max(0, Number(node.dataset.elapsedBase || 0));
+  const renderedAt = Number(node.dataset.renderedAt || Date.now());
+  const elapsed = Math.max(0, Math.round(base + ((Date.now() - renderedAt) / 1000)));
+  node.textContent = `${prefix} ${formatDuration(elapsed)}`;
+}
+
+function updateStoredThinkingTimes() {
+  const pendingMessages = $$(".message.assistant[data-pending='true']");
+  for (const article of pendingMessages) {
+    const total = article.querySelector("[data-live-total='true']");
+    if (total) updateLiveTimeNode(total, "Total");
+    for (const node of Array.from(article.querySelectorAll("[data-live-thinking='true']"))) {
+      updateLiveTimeNode(node, "Thinking");
+    }
+  }
+}
+
+function updateStoredThinkingTimer() {
+  if (state.storedThinkingTimer) {
+    window.clearInterval(state.storedThinkingTimer);
+    state.storedThinkingTimer = null;
+  }
+  if (!$(".message.assistant[data-pending='true']")) return;
+  updateStoredThinkingTimes();
+  state.storedThinkingTimer = window.setInterval(updateStoredThinkingTimes, 1000);
+}
+
 function renderMessageSegments(segments = [], options = {}) {
   const explicitTotalElapsed = Number(options.totalElapsedSeconds);
   const derivedTotalElapsed = segments.reduce((sum, segment) => {
@@ -1907,9 +1949,13 @@ function renderMessageSegments(segments = [], options = {}) {
   const totalElapsed = Number.isFinite(explicitTotalElapsed)
     ? explicitTotalElapsed
     : (derivedTotalElapsed > 0 ? derivedTotalElapsed : NaN);
+  const totalLiveAttrs = liveTimeAttrs(Boolean(options.activeThinking), totalElapsed).replace("data-live-time", "data-live-total");
   const totalTime = Number.isFinite(totalElapsed)
-    ? `<div class="message-total-time" data-total-time>${options.activeThinking ? "Total" : "Done in"} ${escapeHtml(formatDuration(totalElapsed))}</div>`
+    ? `<div class="message-total-time" data-total-time${totalLiveAttrs}>${options.activeThinking ? "Total" : "Done in"} ${escapeHtml(formatDuration(totalElapsed))}</div>`
     : "";
+  const activeThinkingIndex = options.activeThinking
+    ? segments.reduce((lastIndex, segment, index) => segment?.type === "thinking" ? index : lastIndex, -1)
+    : -1;
   const body = segments.map((segment, index) => {
     const type = segment?.type === "thinking" ? "thinking" : "text";
     const content = repairTextForDisplay(segment?.content || "");
@@ -1918,7 +1964,7 @@ function renderMessageSegments(segments = [], options = {}) {
     const segmentOptions = {
       ...options,
       segmentIndex: index,
-      activeThinking: Boolean(segment.activeThinking)
+      activeThinking: Boolean(segment.activeThinking || (options.activeThinking && index === activeThinkingIndex))
     };
     if (Number.isFinite(segmentElapsed)) segmentOptions.elapsedSeconds = segmentElapsed;
     return type === "thinking"
@@ -2674,12 +2720,13 @@ function renderThinkingPanel(thinking, options = {}) {
     : "";
   const stateClass = options.activeThinking ? " streaming" : "";
   const indexAttr = Number.isInteger(options.segmentIndex) ? ` data-segment-index="${options.segmentIndex}"` : "";
+  const timeAttrs = liveTimeAttrs(Boolean(options.activeThinking), options.elapsedSeconds).replace("data-live-time", "data-live-thinking");
   return `
     <details class="thinking-panel${stateClass}"${indexAttr}>
       <summary>
         <span>Thinking</span>
         <span class="thinking-preview">${escapeHtml(previewThinking(thinking))}</span>
-        ${timeLabel ? `<span class="thinking-time" data-thinking-time>${escapeHtml(timeLabel)}</span>` : ""}
+        ${timeLabel ? `<span class="thinking-time" data-thinking-time${timeAttrs}>${escapeHtml(timeLabel)}</span>` : ""}
       </summary>
       <div class="thinking-body">${renderMarkdown(thinking)}</div>
     </details>

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "dbs-goal": {
+      "source": "dontbesilent2025/dbskill",
+      "sourceType": "github",
+      "skillPath": "skills/dbs-goal/SKILL.md",
+      "computedHash": "39b1173cb606fd25eaf1cf624d5260914b1e356dc77a29832bf4aa7bec68815f"
+    }
+  }
+}
