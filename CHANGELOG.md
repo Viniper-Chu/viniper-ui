@@ -1,3 +1,17 @@
+## v4.3.2 (2026-06-16)
+
+### 修复
+- **恢复 Claude Code 原生 `/goal`**：`/goal` 现在只作为 Claude Code 原生命令显示在斜杠菜单中，发送后完整透传给当前 agent shell，不再由 Viniper UI 自己创建外层目标任务。
+- **斜杠菜单可点击选择**：修复弹出提示框后无法用鼠标点击选择的问题，同时保留上下键、Enter 和 Tab 选择。
+- **移除自定义目标模式入口**：删除旧的 Viniper UI 目标任务面板、弹窗和 `/api/goals` 后端入口，避免和 Claude Code 原生 goal/skill 冲突。
+
+### 验证
+- `python scripts/verify_slash_suggestions.py`
+- `python scripts/verify_app.py`
+- `node --check static/app.js`
+- `python -m py_compile server.py scripts/verify_app.py scripts/verify_slash_suggestions.py`
+- 预览版真实点击验证：输入 `/go` 后点击 `/goal`，输入框填入 `/goal ` 且没有打开 Viniper UI 自定义 goal 弹窗
+
 ## v4.3.1 (2026-06-05)
 
 ### 调整

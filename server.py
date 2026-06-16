@@ -1194,9 +1194,6 @@ def allowed_permission_mode(permission_mode: str | None) -> str:
     return DEFAULT_PERMISSION_MODE
 
 
-goals.update(load_goals_from_disk())
-
-
 def provider_config(model_override: str | None = None) -> dict[str, str]:
     settings = load_app_settings()
     provider = settings.get("provider", {})
@@ -1312,16 +1309,34 @@ def claude_cli_compatibility() -> dict[str, Any]:
     return {"ok": True, "detail": version_text or "compatible"}
 
 
+def current_windows_desktop_exe() -> Path | None:
+    if os.name != "nt":
+        return None
+    configured = env_value("VINIPER_UI_DESKTOP_EXE", "").strip().strip('"')
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.exists() and candidate.is_file() and candidate.name.lower() == "viniper ui.exe":
+            return candidate.resolve()
+
+    for root in (APP_DIR, *APP_DIR.parents):
+        candidate = root / "Viniper UI.exe"
+        if candidate.exists() and candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
 def refresh_windows_shortcuts() -> None:
     if os.name != "nt" or PREVIEW_MODE:
         return
     icon = STATIC_DIR / "assets" / "viniper-icon.ico"
     installed_candidates = [
+        current_windows_desktop_exe(),
         BASE_DIR / "Viniper UI.exe",
         BASE_DIR.parent / "Viniper UI.exe",
         Path("C:/Program Files/Viniper UI/Viniper UI.exe"),
         Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Viniper UI" / "Viniper UI.exe",
     ]
+    installed_candidates = [path for path in installed_candidates if path is not None]
     installed_exe = next((path for path in installed_candidates if path.exists()), installed_candidates[-1])
     start_script = APP_DIR / "start.bat"
     target_path = installed_exe if installed_exe.exists() else start_script
@@ -1460,7 +1475,7 @@ def build_generic_cli_prompt(session: dict[str, Any], prompt: str, attachments: 
         parts.append(system_append)
     if history:
         parts.append("Recent conversation:\n" + "\n\n".join(history))
-    parts.append("Current user message:\n" + append_attachment_prompt(expand_skill_prompt(prompt), attachments))
+    parts.append("Current user message:\n" + append_attachment_prompt(prompt, attachments))
     return "\n\n".join(parts)
 
 
@@ -2671,7 +2686,7 @@ async def stream_chat_impl(
     sessions[session_id] = session
     save_sessions_to_disk()
 
-    context_prompt = append_attachment_prompt(expand_skill_prompt(prompt), attachments)
+    context_prompt = append_attachment_prompt(prompt, attachments)
 
     session_args = ["--resume", claude_session_id] if resume_existing else ["--session-id", claude_session_id]
     fallback_model = "deepseek-v4-flash" if selected_model != "deepseek-v4-flash" else ""
@@ -3772,102 +3787,6 @@ async def cancel_chat(session_id: str):
     return {"ok": True, "cancelled": True}
 
 
-@app.get("/api/goals")
-async def list_goals(session_id: str | None = None):
-    goal_items = []
-    for goal_id, goal in list(goals.items()):
-        normalized = normalize_goal(goal_id, goal)
-        goals[goal_id] = normalized
-        if session_id and normalized.get("session_id") != session_id:
-            continue
-        goal_items.append(public_goal(normalized))
-    goal_items.sort(key=lambda item: item.get("updated", item.get("created", 0)), reverse=True)
-    return {"ok": True, "goals": goal_items}
-
-
-@app.post("/api/goals")
-async def create_goal(request: Request):
-    body = await request.json()
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="goal body must be an object")
-    prompt = str(body.get("prompt") or "").strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="goal prompt is required")
-    session_id = str(body.get("session_id") or "").strip()
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id is required")
-    safe_session(session_id)
-
-    title = str(body.get("title") or "").strip()
-    if not title:
-        title = prompt.splitlines()[0][:40] or "目标任务"
-
-    goal_id = str(uuid.uuid4())[:8]
-    while goal_id in goals:
-        goal_id = str(uuid.uuid4())[:8]
-    now = now_ts()
-    goal = normalize_goal(goal_id, {
-        "id": goal_id,
-        "session_id": session_id,
-        "title": title,
-        "prompt": prompt,
-        "status": "running" if body.get("auto_start", True) else "paused",
-        "model": allowed_model(str(body.get("model") or "")),
-        "permission_mode": allowed_permission_mode(str(body.get("permission_mode") or DEFAULT_PERMISSION_MODE)),
-        "turn_count": 0,
-        "max_turns": int(body.get("max_turns") or GOAL_DEFAULT_MAX_TURNS),
-        "created": now,
-        "updated": now,
-        "current_step": "Queued." if body.get("auto_start", True) else "Paused before first turn.",
-    })
-    goals[goal_id] = goal
-    save_goals_to_disk()
-    if goal["status"] == "running":
-        start_goal_task(goal_id)
-    return {"ok": True, "goal": public_goal(goal)}
-
-
-@app.get("/api/goals/{goal_id}")
-async def get_goal(goal_id: str):
-    return {"ok": True, "goal": public_goal(get_goal_or_404(goal_id))}
-
-
-@app.post("/api/goals/{goal_id}/resume")
-async def resume_goal(goal_id: str):
-    goal = get_goal_or_404(goal_id)
-    goal["status"] = "running"
-    goal["last_error"] = ""
-    goal["current_step"] = "Queued."
-    goal["updated"] = now_ts()
-    goals[goal_id] = goal
-    save_goals_to_disk()
-    start_goal_task(goal_id)
-    return {"ok": True, "goal": public_goal(goal)}
-
-
-@app.post("/api/goals/{goal_id}/pause")
-async def pause_goal(goal_id: str):
-    goal = get_goal_or_404(goal_id)
-    goal["status"] = "paused"
-    goal["current_step"] = "Paused."
-    goal["updated"] = now_ts()
-    goals[goal_id] = goal
-    save_goals_to_disk()
-    await stop_goal_task(goal_id, goal)
-    return {"ok": True, "goal": public_goal(goal)}
-
-
-@app.delete("/api/goals/{goal_id}")
-async def delete_goal(goal_id: str):
-    goal = goals.get(goal_id)
-    if goal:
-        await stop_goal_task(goal_id, goal)
-    existed = goal_id in goals
-    goals.pop(goal_id, None)
-    save_goals_to_disk()
-    return {"ok": True, "deleted": existed}
-
-
 @app.post("/api/sessions")
 async def new_session(request: Request):
     body: dict[str, Any] = {}
@@ -4121,13 +4040,7 @@ def _startup_cleanup() -> None:
         session["messages"] = cleaned_messages
         if session.get("messages"):
             session["updated"] = now_ts()
-    for goal in goals.values():
-        if goal.get("status") == "running":
-            goal["status"] = "paused"
-            goal["current_step"] = "Paused after Viniper UI restart."
-            goal["updated"] = now_ts()
     save_sessions_to_disk()
-    save_goals_to_disk()
     _session_locks.clear()
     print(f"  Startup cleanup: {len(sessions)} sessions normalized.")
 

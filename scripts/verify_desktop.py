@@ -78,6 +78,10 @@ def main() -> int:
     main_js = (DESKTOP / "main.js").read_text(encoding="utf-8")
     if "VINIPER_UI_OPEN_BROWSER" not in main_js:
         raise SystemExit("desktop shell must disable automatic browser launch when it starts the server")
+    if "VINIPER_UI_DESKTOP_EXE" not in main_js:
+        raise SystemExit("desktop shell must pass the packaged exe path to the local service")
+    if "shell.openExternal(\"https://www.skills.sh\")" not in main_js or "skillsWindow" in main_js:
+        raise SystemExit("skills.sh must open in the system browser, not an embedded app window")
     if "requestSingleInstanceLock" not in main_js:
         raise SystemExit("desktop shell must keep a single running instance")
     if "runDiagnosticsDialog" not in main_js:
@@ -86,6 +90,8 @@ def main() -> int:
     server_py = (ROOT / "server.py").read_text(encoding="utf-8")
     if "VINIPER_UI_OPEN_BROWSER" not in server_py:
         raise SystemExit("server.py must support disabling browser auto-open")
+    if "current_windows_desktop_exe" not in server_py or "VINIPER_UI_DESKTOP_EXE" not in server_py:
+        raise SystemExit("server.py must refresh shortcuts to the current packaged desktop exe")
 
     if shutil.which("node"):
         run(["node", "--check", str(DESKTOP / "main.js")])

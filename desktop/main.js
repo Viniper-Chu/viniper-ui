@@ -20,7 +20,6 @@ const APP_USER_MODEL_ID = IS_PREVIEW ? "com.viniper.ui.desktop.preview" : "com.v
 let port = Number(process.env.VINIPER_UI_PORT || (IS_PREVIEW ? 17946 : 17373));
 let mainWindow = null;
 let splashWindow = null;
-let skillsWindow = null;
 let tray = null;
 let serverProcess = null;
 let isQuitting = false;
@@ -301,47 +300,7 @@ function openSettingsWindow() {
 }
 
 function openSkillsWindow() {
-  if (skillsWindow && !skillsWindow.isDestroyed()) {
-    if (skillsWindow.isMinimized()) skillsWindow.restore();
-    skillsWindow.show();
-    skillsWindow.focus();
-    return;
-  }
-
-  skillsWindow = new BrowserWindow({
-    width: 1180,
-    height: 820,
-    minWidth: 860,
-    minHeight: 640,
-    title: "Viniper UI - skills.sh",
-    icon: appIcon(),
-    show: false,
-    parent: mainWindow || undefined,
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true
-    }
-  });
-  skillsWindow.setIcon(appIcon());
-  skillsWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("https://www.skills.sh") || url.startsWith("https://skills.sh")) {
-      return { action: "allow" };
-    }
-    shell.openExternal(url);
-    return { action: "deny" };
-  });
-  skillsWindow.webContents.on("will-navigate", (event, url) => {
-    if (!url.startsWith("https://www.skills.sh") && !url.startsWith("https://skills.sh")) {
-      event.preventDefault();
-      shell.openExternal(url);
-    }
-  });
-  skillsWindow.once("ready-to-show", () => skillsWindow.show());
-  skillsWindow.on("closed", () => {
-    skillsWindow = null;
-  });
-  skillsWindow.loadURL("https://www.skills.sh");
+  shell.openExternal("https://www.skills.sh");
 }
 
 function requestJson(urlPath, timeoutMs = 1500) {
@@ -453,6 +412,9 @@ function startServerProcess() {
     VINIPER_UI_DESKTOP: "1",
     VINIPER_UI_PORT: String(port)
   };
+  if (app.isPackaged) {
+    env.VINIPER_UI_DESKTOP_EXE = process.execPath;
+  }
   if (IS_PREVIEW) {
     env.VINIPER_UI_PREVIEW = "1";
     env.VINIPER_UI_DATA_DIR = path.join(app.getPath("userData"), "data");

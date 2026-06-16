@@ -25,11 +25,9 @@ const state = {
   abortController: null,
   cancelRequested: false,
   followOutput: true,
-  goals: [],
-  goalPollTimer: null,
   storedThinkingTimer: null,
-  goalSnapshot: new Map(),
-  goalRefreshingSession: false,
+  slashSuggestions: [],
+  slashSuggestionIndex: 0,
   folderPicker: {
     targetSelector: "",
     currentPath: "",
@@ -98,6 +96,21 @@ const PERMISSION_MODES = [
 const PERMISSION_ACTION_RE = /(打开|运行|执行|安装|删除|修改|修复|编辑|写入|新建|创建|转换|导出|保存|移动|复制|重命名|启动|停止|读取|扫描|部署|提交|克隆|下载|生成|制作|整理|处理|编译|跑)/i;
 const PERMISSION_TARGET_RE = /(文件|目录|文件夹|项目|仓库|网页|网站|浏览器|桌面|快捷方式|程序|应用|服务|文档|资料|试卷|图片|截图|附件|压缩包|word|excel|pdf|docx|xlsx|ppt|pptx|powershell|cmd|bash|npm|pnpm|yarn|pip|python|node|git|github|skill|app|端口|服务器)/i;
 const PERMISSION_DIRECT_RE = /([a-z]:[\\/]|\\\\|\\.(txt|tex|csv|docx|xlsx|pptx|pdf|zip|tar\\.gz|7z|rar|exe|bat|cmd|ps1|html|css|js|jsx|ts|tsx|json|md|py|png|jpe?g|webp)\\b|powershell\\s+-|cmd\\.exe|npm\\s+|pnpm\\s+|yarn\\s+|pip\\s+|git\\s+(clone|pull|push|commit|status|checkout|merge|fetch)|github|skill)/i;
+const CLAUDE_NATIVE_SLASH_COMMANDS = [
+  { command: "/goal", title: "目标任务", description: "Claude Code 原生目标/技能命令，发送后由当前 agent shell 处理", source: "Claude Code" },
+  { command: "/help", title: "帮助", description: "查看 Claude Code 可用命令和帮助", source: "Claude Code" },
+  { command: "/status", title: "状态", description: "查看当前会话、模型和连接状态", source: "Claude Code" },
+  { command: "/model", title: "模型", description: "切换或查看 Claude Code 模型", source: "Claude Code" },
+  { command: "/permissions", title: "权限", description: "查看或调整 Claude Code 权限设置", source: "Claude Code" },
+  { command: "/compact", title: "压缩上下文", description: "压缩长会话上下文", source: "Claude Code" },
+  { command: "/clear", title: "清空显示", description: "清理当前上下文或显示内容", source: "Claude Code" },
+  { command: "/init", title: "初始化项目", description: "为当前项目生成或更新 Claude Code 项目说明", source: "Claude Code" },
+  { command: "/memory", title: "记忆", description: "查看或编辑 Claude Code 记忆", source: "Claude Code" },
+  { command: "/doctor", title: "诊断", description: "运行 Claude Code 环境诊断", source: "Claude Code" },
+  { command: "/theme", title: "主题", description: "调整 Claude Code 终端主题", source: "Claude Code" },
+  { command: "/cost", title: "用量", description: "查看当前会话用量和成本信息", source: "Claude Code" },
+  { command: "/review", title: "代码审查", description: "让 Claude Code 审查当前变更", source: "Claude Code" }
+];
 const FONT_SIZE_OPTIONS = [
   { id: "xs", label: "更小" },
   { id: "sm", label: "小" },
@@ -349,8 +362,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     await loadStatus();
     if ($("#skills-panel")) await loadSkills();
     await restoreLastSession();
-    await loadGoals();
-    startGoalPolling();
     checkForUpdates({ silent: true });
   } finally {
     hideLaunchSplash();
@@ -379,8 +390,10 @@ function bindEvents() {
   const input = $("#user-input");
 
   input.addEventListener("keydown", (event) => {
+    if (handleSlashSuggestionKeydown(event)) return;
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
+      hideSlashSuggestions();
       sendMessage();
     }
     if (event.ctrlKey && event.key.toLowerCase() === "k") {
@@ -389,7 +402,29 @@ function bindEvents() {
     }
   });
 
-  input.addEventListener("input", () => autoResize(input));
+  input.addEventListener("input", () => {
+    autoResize(input);
+    updateSlashSuggestions();
+  });
+  input.addEventListener("click", updateSlashSuggestions);
+  input.addEventListener("keyup", (event) => {
+    if (!["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].includes(event.key)) {
+      updateSlashSuggestions();
+    }
+  });
+  const panel = $("#slash-suggestions");
+  panel.addEventListener("pointerdown", (event) => {
+    const button = event.target.closest("[data-slash-index]");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    acceptSlashSuggestion(Number(button.dataset.slashIndex || 0));
+  });
+  panel.addEventListener("pointerover", (event) => {
+    const button = event.target.closest("[data-slash-index]");
+    if (!button) return;
+    setSlashSuggestionIndex(Number(button.dataset.slashIndex || 0));
+  });
   $("#chat-container").addEventListener("scroll", () => {
     if (state.isStreaming) state.followOutput = isNearChatBottom();
   });
@@ -406,8 +441,6 @@ function bindEvents() {
     closePlusMenu();
     if (button.dataset.plusAction === "attach") {
       $("#file-input").click();
-    } else if (button.dataset.plusAction === "goal") {
-      openGoalModal();
     }
   });
   $("#toggle-sidebar-btn").addEventListener("click", toggleSidebar);
@@ -443,8 +476,6 @@ function bindEvents() {
     storageSet(PERMISSION_KEY, state.permissionMode);
   });
   $("#context-compress-btn").addEventListener("click", compressCurrentContext);
-  $("#cancel-goal-btn").addEventListener("click", closeGoalModal);
-  $("#create-goal-btn").addEventListener("click", createGoalFromModal);
   $("#cancel-session-btn").addEventListener("click", closeNewSessionModal);
   $("#create-session-btn").addEventListener("click", createNamedSession);
   $("#cancel-delete-session-btn").addEventListener("click", () => closeDeleteSessionModal(false));
@@ -492,7 +523,6 @@ function bindEvents() {
       closePermissionModal(false);
       closeFolderPicker();
       closePlusMenu();
-      closeGoalModal();
       closeNewSessionModal();
       closeDeleteSessionModal(false);
       closeRenameSessionModal(null);
@@ -536,13 +566,8 @@ function bindEvents() {
     if (!event.target.closest("#plus-menu") && !event.target.closest("#file-btn")) {
       closePlusMenu();
     }
-
-    const goalButton = event.target.closest("[data-goal-action]");
-    if (goalButton) {
-      event.preventDefault();
-      event.stopPropagation();
-      handleGoalAction(goalButton.dataset.goalAction, goalButton.dataset.goalId);
-      return;
+    if (!event.target.closest("#slash-suggestions") && !event.target.closest("#composer")) {
+      hideSlashSuggestions();
     }
 
     const renameButton = event.target.closest("[data-rename-session]");
@@ -773,201 +798,157 @@ function closePlusMenu() {
   if (menu) menu.classList.add("hidden");
 }
 
-function goalPermissionMode() {
-  if (state.permissionMode === "ask") return "default";
-  if (state.permissionMode === "auto") return "auto";
-  if (state.permissionMode === "bypassPermissions") return "bypassPermissions";
-  return state.permissionMode || "default";
+function slashSuggestionContext() {
+  const input = $("#user-input");
+  if (!input || document.activeElement !== input || input.disabled) return null;
+  const caret = Number.isFinite(input.selectionStart) ? input.selectionStart : input.value.length;
+  const before = input.value.slice(0, caret);
+  const after = input.value.slice(caret);
+  const match = before.match(/^\/([^\s\n]*)$/);
+  if (!match) return null;
+  return { input, caret, query: match[1].toLowerCase(), after };
 }
 
-function openGoalModal() {
-  if (!state.sessionId) {
-    alert("请先创建或打开一个会话。");
-    return;
-  }
-  const currentText = $("#user-input").value.trim();
-  $("#goal-prompt").value = currentText;
-  $("#goal-max-turns").value = "12";
-  $("#goal-modal").classList.remove("hidden");
-  $("#goal-prompt").focus();
-  if (currentText) $("#goal-prompt").select();
+function buildSlashSuggestionCandidates(query) {
+  const seen = new Set();
+  const nativeItems = CLAUDE_NATIVE_SLASH_COMMANDS.map((item) => ({ ...item, kind: "native" }));
+  const skillItems = (state.skills || []).map((skill) => ({
+    command: `/${skill.command || skill.name || skill.id}`,
+    title: skill.title || skill.name || skill.id || skill.command || "skill",
+    description: skill.description || skill.desc || "",
+    source: "Skill",
+    kind: "skill"
+  }));
+
+  return [...nativeItems, ...skillItems]
+    .filter((item) => {
+      const command = String(item.command || "").trim();
+      if (!command || seen.has(command.toLowerCase())) return false;
+      seen.add(command.toLowerCase());
+      if (!query) return true;
+      const haystack = [
+        command,
+        item.title || "",
+        item.description || "",
+        item.source || ""
+      ].join(" ").toLowerCase();
+      return haystack.includes(query);
+    })
+    .sort((a, b) => {
+      const aPrefix = a.command.toLowerCase().startsWith(`/${query}`) ? 0 : 1;
+      const bPrefix = b.command.toLowerCase().startsWith(`/${query}`) ? 0 : 1;
+      if (aPrefix !== bPrefix) return aPrefix - bPrefix;
+      if (a.kind !== b.kind) return a.kind === "native" ? -1 : 1;
+      return a.command.localeCompare(b.command);
+    })
+    .slice(0, 10);
 }
 
-function closeGoalModal() {
-  const modal = $("#goal-modal");
-  if (modal) modal.classList.add("hidden");
-}
-
-async function createGoalFromModal() {
-  if (!state.sessionId) return;
-  const prompt = $("#goal-prompt").value.trim();
-  const maxTurns = Math.max(1, Math.min(100, Number($("#goal-max-turns").value) || 12));
-  if (!prompt) {
-    alert("请先写清楚目标。");
-    $("#goal-prompt").focus();
-    return;
-  }
-
-  const button = $("#create-goal-btn");
-  const oldText = button.textContent;
-  button.disabled = true;
-  button.textContent = "创建中";
-  try {
-    const response = await fetch("/api/goals", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id: state.sessionId,
-        prompt,
-        model: state.selectedModel,
-        permission_mode: goalPermissionMode(),
-        max_turns: maxTurns,
-        auto_start: true
-      })
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || data.ok === false) {
-      throw new Error(data.detail || `HTTP ${response.status}`);
-    }
-    closeGoalModal();
-    await loadGoals();
-  } catch (error) {
-    alert(`目标任务创建失败：${error.message}`);
-  } finally {
-    button.disabled = false;
-    button.textContent = oldText;
-  }
-}
-
-function goalsChangedForCurrentSession(nextGoals = []) {
-  const nextSnapshot = new Map();
-  let changed = false;
-  for (const goal of nextGoals) {
-    const key = String(goal.id || "");
-    if (!key) continue;
-    const value = [
-      goal.status || "",
-      Number(goal.turn_count || 0),
-      goal.current_step || "",
-      Number(goal.updated || 0)
-    ].join("|");
-    nextSnapshot.set(key, value);
-    if (state.goalSnapshot.get(key) !== value) changed = true;
-  }
-  if (state.goalSnapshot.size !== nextSnapshot.size) changed = true;
-  state.goalSnapshot = nextSnapshot;
-  return changed;
-}
-
-async function refreshCurrentSessionMessages() {
-  if (!state.sessionId || state.goalRefreshingSession || state.isStreaming) return;
-  state.goalRefreshingSession = true;
-  const shouldStick = isNearChatBottom();
-  try {
-    const response = await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}`);
-    if (!response.ok) return;
-    const data = await response.json();
-    applySession(state.sessionId, data);
-    if (shouldStick) scrollBottom();
-  } catch {
-  } finally {
-    state.goalRefreshingSession = false;
-  }
-}
-
-async function loadGoals({ refreshMessages = true } = {}) {
-  if (!state.sessionId) {
-    state.goals = [];
-    state.goalSnapshot = new Map();
-    renderGoalPanel();
-    return;
-  }
-  let nextGoals = [];
-  try {
-    const response = await fetch(`/api/goals?session_id=${encodeURIComponent(state.sessionId)}`);
-    const data = await response.json();
-    nextGoals = Array.isArray(data.goals) ? data.goals : [];
-  } catch {
-    nextGoals = [];
-  }
-  const changed = goalsChangedForCurrentSession(nextGoals);
-  state.goals = nextGoals;
-  renderGoalPanel();
-  if (refreshMessages && changed && nextGoals.some((goal) => ["running", "waiting", "completed", "failed"].includes(goal.status))) {
-    await refreshCurrentSessionMessages();
-  }
-}
-
-function startGoalPolling() {
-  if (state.goalPollTimer) return;
-  state.goalPollTimer = window.setInterval(() => {
-    if (!state.sessionId) return;
-    if (!state.goals.length || state.goals.some((goal) => ["running", "waiting"].includes(goal.status))) {
-      loadGoals({ refreshMessages: true });
-    }
-  }, 1600);
-}
-
-function goalStatusLabel(status) {
-  const labels = {
-    running: "运行中",
-    paused: "已暂停",
-    waiting: "待继续",
-    completed: "已完成",
-    failed: "失败"
-  };
-  return labels[status] || status || "未知";
-}
-
-function renderGoalPanel() {
-  const panel = $("#goal-panel");
+function hideSlashSuggestions() {
+  const panel = $("#slash-suggestions");
   if (!panel) return;
-  const visibleGoals = (state.goals || []).filter(Boolean);
-  panel.classList.toggle("hidden", !visibleGoals.length);
-  if (!visibleGoals.length) {
-    panel.innerHTML = "";
-    return;
-  }
-  panel.innerHTML = visibleGoals.map((goal) => {
-    const canPause = goal.status === "running";
-    const canResume = ["paused", "waiting", "failed"].includes(goal.status);
-    return `
-      <div class="goal-card ${escapeAttr(goal.status || "paused")}">
-        <div class="goal-main">
-          <span class="goal-dot" aria-hidden="true"></span>
-          <span class="goal-title-text">${escapeHtml(goal.prompt || goal.title || "目标任务")}</span>
-          <span class="goal-meta">${escapeHtml(goalStatusLabel(goal.status))} · ${Number(goal.turn_count || 0)}/${Number(goal.max_turns || 0)}</span>
-          ${goal.current_step ? `<span class="goal-step">${escapeHtml(goal.current_step)}</span>` : ""}
-        </div>
-        <div class="goal-actions">
-          ${canPause ? `<button class="mini-button" type="button" data-goal-action="pause" data-goal-id="${escapeAttr(goal.id)}">暂停</button>` : ""}
-          ${canResume ? `<button class="mini-button" type="button" data-goal-action="resume" data-goal-id="${escapeAttr(goal.id)}">继续</button>` : ""}
-          <button class="mini-button danger" type="button" data-goal-action="delete" data-goal-id="${escapeAttr(goal.id)}">删除</button>
-        </div>
-      </div>
-    `;
-  }).join("");
+  panel.classList.add("hidden");
+  panel.innerHTML = "";
+  state.slashSuggestions = [];
+  state.slashSuggestionIndex = 0;
+  const input = $("#user-input");
+  input?.removeAttribute("aria-activedescendant");
+  input?.removeAttribute("aria-controls");
+  input?.removeAttribute("aria-expanded");
 }
 
-async function handleGoalAction(action, goalId) {
-  if (!action || !goalId) return;
-  const method = action === "delete" ? "DELETE" : "POST";
-  const url = action === "delete"
-    ? `/api/goals/${encodeURIComponent(goalId)}`
-    : `/api/goals/${encodeURIComponent(goalId)}/${encodeURIComponent(action)}`;
-  try {
-    const response = await fetch(url, { method });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || data.ok === false) {
-      throw new Error(data.detail || `HTTP ${response.status}`);
-    }
-    await loadGoals();
-    if (action === "resume") {
-      await switchSession(state.sessionId, { quiet: true });
-    }
-  } catch (error) {
-    alert(`目标任务操作失败：${error.message}`);
+function updateSlashSuggestions() {
+  const context = slashSuggestionContext();
+  if (!context) {
+    hideSlashSuggestions();
+    return;
   }
+  const suggestions = buildSlashSuggestionCandidates(context.query);
+  if (!suggestions.length) {
+    hideSlashSuggestions();
+    return;
+  }
+  state.slashSuggestions = suggestions;
+  state.slashSuggestionIndex = Math.min(state.slashSuggestionIndex, suggestions.length - 1);
+  renderSlashSuggestions();
+}
+
+function renderSlashSuggestions() {
+  const panel = $("#slash-suggestions");
+  const input = $("#user-input");
+  if (!panel || !input || !state.slashSuggestions.length) return;
+  panel.innerHTML = state.slashSuggestions.map((item, index) => `
+    <button
+      id="slash-suggestion-${index}"
+      class="slash-suggestion-item ${index === state.slashSuggestionIndex ? "active" : ""}"
+      type="button"
+      role="option"
+      aria-selected="${index === state.slashSuggestionIndex ? "true" : "false"}"
+      data-slash-index="${index}"
+    >
+      <span class="slash-suggestion-command">${escapeHtml(item.command)}</span>
+      <span class="slash-suggestion-title">${escapeHtml(item.title || item.command)}</span>
+      <span class="slash-suggestion-source">${escapeHtml(item.source || "")}</span>
+      ${item.description ? `<span class="slash-suggestion-desc">${escapeHtml(item.description)}</span>` : ""}
+    </button>
+  `).join("");
+  panel.classList.remove("hidden");
+  input.setAttribute("aria-controls", "slash-suggestions");
+  input.setAttribute("aria-expanded", "true");
+  input.setAttribute("aria-activedescendant", `slash-suggestion-${state.slashSuggestionIndex}`);
+}
+
+function setSlashSuggestionIndex(index) {
+  const next = Math.max(0, Math.min(Number(index) || 0, state.slashSuggestions.length - 1));
+  if (next === state.slashSuggestionIndex) return;
+  state.slashSuggestionIndex = next;
+  $$("#slash-suggestions [data-slash-index]").forEach((button) => {
+    const active = Number(button.dataset.slashIndex || 0) === next;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  $("#user-input")?.setAttribute("aria-activedescendant", `slash-suggestion-${next}`);
+}
+
+function acceptSlashSuggestion(index = state.slashSuggestionIndex) {
+  const context = slashSuggestionContext();
+  const item = state.slashSuggestions[index];
+  if (!context || !item) return false;
+  const after = context.after.replace(/^\s+/, "");
+  const insert = `${item.command} `;
+  context.input.value = `${insert}${after}`;
+  context.input.selectionStart = insert.length;
+  context.input.selectionEnd = insert.length;
+  autoResize(context.input);
+  hideSlashSuggestions();
+  context.input.focus();
+  return true;
+}
+
+function handleSlashSuggestionKeydown(event) {
+  const panel = $("#slash-suggestions");
+  if (!panel || panel.classList.contains("hidden") || !state.slashSuggestions.length) return false;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    setSlashSuggestionIndex((state.slashSuggestionIndex + 1) % state.slashSuggestions.length);
+    return true;
+  }
+  if (event.key === "ArrowUp") {
+    event.preventDefault();
+    setSlashSuggestionIndex((state.slashSuggestionIndex - 1 + state.slashSuggestions.length) % state.slashSuggestions.length);
+    return true;
+  }
+  if (event.key === "Enter" || event.key === "Tab") {
+    event.preventDefault();
+    acceptSlashSuggestion();
+    return true;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    hideSlashSuggestions();
+    return true;
+  }
+  return false;
 }
 
 async function loadStatus() {
@@ -1553,7 +1534,6 @@ async function createSession({ silent = false, name = "", workdir = "" } = {}) {
   updateContextMeter();
   rememberSession(state.sessionId);
   await loadSessionList();
-  await loadGoals();
   if (!silent) $("#user-input").focus();
 }
 
@@ -1679,7 +1659,6 @@ async function switchSession(sessionId, { quiet = false } = {}) {
   applySession(sessionId, data);
   rememberSession(sessionId);
   await loadSessionList();
-  await loadGoals();
   scrollBottom();
   if (!quiet) $("#user-input").focus();
   return true;

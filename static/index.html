@@ -97,10 +97,10 @@
       </section>
 
       <section id="input-area">
-        <div id="goal-panel" class="goal-panel hidden" aria-live="polite"></div>
         <div id="context-files"></div>
         <div id="composer">
           <textarea id="user-input" rows="1" placeholder="输入消息" autofocus></textarea>
+          <div id="slash-suggestions" class="slash-suggestions hidden" role="listbox" aria-label="Slash commands"></div>
           <div id="input-actions">
             <div id="context-meter" class="context-meter" aria-label="上下文占用" title="上下文 0%">
               <button id="context-compress-btn" class="context-ring" type="button" title="上下文 0%">
@@ -112,7 +112,6 @@
             <input id="file-input" type="file" hidden multiple>
             <div id="plus-menu" class="plus-menu hidden" role="menu" aria-label="添加">
               <button type="button" role="menuitem" data-plus-action="attach">添加附件</button>
-              <button type="button" role="menuitem" data-plus-action="goal">目标任务</button>
             </div>
             <button id="stop-btn" class="stop-button hidden" type="button" title="停止当前任务" aria-label="停止当前任务">■</button>
             <button id="send-btn" class="send-button" title="发送" aria-label="发送">↵</button>
@@ -128,21 +127,6 @@
 
   <div id="drop-overlay" aria-hidden="true">
     <div class="drop-card">松开后添加到聊天附件</div>
-  </div>
-
-  <div id="goal-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="goal-title">
-    <div class="modal-content goal-modal-content">
-      <h2 id="goal-title">目标任务</h2>
-      <p class="modal-copy">创建后 Viniper UI 会持续驱动当前对话推进目标，直到任务完成、暂停或达到轮次上限。</p>
-      <label for="goal-prompt">目标</label>
-      <textarea id="goal-prompt" rows="5" spellcheck="false" placeholder="写清楚要持续完成的任务"></textarea>
-      <label for="goal-max-turns">最多连续轮次</label>
-      <input id="goal-max-turns" type="number" min="1" max="100" value="12">
-      <div class="modal-actions">
-        <button id="cancel-goal-btn" class="ghost-button" type="button">取消</button>
-        <button id="create-goal-btn" class="primary-button" type="button">创建并开始</button>
-      </div>
-    </div>
   </div>
 
   <div id="new-session-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="new-session-title">

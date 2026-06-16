@@ -77,7 +77,7 @@ def verify_local_api() -> None:
             raise SystemExit("local API did not start")
 
         settings = get_json(f"{base}/api/settings")
-        diagnostics = get_json(f"{base}/api/diagnostics")
+        diagnostics = get_json(f"{base}/api/diagnostics", timeout=20.0)
         if not status.get("ok") or not settings.get("ok") or "checks" not in diagnostics:
             raise SystemExit("local API verification failed")
     finally:
@@ -115,14 +115,28 @@ def verify_claude_cli_if_available() -> None:
         raise SystemExit("Claude Code CLI compatibility check failed: " + "; ".join(detail))
 
 
+def verify_thin_shell_behavior() -> None:
+    server_py = (ROOT / "server.py").read_text(encoding="utf-8")
+    app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+
+    if "expand_skill_prompt(prompt)" in server_py:
+        raise SystemExit("slash commands must pass through to the configured agent shell")
+    if "/api/goals" in server_py or "goal-modal" in index_html or "goal-panel" in index_html:
+        raise SystemExit("Viniper UI goal mode must stay removed; /goal should pass through to Claude Code")
+    if 'command: "/goal"' not in app_js:
+        raise SystemExit("slash suggestions must include Claude Code native /goal")
+
+
 def main() -> int:
-    run([sys.executable, "-m", "py_compile", "server.py", "scripts/build_release.py", "scripts/verify_release.py", "scripts/verify_desktop.py", "scripts/build_desktop.py", "scripts/verify_app.py", "scripts/verify_goal_mode.py"])
+    run([sys.executable, "-m", "py_compile", "server.py", "scripts/build_release.py", "scripts/verify_release.py", "scripts/verify_desktop.py", "scripts/build_desktop.py", "scripts/verify_app.py", "scripts/verify_slash_suggestions.py"])
     if shutil.which("node"):
         run(["node", "--check", "static/app.js"])
         run(["node", "--check", "desktop/main.js"])
         run(["node", "--check", "desktop/preload.js"])
+    verify_thin_shell_behavior()
+    run([sys.executable, "scripts/verify_slash_suggestions.py"])
     run([sys.executable, "scripts/verify_desktop.py"])
-    run([sys.executable, "scripts/verify_goal_mode.py"])
     verify_claude_cli_if_available()
     verify_local_api()
     print("Viniper UI full verification passed.")
