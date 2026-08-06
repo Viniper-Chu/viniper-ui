@@ -127,6 +127,11 @@ UPDATE_HTTP_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_UPDATE_TIMEOUT", "45"))
 UPDATE_DOWNLOAD_RETRIES = int(env_value("VINIPER_UI_UPDATE_RETRIES", "5"))
 UPDATE_DOWNLOAD_CHUNK_SIZE = max(64 * 1024, int(env_value("VINIPER_UI_UPDATE_CHUNK_SIZE", str(1024 * 1024))))
 DEFAULT_CONTEXT_LIMIT = 128000
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
+LEGACY_DEEPSEEK_BASE_URLS = {
+    "http://127.0.0.1:57322",
+    "http://localhost:57322",
+}
 MODEL_OPTIONS = [
     {
         "id": "deepseek-v4-pro[1m]",
@@ -463,7 +468,7 @@ def default_settings() -> dict[str, Any]:
         "provider": {
             "id": "deepseek",
             "label": "DeepSeek",
-            "base_url": "https://api.deepseek.com/anthropic",
+            "base_url": DEFAULT_DEEPSEEK_BASE_URL,
             "api_key": "",
             "api_key_env": "ANTHROPIC_AUTH_TOKEN",
             "base_url_env": "ANTHROPIC_BASE_URL",
@@ -519,6 +524,14 @@ def normalize_model_options(value: Any) -> list[dict[str, Any]]:
     return normalized or [dict(item) for item in MODEL_OPTIONS]
 
 
+def normalize_provider_base_url(provider_id: Any, value: Any) -> str:
+    base_url = str(value or "").strip().rstrip("/")
+    if str(provider_id or "").strip().lower() == "deepseek":
+        if not base_url or base_url.lower() in LEGACY_DEEPSEEK_BASE_URLS:
+            return DEFAULT_DEEPSEEK_BASE_URL
+    return base_url or DEFAULT_DEEPSEEK_BASE_URL
+
+
 def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = merge_dict(default_settings(), raw or {})
     appearance = settings["appearance"]
@@ -540,7 +553,7 @@ def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
     provider = settings["provider"]
     provider["id"] = str(provider.get("id") or "custom").strip() or "custom"
     provider["label"] = str(provider.get("label") or provider["id"]).strip() or provider["id"]
-    provider["base_url"] = str(provider.get("base_url") or "https://api.deepseek.com/anthropic").strip()
+    provider["base_url"] = normalize_provider_base_url(provider["id"], provider.get("base_url"))
     provider["api_key"] = str(provider.get("api_key") or "").strip()
     provider["api_key_env"] = str(provider.get("api_key_env") or "ANTHROPIC_AUTH_TOKEN").strip() or "ANTHROPIC_AUTH_TOKEN"
     provider["base_url_env"] = str(provider.get("base_url_env") or "ANTHROPIC_BASE_URL").strip() or "ANTHROPIC_BASE_URL"
@@ -1198,19 +1211,21 @@ def provider_config(model_override: str | None = None) -> dict[str, str]:
     settings = load_app_settings()
     provider = settings.get("provider", {})
     names = provider_env_names(provider)
-    env = merged_env()
+    env = merged_env(include_app_settings=False)
     api_key = (
-        env.get(names["api_key"])
+        str(provider.get("api_key") or "").strip()
+        or env.get(names["api_key"])
         or env.get("ANTHROPIC_AUTH_TOKEN")
         or env.get("ANTHROPIC_API_KEY")
         or env.get("OPENAI_API_KEY")
         or ""
     )
     base_url = (
-        env.get(names["base_url"])
+        str(provider.get("base_url") or "").strip()
+        or env.get(names["base_url"])
         or env.get("ANTHROPIC_BASE_URL")
         or env.get("OPENAI_BASE_URL")
-        or str(provider.get("base_url") or "https://api.deepseek.com/anthropic")
+        or DEFAULT_DEEPSEEK_BASE_URL
     )
     return {
         "provider": str(provider.get("id") or "custom"),
@@ -1397,12 +1412,19 @@ def build_agent_env(cfg: dict[str, str] | None = None, session: dict[str, Any] |
     env = os.environ.copy()
     env.update(merged_env())
     cfg = cfg or provider_config()
+    provider = load_app_settings().get("provider", {})
+    names = provider_env_names(provider)
     env["VINIPER_PROVIDER"] = cfg.get("provider", "")
     env["VINIPER_PROVIDER_LABEL"] = cfg.get("label", "")
     env["VINIPER_BASE_URL"] = cfg.get("base_url", "")
     env["VINIPER_MODEL"] = cfg.get("model", "")
+    if cfg.get("base_url"):
+        env[names["base_url"]] = cfg["base_url"]
+    if cfg.get("model"):
+        env[names["model"]] = cfg["model"]
     if cfg.get("api_key"):
         env["VINIPER_API_KEY"] = cfg.get("api_key", "")
+        env[names["api_key"]] = cfg["api_key"]
     if session:
         env["VINIPER_SESSION_ID"] = str(session.get("id") or "")
         env["VINIPER_WORKDIR"] = str(session.get("workdir") or "")
@@ -1411,8 +1433,13 @@ def build_agent_env(cfg: dict[str, str] | None = None, session: dict[str, Any] |
     return env
 
 
-def build_claude_env() -> dict[str, str]:
-    env = build_agent_env()
+def build_claude_env(cfg: dict[str, str] | None = None) -> dict[str, str]:
+    cfg = cfg or provider_config()
+    env = build_agent_env(cfg)
+    env["ANTHROPIC_BASE_URL"] = cfg.get("base_url", "")
+    env["ANTHROPIC_MODEL"] = cfg.get("model", "")
+    if cfg.get("api_key"):
+        env["ANTHROPIC_AUTH_TOKEN"] = cfg["api_key"]
     env["NO_COLOR"] = "1"
     return env
 
@@ -2850,7 +2877,7 @@ async def stream_chat_impl(
         proc = await asyncio.create_subprocess_exec(
             *command,
             cwd=str(cwd),
-            env=build_claude_env(),
+            env=build_claude_env(cfg),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

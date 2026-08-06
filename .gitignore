@@ -20,6 +20,7 @@ desktop/release-preview/
 *.tar.gz
 
 # Local/editor files
+codex/
 .env
 .DS_Store
 Thumbs.db

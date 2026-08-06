@@ -129,13 +129,14 @@ def verify_thin_shell_behavior() -> None:
 
 
 def main() -> int:
-    run([sys.executable, "-m", "py_compile", "server.py", "scripts/build_release.py", "scripts/verify_release.py", "scripts/verify_desktop.py", "scripts/build_desktop.py", "scripts/verify_app.py", "scripts/verify_slash_suggestions.py"])
+    run([sys.executable, "-m", "py_compile", "server.py", "scripts/build_release.py", "scripts/verify_release.py", "scripts/verify_desktop.py", "scripts/build_desktop.py", "scripts/verify_app.py", "scripts/verify_slash_suggestions.py", "scripts/verify_provider_routing.py"])
     if shutil.which("node"):
         run(["node", "--check", "static/app.js"])
         run(["node", "--check", "desktop/main.js"])
         run(["node", "--check", "desktop/preload.js"])
     verify_thin_shell_behavior()
     run([sys.executable, "scripts/verify_slash_suggestions.py"])
+    run([sys.executable, "scripts/verify_provider_routing.py"])
     run([sys.executable, "scripts/verify_desktop.py"])
     verify_claude_cli_if_available()
     verify_local_api()

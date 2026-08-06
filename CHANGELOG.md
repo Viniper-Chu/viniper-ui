@@ -1,3 +1,17 @@
+## v4.3.3 (2026-08-06)
+
+### 修复
+- **修复模型 API `ConnectionRefused`**：Viniper 应用内的 provider 地址现在优先于 Windows 和 Claude Code 遗留的环境变量，避免旧 `ANTHROPIC_BASE_URL` 把请求错误地导向已经停止的本地网关。
+- **自动迁移旧本地网关**：DeepSeek 配置如果仍指向旧版 `127.0.0.1:57322`，会自动迁回官方 Anthropic 兼容地址 `https://api.deepseek.com/anthropic`。
+- **固定 Claude Code 子进程配置**：启动 Claude Code 时显式传入当前 Viniper 设置中的 API 地址、模型和认证信息，确保设置页显示值与实际请求地址一致。
+
+### 验证
+- `python scripts/verify_provider_routing.py`
+- `python scripts/verify_app.py`
+- `python scripts/verify_desktop.py`
+- `python scripts/verify_slash_suggestions.py`
+- Claude Code `2.1.167` 流式参数兼容检查
+
 ## v4.3.2 (2026-06-16)
 
 ### 修复
