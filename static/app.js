@@ -19,6 +19,7 @@ const state = {
   sidebarVisible: true,
   sidebarWidth: 280,
   sidebarResizing: false,
+  viewMode: "home",
   alwaysOnTop: false,
   sessionPinned: false,
   settings: null,
@@ -297,6 +298,18 @@ function setSidebarVisible(visible) {
   }
 }
 
+function setViewMode(mode) {
+  state.viewMode = mode === "code" ? "code" : "home";
+  document.body.dataset.viewMode = state.viewMode;
+  $$(".view-tab").forEach((button) => {
+    const active = button.id === `${state.viewMode}-view-btn`;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  const main = $("#main");
+  if (main) main.classList.toggle("code-view", state.viewMode === "code");
+}
+
 function toggleSidebar() {
   setSidebarVisible(!state.sidebarVisible);
 }
@@ -318,26 +331,52 @@ function t(key) {
 }
 
 function translateChrome() {
-  $("#new-chat-btn").title = t("newChat");
-  $("#new-chat-btn").setAttribute("aria-label", t("newChat"));
+  const newChat = $("#new-chat-btn");
+  if (newChat) {
+    newChat.title = t("newChat");
+    newChat.setAttribute("aria-label", t("newChat"));
+  }
   if ($("#toggle-skills-btn")) $("#toggle-skills-btn").textContent = t("skills");
-  $("#settings-btn").title = t("settings");
-  $("#settings-btn").setAttribute("aria-label", t("settings"));
-  $(".model-picker span").textContent = t("model");
-  $(".permission-picker span").textContent = t("permission");
-  $("#change-workdir-btn").textContent = t("directory");
-  $("#user-input").placeholder = t("inputPlaceholder");
-  $("#file-btn").title = t("attach");
-  $("#file-btn").setAttribute("aria-label", t("attach"));
-  $("#stop-btn").title = t("stop");
-  $("#stop-btn").setAttribute("aria-label", t("stop"));
-  $("#send-btn").title = t("send");
-  $("#send-btn").setAttribute("aria-label", t("send"));
-  $("#toggle-sidebar-btn").title = t("sidebar");
-  $("#toggle-sidebar-btn").setAttribute("aria-label", t("sidebar"));
-  $("#skills-web-btn").title = "打开 skills.sh";
-  $("#skills-web-btn").setAttribute("aria-label", t("skillsWeb"));
-  $("#thinking span:last-child").textContent = t("thinking");
+  const settings = $("#settings-btn");
+  if (settings) {
+    settings.title = t("settings");
+    settings.setAttribute("aria-label", t("settings"));
+  }
+  const modelLabel = $(".model-picker span");
+  if (modelLabel) modelLabel.textContent = t("model");
+  const permissionLabel = $(".permission-picker span");
+  if (permissionLabel) permissionLabel.textContent = t("permission");
+  const workdir = $("#change-workdir-btn");
+  if (workdir) workdir.textContent = t("directory");
+  const input = $("#user-input");
+  if (input) input.placeholder = t("inputPlaceholder");
+  const fileButton = $("#file-btn");
+  if (fileButton) {
+    fileButton.title = t("attach");
+    fileButton.setAttribute("aria-label", t("attach"));
+  }
+  const stopButton = $("#stop-btn");
+  if (stopButton) {
+    stopButton.title = t("stop");
+    stopButton.setAttribute("aria-label", t("stop"));
+  }
+  const sendButton = $("#send-btn");
+  if (sendButton) {
+    sendButton.title = t("send");
+    sendButton.setAttribute("aria-label", t("send"));
+  }
+  const sidebarButton = $("#toggle-sidebar-btn");
+  if (sidebarButton) {
+    sidebarButton.title = t("sidebar");
+    sidebarButton.setAttribute("aria-label", t("sidebar"));
+  }
+  const skills = $("#skills-web-btn");
+  if (skills) {
+    skills.title = "打开技能库";
+    skills.setAttribute("aria-label", t("skillsWeb"));
+  }
+  const thinking = $("#thinking span:last-child");
+  if (thinking) thinking.textContent = t("thinking");
   updateThemeButton();
   updateWindowPinButton();
   updateModelLabels();
@@ -371,6 +410,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     applyLanguage(getInitialLanguage());
     setSidebarWidth(getInitialSidebarWidth(), { persist: false });
     setSidebarVisible(getInitialSidebarVisible());
+    setViewMode("home");
     bindEvents();
     bindSidebarResize();
     setupDesktopBridge();
@@ -463,6 +503,19 @@ function bindEvents() {
   if (topbarPinButton) topbarPinButton.addEventListener("click", toggleAlwaysOnTop);
   $("#skills-web-btn").addEventListener("click", openSkillsWeb);
   $("#new-chat-btn").addEventListener("click", openNewSessionModal);
+  $("#new-session-nav-btn")?.addEventListener("click", openNewSessionModal);
+  $("#project-btn")?.addEventListener("click", changeWorkdir);
+  $("#customize-btn")?.addEventListener("click", openSettingsModal);
+  $("#home-view-btn")?.addEventListener("click", () => setViewMode("home"));
+  $("#code-view-btn")?.addEventListener("click", () => setViewMode("code"));
+  $$("[data-settings-nav]").forEach((button) => {
+    button.addEventListener("click", () => {
+      activateSettingsSection(button.dataset.settingsNav);
+    });
+  });
+  $(".rail-close")?.addEventListener("click", () => {
+    $("#workspace-rail")?.classList.add("hidden");
+  });
   if ($("#toggle-skills-btn")) $("#toggle-skills-btn").addEventListener("click", toggleSkillsPanel);
   if ($("#close-skills-btn")) $("#close-skills-btn").addEventListener("click", () => $("#skills-panel").classList.add("hidden"));
   if ($("#skill-search")) $("#skill-search").addEventListener("input", renderSkillList);
@@ -626,6 +679,12 @@ function bindEvents() {
     }
 
   });
+}
+
+function activateSettingsSection(key = "account") {
+  const selected = String(key || "account");
+  $$("[data-settings-nav]").forEach((item) => item.classList.toggle("active", item.dataset.settingsNav === selected));
+  $$("[data-settings-panel]").forEach((panel) => panel.classList.toggle("settings-panel-muted", panel.dataset.settingsPanel !== selected));
 }
 
 function bindSidebarResize() {
@@ -1234,6 +1293,7 @@ async function openSettingsModal() {
   renderSettingsModelSelect();
   $("#settings-provider-model").value = provider.model || state.selectedModel;
   $("#diagnostics-panel").innerHTML = "";
+  activateSettingsSection("account");
   $("#settings-modal").classList.remove("hidden");
   $("#settings-display-name").focus();
 }
@@ -1634,7 +1694,7 @@ async function loadSessionList() {
     return;
   }
 
-  list.innerHTML = sessions.map((session) => {
+  const renderSession = (session) => {
     const active = session.id === state.sessionId ? " active" : "";
     const title = session.name || session.id;
     const pinned = Boolean(session.pinned);
@@ -1653,7 +1713,14 @@ async function loadSessionList() {
         <button class="mini-button danger" type="button" title="删除" data-delete-session="${escapeAttr(session.id)}">×</button>
       </div>
     `;
-  }).join("");
+  };
+  const pinnedSessions = sessions.filter((session) => Boolean(session.pinned));
+  const recentSessions = sessions.filter((session) => !session.pinned);
+  const renderGroup = (title, items) => items.length
+    ? `<section class="session-group"><h2>${escapeHtml(title)}</h2>${items.map(renderSession).join("")}</section>`
+    : "";
+  list.innerHTML = `${renderGroup("已置顶", pinnedSessions)}${renderGroup("最近会话", recentSessions)}`
+    || `<div class="empty-list">暂无会话</div>`;
 
   $$("[data-open-session]").forEach((button) => {
     button.addEventListener("click", () => switchSession(button.dataset.openSession));
@@ -1804,21 +1871,25 @@ function renderCurrentSession() {
 function renderWelcome() {
   $("#messages").innerHTML = `
     <div class="welcome">
-      <h1>准备好了</h1>
-      <p>当前模型：${escapeHtml(getSelectedModelOption().label)}</p>
+      <img class="welcome-icon" src="/static/assets/viniper-icon.png?v=${encodeURIComponent(state.status?.version || "preview")}" alt="" aria-hidden="true">
+      <p class="welcome-eyebrow">${escapeHtml(state.previewMode ? "Viniper Preview" : "Viniper")}</p>
+      <h1>今天想做什么？</h1>
+      <p class="welcome-copy">把任务交给当前工作区，Viniper 会保留会话上下文并把结果整理在这里。</p>
       <div class="quick-actions">
-        <button class="quick-btn" data-prompt="帮我检查这个网页还有哪些可以改进">检查网页</button>
-        <button class="quick-btn" data-prompt="帮我整理今天的任务">整理任务</button>
+        <button class="quick-btn" data-prompt="帮我检查当前项目还有哪些可以改进">检查当前项目</button>
+        <button class="quick-btn" data-prompt="帮我整理今天的任务并给出优先级">整理任务</button>
         <button class="quick-btn" data-prompt="帮我写一个清晰的执行计划">制定计划</button>
       </div>
     </div>
   `;
+  updateContextRail();
 }
 
 function renderAllMessages() {
   if (!state.messages.length) {
     renderWelcome();
     updateStoredThinkingTimer();
+    updateContextRail();
     return;
   }
 
@@ -1831,6 +1902,7 @@ function renderAllMessages() {
     return messageTemplate(roleClass, label, content, message.thinking || "", message.segments || [], message);
   }).join("");
   updateStoredThinkingTimer();
+  updateContextRail();
 }
 
 function addMessage(role, content, meta = {}) {
@@ -1840,6 +1912,7 @@ function addMessage(role, content, meta = {}) {
   const roleClass = role;
   const label = role === "user" ? "" : assistantLabel(state.selectedModel);
   $("#messages").insertAdjacentHTML("beforeend", messageTemplate(roleClass, label, content, "", [], meta));
+  updateContextRail();
   scrollBottom();
   return $("#messages .message:last-child .msg-content");
 }
@@ -2211,6 +2284,42 @@ function renderArtifactCards(text) {
       `).join("")}
     </div>
   `;
+}
+
+function updateContextRail() {
+  const rail = $("#workspace-rail");
+  const toolArea = $("#tool-area");
+  const artifactArea = $("#artifact-area");
+  if (!rail || !toolArea || !artifactArea) return;
+
+  const allText = state.messages.map((message) => `${message.content || ""}\n${message.thinking || ""}`).join("\n");
+  const artifactPaths = extractArtifactPaths(allText);
+  const hasToolState = state.isStreaming || state.messages.some((message) => {
+    const value = `${message.content || ""} ${message.thinking || ""}`;
+    return /工具|执行|命令|读取|写入|运行/.test(value) && message.role === "assistant";
+  });
+
+  toolArea.classList.toggle("hidden", !hasToolState);
+  if (hasToolState) {
+    const stateLabel = state.isStreaming ? "运行中" : "已完成";
+    const stateNode = toolArea.querySelector(".workspace-panel-state");
+    if (stateNode) stateNode.textContent = stateLabel;
+    if (!toolArea.querySelector(".rail-tool-copy")) {
+      const copy = document.createElement("p");
+      copy.className = "rail-tool-copy";
+      copy.textContent = state.isStreaming ? "当前任务的工具状态会显示在这里。" : "本轮工具调用已回到会话记录。";
+      toolArea.appendChild(copy);
+    }
+  }
+
+  artifactArea.classList.toggle("hidden", !artifactPaths.length);
+  if (artifactPaths.length) {
+    artifactArea.innerHTML = `<div class="workspace-panel-header"><h2 id="artifact-area-title">产物</h2><span class="workspace-panel-state">${artifactPaths.length} 项</span></div>${renderArtifactCards(allText)}`;
+  }
+
+  const hasContent = hasToolState || artifactPaths.length > 0;
+  rail.classList.toggle("hidden", !hasContent);
+  rail.setAttribute("aria-hidden", hasContent ? "false" : "true");
 }
 
 async function openArtifactPath(path, action = "open") {
@@ -2818,7 +2927,7 @@ function formatDuration(seconds) {
 function renderThinkingPanel(thinking, options = {}) {
   const hasTime = Number.isFinite(Number(options.elapsedSeconds));
   const timeLabel = hasTime
-    ? `${options.activeThinking ? "Thinking" : "Thought for"} ${formatDuration(options.elapsedSeconds)}`
+    ? `${options.activeThinking ? "思考中" : "已思考"} ${formatDuration(options.elapsedSeconds)}`
     : "";
   const stateClass = options.activeThinking ? " streaming" : "";
   const indexAttr = Number.isInteger(options.segmentIndex) ? ` data-segment-index="${options.segmentIndex}"` : "";
@@ -2826,7 +2935,7 @@ function renderThinkingPanel(thinking, options = {}) {
   return `
     <details class="thinking-panel${stateClass}"${indexAttr}>
       <summary>
-        <span>Thinking</span>
+        <span>思考过程</span>
         <span class="thinking-preview">${escapeHtml(previewThinking(thinking))}</span>
         ${timeLabel ? `<span class="thinking-time" data-thinking-time${timeAttrs}>${escapeHtml(timeLabel)}</span>` : ""}
       </summary>
@@ -2837,12 +2946,13 @@ function renderThinkingPanel(thinking, options = {}) {
 
 function previewThinking(thinking) {
   const clean = repairTextForDisplay(thinking).replace(/\s+/g, " ").trim();
-  if (!clean) return "Working...";
+  if (!clean) return "正在处理…";
   return clean.length > 140 ? `${clean.slice(0, 140)}...` : clean;
 }
 
 function showThinking(show) {
   $("#thinking").classList.toggle("hidden", !show);
+  updateContextRail();
 }
 
 async function cancelCurrentTask() {
