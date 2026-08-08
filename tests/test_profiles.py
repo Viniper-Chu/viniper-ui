@@ -53,6 +53,16 @@ class ProfileAndPreviewSafetyTests(unittest.TestCase):
         self.assertNotIn("PREVIEW_RELEASE", source)
         self.assertNotIn("PREVIEW_MARKER", source)
 
+    def test_preview_package_resources_include_server_root_modules(self) -> None:
+        package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
+        resources = package["build"]["extraResources"]
+        resource = next(item for item in resources if item.get("to") == "viniper-ui")
+        resource_filter = resource["filter"]
+        self.assertIn("server.py", resource_filter)
+        self.assertIn("context_lifecycle.py", resource_filter)
+        self.assertIn("profiles.json", resource_filter)
+        self.assertIn("static/**", resource_filter)
+
     def test_cli_promotion_accepts_only_exact_preview_profile_target(self) -> None:
         expected = build_preview.default_install_dir()
         self.assertEqual(

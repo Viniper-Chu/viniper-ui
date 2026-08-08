@@ -35,6 +35,7 @@
         "to": "viniper-ui",
         "filter": [
           "server.py",
+          "context_lifecycle.py",
           "profiles.json",
           "requirements.txt",
           "VERSION",
