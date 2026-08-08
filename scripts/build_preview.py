@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Build an isolated Viniper UI preview desktop app."""
+"""Build an isolated Viniper Preview app using create-only staging."""
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import json
 import os
 import shutil
 import subprocess
@@ -13,8 +15,24 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DESKTOP = ROOT / "desktop"
-PREVIEW_MARKER = ROOT / "PREVIEW"
-PREVIEW_RELEASE = DESKTOP / "release-preview"
+PROFILE_FILE = ROOT / "profiles.json"
+STAGING_ROOT = ROOT / "codex" / "工作输出" / "preview-build"
+PROTECTED_PATHS = {
+    Path("D:/Viniper UI Preview").resolve(),
+    Path("D:/Viniper UI").resolve(),
+}
+PROTECTED_TREE_PATHS = {
+    (ROOT / "desktop" / "release-preview").resolve(),
+    (ROOT / "desktop" / "release").resolve(),
+}
+
+
+def preview_profile() -> dict[str, object]:
+    data = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+    profile = data.get("preview")
+    if not isinstance(profile, dict):
+        raise SystemExit("profiles.json is missing the preview profile")
+    return profile
 
 
 def tool(name: str) -> str:
@@ -26,11 +44,24 @@ def tool(name: str) -> str:
     return resolved
 
 
+def network_env() -> dict[str, str]:
+    env = os.environ.copy()
+    proxy = "http://127.0.0.1:7897"
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        env.setdefault(key, proxy)
+    env.setdefault(
+        "NO_PROXY",
+        "localhost,127.0.0.1,::1,10.*,172.16.*,172.17.*,172.18.*,172.19.*,172.20.*,172.21.*,172.22.*,172.23.*,172.24.*,172.25.*,172.26.*,172.27.*,172.28.*,172.29.*,172.30.*,172.31.*,192.168.*",
+    )
+    return env
+
+
 def run(command: list[str], cwd: Path = ROOT, timeout: int | None = None) -> None:
     print(f"+ {' '.join(command)}")
     completed = subprocess.run(
         command,
         cwd=str(cwd),
+        env=network_env(),
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -47,30 +78,88 @@ def run(command: list[str], cwd: Path = ROOT, timeout: int | None = None) -> Non
 
 
 def default_install_dir() -> Path:
-    if ROOT.drive:
-        return Path(f"{ROOT.drive}\\Viniper UI Preview")
-    return ROOT.parent / "Viniper UI Preview"
+    configured = str(preview_profile().get("install_dir") or "").strip()
+    if configured and sys.platform == "win32":
+        return Path(configured)
+    return ROOT.parent / "Viniper Preview"
 
 
-def copy_preview_app(target: Path) -> None:
-    source = PREVIEW_RELEASE / "win-unpacked"
-    if not source.exists():
+def reject_protected(path: Path, label: str) -> Path:
+    resolved = path.expanduser().resolve()
+    for protected in PROTECTED_PATHS:
+        if resolved == protected:
+            raise SystemExit(f"{label} is protected: {resolved}")
+    for protected in PROTECTED_TREE_PATHS:
+        if resolved == protected or protected in resolved.parents:
+            raise SystemExit(f"{label} is protected: {resolved}")
+    return resolved
+
+
+def create_owned_staging(requested: str | None = None) -> tuple[Path, str]:
+    root = STAGING_ROOT.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    run_id = requested or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f") + f"-p{os.getpid()}"
+    staging = (root / run_id).resolve()
+    if staging.parent != root:
+        raise SystemExit(f"staging must be a direct child of {root}")
+    reject_protected(staging, "staging")
+    if staging.exists():
+        raise SystemExit(f"staging already exists; refusing to reuse: {staging}")
+    staging.mkdir()
+    ownership = {
+        "run_id": run_id,
+        "profile": "preview",
+        "created_by": "scripts/build_preview.py",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (staging / "OWNERSHIP.json").write_text(json.dumps(ownership, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return staging, run_id
+
+
+def require_owned_staging(staging: Path) -> Path:
+    staging = staging.resolve()
+    if staging.parent != STAGING_ROOT.resolve():
+        raise SystemExit(f"staging is outside the owned staging root: {staging}")
+    marker = staging / "OWNERSHIP.json"
+    if not marker.exists():
+        raise SystemExit(f"missing staging ownership record: {marker}")
+    return staging
+
+
+def copy_preview_app(staging: Path, target: Path) -> None:
+    staging = require_owned_staging(staging)
+    source = staging / "release" / "win-unpacked"
+    if not source.is_dir():
         raise SystemExit(f"missing preview build: {source}")
+    target = reject_protected(target, "install target")
     if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(source, target)
+        raise SystemExit(f"install target already exists; refusing to overwrite: {target}")
+    if not target.parent.exists():
+        raise SystemExit(f"install target parent does not exist: {target.parent}")
+
+    created_target = True
+    try:
+        shutil.copytree(source, target)
+    except Exception:
+        if created_target and target.exists():
+            shutil.rmtree(target)
+        raise
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build a standalone Viniper UI preview app.")
+    profile = preview_profile()
+    parser = argparse.ArgumentParser(description="Build a standalone Viniper Preview app.")
     parser.add_argument("--skip-install", action="store_true", help="Skip npm install.")
+    parser.add_argument("--staging-id", default="", help="Use a new, direct child name under codex/工作输出/preview-build.")
     parser.add_argument(
         "--install-dir",
         default=str(default_install_dir()) if sys.platform == "win32" else "",
-        help="Optional directory to copy the standalone preview app into.",
+        help="Optional create-only directory to promote the isolated app into.",
     )
     args = parser.parse_args()
 
+    staging, run_id = create_owned_staging(args.staging_id.strip() or None)
+    release_output = staging / "release"
     npm = tool("npm")
     os.environ.setdefault("ELECTRON_MIRROR", "https://npmmirror.com/mirrors/electron/")
     os.environ.setdefault("ELECTRON_BUILDER_BINARIES_MIRROR", "https://npmmirror.com/mirrors/electron-builder-binaries/")
@@ -78,38 +167,29 @@ def main() -> int:
     if not args.skip_install:
         run([npm, "install"], cwd=DESKTOP, timeout=300)
 
-    if PREVIEW_RELEASE.exists():
-        shutil.rmtree(PREVIEW_RELEASE)
-
-    PREVIEW_MARKER.write_text("Viniper UI preview build\n", encoding="utf-8")
-    try:
-        run([npm, "run", "check"], cwd=DESKTOP, timeout=60)
-        run(
-            [
-                npm,
-                "run",
-                "pack",
-                "--",
-                "--config.directories.output=release-preview",
-                "--config.productName=Viniper UI Preview",
-                "--config.appId=com.viniper.ui.desktop.preview",
-                "--config.win.artifactName=Viniper.UI.Preview.${version}.${ext}",
-            ],
-            cwd=DESKTOP,
-            timeout=600,
-        )
-    finally:
-        try:
-            PREVIEW_MARKER.unlink()
-        except FileNotFoundError:
-            pass
+    run([npm, "run", "check"], cwd=DESKTOP, timeout=60)
+    run(
+        [
+            npm,
+            "run",
+            "pack",
+            "--",
+            f"--config.directories.output={release_output}",
+            f"--config.productName={profile['product_name']}",
+            f"--config.appId={profile['app_id']}",
+            "--config.extraMetadata.viniperProfile=preview",
+            "--config.win.artifactName=Viniper.Preview.${version}.${ext}",
+        ],
+        cwd=DESKTOP,
+        timeout=600,
+    )
 
     if args.install_dir:
         target = Path(args.install_dir)
-        copy_preview_app(target)
-        print(f"Copied standalone preview app to {target}")
+        copy_preview_app(staging, target)
+        print(f"Created isolated preview app at {target}")
 
-    print(f"Preview build is in {PREVIEW_RELEASE}")
+    print(f"Preview staging ({run_id}) is in {staging}")
     return 0
 
 

@@ -9,15 +9,40 @@ const path = require("path");
 const APP_ROOT = app.isPackaged
   ? path.join(process.resourcesPath, "viniper-ui")
   : path.resolve(__dirname, "..");
+function readProfileConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(APP_ROOT, "profiles.json"), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+const PROFILE_CONFIG = readProfileConfig();
+const PREVIEW_PROFILE = PROFILE_CONFIG.preview || {
+  app_id: "com.viniper.desktop.preview",
+  product_name: "Viniper Preview",
+  port: 17946,
+  data_dir_name: "Viniper Preview"
+};
+const DESKTOP_METADATA = (() => {
+  try {
+    return require(path.join(__dirname, "package.json"));
+  } catch {
+    return {};
+  }
+})();
 const ICON_PATH = process.platform === "win32"
   ? path.join(APP_ROOT, "static", "assets", "viniper-icon.ico")
   : path.join(APP_ROOT, "static", "assets", "viniper-icon.png");
 const BADGE_ICON_PATH = path.join(APP_ROOT, "static", "assets", "viniper-icon-badge-1.png");
 const BUNDLED_VERSION = readBundledVersion();
-const IS_PREVIEW = process.env.VINIPER_UI_PREVIEW === "1" || fs.existsSync(path.join(APP_ROOT, "PREVIEW"));
-const APP_USER_MODEL_ID = IS_PREVIEW ? "com.viniper.ui.desktop.preview" : "com.viniper.ui.desktop";
+const IS_PREVIEW = process.env.VINIPER_UI_PREVIEW === "1"
+  || DESKTOP_METADATA.viniperProfile === "preview"
+  || fs.existsSync(path.join(APP_ROOT, "PREVIEW"));
+const DISPLAY_NAME = IS_PREVIEW ? PREVIEW_PROFILE.product_name : "Viniper UI";
+const APP_USER_MODEL_ID = IS_PREVIEW ? PREVIEW_PROFILE.app_id : "com.viniper.ui.desktop";
 
-let port = Number(process.env.VINIPER_UI_PORT || (IS_PREVIEW ? 17946 : 17373));
+let port = Number(process.env.VINIPER_UI_PORT || (IS_PREVIEW ? PREVIEW_PROFILE.port : 17373));
 let mainWindow = null;
 let splashWindow = null;
 let tray = null;
@@ -170,7 +195,7 @@ async function createSplashWindow() {
     skipTaskbar: true,
     alwaysOnTop: true,
     focusable: false,
-    title: "Viniper UI",
+    title: DISPLAY_NAME,
     icon: appIcon(),
     show: false,
     backgroundColor: "#00000000",
@@ -208,7 +233,7 @@ function updateTrayVisuals() {
   const size = process.platform === "win32" ? 16 : 22;
   const image = trayIcon(size);
   if (!image.isEmpty()) tray.setImage(image);
-  tray.setToolTip(trayBadgeCount > 0 ? `Viniper UI - ${trayBadgeCount} 条新回复` : "Viniper UI");
+  tray.setToolTip(trayBadgeCount > 0 ? `${DISPLAY_NAME} - ${trayBadgeCount} 条新回复` : DISPLAY_NAME);
   try {
     app.setBadgeCount(trayBadgeCount);
   } catch {}
@@ -256,17 +281,18 @@ function safeMainLog(level, message) {
 function logServerChunk(level, chunk) {
   const text = chunk.toString().trim();
   if (!text) return;
-  safeMainLog(level, `[Viniper UI] ${text}`);
+  safeMainLog(level, `[${DISPLAY_NAME}] ${text}`);
 }
 
 function previewUserDataDir() {
+  const dataDirName = PREVIEW_PROFILE.data_dir_name || "Viniper Preview";
   if (process.platform === "win32") {
-    return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Viniper UI Preview");
+    return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), dataDirName);
   }
   if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", "Viniper UI Preview");
+    return path.join(os.homedir(), "Library", "Application Support", dataDirName);
   }
-  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "Viniper UI Preview");
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), dataDirName);
 }
 
 function sendRendererCommand(command, payload = {}) {
@@ -475,7 +501,7 @@ async function createMainWindow() {
     closeSplashWindow();
     isStarting = false;
     dialog.showErrorBox(
-      "Viniper UI 启动失败",
+      `${DISPLAY_NAME} 启动失败`,
       `本地服务没有在 ${port} 端口就绪。请确认 Python 3、requirements.txt 依赖和 Claude Code 已安装。`
     );
     return;
@@ -486,7 +512,7 @@ async function createMainWindow() {
     height: 900,
     minWidth: 960,
     minHeight: 680,
-    title: IS_PREVIEW ? "Viniper UI Preview" : "Viniper UI",
+    title: IS_PREVIEW ? PREVIEW_PROFILE.product_name : "Viniper UI",
     icon: appIcon(),
     backgroundColor: "#f6fbff",
     show: false,
@@ -519,7 +545,7 @@ async function createMainWindow() {
     isStarting = false;
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
     mainWindow = null;
-    dialog.showErrorBox("Viniper UI 启动失败", error.message || String(error));
+    dialog.showErrorBox(`${DISPLAY_NAME} 启动失败`, error.message || String(error));
     return;
   }
   const remainingSplashMs = Math.max(0, 1450 - (Date.now() - splashStartedAt));
@@ -569,20 +595,20 @@ async function restartServer() {
     await waitForServer(30000);
     if (mainWindow) mainWindow.loadURL(localUrl());
   } catch (error) {
-    dialog.showErrorBox("Viniper UI 重启失败", error.message);
+    dialog.showErrorBox(`${DISPLAY_NAME} 重启失败`, error.message);
   }
 }
 
 async function runDiagnosticsDialog() {
   const diagnostics = await requestJson("/api/diagnostics", 5000);
   if (!diagnostics) {
-    dialog.showErrorBox("Viniper UI 自检失败", "无法连接本地服务。");
+    dialog.showErrorBox(`${DISPLAY_NAME} 自检失败`, "无法连接本地服务。");
     return;
   }
   const lines = diagnostics.checks.map((item) => `${item.ok ? "✓" : "×"} ${item.label}: ${item.detail || ""}`);
   dialog.showMessageBox(mainWindow || undefined, {
     type: diagnostics.ok ? "info" : "warning",
-    title: "Viniper UI 自检",
+    title: `${DISPLAY_NAME} 自检`,
     message: diagnostics.ok ? "自检通过" : "有项目需要处理",
     detail: lines.join("\n")
   });
@@ -599,9 +625,9 @@ function createTray() {
 
 function updateTrayMenu() {
   if (!tray) return;
-  tray.setToolTip(trayBadgeCount > 0 ? `Viniper UI - ${trayBadgeCount} 条新回复` : "Viniper UI");
+  tray.setToolTip(trayBadgeCount > 0 ? `${DISPLAY_NAME} - ${trayBadgeCount} 条新回复` : DISPLAY_NAME);
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: "打开 Viniper UI", click: showMainWindow },
+    { label: `打开 ${DISPLAY_NAME}`, click: showMainWindow },
     {
       label: mainWindow?.isVisible() ? "隐藏窗口" : "显示窗口",
       click: () => {
@@ -641,7 +667,7 @@ function createApplicationMenu() {
         { label: "选择目录", accelerator: "CmdOrCtrl+Shift+O", click: () => sendRendererCommand("change-workdir") },
         { type: "separator" },
         { label: "打开 skills.sh", click: openSkillsWindow },
-        { label: "在浏览器打开 Viniper UI", click: () => shell.openExternal(localUrl()) },
+        { label: `在浏览器打开 ${DISPLAY_NAME}`, click: () => shell.openExternal(localUrl()) },
         { type: "separator" },
         { role: "quit", label: "退出" }
       ]
@@ -704,7 +730,7 @@ if (IS_PREVIEW) {
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.setName(IS_PREVIEW ? "Viniper UI Preview" : "Viniper UI");
+  app.setName(DISPLAY_NAME);
   app.setAppUserModelId(APP_USER_MODEL_ID);
   app.on("second-instance", showMainWindow);
   app.whenReady().then(async () => {

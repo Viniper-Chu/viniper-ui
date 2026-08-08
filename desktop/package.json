@@ -4,6 +4,7 @@
   "private": true,
   "description": "Desktop shell for Viniper UI.",
   "main": "main.js",
+  "viniperProfile": "formal-runtime",
   "author": "Viniper UI",
   "license": "MIT",
   "scripts": {
@@ -34,6 +35,7 @@
         "to": "viniper-ui",
         "filter": [
           "server.py",
+          "profiles.json",
           "requirements.txt",
           "VERSION",
           "PREVIEW",

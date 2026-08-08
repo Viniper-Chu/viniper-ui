@@ -1,0 +1,49 @@
+{
+  "formal": {
+    "app_id": "com.viniper.desktop",
+    "product_name": "Viniper",
+    "port": 17373,
+    "data_dir_name": "Viniper",
+    "install_dir": "D:\\Viniper",
+    "shortcut_name": "Viniper.lnk",
+    "writable": true,
+    "mode": "future-target",
+    "compatibility_read_boundary": "only approved legacy sources may be read during a separately authorized migration; never write back to legacy"
+  },
+  "preview": {
+    "app_id": "com.viniper.desktop.preview",
+    "product_name": "Viniper Preview",
+    "port": 17946,
+    "data_dir_name": "Viniper Preview",
+    "install_dir": "D:\\Viniper Preview",
+    "shortcut_name": "Viniper Preview.lnk",
+    "writable": true,
+    "mode": "isolated-preview",
+    "compatibility_read_boundary": "isolated Preview root; no formal or legacy import by default, and any explicit import must land in a newly created Preview root"
+  },
+  "legacy_read_only": {
+    "app_ids": [
+      "com.viniper.ui.desktop",
+      "com.viniper.ui.desktop.preview"
+    ],
+    "product_names": [
+      "Viniper UI",
+      "Viniper UI Preview"
+    ],
+    "ports": [],
+    "data_dir_names": [
+      "Viniper UI",
+      "Viniper UI Preview"
+    ],
+    "install_dirs": [
+      "D:\\Viniper UI",
+      "D:\\Viniper UI Preview"
+    ],
+    "shortcut_names": [
+      "Viniper UI.lnk"
+    ],
+    "writable": false,
+    "mode": "read-only",
+    "compatibility_read_boundary": "read-only compatibility source; no runtime start, write, migration, deletion, overwrite, or lock-file update"
+  }
+}

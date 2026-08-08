@@ -33,9 +33,17 @@ from context_lifecycle import (
 )
 
 
-APP_TITLE = "Viniper UI"
 PROFILE_NAME = "agent-shell"
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+PROFILE_FILE = Path(__file__).resolve().parent / "profiles.json"
+
+
+def read_profile_config() -> dict[str, Any]:
+    try:
+        data = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def env_value(name: str, default: str = "") -> str:
@@ -54,6 +62,10 @@ def read_app_version() -> str:
 
 APP_VERSION = read_app_version()
 PREVIEW_MODE = env_value("VINIPER_UI_PREVIEW", "").strip() == "1" or VERSION_FILE.with_name("PREVIEW").exists()
+PREVIEW_PROFILE = read_profile_config().get("preview", {})
+if not isinstance(PREVIEW_PROFILE, dict):
+    PREVIEW_PROFILE = {}
+APP_TITLE = str(PREVIEW_PROFILE.get("product_name") or "Viniper Preview") if PREVIEW_MODE else "Viniper UI"
 ASSET_VERSION = env_value("VINIPER_UI_ASSET_VERSION", "").strip() or APP_VERSION
 PERMISSION_MODE_OPTIONS = [
     {
@@ -282,6 +294,15 @@ def default_data_dir() -> Path:
     configured = env_value("VINIPER_UI_DATA_DIR", "").strip()
     if configured:
         return Path(configured).expanduser()
+    if PREVIEW_MODE:
+        data_dir_name = str(PREVIEW_PROFILE.get("data_dir_name") or "Viniper Preview")
+        if os.name == "nt":
+            base = os.environ.get("APPDATA")
+            if base:
+                return Path(base) / data_dir_name
+        if sys.platform == "darwin":
+            return Path.home() / "Library" / "Application Support" / data_dir_name
+        return Path.home() / ".local" / "share" / data_dir_name.lower().replace(" ", "-")
     if os.name == "nt":
         base = os.environ.get("APPDATA")
         if base:
@@ -3424,6 +3445,7 @@ async def index():
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     asset_version = re.sub(r"[^A-Za-z0-9_.-]", "", ASSET_VERSION) or str(int(time.time()))
     html = html.replace("__APP_VERSION__", asset_version)
+    html = html.replace("__APP_TITLE__", APP_TITLE)
     return HTMLResponse(
         html,
         headers={
