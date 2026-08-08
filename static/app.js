@@ -40,6 +40,7 @@ const state = {
   pendingDeleteResolver: null,
   pendingRenameResolver: null,
   retrySend: { count: 0, max: 3, delayMs: 3000 },
+  contextCompression: { status: "idle", reason: "", lastAutoKey: "", inFlight: false, timer: null },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -1557,6 +1558,7 @@ async function createSession({ silent = false, name = "", workdir = "" } = {}) {
     body: JSON.stringify({ name, workdir })
   });
   const data = await response.json();
+  resetContextCompressionState();
   state.sessionId = data.session_id;
   state.sessionName = data.name || "";
   state.workdir = data.workdir || "";
@@ -1743,6 +1745,7 @@ function closeRenameSessionModal(value) {
 }
 
 function applySession(sessionId, data) {
+  if (state.sessionId !== sessionId) resetContextCompressionState();
   state.sessionId = sessionId;
   state.sessionName = data.name || "";
   state.workdir = data.workdir || "";
@@ -2639,7 +2642,37 @@ function contextStats() {
   };
 }
 
-function updateContextMeter({ announce = false } = {}) {
+function resetContextCompressionState() {
+  if (state.contextCompression?.timer) {
+    clearTimeout(state.contextCompression.timer);
+  }
+  state.contextCompression = { status: "idle", reason: "", lastAutoKey: "", inFlight: false, timer: null };
+}
+
+function contextCompressionKey(stats = contextStats()) {
+  const last = state.messages[state.messages.length - 1] || {};
+  return [
+    state.sessionId || "",
+    state.messages.length,
+    last.role || "",
+    String(last.content || "").length,
+    stats.tokens,
+  ].join(":");
+}
+
+function scheduleContextCompression(stats) {
+  if (!state.sessionId || state.isStreaming || !stats.shouldCompress) return;
+  if (state.contextCompression.inFlight || state.contextCompression.timer) return;
+  const key = contextCompressionKey(stats);
+  if (state.contextCompression.lastAutoKey === key) return;
+  state.contextCompression.timer = setTimeout(() => {
+    state.contextCompression.timer = null;
+    state.contextCompression.lastAutoKey = key;
+    requestContextCompression({ auto: true });
+  }, 450);
+}
+
+function updateContextMeter({ announce = false, schedule = true } = {}) {
   const meter = $("#context-meter");
   if (!meter) return;
 
@@ -2656,12 +2689,22 @@ function updateContextMeter({ announce = false } = {}) {
   meter.classList.toggle("warn", stats.shouldCompress && !stats.critical);
   meter.classList.toggle("critical", stats.critical);
   meter.classList.toggle("compressable", stats.shouldCompress);
+  meter.dataset.compressionState = state.contextCompression.status;
 
-  if (announce && stats.shouldCompress) {
+  if (state.contextCompression.status === "running") {
+    showContextNotice(stats);
+    const notice = $(".context-notice");
+    if (notice) notice.textContent = "正在整理上下文，输入不会被阻塞。";
+  } else if (state.contextCompression.status === "failed" && stats.shouldCompress) {
+    showContextNotice(stats);
+    const notice = $(".context-notice");
+    if (notice) notice.textContent = `上下文压缩失败：${state.contextCompression.reason || "可手动重试"}`;
+  } else if (announce && stats.shouldCompress) {
     showContextNotice(stats);
   } else if (!stats.shouldCompress) {
     hideContextNotice();
   }
+  if (schedule) scheduleContextCompression(stats);
 }
 
 function showContextNotice(stats = contextStats()) {
@@ -2682,41 +2725,61 @@ function hideContextNotice() {
   if (notice) notice.remove();
 }
 
-async function compressCurrentContext() {
-  if (!state.sessionId || state.isStreaming) return;
+async function requestContextCompression({ auto = false } = {}) {
+  if (!state.sessionId || state.isStreaming || state.contextCompression.inFlight) return null;
 
   const button = $("#context-compress-btn");
-  const oldText = button.textContent;
-  button.disabled = true;
-  button.textContent = "压缩中";
+  const oldText = button?.textContent || "";
+  state.contextCompression.inFlight = true;
+  state.contextCompression.status = "running";
+  state.contextCompression.reason = "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "压缩中";
+  }
   showContextNotice({ ...contextStats(), critical: true, percent: contextStats().percent });
+  const notice = $(".context-notice");
+  if (notice) notice.textContent = auto ? "上下文接近上限，正在后台整理，输入不会被阻塞。" : "正在整理上下文，输入不会被阻塞。";
 
   try {
     const response = await fetch(`/api/compress/${encodeURIComponent(state.sessionId)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: state.selectedModel })
+      body: JSON.stringify({ model: state.selectedModel, auto })
     });
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) {
       throw new Error(data.reason || `压缩失败: ${response.status}`);
     }
+    state.contextCompression.status = data.status || (data.compressed ? "succeeded" : "idle");
+    state.contextCompression.reason = data.reason || "";
     if (data.compressed) {
       await switchSession(state.sessionId, { quiet: true });
       showCompressedBanner("上下文已压缩，底层 Claude Code 会话也已重置并带入摘要。");
-    } else {
-      showCompressedBanner("当前上下文还不需要压缩。");
+    } else if (data.reason && !data.deduplicated) {
+      showCompressedBanner(data.reason.includes("below threshold") ? "当前上下文还不需要压缩。" : `上下文整理：${data.reason}`);
     }
+    return data;
   } catch (error) {
+    state.contextCompression.status = "failed";
+    state.contextCompression.reason = error.message || String(error);
     showContextNotice({ ...contextStats(), critical: true, percent: contextStats().percent });
-    const notice = $(".context-notice");
-    if (notice) notice.textContent = `上下文压缩失败：${error.message}`;
+    const errorNotice = $(".context-notice");
+    if (errorNotice) errorNotice.textContent = `上下文压缩失败：${state.contextCompression.reason}`;
+    return null;
   } finally {
-    button.disabled = false;
-    button.textContent = oldText;
-    updateContextMeter();
-    $("#user-input").focus();
+    state.contextCompression.inFlight = false;
+    if (button) {
+      button.disabled = false;
+      button.textContent = oldText;
+    }
+    updateContextMeter({ schedule: false });
+    if (!auto) $("#user-input").focus();
   }
+}
+
+async function compressCurrentContext() {
+  return requestContextCompression({ auto: false });
 }
 
 function formatDuration(seconds) {

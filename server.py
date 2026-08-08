@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import hashlib
 import http.client
 import json
@@ -23,6 +24,13 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+
+from context_lifecycle import (
+    ContextAdapterUnavailable,
+    ContextLifecycle,
+    ExternalSummaryAdapter,
+    NativeContextAdapter,
+)
 
 
 APP_TITLE = "Viniper UI"
@@ -306,6 +314,7 @@ _skills_cache: dict[str, Any] = {"time": 0.0, "items": []}
 _session_locks: dict[str, asyncio.Lock] = {}
 _active_runs: dict[str, dict[str, Any]] = {}
 _goal_tasks: dict[str, asyncio.Task] = {}
+_context_lifecycle: ContextLifecycle | None = None
 
 
 def now_ts() -> float:
@@ -3960,71 +3969,74 @@ async def read_skill(filename: str):
     }
 
 
-@app.post("/api/compress/{session_id}")
-async def compress_context(session_id: str, request: Request):
-    """Compress old messages into a summary to keep context manageable.
-    Uses token-based threshold matching the frontend's estimation."""
-    import urllib.request
+CONTEXT_COMPRESS_THRESHOLD = 0.65
+CONTEXT_LIMITS = {
+    "deepseek-v4-pro[1m]": 1000000,
+    "deepseek-v4-flash": 128000,
+}
 
-    session = safe_session(session_id)
-    messages = session.get("messages", [])
-    if not messages:
-        return {"ok": True, "compressed": False, "reason": "no messages"}
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
 
-    # Token estimation matching frontend: ~3 chars per token
-    model = allowed_model(str(body.get("model") or merged_env().get("ANTHROPIC_MODEL", "deepseek-v4-pro[1m]")))
-    context_limits = {"deepseek-v4-pro[1m]": 1000000, "deepseek-v4-flash": 128000}
-    limit = context_limits.get(model, 128000)
-    threshold = int(limit * 0.65)
+def context_limit_for_model(model: str) -> int:
+    return CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
 
-    total_chars = sum(len(str(m.get("content", ""))) + len(str(m.get("thinking", ""))) for m in messages)
-    est_tokens = total_chars // 3
 
-    if est_tokens < threshold:
-        return {"ok": True, "compressed": False, "reason": f"tokens {est_tokens} below threshold {threshold}"}
+def context_revision(session: dict[str, Any]) -> str:
+    """Return a monotonic-enough revision without reading message contents."""
+    updated = float(session.get("updated") or session.get("created") or 0)
+    message_count = len(session.get("messages", []))
+    claude_session_id = str(session.get("claude_session_id") or "")
+    return f"{updated:.6f}:{message_count}:{claude_session_id}"
 
-    # Keep messages until remaining tokens fit comfortably under threshold
+
+def split_context_messages(messages: list[dict[str, Any]], threshold_tokens: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     keep_count = min(15, len(messages) // 2)
     target_keep = 0
-    char_budget = threshold * 3
+    char_budget = threshold_tokens * 3
     running = 0
-    for i in range(len(messages) - 1, -1, -1):
-        m = messages[i]
-        running += len(str(m.get("content", ""))) + len(str(m.get("thinking", "")))
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        running += len(str(message.get("content", ""))) + len(str(message.get("thinking", "")))
         if running > char_budget * 0.4:
-            target_keep = len(messages) - i
+            target_keep = len(messages) - index
             break
     keep_count = max(keep_count, min(target_keep, len(messages) - 1))
     keep_count = max(5, min(keep_count, len(messages)))
+    return messages[:-keep_count], messages[-keep_count:]
 
-    old_messages = messages[:-keep_count]
-    recent_messages = messages[-keep_count:]
 
-    # Build a summary prompt
-    lines = []
-    if session.get("summary"):
-        lines.append(f"[此前摘要]: {session.get('summary')}")
-    for msg in old_messages:
-        role = "用户" if msg.get("role") == "user" else ("摘要" if msg.get("role") == "system" else "助手")
-        content = str(msg.get("content", ""))[:800]
+def compression_prompt(messages: list[dict[str, Any]], existing_summary: str, threshold_tokens: int) -> str:
+    old_messages, _ = split_context_messages(messages, threshold_tokens)
+    lines: list[str] = []
+    if existing_summary:
+        lines.append(f"[此前摘要]: {existing_summary}")
+    for message in old_messages:
+        role = "用户" if message.get("role") == "user" else ("摘要" if message.get("role") == "system" else "助手")
+        content = str(message.get("content", ""))[:800]
         if content:
             lines.append(f"[{role}]: {content}")
     conversation_text = "\n".join(lines)
-
-    summary_prompt = (
+    return (
         "请用简洁的中文总结以下对话历史，保留关键决策、文件路径、错误和重要结论。"
         "不要遗漏用户提出的需求或问题。控制在300字以内。\n\n"
         f"{conversation_text}"
     )
 
+
+async def summarize_with_deepseek(
+    messages: list[dict[str, Any]],
+    existing_summary: str,
+    model: str,
+) -> str:
+    """External fallback only; never used as proof of native Claude compaction."""
+    import urllib.request
+
     cfg = deepseek_config()
     api_key = cfg["api_key"]
     if not api_key:
-        return {"ok": False, "reason": "no api key"}
+        raise ContextAdapterUnavailable("no external summary API key")
+
+    threshold = int(context_limit_for_model(model) * CONTEXT_COMPRESS_THRESHOLD)
+    summary_prompt = compression_prompt(messages, existing_summary, threshold)
 
     try:
         req_body = json.dumps({
@@ -4053,26 +4065,104 @@ async def compress_context(session_id: str, request: Request):
         result = json.loads(resp.read().decode("utf-8"))
         summary = result["choices"][0]["message"]["content"].strip()
     except Exception as exc:
-        return {"ok": False, "reason": f"summary failed: {exc}"}
+        raise RuntimeError(f"summary failed: {exc}") from exc
 
-    # Replace old messages with a single summary message and reset the Claude Code
-    # session. The next turn carries this summary into a fresh Claude Code context.
-    compressed_messages = [
-        {
-            "role": "system",
-            "content": f"[上下文摘要] {summary}",
-        },
+    if not summary:
+        raise ContextAdapterUnavailable("external summary was empty")
+    return summary
+
+
+async def persist_context_summary(
+    session_id: str,
+    revision: str,
+    summary: str,
+    snapshot: list[dict[str, Any]],
+    threshold_tokens: int,
+) -> bool:
+    current = safe_session(session_id)
+    if context_revision(current) != revision:
+        return False
+
+    _, recent_messages = split_context_messages(snapshot, threshold_tokens)
+    candidate = copy.deepcopy(current)
+    candidate["messages"] = [
+        {"role": "system", "content": f"[上下文摘要] {summary}"},
         *recent_messages,
     ]
-    session["messages"] = compressed_messages
-    session["summary"] = summary
-    session["claude_session_id"] = str(uuid.uuid4())
-    session["claude_initialized"] = False
-    session["updated"] = now_ts()
-    sessions[session_id] = session
-    save_sessions_to_disk()
+    candidate["summary"] = summary
+    candidate["claude_session_id"] = str(uuid.uuid4())
+    candidate["claude_initialized"] = False
+    candidate["updated"] = now_ts()
+    previous = sessions.get(session_id)
+    sessions[session_id] = candidate
+    try:
+        save_sessions_to_disk()
+    except Exception:
+        if previous is not None:
+            sessions[session_id] = previous
+        else:
+            sessions.pop(session_id, None)
+        raise
+    return True
 
-    return {"ok": True, "compressed": True, "summary": summary[:200]}
+
+def context_lifecycle() -> ContextLifecycle:
+    global _context_lifecycle
+    if _context_lifecycle is None:
+        async def unavailable_external(messages: list[dict[str, Any]], existing_summary: str) -> str:
+            raise ContextAdapterUnavailable("external summary adapter requires a configured provider")
+
+        _context_lifecycle = ContextLifecycle(
+            NativeContextAdapter(),
+            ExternalSummaryAdapter(unavailable_external),
+            threshold=CONTEXT_COMPRESS_THRESHOLD,
+        )
+    return _context_lifecycle
+
+
+@app.post("/api/compress/{session_id}")
+async def compress_context(session_id: str, request: Request):
+    """Schedule one versioned compression for a session."""
+    session = safe_session(session_id)
+    messages = session.get("messages", [])
+    if not messages:
+        return {"ok": True, "compressed": False, "reason": "no messages", "status": "idle"}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    model = allowed_model(str(body.get("model") or ""))
+    limit = context_limit_for_model(model)
+    threshold_tokens = int(limit * CONTEXT_COMPRESS_THRESHOLD)
+    total_chars = sum(len(str(message.get("content", ""))) + len(str(message.get("thinking", ""))) for message in messages)
+    estimated_tokens = total_chars // 3
+    usage_ratio = estimated_tokens / limit if limit else 0
+    revision = context_revision(session)
+
+    external_adapter = ExternalSummaryAdapter(
+        lambda snapshot, existing_summary: summarize_with_deepseek(snapshot, existing_summary, model)
+    )
+
+    async def persist(revision_value: str, summary: str, snapshot: list[dict[str, Any]]) -> bool:
+        return await persist_context_summary(
+            session_id,
+            revision_value,
+            summary,
+            snapshot,
+            threshold_tokens,
+        )
+
+    result = await context_lifecycle().request(
+        session_id,
+        revision,
+        messages,
+        str(session.get("summary") or ""),
+        usage_ratio,
+        persist,
+        external_adapter=external_adapter,
+    )
+    return result.as_dict()
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
