@@ -77,6 +77,16 @@ class UiContractTests(unittest.TestCase):
         self.assertIn('class="settings-nav"', HTML)
         self.assertIn("function updateContextRail()", APP)
         self.assertIn("rail.classList.toggle(\"hidden\", !hasContent)", APP)
+        self.assertIn('aria-haspopup="listbox"', HTML)
+        self.assertIn("function setViewMode(mode)", APP)
+        self.assertIn("function activateSettingsSection", APP)
+
+    def test_session_groups_and_code_view_have_runtime_hooks(self) -> None:
+        self.assertIn('class="session-group"', APP)
+        self.assertIn('renderGroup("已置顶"', APP)
+        self.assertIn('renderGroup("最近会话"', APP)
+        self.assertIn('data-settings-nav="provider"', HTML)
+        self.assertIn("#main.code-view", CSS)
 
     def test_local_original_icon_and_chinese_default_surface(self) -> None:
         self.assertIn("/static/assets/viniper-icon.png", HTML)

@@ -1872,7 +1872,7 @@ function renderWelcome() {
   $("#messages").innerHTML = `
     <div class="welcome">
       <img class="welcome-icon" src="/static/assets/viniper-icon.png?v=${encodeURIComponent(state.status?.version || "preview")}" alt="" aria-hidden="true">
-      <p class="welcome-eyebrow">${escapeHtml(state.previewMode ? "Viniper Preview" : "Viniper")}</p>
+      <p class="welcome-eyebrow">${escapeHtml(state.viewMode === "code" ? "代码工作区" : (state.previewMode ? "Viniper Preview" : "Viniper"))}</p>
       <h1>今天想做什么？</h1>
       <p class="welcome-copy">把任务交给当前工作区，Viniper 会保留会话上下文并把结果整理在这里。</p>
       <div class="quick-actions">
