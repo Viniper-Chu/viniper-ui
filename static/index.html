@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>__APP_TITLE__</title>
   <script>
+    window.VINIPER_APP_TITLE = "__APP_TITLE__";
     (() => {
       const savedTheme = localStorage.getItem("viniper-ui:theme");
       const savedAccent = localStorage.getItem("viniper-ui:accent") || "viniper";
@@ -89,6 +90,23 @@
         </div>
       </header>
 
+      <aside id="workspace-rail" aria-label="工具与产物">
+        <section id="tool-area" class="workspace-panel" aria-labelledby="tool-area-title">
+          <div class="workspace-panel-header">
+            <h2 id="tool-area-title">工具</h2>
+            <span class="workspace-panel-state">待命</span>
+          </div>
+          <p class="workspace-empty">当前任务的工具状态会显示在这里。</p>
+        </section>
+        <section id="artifact-area" class="workspace-panel" aria-labelledby="artifact-area-title">
+          <div class="workspace-panel-header">
+            <h2 id="artifact-area-title">产物</h2>
+            <span class="workspace-panel-state">空</span>
+          </div>
+          <p class="workspace-empty">任务生成的文件会集中显示在这里。</p>
+        </section>
+      </aside>
+
       <section id="chat-container" aria-label="对话内容">
         <div id="messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
         <div id="thinking" class="hidden">
@@ -104,10 +122,10 @@
           <div id="slash-suggestions" class="slash-suggestions hidden" role="listbox" aria-label="Slash commands"></div>
           <div id="input-actions">
             <div id="context-meter" class="context-meter" aria-label="上下文占用" title="上下文 0%">
-              <button id="context-compress-btn" class="context-ring" type="button" title="上下文 0%" aria-label="查看或整理上下文" aria-pressed="false">
+              <div id="context-ring" class="context-ring" role="status" aria-live="polite" title="上下文 0%" aria-label="上下文占用，当前 0%" aria-busy="false">
                 <span id="context-percent" class="context-tooltip">0%</span>
                 <span id="context-label" class="sr-only">上下文</span>
-              </button>
+              </div>
             </div>
             <button id="file-btn" class="icon-button" title="附加文件" aria-label="附加文件">＋</button>
             <input id="file-input" type="file" hidden multiple>
@@ -280,7 +298,7 @@
           <textarea id="settings-custom-env" rows="4" spellcheck="false" placeholder="OPENAI_API_KEY=...&#10;OPENAI_BASE_URL=..."></textarea>
           <p class="settings-help">Claude Code 使用原始 stream-json 薄透传。Custom CLI 会把提示词写入 stdin，并把 stdout 流式显示到会话。可用占位符：{model}、{base_url}、{workdir}、{session_id}、{permission_mode}。</p>
           <button id="create-desktop-shortcut-btn" class="panel-button" type="button">创建桌面快捷方式</button>
-          <p class="settings-help">快捷方式会指向已安装的软件版 Viniper UI，而不是网页启动脚本。</p>
+          <p class="settings-help">快捷方式会指向已安装的软件版 __APP_TITLE__，而不是网页启动脚本。</p>
         </section>
 
         <section class="settings-section">

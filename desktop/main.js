@@ -443,7 +443,7 @@ function startServerProcess() {
   }
   if (IS_PREVIEW) {
     env.VINIPER_UI_PREVIEW = "1";
-    env.VINIPER_UI_DATA_DIR = path.join(app.getPath("userData"), "data");
+    env.VINIPER_UI_DATA_DIR = app.getPath("userData");
     env.VINIPER_UI_ASSET_VERSION = `${BUNDLED_VERSION || "dev"}-preview-${Date.now()}`;
   }
 
@@ -459,7 +459,7 @@ function startServerProcess() {
   serverProcess.on("exit", (code) => {
     serverProcess = null;
     if (isQuitting) return;
-    safeMainLog("log", `[Viniper UI] Server exited (code=${code}), restarting in 2s...`);
+    safeMainLog("log", `[${DISPLAY_NAME}] Server exited (code=${code}), restarting in 2s...`);
     setTimeout(async () => {
       if (isQuitting || serverProcess) return;
       try {
@@ -467,7 +467,7 @@ function startServerProcess() {
         await waitForServer(30000);
         if (mainWindow) mainWindow.loadURL(localUrl());
       } catch {
-        safeMainLog("error", "[Viniper UI] Server auto-restart failed.");
+        safeMainLog("error", `[${DISPLAY_NAME}] Server auto-restart failed.`);
       }
     }, 2000);
   });
@@ -512,7 +512,7 @@ async function createMainWindow() {
     height: 900,
     minWidth: 960,
     minHeight: 680,
-    title: IS_PREVIEW ? PREVIEW_PROFILE.product_name : "Viniper UI",
+    title: DISPLAY_NAME,
     icon: appIcon(),
     backgroundColor: "#f6fbff",
     show: false,

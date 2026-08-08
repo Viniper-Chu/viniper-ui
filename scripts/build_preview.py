@@ -79,9 +79,22 @@ def run(command: list[str], cwd: Path = ROOT, timeout: int | None = None) -> Non
 
 def default_install_dir() -> Path:
     configured = str(preview_profile().get("install_dir") or "").strip()
-    if configured and sys.platform == "win32":
+    if configured:
         return Path(configured)
     return ROOT.parent / "Viniper Preview"
+
+
+def validate_cli_install_dir(raw: str) -> Path:
+    expected = default_install_dir()
+    candidate = Path(raw).expanduser()
+    expected_key = os.path.normcase(os.path.normpath(str(expected)))
+    candidate_key = os.path.normcase(os.path.normpath(str(candidate)))
+    if candidate_key != expected_key:
+        raise SystemExit(f"CLI promotion target must exactly match the Preview profile install_dir: {expected}")
+    resolved = reject_protected(candidate, "install target")
+    if resolved.exists():
+        raise SystemExit(f"install target already exists; refusing to overwrite: {resolved}")
+    return resolved
 
 
 def reject_protected(path: Path, label: str) -> Path:
@@ -153,10 +166,11 @@ def main() -> int:
     parser.add_argument("--staging-id", default="", help="Use a new, direct child name under codex/工作输出/preview-build.")
     parser.add_argument(
         "--install-dir",
-        default=str(default_install_dir()) if sys.platform == "win32" else "",
-        help="Optional create-only directory to promote the isolated app into.",
+        default="",
+        help="Optional create-only promotion target; must exactly equal profiles.json preview.install_dir.",
     )
     args = parser.parse_args()
+    target = validate_cli_install_dir(args.install_dir.strip()) if args.install_dir.strip() else None
 
     staging, run_id = create_owned_staging(args.staging_id.strip() or None)
     release_output = staging / "release"
@@ -184,8 +198,7 @@ def main() -> int:
         timeout=600,
     )
 
-    if args.install_dir:
-        target = Path(args.install_dir)
+    if target is not None:
         copy_preview_app(staging, target)
         print(f"Created isolated preview app at {target}")
 

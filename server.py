@@ -66,6 +66,7 @@ PREVIEW_PROFILE = read_profile_config().get("preview", {})
 if not isinstance(PREVIEW_PROFILE, dict):
     PREVIEW_PROFILE = {}
 APP_TITLE = str(PREVIEW_PROFILE.get("product_name") or "Viniper Preview") if PREVIEW_MODE else "Viniper UI"
+ACTIVE_PROFILE = "preview" if PREVIEW_MODE else "formal-runtime"
 ASSET_VERSION = env_value("VINIPER_UI_ASSET_VERSION", "").strip() or APP_VERSION
 PERMISSION_MODE_OPTIONS = [
     {
@@ -478,7 +479,7 @@ def load_goals_from_disk() -> dict[str, dict[str, Any]]:
         normalized = normalize_goal(str(goal_id), goal)
         if normalized["status"] == "running":
             normalized["status"] = "paused"
-            normalized["last_error"] = "Viniper UI restarted while this goal was running."
+            normalized["last_error"] = f"{APP_TITLE} restarted while this goal was running."
         loaded[str(goal_id)] = normalized
     return loaded
 
@@ -1537,7 +1538,7 @@ def build_generic_cli_prompt(session: dict[str, Any], prompt: str, attachments: 
         if content:
             history.append(f"{role}: {content}")
     parts = [
-        "You are running inside Viniper UI as a thin wrapper around a user-selected agent shell.",
+        f"You are running inside {APP_TITLE} as a thin wrapper around a user-selected agent shell.",
         "Use the current working directory and return concise progress plus final results.",
     ]
     system_append = build_system_append(session)
@@ -1552,7 +1553,7 @@ def build_generic_cli_prompt(session: dict[str, Any], prompt: str, attachments: 
 def build_system_append(session: dict[str, Any]) -> str:
     summary = str(session.get("summary") or "").strip()
     isolation_note = (
-        "当前 Viniper UI 会话与其他会话隔离。只把本会话传入的历史摘要、当前工作目录和用户消息"
+        f"当前 {APP_TITLE} 会话与其他会话隔离。只把本会话传入的历史摘要、当前工作目录和用户消息"
         "作为连续上下文；不要主动引用其他 UI 会话的记忆。"
     )
     stability_note = (
@@ -3164,7 +3165,7 @@ async def stream_chat_impl(
                 save_sessions_to_disk()
                 recovery_prompt = (
                     "继续完成上一项任务。上一轮底层模型/API 在工具结果返回后长时间没有输出，"
-                    "Viniper UI 已经重启 Claude Code 进程并恢复同一个会话。"
+                    f"{APP_TITLE} 已经重启 Claude Code 进程并恢复同一个会话。"
                     "请先检查当前工作目录里已经生成或已经读取过的内容，避免重复执行已完成步骤；"
                     "如果需要继续处理大文件、图片很多的 docx/pdf 或长日志，请用脚本生成文件，"
                     "聊天里只返回简短摘要、关键路径和最终结果。"
@@ -3485,6 +3486,8 @@ async def status():
         "ok": True,
         "mode": "custom-cli" if shell_id == "custom-cli" else "claude-code-cli",
         "profile": PROFILE_NAME,
+        "active_profile": ACTIVE_PROFILE,
+        "product_name": APP_TITLE,
         "version": APP_VERSION,
         "preview": PREVIEW_MODE,
         "configured": runtime_configured,
@@ -3715,7 +3718,7 @@ async def create_desktop_shortcut():
     if os.name != "nt":
         return {"ok": False, "message": "当前系统不需要 Windows 桌面快捷方式。"}
     await asyncio.to_thread(refresh_windows_shortcuts)
-    return {"ok": True, "message": "桌面和开始菜单快捷方式已指向软件版 Viniper UI。"}
+    return {"ok": True, "message": f"桌面和开始菜单快捷方式已指向软件版 {APP_TITLE}。"}
 
 
 @app.post("/api/update/check")
@@ -3800,7 +3803,7 @@ async def install_update(request: Request):
         if result.get("installer_opened"):
             message = (
                 "新版桌面安装器已下载并打开。请按安装器提示完成安装；"
-                "安装后桌面快捷方式会指向软件版 Viniper UI，历史会话不会被清空。"
+                f"安装后桌面快捷方式会指向软件版 {APP_TITLE}，历史会话不会被清空。"
             )
         else:
             message = (
@@ -3885,6 +3888,8 @@ async def new_session(request: Request):
         "name": sessions[sid]["name"],
         "workdir": sessions[sid]["workdir"],
         "pinned": False,
+        "updated": sessions[sid]["updated"],
+        "revision": context_revision(sessions[sid]),
     }
 
 
@@ -3900,6 +3905,7 @@ async def list_sessions():
                 "created": session.get("created", 0),
                 "updated": session.get("updated", session.get("created", 0)),
                 "pinned": bool(session.get("pinned")),
+                "revision": context_revision(session),
             }
             for sid, session in sorted(sessions.items(), key=session_sort_key)
         ]
@@ -3925,6 +3931,8 @@ async def last_session():
             "pinned": bool(session.get("pinned")),
             "messages": session.get("messages", []),
             "message_count": len(session.get("messages", [])),
+            "updated": session.get("updated", session.get("created", 0)),
+            "revision": context_revision(session),
         }
     })
 
@@ -3942,6 +3950,8 @@ async def get_session(session_id: str):
         "pinned": bool(session.get("pinned")),
         "messages": session.get("messages", []),
         "message_count": len(session.get("messages", [])),
+        "updated": session.get("updated", session.get("created", 0)),
+        "revision": context_revision(session),
     })
 
 
@@ -4217,7 +4227,7 @@ if __name__ == "__main__":
 
     port = int(env_value("VINIPER_UI_PORT", "17373"))
     url = f"http://127.0.0.1:{port}"
-    print(f"\n  Viniper UI -> {url}\n")
+    print(f"\n  {APP_TITLE} -> {url}\n")
     if env_value("VINIPER_UI_OPEN_BROWSER", "1") != "0":
         webbrowser.open(url)
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")

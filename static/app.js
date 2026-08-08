@@ -2,6 +2,7 @@ const state = {
   sessionId: null,
   sessionName: "",
   workdir: "",
+  contextRevision: "",
   messages: [],
   isStreaming: false,
   contextFiles: [],
@@ -40,11 +41,13 @@ const state = {
   pendingDeleteResolver: null,
   pendingRenameResolver: null,
   retrySend: { count: 0, max: 3, delayMs: 3000 },
-  contextCompression: { status: "idle", reason: "", lastAutoKey: "", inFlight: false, timer: null },
+  contextCompression: { status: "idle", reason: "", lastAttemptKey: "", inFlight: false, timer: null },
+  contextCompressionBySession: {},
 };
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+const APP_TITLE = String(typeof window !== "undefined" && window.VINIPER_APP_TITLE || "Viniper UI");
 const STORAGE_PREFIX = "viniper-ui:";
 const LAST_SESSION_KEY = `${STORAGE_PREFIX}last-session-id`;
 const MODEL_KEY = `${STORAGE_PREFIX}selected-model`;
@@ -487,7 +490,6 @@ function bindEvents() {
     state.permissionMode = sanitizePermissionMode(event.target.value);
     storageSet(PERMISSION_KEY, state.permissionMode);
   });
-  $("#context-compress-btn").addEventListener("click", compressCurrentContext);
   $("#cancel-session-btn").addEventListener("click", closeNewSessionModal);
   $("#create-session-btn").addEventListener("click", createNamedSession);
   $("#cancel-delete-session-btn").addEventListener("click", () => closeDeleteSessionModal(false));
@@ -1102,7 +1104,7 @@ async function installUpdate() {
     }
     renderUpdateButton();
     if (!data.restarting) {
-      alert(data.message || "更新已安装，请重新打开 Viniper UI。");
+      alert(data.message || `更新已安装，请重新打开 ${APP_TITLE}。`);
     }
   } catch (error) {
     $("#update-notes").textContent = `更新失败：${error.message}`;
@@ -1131,7 +1133,7 @@ async function waitForAppRestart(expectedVersion = "") {
       $("#update-notes").textContent = "旧服务已关闭，等待新服务启动。";
     }
   }
-  $("#update-notes").textContent = "更新已安装，但自动刷新超时。请手动重新打开 Viniper UI。";
+  $("#update-notes").textContent = `更新已安装，但自动刷新超时。请手动重新打开 ${APP_TITLE}。`;
 }
 
 function modelsToText(models = []) {
@@ -1558,8 +1560,10 @@ async function createSession({ silent = false, name = "", workdir = "" } = {}) {
     body: JSON.stringify({ name, workdir })
   });
   const data = await response.json();
-  resetContextCompressionState();
+  clearContextCompressionTimer();
   state.sessionId = data.session_id;
+  activateContextCompressionState(state.sessionId);
+  state.contextRevision = data.revision || `${data.updated || ""}:${data.message_count || 0}`;
   state.sessionName = data.name || "";
   state.workdir = data.workdir || "";
   state.sessionPinned = Boolean(data.pinned);
@@ -1745,8 +1749,10 @@ function closeRenameSessionModal(value) {
 }
 
 function applySession(sessionId, data) {
-  if (state.sessionId !== sessionId) resetContextCompressionState();
+  if (state.sessionId !== sessionId) clearContextCompressionTimer();
   state.sessionId = sessionId;
+  activateContextCompressionState(sessionId);
+  state.contextRevision = data.revision || `${data.updated || ""}:${data.message_count || 0}`;
   state.sessionName = data.name || "";
   state.workdir = data.workdir || "";
   state.sessionPinned = Boolean(data.pinned);
@@ -2642,20 +2648,35 @@ function contextStats() {
   };
 }
 
-function resetContextCompressionState() {
-  if (state.contextCompression?.timer) {
-    clearTimeout(state.contextCompression.timer);
+function newContextCompressionState() {
+  return { status: "idle", reason: "", lastAttemptKey: "", inFlight: false, timer: null };
+}
+
+function clearContextCompressionTimer(compressionState = state.contextCompression) {
+  if (compressionState?.timer) {
+    clearTimeout(compressionState.timer);
+    compressionState.timer = null;
   }
-  state.contextCompression = { status: "idle", reason: "", lastAutoKey: "", inFlight: false, timer: null };
+}
+
+function activateContextCompressionState(sessionId) {
+  clearContextCompressionTimer();
+  if (!sessionId) {
+    state.contextCompression = newContextCompressionState();
+    return;
+  }
+  const saved = state.contextCompressionBySession[sessionId]
+    || (state.contextCompressionBySession[sessionId] = newContextCompressionState());
+  state.contextCompression = saved;
 }
 
 function contextCompressionKey(stats = contextStats()) {
   const last = state.messages[state.messages.length - 1] || {};
   return [
     state.sessionId || "",
+    state.contextRevision || "",
     state.messages.length,
     last.role || "",
-    String(last.content || "").length,
     stats.tokens,
   ].join(":");
 }
@@ -2664,11 +2685,14 @@ function scheduleContextCompression(stats) {
   if (!state.sessionId || state.isStreaming || !stats.shouldCompress) return;
   if (state.contextCompression.inFlight || state.contextCompression.timer) return;
   const key = contextCompressionKey(stats);
-  if (state.contextCompression.lastAutoKey === key) return;
+  if (state.contextCompression.lastAttemptKey === key) return;
+  const sessionId = state.sessionId;
+  const compressionState = state.contextCompression;
   state.contextCompression.timer = setTimeout(() => {
+    if (state.sessionId !== sessionId || state.contextCompression !== compressionState) return;
     state.contextCompression.timer = null;
-    state.contextCompression.lastAutoKey = key;
-    requestContextCompression({ auto: true });
+    compressionState.lastAttemptKey = key;
+    requestContextCompression(sessionId, compressionState);
   }, 450);
 }
 
@@ -2682,7 +2706,7 @@ function updateContextMeter({ announce = false, schedule = true } = {}) {
   if (ring) {
     ring.style.setProperty("--context-percent", `${stats.percent}%`);
     ring.title = `${stats.shouldCompress ? "上下文接近上限" : "上下文"} ${stats.percent}%`;
-    ring.setAttribute("aria-label", `${stats.shouldCompress ? "整理上下文" : "查看上下文"}，当前 ${stats.percent}%`);
+    ring.setAttribute("aria-label", `${stats.shouldCompress ? "上下文接近上限" : "上下文占用"}，当前 ${stats.percent}%`);
     ring.setAttribute("aria-busy", state.contextCompression.status === "running" ? "true" : "false");
   }
   $("#context-label").textContent = stats.shouldCompress ? "上下文接近上限" : "上下文";
@@ -2700,7 +2724,7 @@ function updateContextMeter({ announce = false, schedule = true } = {}) {
   } else if (state.contextCompression.status === "failed" && stats.shouldCompress) {
     showContextNotice(stats);
     const notice = $(".context-notice");
-    if (notice) notice.textContent = `上下文压缩失败：${state.contextCompression.reason || "可手动重试"}`;
+    if (notice) notice.textContent = `上下文整理失败：${state.contextCompression.reason || "将在新版本上下文变更后重试"}`;
   } else if (announce && stats.shouldCompress) {
     showContextNotice(stats);
   } else if (!stats.shouldCompress) {
@@ -2720,8 +2744,8 @@ function showContextNotice(stats = contextStats()) {
     if (messagesEl) messagesEl.prepend(notice);
   }
   notice.textContent = stats.critical
-    ? `上下文已到 ${stats.percent}%，建议现在压缩，否则 Claude Code 可能丢上下文或跑偏。`
-    : `上下文已到 ${stats.percent}%，接近上限，可以先压缩再继续。`;
+    ? `上下文已到 ${stats.percent}%，后台整理已排队。`
+    : `上下文已到 ${stats.percent}%，后台整理将在需要时运行。`;
 }
 
 function hideContextNotice() {
@@ -2729,61 +2753,56 @@ function hideContextNotice() {
   if (notice) notice.remove();
 }
 
-async function requestContextCompression({ auto = false } = {}) {
-  if (!state.sessionId || state.isStreaming || state.contextCompression.inFlight) return null;
+function shortContextReason(value) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, 120);
+}
 
-  const button = $("#context-compress-btn");
-  const oldText = button?.textContent || "";
-  state.contextCompression.inFlight = true;
-  state.contextCompression.status = "running";
-  state.contextCompression.reason = "";
-  if (button) {
-    button.disabled = true;
-    button.textContent = "压缩中";
+async function requestContextCompression(sessionId = state.sessionId, compressionState = state.contextCompression) {
+  if (!sessionId || state.isStreaming || compressionState.inFlight) return null;
+
+  compressionState.inFlight = true;
+  compressionState.status = "running";
+  compressionState.reason = "";
+  if (state.sessionId === sessionId) {
+    showContextNotice({ ...contextStats(), critical: true, percent: contextStats().percent });
+    const notice = $(".context-notice");
+    if (notice) notice.textContent = "上下文接近上限，正在后台整理。";
   }
-  showContextNotice({ ...contextStats(), critical: true, percent: contextStats().percent });
-  const notice = $(".context-notice");
-  if (notice) notice.textContent = auto ? "上下文接近上限，正在后台整理，输入不会被阻塞。" : "正在整理上下文，输入不会被阻塞。";
 
   try {
-    const response = await fetch(`/api/compress/${encodeURIComponent(state.sessionId)}`, {
+    const response = await fetch(`/api/compress/${encodeURIComponent(sessionId)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: state.selectedModel, auto })
+      body: JSON.stringify({ model: state.selectedModel })
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) {
       throw new Error(data.reason || `压缩失败: ${response.status}`);
     }
-    state.contextCompression.status = data.status || (data.compressed ? "succeeded" : "idle");
-    state.contextCompression.reason = data.reason || "";
+    compressionState.status = data.status || (data.compressed ? "succeeded" : "idle");
+    compressionState.reason = shortContextReason(data.reason);
     if (data.compressed) {
-      await switchSession(state.sessionId, { quiet: true });
-      showCompressedBanner("上下文已压缩，底层 Claude Code 会话也已重置并带入摘要。");
+      if (state.sessionId === sessionId) {
+        await switchSession(sessionId, { quiet: true });
+        showCompressedBanner("上下文已整理，底层 Claude Code 会话也已重置并带入摘要。");
+      }
     } else if (data.reason && !data.deduplicated) {
-      showCompressedBanner(data.reason.includes("below threshold") ? "当前上下文还不需要压缩。" : `上下文整理：${data.reason}`);
+      if (state.sessionId === sessionId) showCompressedBanner(data.reason.includes("below threshold") ? "当前上下文还不需要整理。" : `上下文整理：${shortContextReason(data.reason)}`);
     }
     return data;
   } catch (error) {
-    state.contextCompression.status = "failed";
-    state.contextCompression.reason = error.message || String(error);
-    showContextNotice({ ...contextStats(), critical: true, percent: contextStats().percent });
-    const errorNotice = $(".context-notice");
-    if (errorNotice) errorNotice.textContent = `上下文压缩失败：${state.contextCompression.reason}`;
+    compressionState.status = "failed";
+    compressionState.reason = shortContextReason(error.message || String(error));
+    if (state.sessionId === sessionId) {
+      showContextNotice({ ...contextStats(), critical: true, percent: contextStats().percent });
+      const errorNotice = $(".context-notice");
+      if (errorNotice) errorNotice.textContent = `上下文整理失败：${compressionState.reason}`;
+    }
     return null;
   } finally {
-    state.contextCompression.inFlight = false;
-    if (button) {
-      button.disabled = false;
-      button.textContent = oldText;
-    }
-    updateContextMeter({ schedule: false });
-    if (!auto) $("#user-input").focus();
+    compressionState.inFlight = false;
+    if (state.sessionId === sessionId) updateContextMeter({ schedule: false });
   }
-}
-
-async function compressCurrentContext() {
-  return requestContextCompression({ auto: false });
 }
 
 function formatDuration(seconds) {

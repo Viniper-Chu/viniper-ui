@@ -49,6 +49,22 @@ class SlowFakeAdapter(FakeAdapter):
         return self.summary
 
 
+class RevisionAdapter(FakeAdapter):
+    def __init__(self, name: str = "external-summary"):
+        super().__init__(name)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.seen_messages = []
+
+    async def summarize(self, messages, existing_summary):
+        self.calls += 1
+        self.seen_messages.append(messages)
+        if self.calls == 1:
+            self.started.set()
+            await self.release.wait()
+        return f"summary-{messages[0]['content']}"
+
+
 class ContextLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_adapter_is_selected_when_capability_is_observable(self) -> None:
         native = FakeAdapter("native")
@@ -119,6 +135,83 @@ class ContextLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertTrue(result.stale)
         self.assertEqual(source[0]["content"], "newer message")
+
+    async def test_different_revision_waits_then_runs_without_old_commit(self) -> None:
+        adapter = RevisionAdapter()
+        lifecycle = ContextLifecycle(NativeContextAdapter(), adapter)
+        current_revision = {"value": "r1"}
+        persisted = []
+
+        async def persist(revision, summary, snapshot):
+            if revision != current_revision["value"]:
+                return False
+            persisted.append((revision, summary, snapshot))
+            return True
+
+        first = asyncio.create_task(
+            lifecycle.request("session-a", "r1", [{"role": "user", "content": "old"}], "", 0.9, persist)
+        )
+        await adapter.started.wait()
+        current_revision["value"] = "r2"
+        second = asyncio.create_task(
+            lifecycle.request("session-a", "r2", [{"role": "user", "content": "new"}], "", 0.9, persist)
+        )
+        await asyncio.sleep(0)
+        adapter.release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertFalse(first_result.ok)
+        self.assertTrue(first_result.stale)
+        self.assertTrue(second_result.ok)
+        self.assertTrue(second_result.compressed)
+        self.assertFalse(second_result.deduplicated)
+        self.assertEqual(adapter.calls, 2)
+        self.assertEqual([item[0] for item in persisted], ["r2"])
+        self.assertEqual(adapter.seen_messages[1][0]["content"], "new")
+
+    async def test_same_revision_different_adapter_is_not_deduplicated(self) -> None:
+        first_adapter = RevisionAdapter()
+        second_adapter = FakeAdapter("external-summary", summary="second adapter")
+        lifecycle = ContextLifecycle(NativeContextAdapter(), first_adapter)
+        persisted = []
+
+        async def persist(revision, summary, snapshot):
+            persisted.append((revision, summary))
+            return True
+
+        first = asyncio.create_task(
+            lifecycle.request(
+                "session-a",
+                "r1",
+                [{"role": "user", "content": "first adapter"}],
+                "",
+                0.9,
+                persist,
+                external_adapter=first_adapter,
+            )
+        )
+        await first_adapter.started.wait()
+        second = asyncio.create_task(
+            lifecycle.request(
+                "session-a",
+                "r1",
+                [{"role": "user", "content": "second adapter"}],
+                "",
+                0.9,
+                persist,
+                external_adapter=second_adapter,
+            )
+        )
+        await asyncio.sleep(0)
+        first_adapter.release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertFalse(first_result.ok)
+        self.assertTrue(first_result.stale)
+        self.assertTrue(second_result.ok)
+        self.assertEqual(first_adapter.calls, 1)
+        self.assertEqual(second_adapter.calls, 1)
+        self.assertEqual(persisted, [("r1", "second adapter")])
 
     async def test_failed_summary_preserves_source_and_can_retry(self) -> None:
         source = [{"role": "user", "content": "keep me"}]

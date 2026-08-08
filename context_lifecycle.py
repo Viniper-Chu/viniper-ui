@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Protocol
 
 
@@ -105,7 +105,14 @@ class CompressionState:
     status: str = "idle"
     revision: str = ""
     adapter: str = ""
+    adapter_key: str = ""
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class CompressionKey:
+    revision: str
+    adapter_key: str
 
 
 class ContextLifecycle:
@@ -121,8 +128,10 @@ class ContextLifecycle:
         self.native_adapter = native_adapter
         self.external_adapter = external_adapter
         self.threshold = float(threshold)
-        self._tasks: dict[str, asyncio.Task[CompressionResult]] = {}
-        self._completed: dict[str, str] = {}
+        self._tasks: dict[str, tuple[CompressionKey, asyncio.Task[CompressionResult]]] = {}
+        self._completed: dict[str, CompressionKey] = {}
+        self._latest_requested: dict[str, CompressionKey] = {}
+        self._adapter_tokens: list[tuple[ContextAdapter, str]] = []
         self._states: dict[str, CompressionState] = {}
 
     def state(self, session_id: str) -> CompressionState:
@@ -132,6 +141,14 @@ class ContextLifecycle:
         if self.native_adapter.available():
             return self.native_adapter
         return external_adapter or self.external_adapter
+
+    def _adapter_key(self, adapter: ContextAdapter) -> str:
+        for known, token in self._adapter_tokens:
+            if known is adapter:
+                return token
+        token = f"{adapter.name}:{len(self._adapter_tokens)}"
+        self._adapter_tokens.append((adapter, token))
+        return token
 
     async def request(
         self,
@@ -153,59 +170,80 @@ class ContextLifecycle:
                 revision=revision,
             )
 
-        previous = self._completed.get(session_id)
-        if previous == revision:
-            state = self.state(session_id)
-            return CompressionResult(
-                ok=True,
-                reason="revision already compressed",
-                status=state.status or "succeeded",
-                adapter=state.adapter,
-                deduplicated=True,
-                revision=revision,
-            )
-
-        task = self._tasks.get(session_id)
-        if task is not None and not task.done():
-            result = await task
-            result.deduplicated = True
-            return result
-
         snapshot = copy.deepcopy(messages)
         adapter = self._select_adapter(external_adapter)
-        state = self.state(session_id)
-        state.status = "scheduled"
-        state.revision = revision
-        state.adapter = adapter.name
-        state.reason = ""
-        task = asyncio.create_task(
-            self._run(
-                session_id,
-                revision,
-                snapshot,
-                existing_summary,
-                adapter,
-                persist,
+        key = CompressionKey(revision=revision, adapter_key=self._adapter_key(adapter))
+        self._latest_requested[session_id] = key
+
+        while True:
+            previous = self._completed.get(session_id)
+            if previous == key:
+                state = self.state(session_id)
+                return CompressionResult(
+                    ok=True,
+                    reason="revision already compressed",
+                    status=state.status or "succeeded",
+                    adapter=state.adapter,
+                    deduplicated=True,
+                    revision=revision,
+                )
+
+            active = self._tasks.get(session_id)
+            if active is not None:
+                active_key, task = active
+                if not task.done():
+                    if active_key == key:
+                        result = await task
+                        return replace(result, deduplicated=True)
+                    await task
+                    continue
+
+            state = self.state(session_id)
+            state.status = "scheduled"
+            state.revision = revision
+            state.adapter = adapter.name
+            state.adapter_key = key.adapter_key
+            state.reason = ""
+            task = asyncio.create_task(
+                self._run(
+                    session_id,
+                    key,
+                    snapshot,
+                    existing_summary,
+                    adapter,
+                    persist,
+                )
             )
-        )
-        self._tasks[session_id] = task
-        return await task
+            self._tasks[session_id] = (key, task)
+            return await task
 
     async def _run(
         self,
         session_id: str,
-        revision: str,
+        key: CompressionKey,
         snapshot: list[dict[str, Any]],
         existing_summary: str,
         adapter: ContextAdapter,
         persist: SummaryPersistence,
     ) -> CompressionResult:
         state = self.state(session_id)
+        revision = key.revision
         state.status = "running"
         try:
             summary = await adapter.summarize(snapshot, existing_summary)
             if not summary.strip():
                 raise ContextAdapterUnavailable("summary adapter returned an empty summary")
+            if self._latest_requested.get(session_id) != key:
+                state.status = "stale"
+                state.reason = "superseded by a newer revision or adapter request"
+                return CompressionResult(
+                    ok=False,
+                    reason=state.reason,
+                    status=state.status,
+                    adapter=adapter.name,
+                    stale=True,
+                    revision=revision,
+                )
             committed = persist(revision, summary, snapshot)
             if asyncio.iscoroutine(committed):
                 committed = await committed
@@ -220,7 +258,7 @@ class ContextLifecycle:
                     stale=True,
                     revision=revision,
                 )
-            self._completed[session_id] = revision
+            self._completed[session_id] = key
             state.status = "succeeded"
             state.reason = ""
             return CompressionResult(
@@ -243,5 +281,5 @@ class ContextLifecycle:
             )
         finally:
             current = self._tasks.get(session_id)
-            if current is asyncio.current_task():
+            if current is not None and current[1] is asyncio.current_task():
                 self._tasks.pop(session_id, None)
