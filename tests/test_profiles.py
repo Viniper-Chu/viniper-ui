@@ -65,10 +65,21 @@ class ProfileAndPreviewSafetyTests(unittest.TestCase):
 
     def test_cli_promotion_accepts_only_exact_preview_profile_target(self) -> None:
         expected = build_preview.default_install_dir()
-        self.assertEqual(
-            build_preview.validate_cli_install_dir(str(expected)),
-            expected.resolve(),
-        )
+        if expected.exists():
+            with self.assertRaises(SystemExit):
+                build_preview.validate_cli_install_dir(str(expected))
+        else:
+            self.assertEqual(
+                build_preview.validate_cli_install_dir(str(expected)),
+                expected.resolve(),
+            )
+
+        synthetic_expected = ROOT / "codex" / "运行残留" / "test-exact-preview-target"
+        with patch.object(build_preview, "default_install_dir", return_value=synthetic_expected):
+            self.assertEqual(
+                build_preview.validate_cli_install_dir(str(synthetic_expected)),
+                synthetic_expected.resolve(),
+            )
         for rejected in (
             "D:\\Viniper",
             "D:\\Viniper UI",
