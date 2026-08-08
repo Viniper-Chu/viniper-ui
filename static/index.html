@@ -45,7 +45,7 @@
           <img class="brand-icon" src="/favicon.ico?v=__APP_VERSION__" alt="" aria-hidden="true">
           <div>
             <div class="brand">Viniper UI</div>
-            <div id="status-line" class="subtle">DeepSeek</div>
+            <div id="status-line" class="subtle" role="status" aria-live="polite">DeepSeek</div>
           </div>
         </div>
         <button id="new-chat-btn" class="icon-button" title="新建会话" aria-label="新建会话">+</button>
@@ -66,7 +66,7 @@
       <span class="sidebar-resizer-grip" aria-hidden="true"></span>
     </div>
 
-    <main id="main">
+    <main id="main" aria-label="主工作区">
       <header id="topbar">
         <div class="topbar-title-group">
           <button id="toggle-sidebar-btn" class="icon-button sidebar-toggle-button" type="button" title="显示/隐藏边栏" aria-label="显示/隐藏边栏">☰</button>
@@ -89,22 +89,22 @@
         </div>
       </header>
 
-      <section id="chat-container" aria-live="polite">
-        <div id="messages"></div>
+      <section id="chat-container" aria-label="对话内容">
+        <div id="messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
         <div id="thinking" class="hidden">
           <span class="spinner"></span>
           <span>正在生成</span>
         </div>
       </section>
 
-      <section id="input-area">
+      <section id="input-area" aria-label="消息输入">
         <div id="context-files"></div>
         <div id="composer">
           <textarea id="user-input" rows="1" placeholder="输入消息" autofocus></textarea>
           <div id="slash-suggestions" class="slash-suggestions hidden" role="listbox" aria-label="Slash commands"></div>
           <div id="input-actions">
             <div id="context-meter" class="context-meter" aria-label="上下文占用" title="上下文 0%">
-              <button id="context-compress-btn" class="context-ring" type="button" title="上下文 0%">
+              <button id="context-compress-btn" class="context-ring" type="button" title="上下文 0%" aria-label="查看或整理上下文" aria-pressed="false">
                 <span id="context-percent" class="context-tooltip">0%</span>
                 <span id="context-label" class="sr-only">上下文</span>
               </button>

@@ -2682,6 +2682,8 @@ function updateContextMeter({ announce = false, schedule = true } = {}) {
   if (ring) {
     ring.style.setProperty("--context-percent", `${stats.percent}%`);
     ring.title = `${stats.shouldCompress ? "上下文接近上限" : "上下文"} ${stats.percent}%`;
+    ring.setAttribute("aria-label", `${stats.shouldCompress ? "整理上下文" : "查看上下文"}，当前 ${stats.percent}%`);
+    ring.setAttribute("aria-busy", state.contextCompression.status === "running" ? "true" : "false");
   }
   $("#context-label").textContent = stats.shouldCompress ? "上下文接近上限" : "上下文";
   meter.title = `${stats.shouldCompress ? "上下文接近上限" : "上下文"} ${stats.percent}%`;
@@ -2712,6 +2714,8 @@ function showContextNotice(stats = contextStats()) {
   if (!notice) {
     notice = document.createElement("div");
     notice.className = "context-notice";
+    notice.setAttribute("role", "status");
+    notice.setAttribute("aria-live", "polite");
     const messagesEl = $("#messages");
     if (messagesEl) messagesEl.prepend(notice);
   }
