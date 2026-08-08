@@ -19,6 +19,7 @@ const state = {
   sidebarWidth: 280,
   sidebarResizing: false,
   alwaysOnTop: false,
+  sessionPinned: false,
   settings: null,
   previewMode: false,
   updateInfo: null,
@@ -136,6 +137,10 @@ const I18N = {
     sidebar: "显示/隐藏边栏",
     pin: "置顶",
     unpin: "取消置顶",
+    sessionPin: "置顶会话",
+    sessionUnpin: "取消置顶会话",
+    windowPin: "置顶聊天窗口",
+    windowUnpin: "取消置顶聊天窗口",
     skillsWeb: "Skills",
     themeLight: "浅色",
     themeDark: "深色",
@@ -159,6 +164,10 @@ const I18N = {
     sidebar: "Toggle sidebar",
     pin: "Pin",
     unpin: "Unpin",
+    sessionPin: "Pin session",
+    sessionUnpin: "Unpin session",
+    windowPin: "Keep chat window on top",
+    windowUnpin: "Stop keeping chat window on top",
     skillsWeb: "Skills",
     themeLight: "Light",
     themeDark: "Dark",
@@ -288,14 +297,16 @@ function toggleSidebar() {
   setSidebarVisible(!state.sidebarVisible);
 }
 
-function updatePinButton() {
-  const title = state.alwaysOnTop ? "取消置顶聊天窗口" : "置顶聊天窗口";
-  $$("[data-window-pin], #always-on-top-btn").forEach((button) => {
-    button.classList.toggle("active", state.alwaysOnTop);
-    button.textContent = state.alwaysOnTop ? "●" : "○";
-    button.title = title;
-    button.setAttribute("aria-label", title);
-  });
+function updateWindowPinButton() {
+  const button = $("#always-on-top-btn");
+  if (!button) return;
+  const title = state.alwaysOnTop ? t("windowUnpin") : t("windowPin");
+  button.classList.toggle("active", state.alwaysOnTop);
+  const label = state.language === "en-US" ? "Window" : "窗口";
+  button.textContent = `${state.alwaysOnTop ? "●" : "○"} ${label}`;
+  button.title = title;
+  button.setAttribute("aria-label", title);
+  button.setAttribute("aria-pressed", state.alwaysOnTop ? "true" : "false");
 }
 
 function t(key) {
@@ -324,7 +335,7 @@ function translateChrome() {
   $("#skills-web-btn").setAttribute("aria-label", t("skillsWeb"));
   $("#thinking span:last-child").textContent = t("thinking");
   updateThemeButton();
-  updatePinButton();
+  updateWindowPinButton();
   updateModelLabels();
   renderUpdateButton();
 }
@@ -575,10 +586,10 @@ function bindEvents() {
   });
 
   document.addEventListener("click", async (event) => {
-    const pinButton = event.target.closest("[data-window-pin]");
+    const pinButton = event.target.closest("[data-session-pin]");
     if (pinButton) {
       event.stopPropagation();
-      await toggleAlwaysOnTop();
+      await setSessionPinned(pinButton.dataset.sessionPin, pinButton.dataset.sessionPinned !== "1");
       return;
     }
 
@@ -709,18 +720,18 @@ function bindSidebarResize() {
 function setupDesktopBridge() {
   const desktop = window.viniperDesktop;
   if (!desktop) {
-    updatePinButton();
+    updateWindowPinButton();
     return;
   }
 
   desktop.getWindowState?.().then((statePayload) => {
     state.alwaysOnTop = Boolean(statePayload?.alwaysOnTop);
-    updatePinButton();
+    updateWindowPinButton();
   }).catch(() => {});
 
   desktop.onWindowState?.((statePayload) => {
     state.alwaysOnTop = Boolean(statePayload?.alwaysOnTop);
-    updatePinButton();
+    updateWindowPinButton();
   });
 
   desktop.onCommand?.((payload) => {
@@ -763,7 +774,7 @@ async function toggleAlwaysOnTop() {
   const desktop = window.viniperDesktop;
   if (!desktop?.setAlwaysOnTop) {
     state.alwaysOnTop = !state.alwaysOnTop;
-    updatePinButton();
+    updateWindowPinButton();
     return;
   }
   try {
@@ -773,7 +784,29 @@ async function toggleAlwaysOnTop() {
   } catch {
     state.alwaysOnTop = false;
   }
-  updatePinButton();
+  updateWindowPinButton();
+}
+
+async function setSessionPinned(sessionId, pinned) {
+  if (!sessionId) return;
+  try {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned: Boolean(pinned) })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.detail || `HTTP ${response.status}`);
+    }
+    if (sessionId === state.sessionId) {
+      state.sessionPinned = Boolean(data.session?.pinned);
+    }
+    await loadSessionList();
+  } catch (error) {
+    alert(`会话置顶失败：${error.message}`);
+    await loadSessionList();
+  }
 }
 
 async function openSkillsWeb() {
@@ -1527,6 +1560,7 @@ async function createSession({ silent = false, name = "", workdir = "" } = {}) {
   state.sessionId = data.session_id;
   state.sessionName = data.name || "";
   state.workdir = data.workdir || "";
+  state.sessionPinned = Boolean(data.pinned);
   state.messages = [];
   clearContextFiles();
   renderCurrentSession();
@@ -1597,6 +1631,8 @@ async function loadSessionList() {
   list.innerHTML = sessions.map((session) => {
     const active = session.id === state.sessionId ? " active" : "";
     const title = session.name || session.id;
+    const pinned = Boolean(session.pinned);
+    const pinTitle = pinned ? t("sessionUnpin") : t("sessionPin");
     const meta = [shortenPath(session.workdir), session.count ? `${session.count} 条消息` : ""]
       .filter(Boolean)
       .join(" · ");
@@ -1607,7 +1643,7 @@ async function loadSessionList() {
           <span class="session-meta">${escapeHtml(meta)}</span>
         </button>
         <button class="mini-button" type="button" title="重命名" data-rename-session="${escapeAttr(session.id)}">✎</button>
-        <button class="mini-button pin-mini-button${state.alwaysOnTop ? " active" : ""}" type="button" data-window-pin title="置顶聊天窗口" aria-label="置顶聊天窗口">${state.alwaysOnTop ? "●" : "○"}</button>
+        <button class="mini-button pin-mini-button${pinned ? " active" : ""}" type="button" data-session-pin="${escapeAttr(session.id)}" data-session-pinned="${pinned ? "1" : "0"}" title="${escapeAttr(pinTitle)}" aria-label="${escapeAttr(pinTitle)}" aria-pressed="${pinned ? "true" : "false"}">${pinned ? "●" : "○"}</button>
         <button class="mini-button danger" type="button" title="删除" data-delete-session="${escapeAttr(session.id)}">×</button>
       </div>
     `;
@@ -1710,6 +1746,7 @@ function applySession(sessionId, data) {
   state.sessionId = sessionId;
   state.sessionName = data.name || "";
   state.workdir = data.workdir || "";
+  state.sessionPinned = Boolean(data.pinned);
   state.messages = data.messages || [];
   renderCurrentSession();
   renderAllMessages();

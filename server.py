@@ -356,10 +356,22 @@ def normalize_session(session_id: str, raw: dict[str, Any]) -> dict[str, Any]:
         "updated": float(raw.get("updated") or raw.get("created") or now_ts()),
         "name": str(raw.get("name") or ""),
         "workdir": str(raw.get("workdir") or BASE_DIR),
+        "pinned": bool(raw.get("pinned")),
         "claude_session_id": new_claude_session_id(raw.get("claude_session_id")),
         "claude_initialized": bool(raw.get("claude_initialized")),
         "summary": str(raw.get("summary") or ""),
     }
+
+
+def session_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, float, float, str]:
+    """Return the deterministic order for the session list."""
+    session_id, session = item
+    return (
+        0 if bool(session.get("pinned")) else 1,
+        -float(session.get("updated", session.get("created", 0)) or 0),
+        float(session.get("created", 0) or 0),
+        str(session_id),
+    )
 
 
 def load_sessions_from_disk() -> dict[str, dict[str, Any]]:
@@ -1108,6 +1120,7 @@ def safe_session(session_id: str) -> dict[str, Any]:
             "updated": now_ts(),
             "name": next_session_name(),
             "workdir": str(BASE_DIR),
+            "pinned": False,
             "claude_session_id": str(uuid.uuid4()),
             "claude_initialized": False,
             "summary": "",
@@ -3830,12 +3843,18 @@ async def new_session(request: Request):
         "updated": now_ts(),
         "name": name,
         "workdir": str(body.get("workdir") or BASE_DIR),
+        "pinned": False,
         "claude_session_id": str(uuid.uuid4()),
         "claude_initialized": False,
         "summary": "",
     }
     save_sessions_to_disk()
-    return {"session_id": sid, "name": sessions[sid]["name"], "workdir": sessions[sid]["workdir"]}
+    return {
+        "session_id": sid,
+        "name": sessions[sid]["name"],
+        "workdir": sessions[sid]["workdir"],
+        "pinned": False,
+    }
 
 
 @app.get("/api/sessions")
@@ -3849,12 +3868,9 @@ async def list_sessions():
                 "count": len(session.get("messages", [])),
                 "created": session.get("created", 0),
                 "updated": session.get("updated", session.get("created", 0)),
+                "pinned": bool(session.get("pinned")),
             }
-            for sid, session in sorted(
-                sessions.items(),
-                key=lambda item: item[1].get("updated", item[1].get("created", 0)),
-                reverse=True,
-            )
+            for sid, session in sorted(sessions.items(), key=session_sort_key)
         ]
     }
 
@@ -3875,6 +3891,7 @@ async def last_session():
             "session_id": sid,
             "name": session.get("name", ""),
             "workdir": session.get("workdir", str(BASE_DIR)),
+            "pinned": bool(session.get("pinned")),
             "messages": session.get("messages", []),
             "message_count": len(session.get("messages", [])),
         }
@@ -3891,6 +3908,7 @@ async def get_session(session_id: str):
         "session_id": session_id,
         "name": session.get("name", ""),
         "workdir": session.get("workdir", str(BASE_DIR)),
+        "pinned": bool(session.get("pinned")),
         "messages": session.get("messages", []),
         "message_count": len(session.get("messages", [])),
     })
@@ -3900,11 +3918,17 @@ async def get_session(session_id: str):
 async def update_session(session_id: str, request: Request):
     session = safe_session(session_id)
     body = await request.json()
+    metadata_changed = False
     if "name" in body:
         session["name"] = str(body.get("name") or "")
+        metadata_changed = True
     if "workdir" in body:
         session["workdir"] = str(body.get("workdir") or BASE_DIR)
-    session["updated"] = now_ts()
+        metadata_changed = True
+    if "pinned" in body:
+        session["pinned"] = bool(body.get("pinned"))
+    if metadata_changed:
+        session["updated"] = now_ts()
     save_sessions_to_disk()
     return {"ok": True, "session": session}
 
