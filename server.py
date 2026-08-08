@@ -4146,7 +4146,7 @@ def context_lifecycle() -> ContextLifecycle:
 
         _context_lifecycle = ContextLifecycle(
             NativeContextAdapter(),
-            ExternalSummaryAdapter(unavailable_external),
+            ExternalSummaryAdapter(unavailable_external, semantic_key="external-summary:unavailable"),
             threshold=CONTEXT_COMPRESS_THRESHOLD,
         )
     return _context_lifecycle
@@ -4173,7 +4173,8 @@ async def compress_context(session_id: str, request: Request):
     revision = context_revision(session)
 
     external_adapter = ExternalSummaryAdapter(
-        lambda snapshot, existing_summary: summarize_with_deepseek(snapshot, existing_summary, model)
+        lambda snapshot, existing_summary: summarize_with_deepseek(snapshot, existing_summary, model),
+        semantic_key=f"external-summary:{model}",
     )
 
     async def persist(revision_value: str, summary: str, snapshot: list[dict[str, Any]]) -> bool:

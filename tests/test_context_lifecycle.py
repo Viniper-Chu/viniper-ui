@@ -19,8 +19,16 @@ from context_lifecycle import (  # noqa: E402
 
 
 class FakeAdapter:
-    def __init__(self, name: str, available: bool = True, summary: str = "fake summary", error: Exception | None = None):
+    def __init__(
+        self,
+        name: str,
+        available: bool = True,
+        summary: str = "fake summary",
+        error: Exception | None = None,
+        semantic_key: str | None = None,
+    ):
         self.name = name
+        self.semantic_key = semantic_key or name
         self._available = available
         self.summary = summary
         self.error = error
@@ -50,8 +58,8 @@ class SlowFakeAdapter(FakeAdapter):
 
 
 class RevisionAdapter(FakeAdapter):
-    def __init__(self, name: str = "external-summary"):
-        super().__init__(name)
+    def __init__(self, name: str = "external-summary", *, semantic_key: str | None = None):
+        super().__init__(name, semantic_key=semantic_key)
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.seen_messages = []
@@ -127,6 +135,64 @@ class ContextLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.calls, 1)
         self.assertEqual(persist_calls, ["r1"])
 
+    async def test_distinct_external_instances_same_semantic_key_are_deduplicated(self) -> None:
+        first_started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def first_summary(messages, existing_summary):
+            calls.append("first")
+            first_started.set()
+            await release.wait()
+            return "first summary"
+
+        async def second_summary(messages, existing_summary):
+            calls.append("second")
+            return "second summary"
+
+        first_adapter = ExternalSummaryAdapter(first_summary, semantic_key="external-summary:model-a")
+        second_adapter = ExternalSummaryAdapter(second_summary, semantic_key="external-summary:model-a")
+        lifecycle = ContextLifecycle(NativeContextAdapter(), first_adapter)
+        persisted = []
+
+        async def persist(revision, summary, snapshot):
+            persisted.append((revision, summary))
+            return True
+
+        first = asyncio.create_task(
+            lifecycle.request(
+                "session-a",
+                "r1",
+                [{"role": "user", "content": "same request"}],
+                "",
+                0.9,
+                persist,
+                external_adapter=first_adapter,
+            )
+        )
+        await first_started.wait()
+        second = asyncio.create_task(
+            lifecycle.request(
+                "session-a",
+                "r1",
+                [{"role": "user", "content": "same request"}],
+                "",
+                0.9,
+                persist,
+                external_adapter=second_adapter,
+            )
+        )
+        await asyncio.sleep(0)
+        release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertTrue(first_result.ok)
+        self.assertTrue(second_result.ok)
+        self.assertTrue(second_result.deduplicated)
+        self.assertEqual(calls, ["first"])
+        self.assertEqual(persisted, [("r1", "first summary")])
+        self.assertFalse(hasattr(lifecycle, "_adapter_tokens"))
+
     async def test_stale_revision_does_not_commit(self) -> None:
         source = [{"role": "user", "content": "newer message"}]
         adapter = FakeAdapter("external-summary")
@@ -170,8 +236,12 @@ class ContextLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.seen_messages[1][0]["content"], "new")
 
     async def test_same_revision_different_adapter_is_not_deduplicated(self) -> None:
-        first_adapter = RevisionAdapter()
-        second_adapter = FakeAdapter("external-summary", summary="second adapter")
+        first_adapter = RevisionAdapter(semantic_key="external-summary:model-a")
+        second_adapter = FakeAdapter(
+            "external-summary",
+            summary="second adapter",
+            semantic_key="external-summary:model-b",
+        )
         lifecycle = ContextLifecycle(NativeContextAdapter(), first_adapter)
         persisted = []
 
@@ -212,6 +282,65 @@ class ContextLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_adapter.calls, 1)
         self.assertEqual(second_adapter.calls, 1)
         self.assertEqual(persisted, [("r1", "second adapter")])
+
+    async def test_different_external_semantic_key_rechecks_same_revision(self) -> None:
+        first_started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def first_summary(messages, existing_summary):
+            calls.append("model-a")
+            first_started.set()
+            await release.wait()
+            return "model-a summary"
+
+        async def second_summary(messages, existing_summary):
+            calls.append("model-b")
+            return "model-b summary"
+
+        first_adapter = ExternalSummaryAdapter(first_summary, semantic_key="external-summary:model-a")
+        second_adapter = ExternalSummaryAdapter(second_summary, semantic_key="external-summary:model-b")
+        lifecycle = ContextLifecycle(NativeContextAdapter(), first_adapter)
+        persisted = []
+
+        async def persist(revision, summary, snapshot):
+            persisted.append((revision, summary))
+            return True
+
+        first = asyncio.create_task(
+            lifecycle.request(
+                "session-a",
+                "r1",
+                [{"role": "user", "content": "model a"}],
+                "",
+                0.9,
+                persist,
+                external_adapter=first_adapter,
+            )
+        )
+        await first_started.wait()
+        second = asyncio.create_task(
+            lifecycle.request(
+                "session-a",
+                "r1",
+                [{"role": "user", "content": "model b"}],
+                "",
+                0.9,
+                persist,
+                external_adapter=second_adapter,
+            )
+        )
+        await asyncio.sleep(0)
+        release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertFalse(first_result.ok)
+        self.assertTrue(first_result.stale)
+        self.assertTrue(second_result.ok)
+        self.assertTrue(second_result.compressed)
+        self.assertEqual(calls, ["model-a", "model-b"])
+        self.assertEqual(persisted, [("r1", "model-b summary")])
+        self.assertFalse(hasattr(lifecycle, "_adapter_tokens"))
 
     async def test_failed_summary_preserves_source_and_can_retry(self) -> None:
         source = [{"role": "user", "content": "keep me"}]

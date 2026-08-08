@@ -20,6 +20,7 @@ class ContextAdapterUnavailable(RuntimeError):
 
 class ContextAdapter(Protocol):
     name: str
+    semantic_key: str
 
     def available(self) -> bool:
         ...
@@ -36,6 +37,7 @@ class NativeContextAdapter:
     """Native Claude Code seam; capability is opt-in until it is observable."""
 
     name = "native"
+    semantic_key = "native"
 
     def __init__(self, *, capability: bool = False, summarizer: SummaryFunction | None = None):
         self._capability = bool(capability)
@@ -58,8 +60,9 @@ class ExternalSummaryAdapter:
 
     name = "external-summary"
 
-    def __init__(self, summarizer: SummaryFunction):
+    def __init__(self, summarizer: SummaryFunction, *, semantic_key: str = "external-summary"):
         self._summarizer = summarizer
+        self.semantic_key = semantic_key
 
     def available(self) -> bool:
         return True
@@ -131,7 +134,6 @@ class ContextLifecycle:
         self._tasks: dict[str, tuple[CompressionKey, asyncio.Task[CompressionResult]]] = {}
         self._completed: dict[str, CompressionKey] = {}
         self._latest_requested: dict[str, CompressionKey] = {}
-        self._adapter_tokens: list[tuple[ContextAdapter, str]] = []
         self._states: dict[str, CompressionState] = {}
 
     def state(self, session_id: str) -> CompressionState:
@@ -143,12 +145,7 @@ class ContextLifecycle:
         return external_adapter or self.external_adapter
 
     def _adapter_key(self, adapter: ContextAdapter) -> str:
-        for known, token in self._adapter_tokens:
-            if known is adapter:
-                return token
-        token = f"{adapter.name}:{len(self._adapter_tokens)}"
-        self._adapter_tokens.append((adapter, token))
-        return token
+        return str(getattr(adapter, "semantic_key", adapter.name))
 
     async def request(
         self,
