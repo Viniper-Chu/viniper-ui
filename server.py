@@ -2103,11 +2103,15 @@ def refresh_windows_shortcuts() -> None:
     desktop = Path.home() / "Desktop"
     start_menu = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
     taskbar = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Internet Explorer" / "Quick Launch" / "User Pinned" / "TaskBar"
+    app_user_model_id = "com.viniper.ui.desktop"
+    app_id_setter = APP_DIR / "scripts" / "set_shortcut_app_id.ps1"
     ps = rf"""
 $shell = New-Object -ComObject WScript.Shell
 $target = '{str(target_path).replace("'", "''")}'
 $workdir = '{str(target_path.parent).replace("'", "''")}'
 $icon = '{icon_location.replace("'", "''")}'
+$appId = '{app_user_model_id}'
+$appIdSetter = '{str(app_id_setter).replace("'", "''")}'
 $desktop = '{str(desktop).replace("'", "''")}'
 $startMenu = '{str(start_menu).replace("'", "''")}'
 $taskbar = '{str(taskbar).replace("'", "''")}'
@@ -2129,6 +2133,10 @@ function Update-ViniperShortcut($path) {{
       $changed = $true
     }}
     if ($changed) {{ $shortcut.Save() }}
+    if (-not (Test-Path -LiteralPath $appIdSetter -PathType Leaf)) {{
+      throw "Shortcut AppUserModelID setter is missing: $appIdSetter"
+    }}
+    & $appIdSetter -ShortcutPath $path -AppUserModelId $appId
   }} catch {{}}
 }}
 if (Test-Path -LiteralPath $desktop) {{

@@ -58,6 +58,8 @@ def main() -> int:
         DESKTOP / "main.js",
         DESKTOP / "preload.js",
         DESKTOP / "README.md",
+        DESKTOP / "build" / "installer.nsh",
+        ROOT / "scripts" / "set_shortcut_app_id.ps1",
         ROOT / "static" / "assets" / "viniper-icon.ico",
         ROOT / "static" / "assets" / "viniper-icon.png",
     ]
@@ -73,6 +75,9 @@ def main() -> int:
         raise SystemExit("desktop package productName must be Viniper")
     if package.get("build", {}).get("appId") != "com.viniper.ui.desktop":
         raise SystemExit("desktop package appId must match the taskbar AppUserModelID")
+    nsis = package.get("build", {}).get("nsis", {})
+    if nsis.get("include") != "build/installer.nsh":
+        raise SystemExit("desktop installer must include the shortcut identity postcondition")
     if not package.get("build", {}).get("extraResources"):
         raise SystemExit("desktop package must bundle the local Viniper service as extraResources")
     filters = package.get("build", {}).get("extraResources", [{}])[0].get("filter", [])
@@ -86,6 +91,10 @@ def main() -> int:
         raise SystemExit(f"desktop package missing runtime modules: {missing_modules}")
     if "RELEASE_REVISION" not in filters:
         raise SystemExit("desktop package missing RELEASE_REVISION")
+
+    installer_nsh = (DESKTOP / "build" / "installer.nsh").read_text(encoding="utf-8")
+    if "set_shortcut_app_id.ps1" not in installer_nsh or "${APP_ID}" not in installer_nsh:
+        raise SystemExit("desktop installer must persist its configured AppUserModelID on shortcuts")
 
     main_js = (DESKTOP / "main.js").read_text(encoding="utf-8")
     if "VINIPER_UI_OPEN_BROWSER" not in main_js:

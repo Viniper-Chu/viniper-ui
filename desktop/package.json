@@ -89,6 +89,7 @@
       "artifactName": "Viniper.${version}-${arch}-mac.${ext}"
     },
     "nsis": {
+      "include": "build/installer.nsh",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
