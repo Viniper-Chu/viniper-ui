@@ -5,7 +5,8 @@ contextBridge.exposeInMainWorld("viniperDesktop", {
   getWindowState: () => ipcRenderer.invoke("viniper:get-window-state"),
   setAlwaysOnTop: (enabled) => ipcRenderer.invoke("viniper:set-always-on-top", Boolean(enabled)),
   toggleAlwaysOnTop: () => ipcRenderer.invoke("viniper:toggle-always-on-top"),
-  openSkills: () => ipcRenderer.invoke("viniper:open-skills"),
+  setTitlebarTheme: (theme) => ipcRenderer.invoke("viniper:set-titlebar-theme", theme || {}),
+  enableWslPlatform: () => ipcRenderer.invoke("viniper:enable-wsl-platform"),
   conversationCompleted: () => ipcRenderer.send("viniper:conversation-completed"),
   onCommand: (callback) => {
     if (typeof callback !== "function") return () => {};

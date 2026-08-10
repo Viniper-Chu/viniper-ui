@@ -1,0 +1,43 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000016",
+  "transcript_path": "/tmp/viniper-v16-fixture/transcript.jsonl",
+  "cwd": "/tmp/viniper-v16-fixture",
+  "permission_mode": "default",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "选择实现路径？",
+        "header": "路径",
+        "options": [
+          {
+            "label": "方案一",
+            "description": "保持现有结构"
+          },
+          {
+            "label": "方案二",
+            "description": "采用新结构"
+          }
+        ],
+        "multiSelect": false
+      },
+      {
+        "question": "选择验证项？",
+        "header": "验证",
+        "options": [
+          {
+            "label": "单元测试",
+            "description": "运行定向测试"
+          },
+          {
+            "label": "界面测试",
+            "description": "运行 Electron 测试"
+          }
+        ],
+        "multiSelect": true
+      }
+    ]
+  },
+  "tool_use_id": "toolu_v16_ask_fixture"
+}

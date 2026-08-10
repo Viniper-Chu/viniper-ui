@@ -16,7 +16,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts import build_preview  # noqa: E402
+from scripts import build_installer_candidate, build_preview  # noqa: E402
 
 
 class ProfileAndPreviewSafetyTests(unittest.TestCase):
@@ -40,7 +40,7 @@ class ProfileAndPreviewSafetyTests(unittest.TestCase):
     def test_formal_runtime_package_remains_legacy_until_release_migration(self) -> None:
         package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
         self.assertEqual(package["build"]["appId"], "com.viniper.ui.desktop")
-        self.assertEqual(package["build"]["productName"], "Viniper UI")
+        self.assertEqual(package["build"]["productName"], "Viniper")
         self.assertEqual(package["viniperProfile"], "formal-runtime")
 
     def test_builder_has_no_protected_release_cleaner(self) -> None:
@@ -60,8 +60,18 @@ class ProfileAndPreviewSafetyTests(unittest.TestCase):
         resource_filter = resource["filter"]
         self.assertIn("server.py", resource_filter)
         self.assertIn("context_lifecycle.py", resource_filter)
+        self.assertIn("context_usage.py", resource_filter)
+        self.assertIn("agent_instructions.py", resource_filter)
+        self.assertIn("agent_runtime.py", resource_filter)
+        self.assertIn("agent_run_coordinator.py", resource_filter)
+        self.assertIn("native_peer.py", resource_filter)
+        self.assertIn("skill_sync.py", resource_filter)
+        self.assertIn("wsl_runtime.py", resource_filter)
         self.assertIn("profiles.json", resource_filter)
         self.assertIn("static/**", resource_filter)
+        self.assertIn("!codex/**", resource_filter)
+        self.assertIn("!.git/**", resource_filter)
+        self.assertIn("!.omx/**", resource_filter)
 
     def test_cli_promotion_accepts_only_exact_preview_profile_target(self) -> None:
         expected = build_preview.default_install_dir()
@@ -104,6 +114,47 @@ class ProfileAndPreviewSafetyTests(unittest.TestCase):
         self.assertIn('env.VINIPER_UI_DATA_DIR = app.getPath("userData")', desktop)
         self.assertIn('APP_TITLE = str(PREVIEW_PROFILE.get("product_name")', server)
         self.assertIn('data_dir_name = str(PREVIEW_PROFILE.get("data_dir_name")', server)
+
+    def test_formal_brand_keeps_the_existing_desktop_data_identity(self) -> None:
+        desktop = (ROOT / "desktop" / "main.js").read_text(encoding="utf-8")
+        self.assertIn("function formalUserDataDir()", desktop)
+        self.assertIn('return path.join(app.getPath("appData"), "Viniper UI")', desktop)
+        self.assertIn('app.setPath("userData", formalUserDataDir())', desktop)
+        self.assertIn('app.setPath("userData", previewUserDataDir())', desktop)
+
+    def test_runtime_profile_updates_visible_environment_copy(self) -> None:
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        renderer = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="profile-label"', html)
+        self.assertIn('id="composer-status"', html)
+        self.assertIn("function updateRuntimeProfileChrome()", renderer)
+        self.assertIn("updateRuntimeProfileChrome();", renderer)
+        script = r'''
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync("static/app.js", "utf8") + "\nthis.__api = { runtimeProfileChromeCopy };";
+const context = {
+  console, TextDecoder, TextEncoder, WeakMap,
+  performance: { now: () => 0 },
+  localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+  document: { addEventListener: () => {}, querySelector: () => null, querySelectorAll: () => [] },
+  window: { VINIPER_APP_TITLE: "Viniper" },
+  setTimeout, clearTimeout, setInterval, clearInterval
+};
+vm.createContext(context);
+vm.runInContext(source, context);
+process.stdout.write(JSON.stringify({formal: context.__api.runtimeProfileChromeCopy(false), preview: context.__api.runtimeProfileChromeCopy(true)}));
+'''
+        result = subprocess.run(["node", "-e", script], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", check=True)
+        copy = json.loads(result.stdout)
+        self.assertEqual(copy["formal"], {
+            "profileLabel": "本地环境",
+            "composerStatus": "本地会话 · 数据保存在当前 Viniper 环境",
+        })
+        self.assertEqual(copy["preview"], {
+            "profileLabel": "预览环境",
+            "composerStatus": "本地会话 · 数据保存在当前 Preview 环境",
+        })
 
     def test_preview_runtime_profile_binds_service_page_and_data_root(self) -> None:
         probe_root = Path(tempfile.mkdtemp(prefix="profile-runtime-", dir=ROOT / "codex" / "运行残留"))
@@ -183,6 +234,118 @@ asyncio.run(run())
                 build_preview.create_owned_staging("test-s4-duplicate")
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+    def test_installer_candidate_is_create_only_and_carries_runtime_contract(self) -> None:
+        script = (ROOT / "scripts" / "build_installer_candidate.py").read_text(encoding="utf-8")
+        main = (ROOT / "desktop" / "main.js").read_text(encoding="utf-8")
+        preload = (ROOT / "desktop" / "preload.js").read_text(encoding="utf-8")
+        package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
+        resource_filter = package["build"]["extraResources"][0]["filter"]
+        self.assertIn("Viniper.Preview.Setup.${version}.${ext}", script)
+        self.assertIn('config.setdefault("nsis", {})["shortcutName"]', script)
+        self.assertIn("patch_preview_executable(output", script)
+        self.assertIn('"--prepackaged"', script)
+        self.assertLess(script.index("patch_preview_executable(output"), script.index('"--prepackaged"'))
+        self.assertIn('"promotion": False', script)
+        self.assertNotIn("rmtree", script)
+        self.assertIn("viniper:enable-wsl-platform", main)
+        self.assertIn("viniper:enable-wsl-platform", preload)
+        self.assertIn("daily_usage.py", resource_filter)
+        self.assertIn('resources / "daily_usage.py"', script)
+        self.assertIn("skill_sync.py", resource_filter)
+        self.assertIn('resources / "skill_sync.py"', script)
+
+        temp_root = Path(tempfile.mkdtemp(prefix="installer-candidate-", dir=ROOT / "codex" / "运行残留"))
+        try:
+            with patch.object(build_installer_candidate, "OUTPUT_ROOT", temp_root):
+                output, run_id = build_installer_candidate.create_output("contract-fixture")
+                self.assertEqual(run_id, "contract-fixture")
+                marker = json.loads((output / "OWNERSHIP.json").read_text(encoding="utf-8"))
+                self.assertFalse(marker["promotion"])
+                with self.assertRaises(SystemExit):
+                    build_installer_candidate.create_output("contract-fixture")
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_installer_candidate_gate_rejects_missing_daily_usage_module(self) -> None:
+        temp_root = Path(tempfile.mkdtemp(prefix="installer-resource-gate-", dir=ROOT / "codex" / "运行残留"))
+        try:
+            output = temp_root / "candidate"
+            resources = output / "win-unpacked" / "resources" / "viniper-ui"
+            resources.mkdir(parents=True)
+            (output / "Viniper.Preview.Setup.5.0.0.exe").write_bytes(b"fixture")
+            for name in (
+                "server.py",
+                "context_lifecycle.py",
+                "agent_runtime.py",
+                "agent_host_bridge.py",
+                "agent_queue.py",
+                "agent_run_coordinator.py",
+                "wsl_runtime.py",
+                "agent_instructions.py",
+                "context_usage.py",
+                "native_peer.py",
+                "profiles.json",
+                "requirements.txt",
+                "VERSION",
+            ):
+                (resources / name).write_text("# fixture\n", encoding="utf-8")
+            icon = resources / "static" / "assets" / "viniper-icon.ico"
+            icon.parent.mkdir(parents=True)
+            icon.write_bytes(b"ico")
+
+            with self.assertRaises(SystemExit) as missing:
+                build_installer_candidate.verify_candidate(output)
+            self.assertIn("daily_usage.py", str(missing.exception))
+            self.assertIn("skill_sync.py", str(missing.exception))
+
+            (resources / "daily_usage.py").write_text("# fixture\n", encoding="utf-8")
+            (resources / "skill_sync.py").write_text("# fixture\n", encoding="utf-8")
+            manifest = build_installer_candidate.verify_candidate(output)
+            self.assertTrue(manifest["ok"])
+            self.assertIn(
+                "win-unpacked\\resources\\viniper-ui\\daily_usage.py",
+                manifest["required_resources"],
+            )
+            self.assertIn(
+                "win-unpacked\\resources\\viniper-ui\\skill_sync.py",
+                manifest["required_resources"],
+            )
+            self.assertIn(
+                "win-unpacked\\resources\\viniper-ui\\agent_host_bridge.py",
+                manifest["required_resources"],
+            )
+            self.assertIn(
+                "win-unpacked\\resources\\viniper-ui\\agent_queue.py",
+                manifest["required_resources"],
+            )
+            self.assertIn(
+                "win-unpacked\\resources\\viniper-ui\\agent_run_coordinator.py",
+                manifest["required_resources"],
+            )
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_installer_candidate_uses_clean_resource_staging_not_workspace_root(self) -> None:
+        temp_root = Path(tempfile.mkdtemp(prefix="installer-resources-", dir=ROOT / "codex" / "运行残留"))
+        try:
+            staging = temp_root / "resource-staging"
+            config_path = build_installer_candidate.prepare_resource_staging(
+                staging,
+                build_installer_candidate.preview_profile(),
+            )
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            resource = config["extraResources"][0]
+            self.assertEqual(Path(resource["from"]), staging.resolve())
+            self.assertEqual(resource["to"], "viniper-ui")
+            self.assertTrue((staging / "server.py").is_file())
+            self.assertTrue((staging / "skill_sync.py").is_file())
+            self.assertTrue((staging / "static" / "app.js").is_file())
+            self.assertFalse((staging / "codex").exists())
+            self.assertFalse((staging / ".git").exists())
+            self.assertFalse((staging / ".omx").exists())
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

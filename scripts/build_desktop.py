@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Build the Viniper UI desktop app for the current platform."""
+"""Build the Viniper desktop app for the current platform."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
+from datetime import datetime, timezone
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -16,15 +15,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DESKTOP = ROOT / "desktop"
-KEEP_RELEASE_VERSIONS = 2
 DIST = ROOT / "dist"
-
-
-def version_tuple(value: str) -> tuple[int, int, int]:
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
-    if not match:
-        return (0, 0, 0)
-    return tuple(int(part) for part in match.groups())
+RESOURCE_STAGING_ROOT = ROOT / "codex" / "运行残留" / "formal-resource-staging"
+OPTIONAL_RESOURCE_FILES = {"PREVIEW"}
 
 
 def tool(name: str) -> str:
@@ -56,16 +49,102 @@ def run(command: list[str], cwd: Path = ROOT, timeout: int | None = None) -> Non
         raise SystemExit(f"command failed: {' '.join(command)}")
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def read_version() -> str:
     return (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+
+
+def prepare_resource_staging(
+    staging: Path,
+    *,
+    root: Path = ROOT,
+    desktop: Path = DESKTOP,
+) -> Path:
+    """Create the exact formal extraResources tree without walking local evidence."""
+    staging = staging.resolve()
+    if staging.exists():
+        raise SystemExit(f"resource staging already exists; refusing to reuse: {staging}")
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    staging.mkdir()
+
+    package_path = desktop / "package.json"
+    try:
+        package = json.loads(package_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"desktop package configuration is inaccessible: {package_path}: {exc}") from exc
+    build = package.get("build")
+    if not isinstance(build, dict):
+        raise SystemExit("desktop/package.json is missing build configuration")
+    resources = build.get("extraResources")
+    if not isinstance(resources, list):
+        raise SystemExit("desktop/package.json is missing extraResources")
+    resource = next(
+        (item for item in resources if isinstance(item, dict) and item.get("to") == "viniper-ui"),
+        None,
+    )
+    if not isinstance(resource, dict) or not isinstance(resource.get("filter"), list):
+        raise SystemExit("desktop/package.json is missing the viniper-ui resource filter")
+
+    filters = [str(item) for item in resource["filter"]]
+    for pattern in filters:
+        if pattern.startswith("!"):
+            continue
+        if pattern.endswith("/**"):
+            relative = pattern[:-3]
+            source = root / relative
+            try:
+                is_directory = source.is_dir()
+            except OSError as exc:
+                raise SystemExit(f"required resource directory is inaccessible: {source}: {exc}") from exc
+            if not is_directory:
+                raise SystemExit(f"required resource directory missing: {source}")
+            try:
+                shutil.copytree(
+                    source,
+                    staging / relative,
+                    ignore=shutil.ignore_patterns(
+                        "__pycache__",
+                        "*.pyc",
+                        "node_modules",
+                        "release",
+                        "release-preview",
+                    ),
+                )
+            except OSError as exc:
+                raise SystemExit(f"required resource directory could not be copied: {source}: {exc}") from exc
+            continue
+        if "*" in pattern or "?" in pattern:
+            raise SystemExit(f"unsupported positive resource glob: {pattern}")
+        source = root / pattern
+        try:
+            is_file = source.is_file()
+        except OSError as exc:
+            raise SystemExit(f"required resource file is inaccessible: {source}: {exc}") from exc
+        if not is_file:
+            if pattern in OPTIONAL_RESOURCE_FILES:
+                continue
+            raise SystemExit(f"required resource file missing: {source}")
+        target = staging / pattern
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(source, target)
+        except OSError as exc:
+            raise SystemExit(f"required resource file could not be copied: {source}: {exc}") from exc
+
+    config = json.loads(json.dumps(build))
+    metadata = config.get("extraMetadata")
+    config["extraMetadata"] = {
+        **(metadata if isinstance(metadata, dict) else {}),
+        "viniperProfile": "formal-runtime",
+    }
+    config["extraResources"] = [
+        {"from": str(staging), "to": "viniper-ui", "filter": filters}
+    ]
+    config_path = staging.parent / "electron-builder.formal.json"
+    config_path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return config_path
 
 
 def release_download_url(manifest: dict, asset_name: str) -> str:
@@ -93,21 +172,23 @@ def update_latest_manifest() -> None:
     release_dir = DESKTOP / "release"
 
     candidates = {
-        "windows": release_dir / f"Viniper.UI.Setup.{version}.exe",
-        "macos": release_dir / f"Viniper.UI.{version}-arm64-mac.zip",
+        "installer_windows": release_dir / f"Viniper.Setup.{version}.exe",
+        "installer_macos_arm64": release_dir / f"Viniper.{version}-arm64-mac.zip",
+        "installer_macos_x64": release_dir / f"Viniper.{version}-x64-mac.zip",
     }
-    has_platform_installer = any(path.exists() for path in candidates.values())
     for key, path in candidates.items():
         if path.exists():
             # Keep the small app package as the default in-app update target.
             # Installers stay in the manifest under non-preferred keys for
             # manual download surfaces and future explicit installer updates.
-            assets[f"installer_{key}"] = {
+            assets[key] = {
                 "name": path.name,
                 "url": release_download_url(manifest, path.name),
-                "sha256": sha256_file(path),
                 "size": path.stat().st_size,
             }
+    default_macos = assets.get("installer_macos_arm64") or assets.get("installer_macos_x64")
+    if default_macos:
+        assets["installer_macos"] = dict(default_macos)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -129,7 +210,7 @@ def rcedit_tool() -> Path:
 def patch_windows_icon() -> None:
     if sys.platform != "win32":
         return
-    exe_path = DESKTOP / "release" / "win-unpacked" / "Viniper UI.exe"
+    exe_path = DESKTOP / "release" / "win-unpacked" / "Viniper.exe"
     icon_path = ROOT / "static" / "assets" / "viniper-icon.ico"
     if not exe_path.exists():
         raise SystemExit(f"missing packaged executable: {exe_path}")
@@ -142,16 +223,16 @@ def patch_windows_icon() -> None:
         str(icon_path),
         "--set-version-string",
         "ProductName",
-        "Viniper UI",
+        "Viniper",
         "--set-version-string",
         "FileDescription",
-        "Viniper UI",
+        "Viniper",
         "--set-version-string",
         "InternalName",
-        "Viniper UI",
+        "Viniper",
         "--set-version-string",
         "OriginalFilename",
-        "Viniper UI.exe",
+        "Viniper.exe",
     ], timeout=60)
 
 
@@ -174,41 +255,6 @@ def prepare_macos_icon() -> None:
     run(["iconutil", "-c", "icns", str(iconset), "-o", str(build_dir / "icon.icns")], timeout=60)
 
 
-def prune_desktop_artifacts(keep: int = KEEP_RELEASE_VERSIONS) -> None:
-    release_dir = DESKTOP / "release"
-    if not release_dir.exists():
-        return
-    versioned: dict[str, list[Path]] = {}
-    for pattern in [
-        "Viniper.UI.Setup.*.exe",
-        "Viniper.UI.Setup.*.exe.blockmap",
-        "Viniper UI Setup *.exe",
-        "Viniper UI Setup *.exe.blockmap",
-        "Viniper.UI.*-mac.zip",
-        "Viniper.UI.*-mac.zip.blockmap",
-    ]:
-        for path in release_dir.glob(pattern):
-            match = re.search(r"(\d+\.\d+\.\d+)", path.name)
-            if match:
-                versioned.setdefault(match.group(1), []).append(path)
-    ordered = sorted(versioned, key=version_tuple, reverse=True)
-    for version, paths in versioned.items():
-        has_stable_windows_name = any(path.name.startswith("Viniper.UI.Setup.") for path in paths)
-        if has_stable_windows_name:
-            for path in paths:
-                if path.name.startswith("Viniper UI Setup "):
-                    try:
-                        path.unlink()
-                    except FileNotFoundError:
-                        pass
-    for version in ordered[keep:]:
-        for path in versioned.get(version, []):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-
-
 def ensure_update_source() -> None:
     """Write update_source.json from env or repo slug so the desktop shell can auto-update."""
     source_path = ROOT / "update_source.json"
@@ -227,12 +273,21 @@ def ensure_update_source() -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build Viniper UI desktop package.")
+    parser = argparse.ArgumentParser(description="Build Viniper desktop package.")
     parser.add_argument("--target", choices=["current", "win", "mac", "dir"], default="current")
+    parser.add_argument("--arch", choices=["x64", "arm64"])
     parser.add_argument("--skip-install", action="store_true", help="Skip npm install.")
     args = parser.parse_args()
 
+    if args.target == "mac" and not args.arch:
+        parser.error("--target mac requires an explicit --arch x64 or --arch arm64")
+
     ensure_update_source()
+
+    staging_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f") + f"-p{os.getpid()}"
+    builder_config = prepare_resource_staging(
+        RESOURCE_STAGING_ROOT / staging_id / "viniper-ui"
+    )
 
     npm = tool("npm")
     os.environ.setdefault("ELECTRON_MIRROR", "https://npmmirror.com/mirrors/electron/")
@@ -244,31 +299,30 @@ def main() -> int:
     run([npm, "run", "check"], cwd=DESKTOP, timeout=60)
 
     if args.target == "dir":
-        run([npm, "run", "pack"], cwd=DESKTOP, timeout=600)
+        run([npm, "run", "pack", "--", "--config", str(builder_config)], cwd=DESKTOP, timeout=600)
         patch_windows_icon()
     elif args.target == "win":
-        run([npm, "run", "pack"], cwd=DESKTOP, timeout=600)
+        run([npm, "run", "pack", "--", "--config", str(builder_config)], cwd=DESKTOP, timeout=600)
         patch_windows_icon()
         prepackaged = DESKTOP / "release" / "win-unpacked"
-        run([npm, "run", "dist", "--", "--win", "nsis", "--prepackaged", str(prepackaged)], cwd=DESKTOP, timeout=900)
+        run([npm, "run", "dist", "--", "--win", "nsis", "--prepackaged", str(prepackaged), "--config", str(builder_config)], cwd=DESKTOP, timeout=900)
     elif args.target == "mac":
         if sys.platform != "darwin":
             raise SystemExit("macOS desktop packages must be built on macOS.")
         prepare_macos_icon()
-        run([npm, "run", "dist", "--", "--mac"], cwd=DESKTOP, timeout=900)
+        run([npm, "run", "dist", "--", "--mac", f"--{args.arch}", "--config", str(builder_config)], cwd=DESKTOP, timeout=900)
     else:
         if sys.platform == "win32":
-            run([npm, "run", "pack"], cwd=DESKTOP, timeout=600)
+            run([npm, "run", "pack", "--", "--config", str(builder_config)], cwd=DESKTOP, timeout=600)
             patch_windows_icon()
             prepackaged = DESKTOP / "release" / "win-unpacked"
-            run([npm, "run", "dist", "--", "--win", "nsis", "--prepackaged", str(prepackaged)], cwd=DESKTOP, timeout=900)
+            run([npm, "run", "dist", "--", "--win", "nsis", "--prepackaged", str(prepackaged), "--config", str(builder_config)], cwd=DESKTOP, timeout=900)
         elif sys.platform == "darwin":
             prepare_macos_icon()
-            run([npm, "run", "dist", "--", "--mac"], cwd=DESKTOP, timeout=900)
+            run([npm, "run", "dist", "--", "--mac", "--config", str(builder_config)], cwd=DESKTOP, timeout=900)
         else:
-            run([npm, "run", "pack"], cwd=DESKTOP, timeout=600)
+            run([npm, "run", "pack", "--", "--config", str(builder_config)], cwd=DESKTOP, timeout=600)
 
-    prune_desktop_artifacts()
     update_latest_manifest()
     print(f"Desktop artifacts are in {DESKTOP / 'release'}")
     return 0

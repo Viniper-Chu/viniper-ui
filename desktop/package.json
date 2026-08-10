@@ -2,10 +2,10 @@
   "name": "viniper-ui-desktop",
   "version": "5.0.0",
   "private": true,
-  "description": "Desktop shell for Viniper UI.",
+  "description": "Desktop shell for Viniper.",
   "main": "main.js",
   "viniperProfile": "formal-runtime",
-  "author": "Viniper UI",
+  "author": "Viniper",
   "license": "MIT",
   "scripts": {
     "start": "electron .",
@@ -20,7 +20,7 @@
   },
   "build": {
     "appId": "com.viniper.ui.desktop",
-    "productName": "Viniper UI",
+    "productName": "Viniper",
     "directories": {
       "output": "release"
     },
@@ -36,6 +36,16 @@
         "filter": [
           "server.py",
           "context_lifecycle.py",
+          "context_usage.py",
+          "daily_usage.py",
+          "skill_sync.py",
+          "agent_instructions.py",
+          "agent_runtime.py",
+          "agent_host_bridge.py",
+          "agent_queue.py",
+          "agent_run_coordinator.py",
+          "native_peer.py",
+          "wsl_runtime.py",
           "profiles.json",
           "requirements.txt",
           "VERSION",
@@ -49,6 +59,9 @@
           ".agents/**",
           "static/**",
           "scripts/**",
+          "!codex/**",
+          "!.git/**",
+          "!.omx/**",
           "!scripts/__pycache__/**",
           "!data/**",
           "!tmp/**",
@@ -61,8 +74,8 @@
     "win": {
       "target": "nsis",
       "icon": "../static/assets/viniper-icon.ico",
-      "artifactName": "Viniper.UI.Setup.${version}.${ext}",
-      "legalTrademarks": "Viniper UI",
+      "artifactName": "Viniper.Setup.${version}.${ext}",
+      "legalTrademarks": "Viniper",
       "signAndEditExecutable": false,
       "verifyUpdateCodeSignature": false
     },
@@ -72,14 +85,14 @@
       ],
       "category": "public.app-category.productivity",
       "icon": "build/icon.icns",
-      "artifactName": "Viniper.UI.${version}-${arch}-mac.${ext}"
+      "artifactName": "Viniper.${version}-${arch}-mac.${ext}"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Viniper UI",
+      "shortcutName": "Viniper",
       "installerIcon": "../static/assets/viniper-icon.ico",
       "uninstallerIcon": "../static/assets/viniper-icon.ico",
       "installerHeaderIcon": "../static/assets/viniper-icon.ico"

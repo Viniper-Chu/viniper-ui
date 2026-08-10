@@ -21,6 +21,7 @@ desktop/release-preview/
 
 # Local/editor files
 codex/
+.omx/
 .env
 .DS_Store
 Thumbs.db

@@ -1,117 +1,89 @@
-# Viniper UI
+# Viniper
 
-Viniper UI is a thin local web UI for running Claude Code with an Anthropic-compatible provider such as DeepSeek.
+Viniper 是面向 Windows 与 macOS 的本地桌面工作区。它把日常对话与 Claude Code 执行会话分成两个清晰表面：Chat 只负责聊天，Agent 通过 Claude Code CLI 执行本地任务、工具调用与权限交互。
 
-It keeps the original Claude Code execution model: prompts are sent to the Claude Code CLI, tool use remains in Claude Code, and the UI only adds a cleaner chat surface, sessions, permissions, attachments, model switching, context compression hints, and release updates.
+## 主要能力
 
-## Features
+- Claude Code 风格的 Chat / Agent 双工作区与浅深色界面。
+- 多个 Agent 会话并行运行；消息、上下文、队列、权限模式和交互请求按会话隔离。
+- 行内 AskUserQuestion 与工具权限卡，支持多题、多选、其他答案、允许、拒绝和中断恢复。
+- Enter 发送或排队，Ctrl+Enter 引导当前任务，Shift+Enter 只换行。
+- 使用 Claude Code 的真实 context usage 与原生压缩边界显示上下文状态。
+- 安全显示助手图片、工具图片与本地产物，不根据普通文本路径猜测文件。
+- 设置中心可维护用户级 `AGENT.md`；Agent 每轮启动或恢复前读取，Chat 不注入。
+- 本地技能库保留原始目录、命令和说明，并提供中文界面显示字段。
+- GitHub Releases 自动更新；应用文件原子替换，用户会话、设置、附件和凭据留在安装目录之外。
 
-- Thin wrapper around the Claude Code CLI.
-- DeepSeek model profile support.
-- Session restore on reopen.
-- Light and dark themes.
-- Permission mode selector.
-- Expandable thinking/tool trace panel.
-- Attachments saved as files and passed to Claude Code by path, not pasted into chat text.
-- Settings center for local account, language, themes, accent colors, shell selection, provider URL, API key, and model list.
-- Built-in update checking through GitHub Releases.
-- Desktop shell for Windows/macOS packaging with tray/background behavior.
+## Claude Code 与技能
 
-## Install
+Windows Agent 使用受管 WSL2 运行环境；Chat 不启动 Claude Code 子进程。源码运行需要 Python 3.10+，桌面打包需要 Node.js 与 `desktop/package-lock.json` 对应的依赖。
 
-Requirements:
+Viniper 只同步兼容且不存在同名冲突的技能。运行 Agent 时，受管技能根通过 Claude Code 官方 `--add-dir` 参数加入启动命令，Claude Code 从该根的 `.claude/skills/<skill-name>/SKILL.md` 发现技能。原始技能目录与 `/command` 始终是真源；同名用户技能不会被覆盖，界面会如实显示“Claude Code 可用”“仅 Viniper 可用”或“冲突”。可用数量来自本机实时扫描，不是固定承诺。
 
-- Python 3.10+
-- Claude Code CLI available as `claude`
-- A compatible provider configured in `~/.claude/settings.json` or environment variables
+## 安装与运行
 
-Windows:
+公开 Release 提供 Windows 安装程序、macOS x64/arm64 包，以及供应用内更新使用的 app zip。源码运行：
 
 ```powershell
 python -m pip install -r requirements.txt
 python server.py
 ```
 
-macOS/Linux:
+默认本地服务地址为 `http://127.0.0.1:17373`。
 
-```bash
-python3 -m pip install -r requirements.txt
-python3 server.py
-```
+Provider 采用 Anthropic-compatible 配置：
 
-Open:
-
-```text
-http://127.0.0.1:17373
-```
-
-## Provider Config
-
-Viniper UI reads the same environment style used by Claude Code:
-
-- `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`
+- `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY`
 - `ANTHROPIC_BASE_URL`
 - `ANTHROPIC_MODEL`
 
-Do not commit API keys.
+不要把 API key 提交到仓库。
 
-## Updates
+## 用户数据与升级兼容
 
-Updates are powered by GitHub Releases. A release should upload:
+正式 5.0.0 的可见品牌为 Viniper，但继续使用 4.x 的桌面 App ID 和兼容数据标识，避免升级后丢失历史：
 
-- `ViniperUI-vX.Y.Z.zip`
+- Windows 正式版：`%APPDATA%\Viniper UI`
+- Windows Preview：`%APPDATA%\Viniper Preview`（与正式版隔离）
+- macOS 正式兼容目录：`~/Library/Application Support/Viniper UI`
+
+更新只替换应用运行文件，不清空 sessions、settings、`AGENT.md`、skills、attachments 或凭据。
+
+## Release 资产
+
+同一 GitHub Release 包含：
+
+- `Viniper.Setup.X.Y.Z.exe` 与对应 blockmap
+- `Viniper.X.Y.Z-x64-mac.zip` 与对应 blockmap
+- `Viniper.X.Y.Z-arm64-mac.zip` 与对应 blockmap
+- `Viniper-vX.Y.Z.zip`
 - `latest.json`
 
-The installed app checks `update_source.json` or `VINIPER_UI_UPDATE_MANIFEST_URL`.
+`latest.json` 的版本、资产名、公开 URL 与文件大小必须与同一 Release 中的真实资产一致。
 
-Example `update_source.json`:
+## 本地验证与构建
 
-```json
-{
-  "repository": "your-github-name/viniper-ui",
-  "manifest_url": "https://github.com/your-github-name/viniper-ui/releases/latest/download/latest.json",
-  "channel": "stable"
-}
-```
-
-Runtime data is stored outside the install directory by default:
-
-- Windows: `%APPDATA%\Viniper UI`
-- macOS: `~/Library/Application Support/Viniper UI`
-- Linux: `~/.local/share/viniper-ui`
-
-On first launch, Viniper UI migrates any old install-local `data/` folder into this user data directory. The update installer only replaces app files such as `server.py`, `requirements.txt`, `VERSION`, `update_source.json`, `start.bat`, and `static/`. It does not touch sessions, attachments, API keys, or local Claude settings.
-
-## Build A Release
-
-```bash
+```powershell
+python -m unittest discover -s tests -v
 python scripts/verify_app.py
-python scripts/build_release.py --version 0.2.0 --repo your-github-name/viniper-ui
+python scripts/verify_provider_routing.py
+python scripts/verify_desktop.py
 python scripts/verify_release.py
 ```
 
-Artifacts are written to `dist/`.
+构建 Windows 桌面安装器：
 
-If this repository is on GitHub, pushing a tag like `v0.1.1` also triggers `.github/workflows/release.yml`, which builds the update zip and uploads `latest.json` to the GitHub Release.
-
-## Development Notes
-
-This project intentionally stays a thin UI. Do not add an extra agent layer that changes Claude Code behavior. When adding features, keep user data outside release artifacts and update `VERSION` before publishing.
-
-## Desktop App
-
-The desktop app lives in `desktop/`. It uses Electron to wrap the existing local service without changing the Claude Code execution path.
-
-```bash
-python scripts/build_desktop.py --target win
+```powershell
+python scripts/build_desktop.py --target win --skip-install
+python scripts/build_release.py --version 5.0.0 --repo Viniper-Chu/viniper-ui
+python scripts/verify_release.py --require-windows-installer
 ```
 
-On macOS, run the same script on a Mac:
+macOS 必须显式指定架构：
 
 ```bash
-python3 scripts/build_desktop.py --target mac
+python3 scripts/build_desktop.py --target mac --arch x64
+python3 scripts/build_desktop.py --target mac --arch arm64
 ```
 
-The desktop shell starts `server.py` with browser auto-open disabled, waits for the local service, then opens the current Viniper UI in a native window. If another Viniper UI service is already on the default port but has a different bundled version, the desktop app starts its own service on the next free port. Closing the window hides it to the tray so it can stay in the background.
-
-Desktop artifacts are written to `desktop/release/`. Runtime sessions and settings remain in the user data directory, so app updates do not erase conversations.
+正式桌面产物写入被 Git 忽略的 `desktop/release/`，更新包写入 `dist/`。构建会先创建显式白名单资源 staging，不遍历 `codex/`、`.omx/`、用户数据或本地证据。

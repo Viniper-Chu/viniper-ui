@@ -32,7 +32,7 @@ jobs:
           text = Path("CHANGELOG.md").read_text(encoding="utf-8")
           pattern = rf"^##\s+{re.escape(version)}[^\n]*\n(?P<body>.*?)(?=^##\s+v|\Z)"
           match = re.search(pattern, text, flags=re.M | re.S)
-          notes = match.group("body").strip() if match else f"Viniper UI {version}"
+          notes = match.group("body").strip() if match else f"Viniper {version}"
           Path("dist").mkdir(exist_ok=True)
           Path("dist/release-notes.md").write_text(notes + "\n", encoding="utf-8")
           PY
@@ -41,14 +41,19 @@ jobs:
           python scripts/verify_release.py
 
       - name: Upload update package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir release-update
+          cp "dist/Viniper-v${VERSION}.zip" release-update/
+          cp dist/latest.json release-update/
+          cp dist/release-notes.md release-update/
+          test -s "release-update/Viniper-v${VERSION}.zip"
+
+      - name: Store update package
         uses: actions/upload-artifact@v4
         with:
           name: update-package
-          path: |
-            dist/ViniperUI-v*.zip
-            dist/ViniperUI-v*.zip.sha256
-            dist/latest.json
-            dist/release-notes.md
+          path: release-update/
 
   build-windows-desktop:
     runs-on: windows-latest
@@ -72,16 +77,29 @@ jobs:
         shell: pwsh
         run: python scripts/build_desktop.py --target win
 
-      - name: Upload Windows desktop installer
+      - name: Stage exact Windows desktop installer
+        shell: pwsh
+        run: |
+          $Version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $Output = "release-windows"
+          New-Item -ItemType Directory -Path $Output | Out-Null
+          Copy-Item -LiteralPath "desktop/release/Viniper.Setup.$Version.exe" -Destination $Output
+          Copy-Item -LiteralPath "desktop/release/Viniper.Setup.$Version.exe.blockmap" -Destination $Output
+          if ((Get-Item -LiteralPath "$Output/Viniper.Setup.$Version.exe").Length -le 0) { throw "empty Windows installer" }
+          if ((Get-Item -LiteralPath "$Output/Viniper.Setup.$Version.exe.blockmap").Length -le 0) { throw "empty Windows blockmap" }
+
+      - name: Store Windows desktop installer
         uses: actions/upload-artifact@v4
         with:
           name: desktop-windows
-          path: |
-            desktop/release/*.exe
-            desktop/release/*.blockmap
+          path: release-windows/
 
   build-macos-desktop:
     runs-on: macos-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [x64, arm64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -99,15 +117,23 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
 
       - name: Build macOS desktop package
-        run: python scripts/build_desktop.py --target mac
+        run: python scripts/build_desktop.py --target mac --arch "${{ matrix.arch }}"
 
-      - name: Upload macOS desktop package
+      - name: Stage exact macOS desktop package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          OUTPUT="release-macos-${{ matrix.arch }}"
+          mkdir "$OUTPUT"
+          cp "desktop/release/Viniper.${VERSION}-${{ matrix.arch }}-mac.zip" "$OUTPUT/"
+          cp "desktop/release/Viniper.${VERSION}-${{ matrix.arch }}-mac.zip.blockmap" "$OUTPUT/"
+          test -s "$OUTPUT/Viniper.${VERSION}-${{ matrix.arch }}-mac.zip"
+          test -s "$OUTPUT/Viniper.${VERSION}-${{ matrix.arch }}-mac.zip.blockmap"
+
+      - name: Store macOS desktop package
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-macos
-          path: |
-            desktop/release/*.zip
-            desktop/release/*.blockmap
+          name: desktop-macos-${{ matrix.arch }}
+          path: release-macos-${{ matrix.arch }}/
 
   publish-release:
     runs-on: ubuntu-latest
@@ -125,7 +151,6 @@ jobs:
       - name: Finalize update manifest
         run: |
           python - <<'PY'
-          import hashlib
           import json
           import os
           from datetime import datetime, timezone
@@ -135,29 +160,48 @@ jobs:
           manifest_path = root / "latest.json"
           manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
           repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
 
-          def sha256_file(path):
-              h = hashlib.sha256()
-              with path.open("rb") as handle:
-                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                      h.update(chunk)
-              return h.hexdigest()
+          def required_asset(path):
+              if not path.is_file() or path.stat().st_size <= 0:
+                  raise SystemExit(f"required release asset missing or empty: {path}")
+              return path
 
           def asset(path):
               return {
                   "name": path.name,
-                  "url": f"https://github.com/{repo}/releases/latest/download/{path.name}",
-                  "sha256": sha256_file(path),
+                  "url": f"https://github.com/{repo}/releases/download/{tag}/{path.name}",
                   "size": path.stat().st_size,
               }
 
           assets = manifest.setdefault("assets", {})
-          windows = sorted(root.glob("Viniper.UI.Setup.*.exe"))
-          macos = sorted(root.glob("Viniper.UI.*-mac.zip"))
-          if windows:
-              assets["installer_windows"] = asset(windows[-1])
-          if macos:
-              assets["installer_macos"] = asset(macos[-1])
+          app = required_asset(root / f"Viniper-v{version}.zip")
+          windows = required_asset(root / f"Viniper.Setup.{version}.exe")
+          windows_map = required_asset(root / f"Viniper.Setup.{version}.exe.blockmap")
+          macos_arm64 = required_asset(root / f"Viniper.{version}-arm64-mac.zip")
+          macos_arm64_map = required_asset(root / f"Viniper.{version}-arm64-mac.zip.blockmap")
+          macos_x64 = required_asset(root / f"Viniper.{version}-x64-mac.zip")
+          macos_x64_map = required_asset(root / f"Viniper.{version}-x64-mac.zip.blockmap")
+          if manifest.get("version") != version:
+              raise SystemExit("latest.json version does not match the release tag")
+          assets["app"] = asset(app)
+          assets["installer_windows"] = asset(windows)
+          assets["installer_macos"] = asset(macos_arm64)
+          assets["installer_macos_arm64"] = asset(macos_arm64)
+          assets["installer_macos_x64"] = asset(macos_x64)
+          for key, path in (
+              ("app", app),
+              ("installer_windows", windows),
+              ("installer_macos", macos_arm64),
+              ("installer_macos_arm64", macos_arm64),
+              ("installer_macos_x64", macos_x64),
+          ):
+              if assets[key] != asset(path):
+                  raise SystemExit(f"latest.json {key} does not match the merged release asset")
+          # Both blockmaps are required upload assets even though latest.json
+          # describes only the user-facing installer files.
+          _ = (windows_map, macos_arm64_map, macos_x64_map)
           manifest["published_at"] = datetime.now(timezone.utc).isoformat()
           manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
           PY
@@ -166,76 +210,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release-artifacts/*
-          name: Viniper UI ${{ github.ref_name }}
+          name: Viniper ${{ github.ref_name }}
           body_path: release-artifacts/release-notes.md
           make_latest: true
-          overwrite_files: true
-
-      - name: Keep only latest two releases
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const keep = 2;
-            const semver = (tag) => {
-              const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(tag || "");
-              return match ? match.slice(1).map(Number) : [0, 0, 0];
-            };
-            const compareDesc = (a, b) => {
-              const av = semver(a.tag_name);
-              const bv = semver(b.tag_name);
-              for (let i = 0; i < 3; i += 1) {
-                if (av[i] !== bv[i]) return bv[i] - av[i];
-              }
-              return new Date(b.created_at) - new Date(a.created_at);
-            };
-            const releases = (await github.paginate(github.rest.repos.listReleases, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              per_page: 100
-            })).filter((release) => /^v?\d+\.\d+\.\d+$/.test(release.tag_name));
-            releases.sort(compareDesc);
-            for (const release of releases.slice(keep)) {
-              core.info(`Deleting old release ${release.tag_name}`);
-              await github.rest.repos.deleteRelease({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                release_id: release.id
-              });
-              try {
-                await github.rest.git.deleteRef({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  ref: `tags/${release.tag_name}`
-                });
-              } catch (error) {
-                core.warning(`Could not delete tag ${release.tag_name}: ${error.message}`);
-              }
-            }
-            const tagRefs = await github.paginate(github.rest.git.listMatchingRefs, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: "tags/v"
-            });
-            const semverTags = tagRefs
-              .map((item) => item.ref.replace("refs/tags/", ""))
-              .filter((tag) => /^v?\d+\.\d+\.\d+$/.test(tag))
-              .sort((a, b) => {
-                const av = semver(a);
-                const bv = semver(b);
-                for (let i = 0; i < 3; i += 1) {
-                  if (av[i] !== bv[i]) return bv[i] - av[i];
-                }
-                return 0;
-              });
-            for (const tag of semverTags.slice(keep)) {
-              core.info(`Deleting old tag ${tag}`);
-              try {
-                await github.rest.git.deleteRef({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  ref: `tags/${tag}`
-                });
-              } catch (error) {
-                core.warning(`Could not delete tag ${tag}: ${error.message}`);
-              }
-            }
+          overwrite_files: false

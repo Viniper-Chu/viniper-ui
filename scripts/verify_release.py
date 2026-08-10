@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Verify Viniper UI source and release artifacts."""
+"""Verify Viniper source and release artifacts."""
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -11,6 +13,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +42,43 @@ def scan_for_secrets(paths: list[Path]) -> None:
             raise SystemExit(f"secret-looking token found in {path}")
 
 
+def release_source_files(root: Path = ROOT) -> list[Path]:
+    """Enumerate publishable source inputs without traversing local evidence."""
+    skipped_names = {
+        ".git", ".omx", ".venv", "__pycache__", "codex", "data", "dist",
+        "node_modules", "tmp",
+    }
+    skipped_relative = {"desktop/release", "desktop/release-preview"}
+    result: list[Path] = []
+
+    def fail_walk(error: OSError) -> None:
+        raise SystemExit(f"release source tree is inaccessible: {error}")
+
+    for current, directories, filenames in os.walk(root, topdown=True, onerror=fail_walk):
+        current_path = Path(current)
+        try:
+            relative = current_path.relative_to(root).as_posix()
+        except ValueError:
+            raise SystemExit(f"release source escaped root: {current_path}")
+        kept: list[str] = []
+        for name in directories:
+            child_relative = f"{relative}/{name}".lstrip("./")
+            if name in skipped_names or child_relative in skipped_relative:
+                continue
+            kept.append(name)
+        directories[:] = kept
+        for filename in filenames:
+            path = current_path / filename
+            try:
+                is_file = path.is_file()
+            except OSError as exc:
+                raise SystemExit(f"release source is inaccessible: {path}: {exc}") from exc
+            if not is_file:
+                raise SystemExit(f"release source entry disappeared or is not a file: {path}")
+            result.append(path)
+    return result
+
+
 def verify_zip(zip_path: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="viniper-ui-release-check-") as tmp:
         target = Path(tmp)
@@ -54,6 +94,17 @@ def verify_zip(zip_path: Path) -> None:
         app = app_roots[0]
         required = [
             "server.py",
+            "context_lifecycle.py",
+            "context_usage.py",
+            "daily_usage.py",
+            "skill_sync.py",
+            "agent_instructions.py",
+            "agent_runtime.py",
+            "agent_host_bridge.py",
+            "agent_queue.py",
+            "agent_run_coordinator.py",
+            "native_peer.py",
+            "wsl_runtime.py",
             "requirements.txt",
             "VERSION",
             "desktop/package.json",
@@ -76,43 +127,115 @@ def verify_zip(zip_path: Path) -> None:
         scan_for_secrets([path for path in app.rglob("*") if path.is_file()])
 
 
+def asset_url_matches_name(value: object, name: str) -> bool:
+    url = str(value or "").strip()
+    if url == name:
+        return True
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and Path(unquote(parsed.path)).name == name
+
+
+def require_manifest_asset(assets: dict[str, object], key: str, path: Path) -> None:
+    item = assets.get(key)
+    if not isinstance(item, dict):
+        raise SystemExit(f"latest.json missing assets.{key}")
+    if item.get("name") != path.name:
+        raise SystemExit(f"latest.json assets.{key}.name mismatch")
+    if int(item.get("size") or 0) != path.stat().st_size:
+        raise SystemExit(f"latest.json assets.{key}.size mismatch")
+    if not asset_url_matches_name(item.get("url"), path.name):
+        raise SystemExit(f"latest.json assets.{key}.url mismatch")
+
+
+def verify_release_assets(
+    manifest: dict[str, object],
+    version: str,
+    *,
+    root: Path = ROOT,
+    dist: Path = DIST,
+    require_windows: bool = False,
+    require_macos: bool = False,
+) -> list[Path]:
+    if manifest.get("version") != version:
+        raise SystemExit("latest.json version does not match VERSION")
+    assets = manifest.get("assets")
+    if not isinstance(assets, dict):
+        raise SystemExit("latest.json assets must be an object")
+
+    manifest_path = dist / "latest.json"
+    if not manifest_path.is_file():
+        raise SystemExit("dist/latest.json missing")
+    app_path = dist / f"Viniper-v{version}.zip"
+    if not app_path.is_file():
+        raise SystemExit(f"release zip missing: {app_path}")
+    require_manifest_asset(assets, "app", app_path)
+    upload_files = [app_path, manifest_path]
+
+    release_dir = root / "desktop" / "release"
+    installers = {
+        "installer_windows": release_dir / f"Viniper.Setup.{version}.exe",
+        "installer_macos_arm64": release_dir / f"Viniper.{version}-arm64-mac.zip",
+        "installer_macos_x64": release_dir / f"Viniper.{version}-x64-mac.zip",
+    }
+    if require_windows and not installers["installer_windows"].is_file():
+        raise SystemExit(f"required Windows installer missing: {installers['installer_windows']}")
+    if require_macos:
+        for key in ("installer_macos_arm64", "installer_macos_x64"):
+            if not installers[key].is_file():
+                raise SystemExit(f"required macOS installer missing: {installers[key]}")
+
+    for key, installer in installers.items():
+        declared = key in assets
+        if not installer.is_file():
+            if declared:
+                raise SystemExit(f"latest.json declares missing {key}: {installer}")
+            continue
+        require_manifest_asset(assets, key, installer)
+        blockmap = installer.with_name(installer.name + ".blockmap")
+        if not blockmap.is_file() or blockmap.stat().st_size <= 0:
+            raise SystemExit(f"required blockmap missing or empty: {blockmap}")
+        upload_files.extend([installer, blockmap])
+    default_macos = (
+        installers["installer_macos_arm64"]
+        if installers["installer_macos_arm64"].is_file()
+        else installers["installer_macos_x64"]
+    )
+    if "installer_macos" in assets:
+        if not default_macos.is_file():
+            raise SystemExit("latest.json declares installer_macos without a macOS installer")
+        require_manifest_asset(assets, "installer_macos", default_macos)
+    return upload_files
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Verify Viniper release artifacts.")
+    parser.add_argument("--print-upload-files", action="store_true")
+    parser.add_argument("--require-windows-installer", action="store_true")
+    parser.add_argument("--require-macos-installers", action="store_true")
+    args = parser.parse_args()
     run([sys.executable, "-m", "py_compile", str(ROOT / "server.py")])
     run([sys.executable, str(ROOT / "scripts" / "verify_desktop.py")])
     if shutil.which("node"):
         run(["node", "--check", str(ROOT / "static" / "app.js")])
-    scan_for_secrets([path for path in ROOT.rglob("*") if path.is_file() and "data" not in path.parts and "dist" not in path.parts])
+    scan_for_secrets(release_source_files())
 
     manifest_path = DIST / "latest.json"
     if not manifest_path.exists():
         raise SystemExit("dist/latest.json missing; run scripts/build_release.py first")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assets = manifest.get("assets", {})
-    asset = assets.get("app") or assets.get("portable") or {}
-    zip_name = asset.get("name")
-    if not zip_name:
-        raise SystemExit("latest.json missing assets.app.name or assets.portable.name")
-    zip_path = DIST / zip_name
-    if not zip_path.exists():
-        raise SystemExit(f"release zip missing: {zip_path}")
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-    windows_installer = ROOT / "desktop" / "release" / f"Viniper.UI.Setup.{version}.exe"
-    if windows_installer.exists():
-        windows_asset = manifest.get("assets", {}).get("installer_windows", {}) or manifest.get("assets", {}).get("windows", {})
-        if windows_asset.get("name") != windows_installer.name:
-            raise SystemExit("latest.json missing matching installer_windows asset")
-        if not windows_asset.get("sha256"):
-            raise SystemExit("latest.json missing installer_windows.sha256")
-    mac_installer = ROOT / "desktop" / "release" / f"Viniper.UI.{version}-arm64-mac.zip"
-    if mac_installer.exists():
-        mac_asset = manifest.get("assets", {}).get("installer_macos", {}) or manifest.get("assets", {}).get("macos", {})
-        if mac_asset.get("name") != mac_installer.name:
-            raise SystemExit("latest.json missing matching installer_macos asset")
-        if not mac_asset.get("sha256"):
-            raise SystemExit("latest.json missing installer_macos.sha256")
-    if zip_path.suffix.lower() == ".zip":
-        verify_zip(zip_path)
-    print("Viniper UI release verification passed.")
+    upload_files = verify_release_assets(
+        manifest,
+        version,
+        require_windows=args.require_windows_installer,
+        require_macos=args.require_macos_installers,
+    )
+    verify_zip(DIST / f"Viniper-v{version}.zip")
+    if args.print_upload_files:
+        for path in upload_files:
+            print(path.relative_to(ROOT).as_posix())
+    else:
+        print("Viniper release verification passed.")
     return 0
 
 

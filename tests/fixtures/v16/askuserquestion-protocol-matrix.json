@@ -1,0 +1,87 @@
+{
+  "source_evidence": "codex/运行残留/v163breal-073007/v163-real-composite-result.json",
+  "session_id": "matrix-session-A",
+  "run_id": "matrix-run-A",
+  "process_identity": "wsl:ViniperRuntime:matrix-session-A:4101",
+  "bridge_request_id": "matrixbridgeask01",
+  "tool_use_id": "call_matrix_ask_01",
+  "tool_name": "AskUserQuestion",
+  "agent_id": "agent-matrix-A",
+  "response": "关闭结构化问题后的可选自由回复",
+  "input": {
+    "questions": [
+      {
+        "question": "选择实现路径？",
+        "header": "路径",
+        "options": [
+          {
+            "label": "方案一",
+            "description": "保持现有结构",
+            "preview": "保留当前模块边界",
+            "futureOptionField": "safe-option-extension"
+          },
+          {
+            "label": "方案二",
+            "description": "采用新结构"
+          }
+        ],
+        "multiSelect": false,
+        "preview": "首题安全预览",
+        "futureQuestionField": {
+          "version": 1,
+          "enabled": true
+        }
+      },
+      {
+        "question": "选择验证项？",
+        "header": "验证",
+        "options": [
+          {
+            "label": "单元测试",
+            "description": "运行定向测试"
+          },
+          {
+            "label": "界面测试",
+            "description": "运行 Electron 测试"
+          }
+        ],
+        "multiSelect": true
+      },
+      {
+        "question": "补充说明？",
+        "header": "说明",
+        "options": [
+          {
+            "label": "无需补充",
+            "description": "直接继续"
+          },
+          {
+            "label": "其他",
+            "description": "输入自由文本"
+          }
+        ],
+        "multiSelect": false
+      }
+    ]
+  },
+  "answers": {
+    "选择实现路径？": "方案一",
+    "选择验证项？": [
+      "单元测试",
+      "界面测试"
+    ],
+    "补充说明？": "保留用户输入的自由文本"
+  },
+  "expected_ack_stages": [
+    "response_committed",
+    "response_read",
+    "mcp_response_written_and_flushed",
+    "cli_tool_result"
+  ],
+  "deny_result": {
+    "behavior": "deny",
+    "message": "用户取消了结构化询问",
+    "interrupt": true,
+    "toolUseID": "call_matrix_ask_01"
+  }
+}

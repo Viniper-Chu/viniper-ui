@@ -1,0 +1,13 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000016",
+  "transcript_path": "/tmp/viniper-v16-fixture/transcript.jsonl",
+  "cwd": "/tmp/viniper-v16-fixture",
+  "permission_mode": "default",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf fixture-ok",
+    "description": "输出无害夹具文本"
+  },
+  "permission_suggestions": []
+}

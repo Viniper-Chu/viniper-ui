@@ -1,8 +1,9 @@
 import asyncio
 import base64
 import copy
-import hashlib
 import http.client
+import httpx
+import inspect
 import json
 import os
 import platform
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import uuid
@@ -21,7 +23,7 @@ from typing import Any
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -31,6 +33,38 @@ from context_lifecycle import (
     ExternalSummaryAdapter,
     NativeContextAdapter,
 )
+from context_usage import ContextUsageLedger, ContextUsageSnapshot
+from daily_usage import DailyUsageLedger
+from agent_runtime import (
+    AgentRunSpec,
+    MANAGED_DISTRO_NAME,
+    MANAGED_DISTRO_USER,
+    RuntimeProbe,
+    WindowsNativeRuntime,
+    WslAgentRuntime,
+    stable_session_name,
+)
+from agent_instructions import AgentInstructionsStore
+from agent_host_bridge import (
+    MCP_RESPONSE_ACK_STAGE,
+    PERMISSION_PROMPT_MCP_QUALIFIED_TOOL,
+    HostInteractionChannel,
+    build_hook_response,
+    build_hook_settings,
+    build_passive_hook_settings,
+    build_permission_prompt_mcp_config,
+    build_permission_prompt_response,
+)
+from agent_queue import AgentQueueStore
+from agent_run_coordinator import (
+    ActiveRunExists,
+    AgentRunCoordinator,
+    AgentRunJournal,
+    DurableInteractionStore,
+)
+from native_peer import ClaudeCrossSessionAdapter, NativePeerMessaging, build_native_send_instruction
+from skill_sync import localized_skill_fields, status_display, synchronize_skill_records
+from wsl_runtime import RuntimeUpdateCoordinator, WslRuntimeProvisioner
 
 
 PROFILE_NAME = "agent-shell"
@@ -65,24 +99,24 @@ PREVIEW_MODE = env_value("VINIPER_UI_PREVIEW", "").strip() == "1" or VERSION_FIL
 PREVIEW_PROFILE = read_profile_config().get("preview", {})
 if not isinstance(PREVIEW_PROFILE, dict):
     PREVIEW_PROFILE = {}
-APP_TITLE = str(PREVIEW_PROFILE.get("product_name") or "Viniper Preview") if PREVIEW_MODE else "Viniper UI"
+APP_TITLE = str(PREVIEW_PROFILE.get("product_name") or "Viniper Preview") if PREVIEW_MODE else "Viniper"
 ACTIVE_PROFILE = "preview" if PREVIEW_MODE else "formal-runtime"
 ASSET_VERSION = env_value("VINIPER_UI_ASSET_VERSION", "").strip() or APP_VERSION
+SESSION_MODES = {"chat", "agent"}
+
+
+def normalize_session_mode(value: Any) -> str:
+    return "chat" if str(value or "").strip().lower() == "chat" else "agent"
 PERMISSION_MODE_OPTIONS = [
     {
         "id": "default",
-        "label": "Claude 默认",
-        "description": "使用 Claude Code 默认权限策略",
+        "label": "询问权限",
+        "description": "Claude 在需要权限时暂停并询问",
     },
     {
         "id": "acceptEdits",
         "label": "自动接受编辑",
-        "description": "自动允许文件编辑，其他高风险操作仍按 Claude Code 策略处理",
-    },
-    {
-        "id": "auto",
-        "label": "自动",
-        "description": "使用 Claude Code 的自动权限策略",
+        "description": "自动允许文件编辑，其他高风险操作仍会询问",
     },
     {
         "id": "plan",
@@ -90,14 +124,14 @@ PERMISSION_MODE_OPTIONS = [
         "description": "先规划，减少直接执行动作",
     },
     {
-        "id": "dontAsk",
-        "label": "不询问",
-        "description": "拒绝需要确认的操作",
+        "id": "auto",
+        "label": "自动模式",
+        "description": "由 Claude Code 的可用自动模式判断动作",
     },
     {
         "id": "bypassPermissions",
-        "label": "总是允许",
-        "description": "跳过 Claude Code 权限确认，适合已信任的本地任务",
+        "label": "跳过权限",
+        "description": "跳过 Claude Code 权限确认，仅在设置中明确启用后提供",
     },
 ]
 PERMISSION_MODE_IDS = {item["id"] for item in PERMISSION_MODE_OPTIONS}
@@ -108,14 +142,19 @@ CLAUDE_REQUIRED_OPTIONS = [
     "-p",
     "--output-format",
     "--include-partial-messages",
+    "--include-hook-events",
     "--model",
     "--session-id",
     "--resume",
     "--permission-mode",
+    "--allow-dangerously-skip-permissions",
     "--fallback-model",
     "--name",
     "--append-system-prompt",
     "--add-dir",
+    "--settings",
+    "--mcp-config",
+    "--permission-prompt-tool",
     "--verbose",
 ]
 CLAUDE_REQUIRED_PERMISSION_MODES = [
@@ -129,6 +168,8 @@ CLAUDE_REQUIRED_PERMISSION_MODES = [
 RUN_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_RUN_TIMEOUT", "0"))
 HEARTBEAT_INTERVAL_SECONDS = int(env_value("VINIPER_UI_HEARTBEAT_INTERVAL", "15"))
 NO_OUTPUT_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_NO_OUTPUT_TIMEOUT", str(40 * 60)))
+CLI_INTERACTION_ACK_TIMEOUT_SECONDS = float(env_value("VINIPER_UI_CLI_ACK_TIMEOUT", "30"))
+HOST_HOOK_COMPATIBILITY_GRACE_SECONDS = float(env_value("VINIPER_UI_HOOK_COMPAT_GRACE", "0.35"))
 MODEL_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_MODEL_IDLE_TIMEOUT", str(25 * 60)))
 MODEL_STALL_RECOVERY_ATTEMPTS = int(env_value("VINIPER_UI_MODEL_STALL_RECOVERY_ATTEMPTS", "2"))
 GUI_COMMAND_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_GUI_COMMAND_TIMEOUT", "0"))
@@ -141,6 +182,20 @@ STREAM_READ_CHUNK_SIZE = max(
 )
 MAX_ATTACHMENT_BYTES = int(env_value("VINIPER_UI_MAX_ATTACHMENT_BYTES", str(50 * 1024 * 1024)))
 MAX_ATTACHMENT_TOTAL_BYTES = int(env_value("VINIPER_UI_MAX_ATTACHMENT_TOTAL_BYTES", str(100 * 1024 * 1024)))
+MAX_RENDER_IMAGE_BYTES = int(env_value("VINIPER_UI_MAX_RENDER_IMAGE_BYTES", str(10 * 1024 * 1024)))
+SUPPORTED_RENDER_IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+}
+IMAGE_SUFFIX_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
 UPDATE_SOURCE_FILE = VERSION_FILE.with_name("update_source.json")
 UPDATE_MANIFEST_URL_ENV = env_value("VINIPER_UI_UPDATE_MANIFEST_URL", "").strip()
 UPDATE_REPOSITORY_ENV = env_value("VINIPER_UI_UPDATE_REPO", "").strip()
@@ -157,13 +212,13 @@ MODEL_OPTIONS = [
     {
         "id": "deepseek-v4-pro[1m]",
         "label": "DeepSeek V4 Pro",
-        "description": "Complex coding and long context work",
+        "description": "复杂编码与长上下文工作",
         "context": 1000000,
     },
     {
         "id": "deepseek-v4-flash",
         "label": "DeepSeek V4 Flash",
-        "description": "Faster daily work",
+        "description": "更快完成日常工作",
         "context": 128000,
     },
 ]
@@ -171,13 +226,13 @@ SHELL_OPTIONS = [
     {
         "id": "claude-code",
         "label": "Claude Code",
-        "description": "Run the Claude Code CLI as the agent shell.",
+        "description": "使用 Claude Code CLI 作为 Agent 执行壳。",
         "available": True,
     },
     {
         "id": "custom-cli",
-        "label": "Custom CLI",
-        "description": "Run any local agent CLI through stdin/stdout. The prompt is sent through stdin.",
+        "label": "自定义 CLI",
+        "description": "通过标准输入输出运行本地 Agent CLI，并从标准输入发送任务。",
         "available": True,
     },
 ]
@@ -255,10 +310,22 @@ BASE_DIR = APP_DIR.parent
 STATIC_DIR = APP_DIR / "static"
 PROJECT_SKILLS_DIR = BASE_DIR / ".claude" / "skills"
 PROJECT_SKILLS_DIRS = [
+    Path.home() / ".claude" / "skills",
     PROJECT_SKILLS_DIR,
     APP_DIR / ".claude" / "skills",
     APP_DIR / ".agents" / "skills",
     BASE_DIR / ".agents" / "skills",
+    Path.home() / ".codex" / "skills",
+    Path.home() / ".agents" / "skills",
+]
+SKILL_SOURCE_ROOTS = [
+    ("global-claude", Path.home() / ".claude" / "skills"),
+    ("project-claude", PROJECT_SKILLS_DIR),
+    ("project-app-claude", APP_DIR / ".claude" / "skills"),
+    ("project-app-agents", APP_DIR / ".agents" / "skills"),
+    ("project-agents", BASE_DIR / ".agents" / "skills"),
+    ("global-codex", Path.home() / ".codex" / "skills"),
+    ("global-agents", Path.home() / ".agents" / "skills"),
 ]
 GOAL_SKILL_COMMAND = "dbs-goal"
 USER_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
@@ -316,6 +383,9 @@ def default_data_dir() -> Path:
 DATA_DIR = default_data_dir()
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
+AGENT_QUEUE_FILE = DATA_DIR / "runtime" / "agent-queue.json"
+AGENT_RUN_JOURNAL_FILE = DATA_DIR / "runtime" / "agent-runs.json"
+INTERACTION_STATE_FILE = DATA_DIR / "runtime" / "interaction-state.json"
 GOALS_FILE = DATA_DIR / "goals.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 KNOWN_WORK_DIRS = [
@@ -326,21 +396,311 @@ KNOWN_WORK_DIRS = [
 async def lifespan(_app: FastAPI):
     if not PREVIEW_MODE:
         await asyncio.to_thread(refresh_windows_shortcuts)
+    update_task = asyncio.create_task(runtime_update_coordinator().ensure_current(APP_VERSION))
     yield
+    if _agent_run_coordinator is not None:
+        await _agent_run_coordinator.shutdown()
+    if not update_task.done():
+        update_task.cancel()
 
 
 app = FastAPI(title=APP_TITLE, lifespan=lifespan)
 sessions: dict[str, dict[str, Any]] = {}
 goals: dict[str, dict[str, Any]] = {}
 _skills_cache: dict[str, Any] = {"time": 0.0, "items": []}
+_skill_sync_cache: dict[str, Any] = {"time": 0.0, "target": "", "result": {}}
+_skill_sync_statuses: dict[str, dict[str, str]] = {}
+_skill_sync_lock = threading.Lock()
 _session_locks: dict[str, asyncio.Lock] = {}
 _active_runs: dict[str, dict[str, Any]] = {}
+_chat_tasks: dict[str, asyncio.Task] = {}
 _goal_tasks: dict[str, asyncio.Task] = {}
 _context_lifecycle: ContextLifecycle | None = None
+_agent_runtime: WslAgentRuntime | WindowsNativeRuntime | None = None
+_runtime_provisioner: WslRuntimeProvisioner | None = None
+_runtime_update_coordinator: RuntimeUpdateCoordinator | None = None
+_agent_instructions_store: AgentInstructionsStore | None = None
+_context_usage_ledger: ContextUsageLedger | None = None
+_daily_usage_ledger: DailyUsageLedger | None = None
+_agent_queue_store: AgentQueueStore | None = None
+_agent_run_coordinator: AgentRunCoordinator | None = None
+_agent_run_journal: AgentRunJournal | None = None
+_durable_interaction_store: DurableInteractionStore | None = None
+_native_peer_messaging: NativePeerMessaging = ClaudeCrossSessionAdapter()
 
 
 def now_ts() -> float:
     return time.time()
+
+
+def managed_runtime_location() -> Path:
+    configured = env_value("VINIPER_UI_RUNTIME_LOCATION", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    local_app_data = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    profile_name = str(PREVIEW_PROFILE.get("data_dir_name") or "Viniper Preview") if PREVIEW_MODE else "Viniper"
+    return local_app_data / profile_name / "Runtime" / "ViniperRuntime"
+
+
+def agent_runtime() -> WslAgentRuntime | WindowsNativeRuntime:
+    global _agent_runtime
+    if _agent_runtime is None:
+        _agent_runtime = WslAgentRuntime()
+    return _agent_runtime
+
+
+def agent_run_coordinator() -> AgentRunCoordinator:
+    global _agent_run_coordinator
+    if _agent_run_coordinator is None:
+        _agent_run_coordinator = AgentRunCoordinator(decode=sse_payloads)
+    return _agent_run_coordinator
+
+
+def agent_run_journal() -> AgentRunJournal:
+    global _agent_run_journal
+    expected = DATA_DIR / "runtime" / "agent-runs.json"
+    if _agent_run_journal is None or _agent_run_journal.path != expected:
+        _agent_run_journal = AgentRunJournal(expected)
+    return _agent_run_journal
+
+
+def durable_interaction_store() -> DurableInteractionStore:
+    global _durable_interaction_store
+    expected = DATA_DIR / "runtime" / "interaction-state.json"
+    if _durable_interaction_store is None or _durable_interaction_store.path != expected:
+        _durable_interaction_store = DurableInteractionStore(expected)
+    return _durable_interaction_store
+
+
+def runtime_provisioner() -> WslRuntimeProvisioner:
+    global _runtime_provisioner
+    if _runtime_provisioner is None:
+        _runtime_provisioner = WslRuntimeProvisioner(
+            runtime=agent_runtime(),
+            state_path=DATA_DIR / "runtime" / "provision-state.json",
+            install_location=managed_runtime_location(),
+        )
+    return _runtime_provisioner
+
+
+def runtime_update_coordinator() -> RuntimeUpdateCoordinator:
+    global _runtime_update_coordinator
+    if _runtime_update_coordinator is None:
+        _runtime_update_coordinator = RuntimeUpdateCoordinator(
+            agent_runtime(),
+            DATA_DIR / "runtime" / "update-state.json",
+            lambda: {sid for sid, run in _active_runs.items() if run.get("kind") == "agent"},
+        )
+    return _runtime_update_coordinator
+
+
+def runtime_payload_from_probe(probe: RuntimeProbe) -> dict[str, Any]:
+    payload = probe.as_dict()
+    payload["install_location"] = str(managed_runtime_location())
+    payload["configured"] = probe.ready
+    payload["update"] = runtime_update_coordinator().status()
+    return payload
+
+
+def runtime_public_status(*, refresh: bool = False) -> dict[str, Any]:
+    runtime = agent_runtime()
+    cached_probe = getattr(runtime, "cached_probe", None)
+    probe = runtime.probe() if refresh else (cached_probe() if callable(cached_probe) else None)
+    if probe is None:
+        probe = RuntimeProbe(
+            status="checking",
+            detail="managed WSL runtime compatibility check is in progress",
+        )
+    return runtime_payload_from_probe(probe)
+
+
+def agent_instructions_store() -> AgentInstructionsStore:
+    global _agent_instructions_store
+    if _agent_instructions_store is None:
+        _agent_instructions_store = AgentInstructionsStore(DATA_DIR / "AGENT.md")
+    return _agent_instructions_store
+
+
+def read_agent_instructions() -> str:
+    return agent_instructions_store().read().content
+
+
+def context_usage_ledger() -> ContextUsageLedger:
+    global _context_usage_ledger
+    if _context_usage_ledger is None:
+        _context_usage_ledger = ContextUsageLedger(DATA_DIR / "runtime" / "context-usage.json")
+    return _context_usage_ledger
+
+
+def context_usage_payload(session_id: str, model: str = "") -> dict[str, Any]:
+    selected_model = allowed_model(model) if model else allowed_model("")
+    return context_usage_ledger().get(
+        session_id,
+        model=selected_model,
+        context_limit=context_limit_for_model(selected_model),
+    ).as_dict()
+
+
+def daily_usage_ledger() -> DailyUsageLedger:
+    global _daily_usage_ledger
+    if _daily_usage_ledger is None:
+        _daily_usage_ledger = DailyUsageLedger(DATA_DIR / "runtime" / "daily-usage.json")
+    return _daily_usage_ledger
+
+
+def agent_queue_store() -> AgentQueueStore:
+    global _agent_queue_store
+    if _agent_queue_store is None:
+        _agent_queue_store = AgentQueueStore(AGENT_QUEUE_FILE)
+    return _agent_queue_store
+
+
+def prepare_agent_host_channel(
+    runtime: WslAgentRuntime | WindowsNativeRuntime,
+    session_id: str,
+    run_id: str,
+) -> tuple[HostInteractionChannel, Path, Path | None]:
+    safe_session_id = re.sub(r"[^A-Za-z0-9_-]", "-", str(session_id or "session"))[:80] or "session"
+    root = DATA_DIR / "runtime" / "agent-host" / safe_session_id / str(run_id)
+    channel = HostInteractionChannel(root, session_id=session_id, run_id=run_id)
+    script_path = Path(__file__).resolve().with_name("agent_host_bridge.py")
+    if isinstance(runtime, WslAgentRuntime):
+        hook_script = runtime.map_path(script_path)
+        hook_channel = runtime.map_path(root)
+        settings_payload = build_passive_hook_settings()
+        mcp_config_path: Path | None = root / "mcp-config.json"
+        mcp_config_path.write_text(
+            json.dumps(
+                build_permission_prompt_mcp_config(
+                    script_path=hook_script,
+                    channel_path=hook_channel,
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+    else:
+        hook_script = str(script_path)
+        hook_channel = str(root)
+        settings_payload = build_hook_settings(script_path=hook_script, channel_path=hook_channel)
+        mcp_config_path = None
+    settings_path = root / "hook-settings.json"
+    settings_path.write_text(
+        json.dumps(settings_payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return channel, settings_path, mcp_config_path
+
+
+def _viniper_peer_runs() -> dict[str, dict[str, Any]]:
+    return {
+        str(session_id): {
+            "claude_session_id": str(run.get("claude_session_id") or ""),
+            "peer_name": str(run.get("peer_name") or ""),
+            "display_name": str(run.get("display_name") or session_id),
+        }
+        for session_id, run in _active_runs.items()
+        if run.get("kind") == "agent"
+        and str(run.get("claude_session_id") or "")
+        and str(run.get("peer_name") or "")
+    }
+
+
+async def native_peer_status_payload(session_id: str) -> dict[str, Any]:
+    """Project native peer availability without creating a parallel mailbox."""
+
+    sid = str(session_id)
+    session = safe_session(sid)
+    if normalize_session_mode(session.get("mode")) != "agent":
+        return {
+            "available": False,
+            "verified": False,
+            "reason": "Chat 不具备 Agent 跨会话能力",
+            "discovery": "unavailable",
+            "targets": [],
+        }
+    if is_custom_shell(load_app_settings().get("shell", {})):
+        return {
+            "available": False,
+            "verified": False,
+            "reason": "原生跨会话消息仅由受管 Claude Code WSL2 运行时提供",
+            "discovery": "unavailable",
+            "targets": [],
+        }
+    runtime_capabilities = await asyncio.to_thread(agent_runtime().capabilities)
+    if runtime_capabilities.platform != "wsl2" or not runtime_capabilities.native_cli:
+        return {
+            "available": False,
+            "verified": False,
+            "reason": runtime_capabilities.reason or "原生跨会话消息需要受管 WSL2 Linux Claude Code 运行时",
+            "discovery": "unavailable",
+            "targets": [],
+        }
+    observed = _native_peer_messaging.capability_for(sid)
+    if not observed.send_message:
+        observed = _native_peer_messaging.best_capability()
+    targets = _native_peer_messaging.reachable_targets(
+        sid,
+        _viniper_peer_runs(),
+        current_session_id=sid,
+    )
+    roster_verified = bool(observed.available and _native_peer_messaging.roster_observed(sid))
+    available = bool(roster_verified and targets)
+    reason = observed.reason
+    if observed.available and not roster_verified:
+        reason = "当前会话尚未取得原生 ListAgents 可达会话列表"
+    elif roster_verified and not targets:
+        reason = "当前没有另一个真实运行且可达的 Viniper Agent 会话"
+    return {
+        **observed.as_dict(),
+        "available": available,
+        "verified": roster_verified,
+        "reason": reason,
+        "targets": targets,
+    }
+
+
+async def prepare_native_peer_request(
+    sender_session_id: str,
+    target_session_id: str,
+    message: str,
+) -> dict[str, str]:
+    """Validate a native target against the live CLI registry."""
+
+    status = await native_peer_status_payload(sender_session_id)
+    target = next(
+        (item for item in status.get("targets", []) if str(item.get("session_id")) == str(target_session_id)),
+        None,
+    )
+    if not status.get("verified"):
+        raise HTTPException(status_code=409, detail=status.get("reason") or "尚未验证原生 SendMessage 能力")
+    if target is None:
+        raise HTTPException(status_code=409, detail="目标 Viniper Agent 会话当前未运行或原生能力尚未验证")
+    content = str(message or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="message is required")
+    return {
+        "target_session_id": str(target["session_id"]),
+        "target_peer_name": str(target["peer_name"]),
+        "target_display_name": str(target["display_name"]),
+        "message": content,
+    }
+
+
+def decorate_peer_event(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach safe Viniper identity to an incoming native peer event."""
+
+    result = dict(payload)
+    if result.get("type") != "peer_incoming":
+        return result
+    sender = str(result.get("sender") or "")
+    for session_id, run in _viniper_peer_runs().items():
+        if str(run.get("peer_name") or "") == sender:
+            result["sender_session_id"] = session_id
+            result["sender_display_name"] = str(run.get("display_name") or sender)
+            break
+    return result
 
 
 def session_lock(session_id: str) -> asyncio.Lock:
@@ -380,18 +740,53 @@ def is_claude_session_in_use_error(detail: str) -> bool:
 
 
 def normalize_session(session_id: str, raw: dict[str, Any]) -> dict[str, Any]:
-    return {
+    last_run_status = str(raw.get("last_run_status") or "")
+    if last_run_status not in {"running", "completed", "failed", "cancelled"}:
+        last_run_status = ""
+    configured_default = str(load_app_settings().get("runtime", {}).get("permission_mode") or DEFAULT_PERMISSION_MODE)
+    if configured_default in {"ask", "manual"}:
+        configured_default = "default"
+    if configured_default not in PERMISSION_MODE_IDS or configured_default == "dontAsk":
+        configured_default = "default"
+    stored_permission_mode = str(raw.get("permission_mode") or configured_default)
+    if stored_permission_mode in {"ask", "manual"}:
+        stored_permission_mode = "default"
+    if stored_permission_mode not in PERMISSION_MODE_IDS or stored_permission_mode == "dontAsk":
+        stored_permission_mode = configured_default
+    mode = normalize_session_mode(raw.get("mode"))
+    normalized = {
         "id": str(raw.get("id") or session_id),
+        "mode": mode,
         "messages": raw.get("messages") if isinstance(raw.get("messages"), list) else [],
         "created": float(raw.get("created") or now_ts()),
         "updated": float(raw.get("updated") or raw.get("created") or now_ts()),
         "name": str(raw.get("name") or ""),
         "workdir": str(raw.get("workdir") or BASE_DIR),
         "pinned": bool(raw.get("pinned")),
-        "claude_session_id": new_claude_session_id(raw.get("claude_session_id")),
+        "unread": bool(raw.get("unread")),
+        "last_run_status": last_run_status,
+        # Chat never resumes a Claude Code run. Preserve its stored value
+        # exactly during startup migration instead of manufacturing an Agent
+        # session identifier for an empty legacy field.
+        "claude_session_id": (
+            new_claude_session_id(raw.get("claude_session_id"))
+            if mode == "agent"
+            else str(raw.get("claude_session_id") or "")
+        ),
         "claude_initialized": bool(raw.get("claude_initialized")),
         "summary": str(raw.get("summary") or ""),
     }
+    # The v17 migration is intentionally narrow: only legacy Agent sessions
+    # acquire the configured default. Chat sessions that predate the field are
+    # left byte-semantically alone, while an already stored value is retained.
+    if mode == "agent" or "permission_mode" in raw:
+        normalized["permission_mode"] = stored_permission_mode
+    # These user-owned collections may be present in older/newer compatible
+    # session records. Normalization must not discard them during startup.
+    for key in ("queue", "attachments"):
+        if key in raw:
+            normalized[key] = raw[key]
+    return normalized
 
 
 def session_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, float, float, str]:
@@ -462,6 +857,95 @@ def normalize_goal(goal_id: str, raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def session_runtime_state(session_id: str, session: dict[str, Any] | None = None) -> str:
+    coordinated = _agent_run_coordinator.snapshot(str(session_id)) if _agent_run_coordinator is not None else None
+    if coordinated and coordinated.get("active"):
+        if coordinated.get("status") == "awaiting_cli_ack":
+            return "awaiting_cli_ack"
+        if coordinated.get("pending_interaction") or coordinated.get("status") == "waiting_input":
+            return "waiting_input"
+        if coordinated.get("status") == "failed":
+            return "failed"
+        return "running"
+    run = _active_runs.get(str(session_id))
+    if run:
+        if run.get("awaiting_interaction_ack"):
+            return "awaiting_cli_ack"
+        if run.get("pending_interaction"):
+            return "waiting_input"
+        if run.get("status") == "failed":
+            return "failed"
+        return "running"
+    durable_interaction = agent_interaction_broker.pending_for(str(session_id))
+    if durable_interaction:
+        interaction_state = str(durable_interaction.get("interaction_state") or "pending")
+        if interaction_state in {"response_committed", "awaiting_cli_ack"}:
+            return "awaiting_cli_ack"
+        if interaction_state == "failed":
+            return "failed"
+        if interaction_state in {"created", "pending", "answering", "waiting_input"}:
+            return "waiting_input"
+    if session and str(session.get("last_run_status") or "") == "failed":
+        return "failed"
+    if session and session.get("unread"):
+        return "completed_unread"
+    return "idle"
+
+
+def coordinated_run_snapshot(session_id: str) -> dict[str, Any] | None:
+    if _agent_run_coordinator is None:
+        return None
+    return _agent_run_coordinator.snapshot(str(session_id))
+
+
+def pending_interaction_for_session(session_id: str) -> dict[str, Any] | None:
+    snapshot = coordinated_run_snapshot(session_id)
+    if snapshot and snapshot.get("active") and snapshot.get("pending_interaction"):
+        return copy.deepcopy(snapshot["pending_interaction"])
+    return agent_interaction_broker.pending_for(str(session_id))
+
+
+def project_permission_denied_event(
+    data: dict[str, Any],
+    *,
+    session_id: str,
+    run_id: str,
+    store: DurableInteractionStore | None = None,
+) -> dict[str, Any]:
+    """Persist and project one official permission_denied terminal event.
+
+    The durable record and renderer event intentionally share the same
+    tool-use identity and error content, so a rejected tool can never become a
+    vanished card or an unmatched transcript row.
+    """
+    tool_use_id = str(data.get("tool_use_id") or "")
+    message = clean_stream_text(str(
+        data.get("message") or data.get("decision_reason") or "权限请求已被拒绝"
+    ))
+    projected = {
+        "type": "tool_result",
+        "tool_id": tool_use_id,
+        "tool_use_id": tool_use_id,
+        "status": "失败",
+        "content": message,
+        "permission_denied": True,
+        "is_error": True,
+    }
+    denied_event = {
+        **copy.deepcopy(data),
+        "session_id": str(data.get("session_id") or session_id),
+        "run_id": str(data.get("run_id") or run_id),
+        "tool_result": {
+            "tool_use_id": tool_use_id,
+            "is_error": True,
+            "content": message,
+        },
+    }
+    if tool_use_id:
+        (store or durable_interaction_store()).record_permission_denied(denied_event)
+    return projected
+
+
 def load_goals_from_disk() -> dict[str, dict[str, Any]]:
     if not GOALS_FILE.exists():
         return {}
@@ -525,6 +1009,13 @@ def default_settings() -> dict[str, Any]:
         },
         "workspace": {
             "default_root": str(platform_default_workspace_root()),
+        },
+        "runtime": {
+            "kind": "wsl2",
+            "cross_session_inbound": "permissions",
+            "permission_mode": "default",
+            "enable_auto_mode": False,
+            "allow_bypass_permissions": False,
         },
     }
 
@@ -608,6 +1099,16 @@ def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
 
     workspace = settings.setdefault("workspace", {})
     workspace["default_root"] = normalize_existing_dir(workspace.get("default_root"), platform_default_workspace_root())
+    runtime = settings.setdefault("runtime", {})
+    runtime["kind"] = "wsl2"
+    inbound = str(runtime.get("cross_session_inbound") or "permissions")
+    runtime["cross_session_inbound"] = inbound if inbound in {"permissions", "accept", "hold", "reject"} else "permissions"
+    permission_mode = str(runtime.get("permission_mode") or "default")
+    if permission_mode in {"ask", "manual"}:
+        permission_mode = "default"
+    runtime["permission_mode"] = permission_mode if permission_mode in PERMISSION_MODE_IDS else "default"
+    runtime["enable_auto_mode"] = bool(runtime.get("enable_auto_mode"))
+    runtime["allow_bypass_permissions"] = bool(runtime.get("allow_bypass_permissions"))
     return settings
 
 
@@ -728,6 +1229,61 @@ def safe_attachment_filename(name: Any) -> str:
     if not cleaned:
         cleaned = "attachment.bin"
     return cleaned[:120]
+
+
+def normalize_image_block(block: Any, *, alt: str = "") -> dict[str, Any] | None:
+    """Normalize only explicit supported image blocks; never infer images from text."""
+    if not isinstance(block, dict) or str(block.get("type") or "") != "image":
+        return None
+    source = block.get("source") if isinstance(block.get("source"), dict) else None
+    if source is not None and str(source.get("type") or "") not in {"", "base64"}:
+        return None
+    payload = source or block
+    mime_type = str(
+        payload.get("mimeType")
+        or payload.get("mime_type")
+        or payload.get("media_type")
+        or block.get("mimeType")
+        or block.get("mime_type")
+        or ""
+    ).strip().lower()
+    if mime_type not in SUPPORTED_RENDER_IMAGE_MIME_TYPES:
+        return None
+    encoded = str(payload.get("data") or "").strip()
+    if encoded.startswith("data:") and "," in encoded:
+        header, encoded = encoded.split(",", 1)
+        if mime_type not in header.lower() or ";base64" not in header.lower():
+            return None
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except Exception:
+        return None
+    if not decoded or len(decoded) > MAX_RENDER_IMAGE_BYTES:
+        return None
+    return {
+        "type": "image",
+        "mime_type": mime_type,
+        "data": base64.b64encode(decoded).decode("ascii"),
+        "alt": str(alt or block.get("alt") or "图片")[:160],
+    }
+
+
+def local_artifact_image(path: Any, allowed_roots: list[Path]) -> dict[str, Any] | None:
+    try:
+        target = Path(str(path or "")).resolve()
+        roots = [Path(root).resolve() for root in allowed_roots]
+        if not target.is_file() or not any(target == root or target.is_relative_to(root) for root in roots):
+            return None
+        mime_type = IMAGE_SUFFIX_MIME_TYPES.get(target.suffix.lower())
+        if not mime_type or target.stat().st_size > MAX_RENDER_IMAGE_BYTES:
+            return None
+        encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+        return normalize_image_block(
+            {"type": "image", "mimeType": mime_type, "data": encoded},
+            alt=target.name,
+        )
+    except (OSError, ValueError):
+        return None
 
 
 def save_chat_attachments(session_id: str, raw_items: Any) -> list[dict[str, Any]]:
@@ -870,16 +1426,43 @@ def fetch_json_url(url: str) -> dict[str, Any]:
     return data
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def update_requires_installer(manifest: dict[str, Any]) -> bool:
+    migration = manifest.get("migration") if isinstance(manifest.get("migration"), dict) else {}
+    return bool(manifest.get("requires_installer") is True or migration.get("requires_installer") is True)
+
+
+def _installer_asset(assets: Any) -> dict[str, Any] | None:
+    if isinstance(assets, dict):
+        for key in ("installer", "windows-installer", "nsis", "setup"):
+            item = assets.get(key)
+            if isinstance(item, dict) and item.get("url"):
+                result = dict(item)
+                result["key"] = key
+                return result
+        for key, item in assets.items():
+            if not isinstance(item, dict) or not item.get("url"):
+                continue
+            name = str(item.get("name") or item.get("url") or "")
+            if name.casefold().endswith(".exe"):
+                result = dict(item)
+                result["key"] = str(key)
+                return result
+    if isinstance(assets, list):
+        for item in assets:
+            if isinstance(item, dict) and str(item.get("name") or item.get("url") or "").casefold().endswith(".exe"):
+                return dict(item)
+    return None
 
 
 def choose_update_asset(manifest: dict[str, Any], requested_asset: str | None = None) -> dict[str, Any]:
     assets = manifest.get("assets")
+    if update_requires_installer(manifest):
+        installer = _installer_asset(assets)
+        if installer is None:
+            raise ValueError("this update requires a full Windows installer, but the manifest has no installer asset")
+        if requested_asset and str(installer.get("key") or "") != str(requested_asset):
+            raise ValueError("this runtime migration cannot use a portable update asset")
+        return installer
     if isinstance(assets, dict):
         if requested_asset and isinstance(assets.get(requested_asset), dict):
             return dict(assets[requested_asset])
@@ -924,6 +1507,8 @@ def download_update_asset(asset: dict[str, Any], target_path: Path) -> None:
         raise ValueError("selected update asset has no url")
 
     expected_size = int(asset.get("size") or 0)
+    if expected_size <= 0:
+        raise ValueError("selected update asset has no positive size")
     part_path = target_path.with_name(f"{target_path.name}.part")
     last_error: Exception | None = None
 
@@ -984,33 +1569,58 @@ def find_update_app_root(extract_dir: Path) -> Path:
     for candidate in candidates:
         if (candidate / "server.py").exists() and (candidate / "static").exists():
             return candidate
-    raise ValueError("downloaded package does not contain Viniper UI app files")
+    raise ValueError("downloaded package does not contain Viniper app files")
 
 
 def copy_update_tree(src: Path, dst: Path) -> None:
-    backup_dir = DATA_DIR / "update-backups" / time.strftime("%Y%m%d-%H%M%S")
+    batch = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    backup_dir = DATA_DIR / "update-backups" / batch
+    staging_dir = DATA_DIR / "update-staging" / batch
     backup_dir.mkdir(parents=True, exist_ok=True)
-    allowed_files = ["server.py", "requirements.txt", "VERSION", "update_source.json", "start.bat"]
-    allowed_dirs = ["static"]
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    allowed_files = [
+        "server.py", "context_lifecycle.py", "context_usage.py", "daily_usage.py", "skill_sync.py",
+        "agent_instructions.py", "agent_runtime.py", "agent_host_bridge.py",
+        "agent_queue.py", "agent_run_coordinator.py", "native_peer.py", "wsl_runtime.py",
+        "profiles.json", "requirements.txt", "VERSION", "update_source.json", "start.bat",
+    ]
+    allowed_dirs = ["static", "scripts", ".agents"]
+    required_runtime = [name for name in allowed_files if name.endswith(".py")]
+    missing = [name for name in required_runtime if not (src / name).is_file()]
+    if missing:
+        raise ValueError(f"update package missing runtime modules: {', '.join(missing)}")
 
     for name in allowed_files:
         source = src / name
-        target = dst / name
-        if not source.exists():
-            continue
-        if target.exists():
-            shutil.copy2(target, backup_dir / name)
-        shutil.copy2(source, target)
-
+        if source.is_file():
+            shutil.copy2(source, staging_dir / name)
     for name in allowed_dirs:
         source = src / name
-        target = dst / name
-        if not source.exists() or not source.is_dir():
-            continue
-        if target.exists():
-            shutil.copytree(target, backup_dir / name, dirs_exist_ok=True)
-            shutil.rmtree(target)
-        shutil.copytree(source, target)
+        if source.is_dir():
+            shutil.copytree(source, staging_dir / name)
+
+    applied: list[str] = []
+    try:
+        for name in [*allowed_files, *allowed_dirs]:
+            staged = staging_dir / name
+            if not staged.exists():
+                continue
+            target = dst / name
+            previous = backup_dir / name
+            if target.exists():
+                os.replace(target, previous)
+            applied.append(name)
+            os.replace(staged, target)
+    except Exception:
+        for name in reversed(applied):
+            target = dst / name
+            previous = backup_dir / name
+            if target.exists():
+                failed = backup_dir / f"failed-new-{name.replace('/', '_')}"
+                os.replace(target, failed)
+            if previous.exists():
+                os.replace(previous, target)
+        raise
 
 
 def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str | None = None) -> dict[str, Any]:
@@ -1024,12 +1634,9 @@ def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str 
         package_path = tmp_dir / "update.zip"
         download_update_asset(asset, package_path)
 
-        expected_sha = str(asset.get("sha256") or "").strip().lower()
-        actual_sha = sha256_file(package_path)
-        if expected_sha and actual_sha.lower() != expected_sha:
-            raise ValueError("downloaded update checksum does not match manifest")
-
         asset_name = str(asset.get("name") or package_path.name)
+        if update_requires_installer(manifest) and not asset_name.lower().endswith(".exe"):
+            raise ValueError("runtime migration requires the full Windows installer")
         if os.name == "nt" and asset_name.lower().endswith(".exe"):
             updates_dir = DATA_DIR / "updates"
             updates_dir.mkdir(parents=True, exist_ok=True)
@@ -1038,9 +1645,9 @@ def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str 
             subprocess.Popen([str(installer_path)], cwd=str(updates_dir), close_fds=True)
             return {
                 "asset": asset,
-                "sha256": asset.get("sha256") or "",
                 "installer": str(installer_path),
                 "installer_opened": True,
+                "requires_installer": update_requires_installer(manifest),
                 "dependencies": "",
             }
 
@@ -1072,7 +1679,6 @@ def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str 
 
     return {
         "asset": asset,
-        "sha256": asset.get("sha256") or "",
         "dependencies": deps_output,
         "restarting": True,
     }
@@ -1110,18 +1716,19 @@ migrate_legacy_data_dir()
 sessions.update(load_sessions_from_disk())
 
 
-def next_session_name() -> str:
+def next_session_name(mode: str = "agent") -> str:
+    prefix = "新建聊天" if normalize_session_mode(mode) == "chat" else "新建会话"
     existing_numbers: set[int] = set()
     for session in sessions.values():
         existing_name = str(session.get("name") or "")
-        match = re.fullmatch(r"新建会话（(\d+)）", existing_name)
+        match = re.fullmatch(rf"{re.escape(prefix)}（(\d+)）", existing_name)
         if match:
             existing_numbers.add(int(match.group(1)))
 
     number = 1
     while number in existing_numbers:
         number += 1
-    return f"新建会话（{number}）"
+    return f"{prefix}（{number}）"
 
 
 def remove_dir_inside(path: Path, base: Path) -> None:
@@ -1146,15 +1753,19 @@ def safe_session(session_id: str) -> dict[str, Any]:
     if session_id not in sessions:
         sessions[session_id] = {
             "id": session_id,
+            "mode": "agent",
             "messages": [],
             "created": now_ts(),
             "updated": now_ts(),
-            "name": next_session_name(),
+            "name": next_session_name("agent"),
             "workdir": str(BASE_DIR),
             "pinned": False,
+            "unread": False,
+            "last_run_status": "",
             "claude_session_id": str(uuid.uuid4()),
             "claude_initialized": False,
             "summary": "",
+            "permission_mode": allowed_permission_mode(None),
         }
         save_sessions_to_disk()
     session = normalize_session(session_id, sessions[session_id])
@@ -1245,10 +1856,57 @@ def allowed_model(model: str | None) -> str:
     return env_model if env_model in ids else models[0]["id"]
 
 
+def available_permission_mode_ids() -> set[str]:
+    app_settings = load_app_settings()
+    settings = app_settings.get("runtime", {})
+    available = {"default", "acceptEdits", "plan"}
+    provider = deepseek_config()
+    provider_id = str(provider.get("provider") or "").strip().lower()
+    provider_label = str(provider.get("label") or "").strip().lower()
+    provider_url = str(provider.get("base_url") or "").strip().lower()
+    provider_model = str(provider.get("model") or "").strip().lower()
+    native_anthropic = (
+        bool(app_settings.get("account", {}).get("signed_in"))
+        and
+        provider_id in {"anthropic", "claude"}
+        and "deepseek" not in provider_label
+        and (not provider_url or "api.anthropic.com" in provider_url)
+        and (not provider_model or provider_model.startswith("claude"))
+    )
+    if bool(settings.get("enable_auto_mode")) and native_anthropic and agent_runtime().capabilities().auto_permission:
+        available.add("auto")
+    if bool(settings.get("allow_bypass_permissions")):
+        available.add("bypassPermissions")
+    return available
+
+
 def allowed_permission_mode(permission_mode: str | None) -> str:
-    if permission_mode in PERMISSION_MODE_IDS:
-        return str(permission_mode)
-    return DEFAULT_PERMISSION_MODE
+    value = str(permission_mode or "").strip()
+    if value in {"ask", "manual"}:
+        value = "default"
+    settings = load_app_settings().get("runtime", {})
+    available = available_permission_mode_ids()
+    configured_default = str(settings.get("permission_mode") or DEFAULT_PERMISSION_MODE)
+    if configured_default in {"ask", "manual"}:
+        configured_default = "default"
+    fallback = configured_default if configured_default in available else "default"
+    return value if value in available else fallback
+
+
+def require_permission_mode(permission_mode: str | None) -> str:
+    value = str(permission_mode or "").strip()
+    if value not in available_permission_mode_ids():
+        raise HTTPException(status_code=400, detail="unknown permission_mode")
+    return value
+
+
+def session_permission_mode(session: dict[str, Any]) -> str:
+    """Return the durable per-session Desktop permission mode, fail closed."""
+    value = str(session.get("permission_mode") or "default")
+    if value in available_permission_mode_ids():
+        return value
+    session["permission_mode"] = "default"
+    return "default"
 
 
 def provider_config(model_override: str | None = None) -> dict[str, str]:
@@ -1313,7 +1971,7 @@ def claude_launcher() -> list[str]:
     return ["claude"]
 
 
-def claude_available() -> bool:
+def native_claude_available() -> bool:
     try:
         if shutil.which("claude"):
             return True
@@ -1328,44 +1986,20 @@ def claude_available() -> bool:
         return False
 
 
-def claude_cli_compatibility() -> dict[str, Any]:
-    if not claude_available():
-        return {"ok": False, "detail": "not found on PATH"}
-    command = claude_launcher()
-    try:
-        version_result = subprocess.run(
-            [*command, "--version"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=15,
-            check=False,
-        )
-        help_result = subprocess.run(
-            [*command, "--help"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=20,
-            check=False,
-        )
-    except Exception as exc:
-        return {"ok": False, "detail": f"failed to inspect Claude Code CLI: {exc}"}
+def claude_available() -> bool:
+    return agent_runtime().probe().ready
 
-    help_text = help_result.stdout or ""
-    version_text = (version_result.stdout or "").strip().splitlines()[0] if version_result.stdout else ""
-    missing = [item for item in CLAUDE_REQUIRED_OPTIONS if item not in help_text]
-    missing_modes = [item for item in CLAUDE_REQUIRED_PERMISSION_MODES if item not in help_text]
-    if missing or missing_modes:
-        detail = []
-        if version_text:
-            detail.append(version_text)
-        if missing:
-            detail.append(f"missing options: {', '.join(missing)}")
-        if missing_modes:
-            detail.append(f"missing permission modes: {', '.join(missing_modes)}")
-        return {"ok": False, "detail": "; ".join(detail)}
-    return {"ok": True, "detail": version_text or "compatible"}
+
+def claude_cli_compatibility() -> dict[str, Any]:
+    probe = agent_runtime().probe()
+    return {
+        "ok": probe.ready,
+        "detail": probe.detail,
+        "version": probe.version,
+        "runtime": "wsl2",
+        "capabilities": probe.capabilities.as_dict(),
+        "native_migration_available": native_claude_available(),
+    }
 
 
 def current_windows_desktop_exe() -> Path | None:
@@ -1374,13 +2008,14 @@ def current_windows_desktop_exe() -> Path | None:
     configured = env_value("VINIPER_UI_DESKTOP_EXE", "").strip().strip('"')
     if configured:
         candidate = Path(configured).expanduser()
-        if candidate.exists() and candidate.is_file() and candidate.name.lower() == "viniper ui.exe":
+        if candidate.exists() and candidate.is_file() and candidate.name.lower() in {"viniper.exe", "viniper ui.exe"}:
             return candidate.resolve()
 
     for root in (APP_DIR, *APP_DIR.parents):
-        candidate = root / "Viniper UI.exe"
-        if candidate.exists() and candidate.is_file():
-            return candidate.resolve()
+        for executable_name in ("Viniper.exe", "Viniper UI.exe"):
+            candidate = root / executable_name
+            if candidate.exists() and candidate.is_file():
+                return candidate.resolve()
     return None
 
 
@@ -1390,6 +2025,10 @@ def refresh_windows_shortcuts() -> None:
     icon = STATIC_DIR / "assets" / "viniper-icon.ico"
     installed_candidates = [
         current_windows_desktop_exe(),
+        BASE_DIR / "Viniper.exe",
+        BASE_DIR.parent / "Viniper.exe",
+        Path("C:/Program Files/Viniper/Viniper.exe"),
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Viniper" / "Viniper.exe",
         BASE_DIR / "Viniper UI.exe",
         BASE_DIR.parent / "Viniper UI.exe",
         Path("C:/Program Files/Viniper UI/Viniper UI.exe"),
@@ -1416,27 +2055,35 @@ $startMenu = '{str(start_menu).replace("'", "''")}'
 $taskbar = '{str(taskbar).replace("'", "''")}'
 function Update-ViniperShortcut($path) {{
   try {{
+    $exists = Test-Path -LiteralPath $path
     $shortcut = $shell.CreateShortcut($path)
-    $shortcut.TargetPath = $target
-    $shortcut.WorkingDirectory = $workdir
-    if ($icon) {{ $shortcut.IconLocation = $icon }}
-    $shortcut.Save()
+    $changed = -not $exists
+    if ($shortcut.TargetPath -ne $target) {{
+      $shortcut.TargetPath = $target
+      $changed = $true
+    }}
+    if ($shortcut.WorkingDirectory -ne $workdir) {{
+      $shortcut.WorkingDirectory = $workdir
+      $changed = $true
+    }}
+    if ($icon -and $shortcut.IconLocation -ne $icon) {{
+      $shortcut.IconLocation = $icon
+      $changed = $true
+    }}
+    if ($changed) {{ $shortcut.Save() }}
   }} catch {{}}
 }}
 if (Test-Path -LiteralPath $desktop) {{
-  $desktopLinks = @(Get-ChildItem -LiteralPath $desktop -Filter 'Viniper UI*.lnk' -ErrorAction SilentlyContinue)
-  if ($desktopLinks.Count -eq 0) {{
-    Update-ViniperShortcut (Join-Path $desktop 'Viniper UI.lnk')
-  }} else {{
-    $desktopLinks | ForEach-Object {{ Update-ViniperShortcut $_.FullName }}
-  }}
+  Update-ViniperShortcut (Join-Path $desktop 'Viniper.lnk')
+  Get-ChildItem -LiteralPath $desktop -Filter 'Viniper UI*.lnk' -ErrorAction SilentlyContinue |
+    ForEach-Object {{ Update-ViniperShortcut $_.FullName }}
 }}
 if (Test-Path -LiteralPath $startMenu) {{
-  Update-ViniperShortcut (Join-Path $startMenu 'Viniper UI.lnk')
+  Update-ViniperShortcut (Join-Path $startMenu 'Viniper.lnk')
 }}
 if (Test-Path -LiteralPath $taskbar) {{
   Get-ChildItem -LiteralPath $taskbar -Filter '*.lnk' -ErrorAction SilentlyContinue |
-    Where-Object {{ $_.Name -like 'Viniper UI*.lnk' }} |
+    Where-Object {{ $_.Name -like 'Viniper*.lnk' }} |
     ForEach-Object {{ Update-ViniperShortcut $_.FullName }}
 }}
 """
@@ -1477,15 +2124,41 @@ def build_agent_env(cfg: dict[str, str] | None = None, session: dict[str, Any] |
     return env
 
 
-def build_claude_env(cfg: dict[str, str] | None = None) -> dict[str, str]:
+def build_claude_env(cfg: dict[str, str] | None = None, session: dict[str, Any] | None = None) -> dict[str, str]:
     cfg = cfg or provider_config()
-    env = build_agent_env(cfg)
+    env = build_agent_env(cfg, session)
     env["ANTHROPIC_BASE_URL"] = cfg.get("base_url", "")
     env["ANTHROPIC_MODEL"] = cfg.get("model", "")
     if cfg.get("api_key"):
         env["ANTHROPIC_AUTH_TOKEN"] = cfg["api_key"]
     env["NO_COLOR"] = "1"
     return env
+
+
+def runtime_bridge_keys() -> tuple[str, ...]:
+    names = provider_env_names(load_app_settings().get("provider", {}))
+    return tuple(dict.fromkeys((
+        names["api_key"],
+        names["base_url"],
+        names["model"],
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "VINIPER_PROVIDER",
+        "VINIPER_PROVIDER_LABEL",
+        "VINIPER_BASE_URL",
+        "VINIPER_MODEL",
+        "VINIPER_API_KEY",
+        "VINIPER_SESSION_ID",
+        "VINIPER_WORKDIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    )))
 
 
 def active_shell_settings() -> dict[str, Any]:
@@ -1528,7 +2201,12 @@ def format_custom_command(template: str, cfg: dict[str, str], session: dict[str,
     return command
 
 
-def build_generic_cli_prompt(session: dict[str, Any], prompt: str, attachments: list[dict[str, Any]]) -> str:
+def build_generic_cli_prompt(
+    session: dict[str, Any],
+    prompt: str,
+    attachments: list[dict[str, Any]],
+    agent_instructions: str = "",
+) -> str:
     history = []
     for message in list(session.get("messages", []))[-12:]:
         if not isinstance(message, dict):
@@ -1541,7 +2219,7 @@ def build_generic_cli_prompt(session: dict[str, Any], prompt: str, attachments: 
         f"You are running inside {APP_TITLE} as a thin wrapper around a user-selected agent shell.",
         "Use the current working directory and return concise progress plus final results.",
     ]
-    system_append = build_system_append(session)
+    system_append = build_system_append(session, agent_instructions)
     if system_append:
         parts.append(system_append)
     if history:
@@ -1550,7 +2228,7 @@ def build_generic_cli_prompt(session: dict[str, Any], prompt: str, attachments: 
     return "\n\n".join(parts)
 
 
-def build_system_append(session: dict[str, Any]) -> str:
+def build_system_append(session: dict[str, Any], agent_instructions: str = "") -> str:
     summary = str(session.get("summary") or "").strip()
     isolation_note = (
         f"当前 {APP_TITLE} 会话与其他会话隔离。只把本会话传入的历史摘要、当前工作目录和用户消息"
@@ -1561,9 +2239,43 @@ def build_system_append(session: dict[str, Any]) -> str:
         "大段日志或二进制内容直接打印到聊天里；优先用脚本在工作目录生成中间文件或最终文件，"
         "聊天里只返回简短摘要、关键路径和下一步。这样可以避免第三方模型网关在工具结果后卡住。"
     )
-    if not summary:
-        return f"{isolation_note}\n\n{stability_note}"
-    return f"{isolation_note}\n\n{stability_note}\n\n以下是网页端压缩后的历史摘要，请在回答时保持连续性：{summary}"
+    parts = [isolation_note, stability_note]
+    if summary:
+        parts.append(f"以下是网页端压缩后的历史摘要，请在回答时保持连续性：{summary}")
+    instructions = str(agent_instructions or "")
+    if instructions.strip():
+        parts.append(
+            "以下是用户在 Viniper 全局 AGENT.md 中保存的自定义指令。"
+            "它与工作目录中的 CLAUDE.md、AGENTS.md 可以同时生效；请在本次 Agent 工作中遵循：\n"
+            f"{instructions}"
+        )
+    return "\n\n".join(parts)
+
+
+def prepare_agent_system_prompt(session: dict[str, Any]) -> Path:
+    """Read AGENT.md for this turn and materialize one private prompt file."""
+    content = build_system_append(session, read_agent_instructions())
+    prompt_dir = DATA_DIR / "runtime" / "prompts"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    session_token = safe_attachment_filename(str(session.get("id") or "session"))
+    target = prompt_dir / f"{session_token}-{uuid.uuid4().hex}.md"
+    temporary = target.with_suffix(".md.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(target)
+    return target
+
+
+def cleanup_agent_system_prompt(path: Path | str | None) -> None:
+    if not path:
+        return
+    target = Path(path)
+    prompt_dir = (DATA_DIR / "runtime" / "prompts").resolve()
+    try:
+        resolved = target.resolve()
+        if resolved.parent == prompt_dir:
+            resolved.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def existing_workdir(value: str | None) -> Path:
@@ -1588,6 +2300,8 @@ FILE_CHANGE_SKIP_DIRS = {
     ".turbo",
     ".cache",
     "update-backups",
+    "codex",
+    "cache_data",
 }
 FILE_CHANGE_SKIP_SUFFIXES = {".pyc", ".pyo", ".tmp", ".temp", ".log"}
 FILE_CHANGE_SCAN_LIMIT = 8000
@@ -1625,7 +2339,6 @@ def file_change_watch_roots(workdir: Path) -> list[Path]:
             roots.append(root)
 
     add(workdir)
-    add(Path.home() / "Desktop")
     return roots
 
 
@@ -1643,7 +2356,7 @@ def iter_watch_files(root: Path, limit: int = FILE_CHANGE_SCAN_LIMIT):
                 if entry.is_symlink():
                     continue
                 if entry.is_dir():
-                    if entry.name not in FILE_CHANGE_SKIP_DIRS:
+                    if entry.name.casefold() not in FILE_CHANGE_SKIP_DIRS:
                         stack.append(entry)
                     continue
                 if not entry.is_file() or entry.suffix.lower() in FILE_CHANGE_SKIP_SUFFIXES:
@@ -1678,13 +2391,6 @@ def changed_watch_files(before: dict[str, tuple[int, int]], roots: list[Path]) -
             changed.append((current[0], str(path)))
     changed.sort(key=lambda item: item[0], reverse=True)
     return [path for _, path in changed[:FILE_CHANGE_RESULT_LIMIT]]
-
-
-def changed_files_summary(before: dict[str, tuple[int, int]], roots: list[Path]) -> str:
-    files = changed_watch_files(before, roots)
-    if not files:
-        return ""
-    return "\n\n修改的文件：\n" + "\n".join(files)
 
 
 def directory_payload(path: Path) -> dict[str, str]:
@@ -1732,7 +2438,7 @@ def validate_folder_name(name: Any) -> str:
     return value[:120]
 
 
-def add_dir_args(session: dict[str, Any], prompt: str, attachments: list[dict[str, Any]] | None = None) -> list[str]:
+def agent_add_dirs(session: dict[str, Any], prompt: str, attachments: list[dict[str, Any]] | None = None) -> list[str]:
     paths: list[Path] = [existing_workdir(str(session.get("workdir") or ""))]
     paths.extend(path for path in KNOWN_WORK_DIRS if path.exists())
     for item in attachments or []:
@@ -1758,7 +2464,18 @@ def add_dir_args(session: dict[str, Any], prompt: str, attachments: list[dict[st
         key = resolved.lower()
         if key not in seen:
             seen.add(key)
-            result.extend(["--add-dir", resolved])
+            result.append(resolved)
+    skill_bridge = claude_skill_bridge_root()
+    if skill_bridge and skill_bridge.lower() not in seen:
+        result.append(skill_bridge)
+    return result
+
+
+def add_dir_args(session: dict[str, Any], prompt: str, attachments: list[dict[str, Any]] | None = None) -> list[str]:
+    """Compatibility helper; AgentRuntime owns final CLI argument construction."""
+    result: list[str] = []
+    for directory in agent_add_dirs(session, prompt, attachments):
+        result.extend(["--add-dir", directory])
     return result
 
 
@@ -1818,6 +2535,1044 @@ def clean_payload_value(value: Any) -> Any:
 
 def sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(clean_payload_value(payload), ensure_ascii=False)}\n\n"
+
+
+class InteractionRequestError(RuntimeError):
+    """A structured CLI interaction could not be safely matched or answered."""
+
+
+def _control_display_text(value: Any, limit: int = 320) -> str:
+    text = clean_stream_text(str(value or "")).strip()
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def _permission_display_payload(tool_input: dict[str, Any], summary: str = "") -> dict[str, str]:
+    """Expose only short, user-action-relevant permission details to the renderer."""
+    display: dict[str, str] = {}
+    for key in ("command", "file_path", "path", "url"):
+        value = _control_display_text(tool_input.get(key))
+        if value:
+            display[key] = value
+    description = _control_display_text(tool_input.get("description") or summary)
+    if description:
+        display["description"] = description
+    return display
+
+
+def _question_answer_map(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key, answer in value.items():
+        result[str(key)] = ", ".join(str(item) for item in answer) if isinstance(answer, list) else answer
+    return result
+
+
+def _control_request_body(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    body = payload.get("request")
+    if isinstance(body, dict) and isinstance(body.get("request"), dict):
+        body = body["request"]
+    if not isinstance(body, dict):
+        body = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if isinstance(body, dict) and isinstance(body.get("request"), dict):
+        body = body["request"]
+    return body if isinstance(body, dict) else {}
+
+
+def normalize_control_request(payload: Any) -> dict[str, Any] | None:
+    """Normalize only Claude's explicit structured control request envelopes.
+
+    Plain assistant text is deliberately ignored. This function is the single
+    server-side gate for inline questions and permission cards.
+    """
+    if not isinstance(payload, dict):
+        return None
+    event_type = str(payload.get("type") or "").strip().lower()
+    nested = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    tool_name = str(payload.get("name") or payload.get("tool_name") or "")
+    tool_input = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+    structured_question_tool = (
+        event_type in {"tool_start", "tool_use"}
+        and tool_name.casefold() == "askuserquestion"
+        and isinstance(tool_input.get("questions"), list)
+    )
+    if (
+        event_type != "control_request"
+        and str(nested.get("type") or "").strip().lower() != "control_request"
+        and not structured_question_tool
+    ):
+        return None
+    body = payload if structured_question_tool else _control_request_body(payload)
+    subtype = "askuserquestion" if structured_question_tool else str(
+        body.get("subtype")
+        or body.get("request_type")
+        or body.get("kind")
+        or body.get("type")
+        or payload.get("subtype")
+        or ""
+    ).strip().lower()
+    request_id = str(
+        payload.get("request_id")
+        or payload.get("tool_id")
+        or payload.get("id")
+        or body.get("request_id")
+        or nested.get("request_id")
+        or ""
+    ).strip()
+    if not request_id:
+        return None
+
+    tool_name = str(body.get("tool_name") or body.get("name") or tool_name)
+    question_input = body.get("input") if isinstance(body.get("input"), dict) else {}
+    question_payload = body if isinstance(body.get("questions"), list) else question_input
+
+    if subtype in {"askuserquestion", "ask_user_question", "question", "questions"} or (
+        subtype == "can_use_tool"
+        and tool_name.casefold() == "askuserquestion"
+        and isinstance(question_payload.get("questions"), list)
+    ):
+        questions = question_payload.get("questions") if isinstance(question_payload.get("questions"), list) else []
+        normalized_questions: list[dict[str, Any]] = []
+        for question in questions:
+            if not isinstance(question, dict):
+                continue
+            options = question.get("options") if isinstance(question.get("options"), list) else []
+            normalized_questions.append({
+                "question": clean_stream_text(str(question.get("question") or question.get("prompt") or "")),
+                "header": clean_stream_text(str(question.get("header") or "")),
+                "multiSelect": bool(question.get("multiSelect")),
+                "options": [
+                    {
+                        "label": clean_stream_text(str(option.get("label") or "")),
+                        "description": clean_stream_text(str(option.get("description") or "")),
+                    }
+                    for option in options if isinstance(option, dict) and str(option.get("label") or "").strip()
+                ],
+            })
+        return {
+            "type": "interaction_request",
+            "kind": "question",
+            "request_id": request_id,
+            "questions": normalized_questions,
+            "_original_questions": copy.deepcopy(questions),
+            "_response_mode": "continuation" if structured_question_tool else "control_response",
+            "allowed_actions": ["answer", "skip"] if structured_question_tool else ["answer"],
+        }
+
+    if subtype in {"can_use_tool", "permission", "permission_request", "tool_permission"}:
+        raw_suggestions = body.get("permission_suggestions") or body.get("suggestions") or []
+        permission_updates: list[dict[str, Any]] = []
+        if isinstance(raw_suggestions, list):
+            for item in raw_suggestions:
+                if not isinstance(item, dict):
+                    continue
+                candidate = item.get("permission_update") if isinstance(item.get("permission_update"), dict) else item
+                if not isinstance(candidate, dict) or not any(candidate.get(field) for field in ("destination", "type", "behavior", "rules")):
+                    continue
+                permission_updates.append(copy.deepcopy(candidate))
+        tool_input = copy.deepcopy(body.get("input") if isinstance(body.get("input"), dict) else {})
+        summary = clean_stream_text(str(body.get("description") or body.get("summary") or ""))
+        allowed_actions = ["deny", "allow_once"]
+        if permission_updates:
+            allowed_actions.append("allow_always")
+        return {
+            "type": "interaction_request",
+            "kind": "permission",
+            "request_id": request_id,
+            "tool_name": tool_name or "工具",
+            "input": tool_input,
+            "summary": summary,
+            "display": _permission_display_payload(tool_input, summary),
+            "_permission_updates": permission_updates,
+            "allowed_actions": allowed_actions,
+        }
+
+    return None
+
+
+def build_stream_json_user_envelope(prompt: str, session_id: str | None = None) -> dict[str, Any]:
+    """Build the first NDJSON user event for a bidirectional CLI run."""
+    envelope: dict[str, Any] = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": str(prompt or "")}],
+        },
+    }
+    if session_id:
+        envelope["session_id"] = str(session_id)
+    return envelope
+
+
+def build_control_response_envelope(record: dict[str, Any], action: str, answers: Any = None, value: Any = None) -> dict[str, Any]:
+    kind = str(record.get("kind") or "")
+    request_id = str(record.get("request_id") or "")
+    if kind == "permission":
+        if action == "deny":
+            response = {"behavior": "deny", "message": "用户拒绝了本次操作"}
+        elif action in {"allow_later", "allow_always"}:
+            permission_updates = copy.deepcopy(record.get("_permission_updates") or [])
+            if not permission_updates:
+                response = {"behavior": "deny", "message": "当前请求没有可验证的后续权限规则"}
+            else:
+                response = {
+                    "behavior": "allow",
+                    "updatedInput": copy.deepcopy(record.get("input") or {}),
+                    "updatedPermissions": permission_updates,
+                }
+        else:
+            response = {"behavior": "allow", "updatedInput": copy.deepcopy(record.get("input") or {})}
+        return {"type": "control_response", "request_id": request_id, "response": response}
+    answer_value = _question_answer_map(copy.deepcopy(answers if answers is not None else value))
+    original_questions = copy.deepcopy(record.get("_original_questions"))
+    if not isinstance(original_questions, list):
+        original_questions = copy.deepcopy(record.get("questions") or [])
+    return {
+        "type": "control_response",
+        "request_id": request_id,
+        "response": {
+            "behavior": "allow",
+            "updatedInput": {"questions": original_questions, "answers": answer_value},
+        },
+    }
+
+
+def build_question_continuation_envelope(record: dict[str, Any], action: str, answers: Any = None) -> dict[str, Any]:
+    """Resume a CLI stream that surfaced AskUserQuestion only as tool events."""
+    answer_map = _question_answer_map(copy.deepcopy(answers))
+    if action == "skip":
+        guidance = (
+            "[Viniper 问答续写] 用户选择跳过刚才的 AskUserQuestion。"
+            "请在不再次输出该失败工具结果的情况下继续当前任务。"
+        )
+    else:
+        guidance = (
+            "[Viniper 问答续写] 用户已回答刚才的 AskUserQuestion。"
+            f"精确答案：{json.dumps(answer_map, ensure_ascii=False, separators=(',', ':'))}。"
+            "请沿用这些答案继续当前任务，不要重复提问，也不要解释问答桥接。"
+        )
+    return build_stream_json_user_envelope(guidance)
+
+
+class ActiveAgentInputError(RuntimeError):
+    """A same-run Agent input could not be written safely."""
+
+
+class ActiveAgentInputChannel:
+    """Serialize every NDJSON input written to one active Agent run."""
+
+    def __init__(self, active_runs: Any) -> None:
+        self._active_runs = active_runs
+
+    def _runs(self) -> dict[str, dict[str, Any]]:
+        runs = self._active_runs() if callable(self._active_runs) else self._active_runs
+        return runs if isinstance(runs, dict) else {}
+
+    @staticmethod
+    def _lock_for(run: dict[str, Any]) -> asyncio.Lock:
+        lock = run.get("input_lock")
+        if lock is None:
+            lock = asyncio.Lock()
+            run["input_lock"] = lock
+        return lock
+
+    @staticmethod
+    def _writer_is_closing(writer: Any) -> bool:
+        probe = getattr(writer, "is_closing", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            return True
+
+    async def write(
+        self,
+        session_id: str,
+        run: dict[str, Any],
+        envelope: dict[str, Any],
+        *,
+        process_identity: str = "",
+    ) -> None:
+        sid = str(session_id or "")
+        if not sid or not isinstance(run, dict):
+            raise ActiveAgentInputError("Agent 运行标识无效")
+        lock = self._lock_for(run)
+        async with lock:
+            if self._runs().get(sid) is not run:
+                raise ActiveAgentInputError("当前 Agent 任务已经结束，请重新发送")
+            if run.get("kind") != "agent":
+                raise ActiveAgentInputError("当前会话不是可引导的 Agent 任务")
+            if process_identity and str(run.get("process_identity") or "") != str(process_identity):
+                raise ActiveAgentInputError("Agent 输入不属于当前运行进程")
+            writer = run.get("stdin")
+            if writer is None or self._writer_is_closing(writer):
+                raise ActiveAgentInputError("当前 Agent 输入通道已关闭，请重新发送")
+            writer.write((json.dumps(envelope, ensure_ascii=False) + "\n").encode("utf-8"))
+            drain = getattr(writer, "drain", None)
+            if drain is not None:
+                result = drain()
+                if inspect.isawaitable(result):
+                    await result
+
+    async def send_guidance(self, session_id: str, message: str) -> dict[str, Any]:
+        sid = str(session_id or "")
+        text = str(message or "").strip()
+        if not text:
+            raise ActiveAgentInputError("运行中引导不能为空")
+        run = self._runs().get(sid)
+        if not isinstance(run, dict) or run.get("kind") != "agent":
+            raise ActiveAgentInputError("当前会话没有正在运行的 Agent 任务")
+        claude_session_id = str(run.get("claude_session_id") or "")
+        if not claude_session_id:
+            raise ActiveAgentInputError("当前 Agent 会话标识不可用")
+        await self.write(
+            sid,
+            run,
+            build_stream_json_user_envelope(text, claude_session_id),
+            process_identity=str(run.get("process_identity") or ""),
+        )
+        return {"ok": True, "accepted": True, "queued": True, "session_id": sid}
+
+
+active_agent_input_channel = ActiveAgentInputChannel(lambda: _active_runs)
+
+
+def finalize_transcript_segments(segments: Any) -> list[dict[str, Any]]:
+    """Persist completed activity/text while hiding transient thinking."""
+    if not isinstance(segments, list):
+        return []
+    return [
+        copy.deepcopy(segment)
+        for segment in segments
+        if isinstance(segment, dict) and str(segment.get("type") or "") != "thinking"
+    ]
+
+
+def persist_accepted_agent_turn(
+    session_id: str,
+    display_prompt: str,
+    model: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> str:
+    """Persist the accepted Agent turn before its SSE producer can fail."""
+    session = safe_session(session_id)
+    turn_id = str(uuid.uuid4())
+    user_message: dict[str, Any] = {
+        "role": "user",
+        "content": str(display_prompt or ""),
+        "turn_id": turn_id,
+    }
+    if attachments:
+        user_message["attachments"] = attachment_message_items(attachments, session_id)
+    assistant_message = {
+        "role": "assistant",
+        "content": "",
+        "model": str(model or ""),
+        "segments": [],
+        "pending": True,
+        "turn_id": turn_id,
+    }
+    session["messages"] = [
+        *list(session.get("messages", [])),
+        user_message,
+        assistant_message,
+    ]
+    session["last_run_status"] = "running"
+    session["updated"] = now_ts()
+    sessions[session_id] = session
+    save_sessions_to_disk()
+    return turn_id
+
+
+def finalize_accepted_agent_turn_failure(
+    session_id: str,
+    turn_id: str,
+    detail: str,
+    model: str = "",
+) -> None:
+    """Keep the user turn and replace its pending assistant with a retryable error."""
+    session = safe_session(session_id)
+    message: dict[str, Any] | None = None
+    for candidate in reversed(session.get("messages", [])):
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("role") == "assistant"
+            and str(candidate.get("turn_id") or "") == str(turn_id)
+        ):
+            message = candidate
+            break
+    if message is None:
+        message = {"role": "assistant", "turn_id": str(turn_id)}
+        session.setdefault("messages", []).append(message)
+    content = str(detail or "Agent 请求失败")
+    if not content.startswith("错误："):
+        content = f"错误：{content}"
+    message.update({
+        "content": content,
+        "model": str(model or message.get("model") or ""),
+        "segments": [{"type": "text", "content": content}],
+        "error": str(detail or "Agent 请求失败"),
+        "retryable": True,
+    })
+    message.pop("pending", None)
+    message.pop("thinking", None)
+    session["last_run_status"] = "failed"
+    session["unread"] = True
+    session["updated"] = now_ts()
+    sessions[session_id] = session
+    save_sessions_to_disk()
+
+
+def process_is_alive(pid: int) -> bool:
+    value = int(pid or 0)
+    if value <= 1:
+        return False
+    try:
+        os.kill(value, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def reconcile_orphaned_agent_runs(
+    session_records: dict[str, dict[str, Any]],
+    *,
+    journal: AgentRunJournal,
+    runtime: Any,
+    owner_alive: Any = process_is_alive,
+    interaction_store: DurableInteractionStore | None = None,
+    at: float | None = None,
+) -> list[dict[str, Any]]:
+    """Fail closed only journaled runs whose exact backend owner is gone."""
+    results: list[dict[str, Any]] = []
+    timestamp = float(at if at is not None else now_ts())
+    failure_text = "运行 owner 已失效；任务中断，请求未执行。"
+    for entry in journal.active():
+        session_id = str(entry.get("session_id") or "")
+        run_id = str(entry.get("coordinator_run_id") or "")
+        owner_pid = int(entry.get("owner_pid") or 0)
+        if owner_alive(owner_pid):
+            results.append({"session_id": session_id, "run_id": run_id, "status": "owned"})
+            continue
+        try:
+            cleaned = bool(runtime.cleanup_orphaned(
+                str(entry.get("session_key") or ""),
+                int(entry.get("runtime_pgid") or 0),
+                int(entry.get("runtime_pid") or 0),
+            ))
+        except (OSError, ValueError):
+            cleaned = False
+        session = session_records.get(session_id)
+        if isinstance(session, dict):
+            message: dict[str, Any] | None = None
+            for candidate in reversed(session.get("messages", [])):
+                if isinstance(candidate, dict) and candidate.get("role") == "assistant" and candidate.get("pending"):
+                    message = candidate
+                    break
+            if message is None:
+                message = {"role": "assistant"}
+                session.setdefault("messages", []).append(message)
+            message.update({
+                "content": failure_text,
+                "segments": [{"type": "text", "content": failure_text}],
+                "error": "owner_lost",
+                "retryable": True,
+            })
+            message.pop("pending", None)
+            message.pop("thinking", None)
+            session["last_run_status"] = "failed"
+            session["unread"] = True
+            session["updated"] = timestamp
+        if interaction_store is not None:
+            try:
+                interaction_store.fail_owner(session_id, run_id, reason=failure_text)
+            except ValueError:
+                pass
+        journal.finish(session_id, run_id, status="failed")
+        results.append({
+            "session_id": session_id,
+            "run_id": run_id,
+            "status": "cleaned" if cleaned else "not_found",
+        })
+    return results
+
+
+class AgentInteractionBroker:
+    """Match one explicit CLI interaction to its same-run response channel."""
+
+    def __init__(
+        self,
+        input_channel: ActiveAgentInputChannel | None = None,
+        store_factory: Any = None,
+        managed_channels_only: bool = False,
+    ) -> None:
+        self._pending: dict[str, dict[str, Any]] = {}
+        self._input_channel = input_channel
+        self._store_factory = store_factory
+        self._managed_channels_only = bool(managed_channels_only)
+
+    def _store(self) -> DurableInteractionStore | None:
+        if self._store_factory is None:
+            return None
+        candidate = self._store_factory() if callable(self._store_factory) else self._store_factory
+        return candidate if isinstance(candidate, DurableInteractionStore) else None
+
+    @staticmethod
+    def _public_record(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not record:
+            return None
+        safe_keys = {
+            "type", "kind", "request_id", "tool_use_id", "session_id", "run_id",
+            "tool_name", "summary", "workdir", "allowed_actions", "questions", "display",
+            "agent_id", "response", "interaction_state", "terminal", "failure_message",
+            "blocked_path", "decision_reason", "decision_reason_type", "title",
+            "display_name", "description", "risk",
+        }
+        public = {key: copy.deepcopy(value) for key, value in record.items() if key in safe_keys}
+        state = str(record.get("interaction_state") or record.get("state") or "")
+        if state == "waiting_input":
+            state = "pending"
+        if state:
+            public["interaction_state"] = state
+        if state not in {"created", "pending"}:
+            public["allowed_actions"] = []
+        return public
+
+    def pending_for(self, session_id: str) -> dict[str, Any] | None:
+        store = self._store()
+        if store is not None:
+            durable = store.public_for_session(str(session_id))
+            if durable is not None:
+                return durable
+        record = self._pending.get(str(session_id))
+        if not record or str(record.get("state") or "waiting_input") not in {
+            "waiting_input", "answering", "response_committed", "awaiting_cli_ack", "failed",
+        }:
+            return None
+        return self._public_record(record)
+
+    def unsettled_for(self, session_id: str) -> bool:
+        sid = str(session_id)
+        store = self._store()
+        if store is not None and any(str(item.get("session_id") or "") == sid for item in store.active()):
+            return True
+        return sid in self._pending
+
+    def _record_from_durable(self, session_id: str, request_id: str) -> dict[str, Any] | None:
+        store = self._store()
+        if store is None:
+            return None
+        durable = store.record_for(str(session_id), str(request_id))
+        if not durable:
+            return None
+        private = durable.get("private") if isinstance(durable.get("private"), dict) else {}
+        channel_path = str(durable.get("host_channel") or "")
+        channel = HostInteractionChannel(channel_path) if channel_path else None
+        return {
+            "type": "interaction_request",
+            "kind": str(durable.get("kind") or ""),
+            "request_id": str(durable.get("request_id") or ""),
+            "tool_use_id": str(durable.get("tool_use_id") or durable.get("request_id") or ""),
+            "bridge_request_id": str(durable.get("bridge_request_id") or ""),
+            "session_id": str(durable.get("session_id") or ""),
+            "run_id": str(durable.get("run_id") or ""),
+            "process_identity": str(durable.get("process_identity") or ""),
+            "tool_name": str(durable.get("tool_name") or ""),
+            "questions": copy.deepcopy(durable.get("questions") or []),
+            "_original_questions": copy.deepcopy(private.get("original_questions") or []),
+            "_tool_input": copy.deepcopy(private.get("tool_input") or {}),
+            "_permission_suggestions": copy.deepcopy(private.get("permission_suggestions") or []),
+            "display": copy.deepcopy(durable.get("display") or {}),
+            "summary": str(durable.get("summary") or ""),
+            "workdir": str(durable.get("workdir") or ""),
+            "allowed_actions": copy.deepcopy(durable.get("allowed_actions") or []),
+            "_response_mode": str(durable.get("response_mode") or "host_hook"),
+            "_committed_response": copy.deepcopy(durable.get("response") or {}),
+            "_committed_action": str(durable.get("action") or ""),
+            "_host_channel": channel,
+            "state": str(durable.get("state") or ""),
+        }
+
+    def _persist_host_request(self, record: dict[str, Any], channel: HostInteractionChannel) -> None:
+        store = self._store()
+        if store is None:
+            return
+        if self._managed_channels_only:
+            try:
+                channel.root.resolve().relative_to((DATA_DIR / "runtime" / "agent-host").resolve())
+            except ValueError:
+                return
+        run_id = str(record.get("run_id") or channel.run_id or "").strip()
+        if not run_id:
+            raise ValueError("host interaction is missing its run identity")
+        # ``record`` also owns live runtime objects (the active run, stdin,
+        # locks and the channel instance).  Persist the immutable protocol
+        # envelope only; attempting to deepcopy the whole record reaches
+        # asyncio Futures on real WSL runs and aborts before the card appears.
+        durable_entry = {
+            key: value
+            for key, value in record.items()
+            if key not in {
+                "_run", "_host_channel", "_channel", "stdin", "_input_lock",
+            }
+        }
+        created = store.create({
+            **durable_entry,
+            "run_id": run_id,
+            "host_channel": str(channel.root),
+            "response_mode": str(record.get("_response_mode") or "host_hook"),
+        })
+        if str(created.get("state") or "") == "created":
+            store.mark_pending(str(record.get("session_id") or ""), str(record.get("request_id") or ""))
+
+    def ack_status_for(self, session_id: str) -> dict[str, Any] | None:
+        record = self._pending.get(str(session_id))
+        if record is None:
+            store = self._store()
+            durable = store.latest_for_session(str(session_id)) if store is not None else None
+            if durable and str(durable.get("state") or "") in {"response_committed", "awaiting_cli_ack"}:
+                record = self._record_from_durable(session_id, str(durable.get("request_id") or ""))
+        if not record or str(record.get("_response_mode") or "") not in {
+            "host_hook", "permission_prompt_mcp",
+        }:
+            return None
+        channel = record.get("_host_channel")
+        if not isinstance(channel, HostInteractionChannel):
+            return None
+        status = channel.acknowledgement(str(record.get("bridge_request_id") or ""))
+        status["session_id"] = str(record.get("session_id") or "")
+        status["request_id"] = str(record.get("request_id") or "")
+        status["state"] = str(record.get("state") or "waiting_input")
+        self._sync_durable_ack(record, status)
+        return status
+
+    def _sync_durable_ack(self, record: dict[str, Any], acknowledgement: dict[str, Any]) -> None:
+        store = self._store()
+        if store is None:
+            return
+        session_id = str(record.get("session_id") or "")
+        request_id = str(record.get("request_id") or "")
+        if not session_id or not request_id:
+            return
+        for stage in (
+            "response_committed", "response_read", "stdout_written_and_flushed",
+            MCP_RESPONSE_ACK_STAGE, "hook_exit",
+        ):
+            if not acknowledgement.get(stage):
+                continue
+            try:
+                store.record_ack(
+                    session_id,
+                    request_id,
+                    stage,
+                    exit_code=(acknowledgement.get("hook_exit_code") if stage == "hook_exit" else None),
+                )
+            except ValueError:
+                continue
+
+    def expire_unacknowledged(self, *, now: float | None = None, timeout_seconds: float) -> list[dict[str, str]]:
+        current = float(now if now is not None else time.time())
+        expired: list[dict[str, str]] = []
+        for sid, record in list(self._pending.items()):
+            if str(record.get("state") or "") != "awaiting_cli_ack":
+                continue
+            if current - float(record.get("response_committed_at") or current) < max(0.01, float(timeout_seconds)):
+                continue
+            request_id = str(record.get("request_id") or "")
+            bound_run = record.get("_run")
+            if isinstance(bound_run, dict):
+                bound_run["pending_interaction"] = None
+                bound_run["awaiting_interaction_ack"] = None
+                bound_run["interaction_failure"] = "cli_ack_timeout"
+            channel = record.get("_host_channel")
+            if isinstance(channel, HostInteractionChannel):
+                channel.finalize("timeout", reason="cli_ack_timeout")
+            store = self._store()
+            if store is not None:
+                try:
+                    store.fail_owner(
+                        sid,
+                        str(record.get("run_id") or ""),
+                        reason="Claude 未确认本次交互；请求未执行。",
+                    )
+                except ValueError:
+                    pass
+            self._pending.pop(sid, None)
+            expired.append({"session_id": sid, "request_id": request_id, "reason": "cli_ack_timeout"})
+        return expired
+
+    def confirm_cli_tool_result(self, session_id: str, request_id: str, *, success: bool) -> dict[str, Any] | None:
+        sid = str(session_id)
+        record = self._pending.get(sid)
+        if not record or str(record.get("state") or "") != "awaiting_cli_ack":
+            return None
+        if str(record.get("request_id") or "") != str(request_id):
+            return None
+        channel = record.get("_host_channel")
+        if not isinstance(channel, HostInteractionChannel):
+            return None
+        bridge_id = str(record.get("bridge_request_id") or "")
+        channel.record_cli_tool_result(bridge_id, str(request_id), success=bool(success))
+        response_mode = str(record.get("_response_mode") or "")
+        store = self._store()
+        durable = store.record_for(sid, str(request_id)) if store is not None else None
+        committed_response = record.get("_committed_response")
+        if not isinstance(committed_response, dict) and isinstance(durable, dict):
+            committed_response = durable.get("response")
+        response_behavior = DurableInteractionStore.response_behavior(committed_response)
+        expected_tool_result_success = response_behavior != "deny"
+        deadline = time.monotonic() + 0.25
+        while True:
+            acknowledgement = channel.acknowledgement(bridge_id)
+            if response_mode == "permission_prompt_mcp":
+                protocol_ready = all(bool(acknowledgement.get(stage)) for stage in (
+                    "response_committed", "response_read", MCP_RESPONSE_ACK_STAGE,
+                ))
+            else:
+                protocol_ready = all(bool(acknowledgement.get(stage)) for stage in (
+                    "response_committed", "response_read", "stdout_written_and_flushed", "hook_exit",
+                )) and int(acknowledgement.get("hook_exit_code") or 0) == 0
+            if protocol_ready or time.monotonic() >= deadline:
+                break
+            time.sleep(0.005)
+        tool_result_matches = bool(success) == expected_tool_result_success
+        accepted = bool(protocol_ready and tool_result_matches)
+        self._sync_durable_ack(record, acknowledgement)
+        if store is not None:
+            try:
+                store.record_ack(
+                    sid,
+                    str(request_id),
+                    "cli_tool_result",
+                    success=bool(success),
+                )
+            except ValueError:
+                pass
+        bound_run = record.get("_run")
+        if isinstance(bound_run, dict):
+            bound_run["pending_interaction"] = None
+            bound_run["awaiting_interaction_ack"] = None
+            if not accepted:
+                bound_run["interaction_failure"] = "cli_tool_result_mismatch" if not tool_result_matches else "cli_ack_incomplete"
+        self._pending.pop(sid, None)
+        terminal_state = "denied" if response_behavior == "deny" and accepted else ("accepted" if accepted else "failed")
+        return {
+            "session_id": sid,
+            "request_id": str(request_id),
+            "accepted": accepted,
+            "success": bool(success),
+            "terminal_state": terminal_state,
+            "acknowledgement": acknowledgement,
+            "reason": "" if accepted else ("cli_tool_result_mismatch" if not tool_result_matches else "cli_ack_incomplete"),
+        }
+
+    def create_request(
+        self,
+        session_id: str,
+        process_identity: str,
+        payload: Any,
+        stdin: Any = None,
+        workdir: str = "",
+        run: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        normalized = normalize_control_request(payload)
+        if normalized is None:
+            return None
+        sid = str(session_id)
+        request_id = str(normalized["request_id"])
+        existing = self._pending.get(sid)
+        if existing and existing.get("request_id") == request_id:
+            if str(existing.get("process_identity")) != str(process_identity):
+                return None
+            if stdin is not None:
+                existing["stdin"] = stdin
+            if run is not None:
+                existing["_run"] = run
+            return self._public_record(existing) or {}
+        if existing:
+            return None
+        record = {
+            **normalized,
+            "session_id": sid,
+            "process_identity": str(process_identity),
+            "workdir": str(workdir or ""),
+            "stdin": stdin,
+            "_run": run,
+            "_input_lock": asyncio.Lock(),
+            "payload": copy.deepcopy(payload),
+            "state": "waiting_input",
+            "created": now_ts(),
+        }
+        self._pending[sid] = record
+        return self.pending_for(sid) or {}
+
+    def create_host_request(
+        self,
+        session_id: str,
+        process_identity: str,
+        normalized: dict[str, Any],
+        channel: HostInteractionChannel,
+        *,
+        workdir: str = "",
+        run: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(normalized, dict) or normalized.get("type") != "interaction_request":
+            return None
+        request_id = str(normalized.get("request_id") or "").strip()
+        bridge_request_id = str(normalized.get("bridge_request_id") or "").strip()
+        if not request_id or not bridge_request_id:
+            return None
+        sid = str(session_id)
+        owner_mode = (
+            "permission_prompt_mcp"
+            if str(normalized.get("_transport") or "") == "permission_prompt_mcp"
+            else "host_hook"
+        )
+        existing = self._pending.get(sid)
+        if existing and str(existing.get("request_id")) == request_id:
+            if str(existing.get("process_identity")) != str(process_identity):
+                return None
+            if str(existing.get("_response_mode") or "") in {"host_hook", "permission_prompt_mcp"}:
+                return self._public_record(existing) or {}
+            if str(existing.get("state") or "waiting_input") != "waiting_input":
+                return None
+            # The official owner wins if it arrives during the bounded stdout
+            # compatibility grace window without creating a second card.
+            display = copy.deepcopy(normalized.get("display_payload") or {})
+            channel.bind_process_identity(str(process_identity))
+            try:
+                channel.record_interaction(
+                    bridge_request_id,
+                    request_id,
+                    str(normalized.get("kind") or ""),
+                    str(normalized.get("tool_name") or ""),
+                )
+            except FileExistsError:
+                pass
+            normalized_copy = {
+                key: copy.deepcopy(value)
+                for key, value in normalized.items()
+                if key != "_channel"
+            }
+            replacement = {
+                **normalized_copy,
+                "display": display,
+                "session_id": sid,
+                "process_identity": str(process_identity),
+                "workdir": str(workdir or normalized.get("workdir") or ""),
+                "_run": run or existing.get("_run"),
+                "_response_mode": owner_mode,
+                "_host_channel": channel,
+                "state": "waiting_input",
+                "created": existing.get("created") or now_ts(),
+            }
+            replacement["run_id"] = str(normalized.get("run_id") or channel.run_id or "")
+            self._pending[sid] = replacement
+            try:
+                self._persist_host_request(replacement, channel)
+            except ValueError:
+                self._pending.pop(sid, None)
+                return None
+            return self.pending_for(sid) or {}
+        if existing:
+            return None
+        display = copy.deepcopy(normalized.get("display_payload") or {})
+        channel.bind_process_identity(str(process_identity))
+        try:
+            channel.record_interaction(
+                bridge_request_id,
+                request_id,
+                str(normalized.get("kind") or ""),
+                str(normalized.get("tool_name") or ""),
+            )
+        except FileExistsError:
+            pass
+        normalized_copy = {
+            key: copy.deepcopy(value)
+            for key, value in normalized.items()
+            if key != "_channel"
+        }
+        record = {
+            **normalized_copy,
+            "display": display,
+            "session_id": sid,
+            "process_identity": str(process_identity),
+            "workdir": str(workdir or normalized.get("workdir") or ""),
+            "_run": run,
+            "_response_mode": owner_mode,
+            "_host_channel": channel,
+            "state": "waiting_input",
+            "created": now_ts(),
+        }
+        record["run_id"] = str(normalized.get("run_id") or channel.run_id or "")
+        self._pending[sid] = record
+        try:
+            self._persist_host_request(record, channel)
+        except ValueError:
+            self._pending.pop(sid, None)
+            return None
+        return self.pending_for(sid) or {}
+
+    async def resolve(
+        self,
+        session_id: str,
+        request_id: str,
+        kind: str,
+        action: str,
+        *,
+        stdin: Any = None,
+        run: dict[str, Any] | None = None,
+        process_identity: str = "",
+        answers: Any = None,
+        value: Any = None,
+    ) -> dict[str, Any]:
+        sid = str(session_id)
+        record = self._pending.get(sid)
+        if record is None:
+            record = self._record_from_durable(sid, str(request_id))
+        if not record:
+            raise InteractionRequestError("interaction request is stale or already answered")
+        if str(record.get("request_id")) != str(request_id) or str(record.get("kind")) != str(kind):
+            raise InteractionRequestError("interaction request does not match the active request")
+        if process_identity and str(record.get("process_identity")) != str(process_identity):
+            raise InteractionRequestError("interaction request belongs to another process")
+        allowed = {str(item) for item in record.get("allowed_actions") or []}
+        if action not in allowed and not (kind == "question" and action in {"answer", "submit"}):
+            raise InteractionRequestError("interaction action is not allowed")
+        owner_mode = str(record.get("_response_mode") or "")
+        if owner_mode in {"host_hook", "permission_prompt_mcp"}:
+            try:
+                normalized_action = "answer" if kind == "question" and action in {"answer", "submit"} else action
+                if owner_mode == "permission_prompt_mcp":
+                    response = build_permission_prompt_response(
+                        record, normalized_action, answers=answers, value=value,
+                    )
+                else:
+                    response = build_hook_response(
+                        record, normalized_action, answers=answers, value=value,
+                    )
+                channel = record.get("_host_channel")
+                if not isinstance(channel, HostInteractionChannel):
+                    raise InteractionRequestError("interaction host channel is unavailable")
+                store = self._store()
+                durable_before = store.record_for(sid, str(request_id)) if store is not None else None
+                if durable_before and str(durable_before.get("state") or "") in {"accepted", "denied", "cancelled", "failed", "terminal"}:
+                    raise InteractionRequestError("interaction request is no longer answerable")
+                if store is not None and str((durable_before or {}).get("state") or "") in {"created", "pending"}:
+                    store.begin_answer(sid, str(request_id))
+                channel.respond(str(record.get("bridge_request_id") or ""), response, action=action)
+                if store is not None and durable_before is not None:
+                    store.commit_response(sid, str(request_id), action=normalized_action, response=response)
+                    store.mark_awaiting_cli_ack(sid, str(request_id))
+                record["_committed_response"] = copy.deepcopy(response)
+                record["_committed_action"] = normalized_action
+                record["state"] = "awaiting_cli_ack"
+                record["response_committed_at"] = time.time()
+            except (FileExistsError, OSError, ValueError) as exc:
+                raise InteractionRequestError(str(exc)) from exc
+        elif kind == "question" and record.get("_response_mode") == "continuation":
+            envelope = build_question_continuation_envelope(record, action, answers)
+        else:
+            envelope = build_control_response_envelope(record, "answer" if kind == "question" else action, answers, value)
+        if owner_mode not in {"host_hook", "permission_prompt_mcp"}:
+            active_run = run or record.get("_run")
+            if self._input_channel is not None and isinstance(active_run, dict):
+                try:
+                    await self._input_channel.write(
+                        sid,
+                        active_run,
+                        envelope,
+                        process_identity=process_identity or str(record.get("process_identity") or ""),
+                    )
+                except ActiveAgentInputError as exc:
+                    raise InteractionRequestError(str(exc)) from exc
+            else:
+                writer = stdin or record.get("stdin")
+                if writer is None:
+                    raise InteractionRequestError("interaction process stdin is unavailable")
+                async with record["_input_lock"]:
+                    writer.write((json.dumps(envelope, ensure_ascii=False) + "\n").encode("utf-8"))
+                    drain = getattr(writer, "drain", None)
+                    if drain is not None:
+                        result = drain()
+                        if inspect.isawaitable(result):
+                            await result
+        bound_run = run or record.get("_run")
+        if isinstance(bound_run, dict) and str(bound_run.get("pending_interaction") or "") == str(request_id):
+            bound_run["pending_interaction"] = None
+        if owner_mode in {"host_hook", "permission_prompt_mcp"}:
+            if isinstance(bound_run, dict):
+                bound_run["awaiting_interaction_ack"] = str(request_id)
+            return {
+                "ok": True,
+                "request_id": str(request_id),
+                "kind": kind,
+                "action": action,
+                "status": "awaiting_cli_ack",
+                "acknowledgement": self.ack_status_for(sid),
+            }
+        self._pending.pop(sid, None)
+        return {"ok": True, "request_id": str(request_id), "kind": kind, "action": action, "status": "accepted"}
+
+    def invalidate(self, session_id: str, reason: str = "") -> dict[str, Any] | None:
+        sid = str(session_id)
+        record = self._pending.pop(sid, None)
+        if record is None:
+            store = self._store()
+            durable = store.latest_for_session(sid) if store is not None else None
+            if durable and str(durable.get("state") or "") in DurableInteractionStore._OPEN_STATES:
+                record = self._record_from_durable(sid, str(durable.get("request_id") or ""))
+        if record is not None:
+            record["invalidated_reason"] = str(reason or "cancelled")
+            owner_mode = str(record.get("_response_mode") or "")
+            explicit_cancel = str(reason or "") == "cancelled"
+            if explicit_cancel and owner_mode in {"host_hook", "permission_prompt_mcp"}:
+                channel = record.get("_host_channel")
+                if isinstance(channel, HostInteractionChannel):
+                    try:
+                        action = "skip" if record.get("kind") == "question" else "deny"
+                        if owner_mode == "permission_prompt_mcp":
+                            response = build_permission_prompt_response(record, action)
+                        else:
+                            response = build_hook_response(record, action)
+                        channel.respond(
+                            str(record.get("bridge_request_id") or ""),
+                            response,
+                        )
+                    except (FileExistsError, OSError, ValueError):
+                        pass
+            store = self._store()
+            if store is not None:
+                try:
+                    if explicit_cancel:
+                        store.mark_cancelled(sid, str(record.get("request_id") or ""), reason="用户已停止任务")
+                    else:
+                        store.fail_owner(
+                            sid,
+                            str(record.get("run_id") or ""),
+                            reason="任务中断；请求未执行。",
+                        )
+                except ValueError:
+                    pass
+            bound_run = record.get("_run")
+            if isinstance(bound_run, dict):
+                bound_run["pending_interaction"] = None
+                bound_run["awaiting_interaction_ack"] = None
+        return record
+
+
+agent_interaction_broker = AgentInteractionBroker(
+    input_channel=active_agent_input_channel,
+    store_factory=durable_interaction_store,
+    managed_channels_only=True,
+)
 
 
 def tool_use_text(block: dict[str, Any]) -> str:
@@ -2106,7 +3861,7 @@ def is_action_task_prompt(prompt: str) -> bool:
 
 
 def skill_aliases(skill: dict[str, str]) -> set[str]:
-    filename_stem = str(skill.get("id") or Path(skill.get("filename", "")).stem)
+    filename_stem = str(skill.get("slug") or Path(skill.get("filename", "")).stem)
     command = str(skill.get("command") or "")
     display_name = str(skill.get("name") or "")
     aliases = {command, filename_stem, display_name}
@@ -2229,11 +3984,85 @@ def unique_skill_dirs() -> list[Path]:
     return dirs
 
 
-def skill_id_from_path(path: Path) -> str:
+def unique_skill_source_roots() -> list[tuple[str, Path]]:
+    seen: set[str] = set()
+    roots: list[tuple[str, Path]] = []
+    for source, path in SKILL_SOURCE_ROOTS:
+        try:
+            key = str(path.resolve()).lower()
+        except Exception:
+            key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append((source, path))
+    return roots
+
+
+def skill_source_for_path(path: Path) -> tuple[str, Path]:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    for source, root in unique_skill_source_roots():
+        try:
+            if resolved == root.resolve() or root.resolve() in resolved.parents:
+                return source, root
+        except Exception:
+            continue
+    return "local", path.parent
+
+
+def skill_name_from_path(path: Path) -> str:
     return path.parent.name if path.name.lower() == "skill.md" else path.stem
 
 
+def claude_skill_bridge_root() -> str:
+    configured = env_value("VINIPER_UI_CLAUDE_SKILL_BRIDGE_ROOT", "").strip()
+    return configured or f"/home/{MANAGED_DISTRO_USER}/.local/share/viniper/skill-library"
+
+
+def run_wsl_skill_bridge(script: str) -> subprocess.CompletedProcess:
+    try:
+        completed = subprocess.run(
+            [
+                "wsl.exe", "--distribution", MANAGED_DISTRO_NAME,
+                "--user", MANAGED_DISTRO_USER, "--exec", "bash", "-s",
+            ],
+            # Passing text through a Windows TextIO wrapper translates LF to
+            # CRLF; bash -s then reads tokens such as `set -eu\r`.  Send the
+            # generated POSIX script as UTF-8 bytes so WSL receives exact LF.
+            input=str(script).replace("\r\n", "\n").encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+        return subprocess.CompletedProcess(
+            completed.args,
+            completed.returncode,
+            stdout=bytes(completed.stdout or b"").decode("utf-8", errors="replace"),
+            stderr=bytes(completed.stderr or b"").decode("utf-8", errors="replace"),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(["wsl.exe"], 1, stdout="", stderr=str(exc))
+
+
+def skill_id_from_path(path: Path) -> str:
+    source, root = skill_source_for_path(path)
+    try:
+        relative = path.resolve().relative_to(root.resolve()).as_posix()
+    except Exception:
+        relative = path.name
+    return f"{source}:{relative}"
+
+
 def skill_display_path(path: Path) -> str:
+    source, root = skill_source_for_path(path)
+    try:
+        return f"{source}/{path.resolve().relative_to(root.resolve()).as_posix()}"
+    except Exception:
+        pass
     for root in (APP_DIR, BASE_DIR):
         try:
             return str(path.relative_to(root))
@@ -2243,6 +4072,19 @@ def skill_display_path(path: Path) -> str:
 
 
 def skill_file_from_record(skill: dict[str, str]) -> Path | None:
+    record_id = str(skill.get("id") or "").strip()
+    if ":" in record_id:
+        source, relative = record_id.split(":", 1)
+        for candidate_source, root in unique_skill_source_roots():
+            if candidate_source != source:
+                continue
+            try:
+                candidate = (root / relative).resolve()
+                if root.resolve() in candidate.parents and candidate.is_file() and candidate.suffix.lower() == ".md":
+                    return candidate
+            except Exception:
+                return None
+        return None
     absolute = str(skill.get("absolute_path") or "").strip()
     if absolute:
         path = Path(absolute)
@@ -2521,6 +4363,285 @@ async def run_goal_loop(goal_id: str) -> None:
             _goal_tasks.pop(goal_id, None)
 
 
+class ChatTransport:
+    """Text-only Anthropic-compatible transport; it never launches an agent process."""
+
+    def __init__(self, provider_request=None):
+        self.provider_request = provider_request
+
+    @staticmethod
+    def build_messages(session: dict[str, Any], prompt: str) -> list[dict[str, str]]:
+        history: list[dict[str, str]] = []
+        for message in session.get("messages", []):
+            if not isinstance(message, dict) or message.get("pending"):
+                continue
+            role = str(message.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = str(message.get("content") or "").strip()
+            if content:
+                history.append({"role": role, "content": content})
+        history.append({"role": "user", "content": prompt})
+        return history
+
+    @staticmethod
+    def build_payload(session: dict[str, Any], prompt: str, model: str) -> dict[str, Any]:
+        return {
+            "model": model,
+            "max_tokens": 4096,
+            "messages": ChatTransport.build_messages(session, prompt),
+            "stream": True,
+        }
+
+    async def _provider_events(self, cfg: dict[str, str], payload: dict[str, Any]):
+        if self.provider_request is not None:
+            result = self.provider_request(cfg, payload)
+            if inspect.isawaitable(result):
+                result = await result
+            if hasattr(result, "__aiter__"):
+                async for event in result:
+                    if isinstance(event, dict):
+                        yield event
+            else:
+                for event in result or []:
+                    if isinstance(event, dict):
+                        yield event
+            return
+
+        if not cfg.get("api_key"):
+            raise RuntimeError(f"未找到 {cfg.get('label') or '模型供应商'} API key，请在设置里配置 API Key 或环境变量。")
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "x-api-key": cfg["api_key"],
+            "anthropic-version": "2023-06-01",
+        }
+        async with httpx.AsyncClient(timeout=120.0, trust_env=True) as client:
+            async with client.stream("POST", messages_url(cfg["base_url"]), headers=headers, json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    value = str(line or "").strip()
+                    if not value or value.startswith(":"):
+                        continue
+                    if value.startswith("data:"):
+                        value = value[5:].strip()
+                    if value == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(value)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict):
+                        yield event
+
+    async def stream(self, session_id: str, user_msg: str, model: str | None = None):
+        session = safe_session(session_id)
+        if normalize_session_mode(session.get("mode")) != "chat":
+            raise RuntimeError("ChatTransport 只能服务 Chat 会话。")
+        prompt = str(user_msg or "").strip()
+        if not prompt:
+            return
+        cfg = provider_config(model)
+        selected_model = cfg["model"]
+        payload = self.build_payload(session, prompt, selected_model)
+        session["messages"] = list(session.get("messages", [])) + [{"role": "user", "content": prompt}]
+        session["last_run_status"] = "running"
+        session["updated"] = now_ts()
+        sessions[session_id] = session
+        save_sessions_to_disk()
+
+        assistant_text = ""
+        thinking_text = ""
+        segments: list[dict[str, Any]] = []
+        thinking_started = False
+        started = time.monotonic()
+        last_save = 0.0
+
+        def append_segment(segment_type: str, content: str) -> None:
+            if not content:
+                return
+            if segments and segments[-1].get("type") == segment_type:
+                segments[-1]["content"] = str(segments[-1].get("content") or "") + content
+            else:
+                segments.append({"type": segment_type, "content": content})
+
+        def save_progress(force: bool = False) -> None:
+            nonlocal last_save
+            now = time.monotonic()
+            if not force and now - last_save < 1.0:
+                return
+            last_save = now
+            session.setdefault("messages", []).append({
+                "role": "assistant",
+                "content": assistant_text,
+                "thinking": thinking_text,
+                "model": selected_model,
+                "segments": copy.deepcopy(segments),
+                "elapsed_seconds": max(0, round(now - started)),
+                "pending": True,
+            })
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+
+        def update_pending() -> None:
+            for message in reversed(session.get("messages", [])):
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
+                    message.update({
+                        "content": assistant_text,
+                        "thinking": thinking_text,
+                        "model": selected_model,
+                        "segments": copy.deepcopy(segments),
+                        "elapsed_seconds": max(0, round(time.monotonic() - started)),
+                    })
+                    return
+
+        save_progress(force=True)
+        yield {
+            "type": "assistant_start",
+            "mode": "chat",
+            "model": selected_model,
+        }
+        try:
+            async for event in self._provider_events(cfg, payload):
+                event_type = str(event.get("type") or "")
+                if event_type == "content_block_start":
+                    block = event.get("content_block") if isinstance(event.get("content_block"), dict) else {}
+                    if block.get("type") == "thinking" and not thinking_started:
+                        thinking_started = True
+                        yield {"type": "thinking_start", "elapsed": 0}
+                    continue
+                if event_type == "content_block_delta":
+                    delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                    delta_type = str(delta.get("type") or "")
+                    if delta_type == "thinking_delta":
+                        text = clean_stream_text(str(delta.get("thinking") or ""))
+                        if text:
+                            if not thinking_started:
+                                thinking_started = True
+                                yield {"type": "thinking_start", "elapsed": 0}
+                            thinking_text += text
+                            append_segment("thinking", text)
+                            update_pending()
+                            yield {"type": "thinking_delta", "content": text, "elapsed": max(0, round(time.monotonic() - started))}
+                    elif delta_type == "text_delta":
+                        text = clean_stream_text(str(delta.get("text") or ""))
+                        if text:
+                            if thinking_started:
+                                thinking_started = False
+                                yield {"type": "thinking_complete", "elapsed": max(0, round(time.monotonic() - started))}
+                            assistant_text += text
+                            append_segment("text", text)
+                            update_pending()
+                            yield {"type": "text", "content": text}
+                    continue
+                if event_type in {"thinking", "thinking_delta"}:
+                    text = clean_stream_text(str(event.get("content") or event.get("thinking") or ""))
+                    if text:
+                        if not thinking_started:
+                            thinking_started = True
+                            yield {"type": "thinking_start", "elapsed": 0}
+                        thinking_text += text
+                        append_segment("thinking", text)
+                        update_pending()
+                        yield {"type": "thinking_delta", "content": text, "elapsed": max(0, round(time.monotonic() - started))}
+                    continue
+                if event_type in {"text", "text_delta"}:
+                    text = clean_stream_text(str(event.get("content") or event.get("text") or ""))
+                    if text:
+                        if thinking_started:
+                            thinking_started = False
+                            yield {"type": "thinking_complete", "elapsed": max(0, round(time.monotonic() - started))}
+                        assistant_text += text
+                        append_segment("text", text)
+                        update_pending()
+                        yield {"type": "text", "content": text}
+                    continue
+                if event_type == "message_stop" and thinking_started:
+                    thinking_started = False
+                    yield {"type": "thinking_complete", "elapsed": max(0, round(time.monotonic() - started))}
+
+            if thinking_started:
+                thinking_started = False
+                yield {"type": "thinking_complete", "elapsed": max(0, round(time.monotonic() - started))}
+            update_pending()
+            for message in reversed(session.get("messages", [])):
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
+                    message["segments"] = finalize_transcript_segments(message.get("segments"))
+                    message.pop("thinking", None)
+                    message.pop("pending", None)
+                    break
+            session["last_run_status"] = "completed"
+            session["unread"] = True
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield {"type": "done"}
+        except asyncio.CancelledError:
+            update_pending()
+            for message in reversed(session.get("messages", [])):
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
+                    message["segments"] = finalize_transcript_segments(message.get("segments"))
+                    message.pop("thinking", None)
+                    message.pop("pending", None)
+                    message["cancelled"] = True
+                    break
+            session["last_run_status"] = "cancelled"
+            session["unread"] = True
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            raise
+        except Exception as exc:
+            update_pending()
+            for message in reversed(session.get("messages", [])):
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
+                    message["segments"] = finalize_transcript_segments(message.get("segments"))
+                    message.pop("thinking", None)
+                    message.pop("pending", None)
+                    message["error"] = str(exc)
+                    break
+            session["last_run_status"] = "failed"
+            session["unread"] = True
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield {"type": "error", "content": f"Chat 请求失败：{exc}"}
+            yield {"type": "done"}
+
+
+class AgentTransport:
+    """Stable seam around the existing Agent/CLI stream implementation."""
+
+    async def stream(self, session_id: str, user_msg: str, is_guidance: bool = False,
+                     model: str | None = None, permission_mode: str | None = None,
+                     attachments: list[dict[str, Any]] | None = None,
+                     suppress_user_message: bool = False,
+                     process_factory: Any = None,
+                     peer_request: dict[str, str] | None = None,
+                     queued_item_id: str = "",
+                     accepted_turn_id: str = ""):
+        async for chunk in stream_chat_impl(
+            session_id,
+            user_msg,
+            is_guidance,
+            model,
+            permission_mode,
+            attachments or [],
+            suppress_user_message=suppress_user_message,
+            process_factory=process_factory,
+            peer_request=peer_request,
+            queued_item_id=queued_item_id,
+            accepted_turn_id=accepted_turn_id,
+        ):
+            yield chunk
+
+
+CHAT_TRANSPORT = ChatTransport()
+AGENT_TRANSPORT = AgentTransport()
+
+
 async def stream_chat(
     session_id: str,
     user_msg: str,
@@ -2529,8 +4650,11 @@ async def stream_chat(
     permission_mode: str | None = None,
     attachments: list[dict[str, Any]] | None = None,
     suppress_user_message: bool = False,
+    peer_request: dict[str, str] | None = None,
+    accepted_turn_id: str = "",
 ):
     lock = session_lock(session_id)
+    agent_mode = False
     try:
         await asyncio.wait_for(lock.acquire(), timeout=6)
     except asyncio.TimeoutError:
@@ -2541,17 +4665,104 @@ async def stream_chat(
         yield sse({"type": "done"})
         return
     try:
-        async for chunk in stream_chat_impl(
-            session_id,
-            user_msg,
-            is_guidance,
-            model,
-            permission_mode,
-            attachments or [],
-            suppress_user_message=suppress_user_message,
-        ):
-            yield chunk
+        session = safe_session(session_id)
+        mode = normalize_session_mode(session.get("mode"))
+        if mode == "chat":
+            if is_guidance or attachments or permission_mode:
+                yield sse({
+                    "type": "error",
+                    "content": "Chat 只接受普通对话文本，不支持权限、附件、技能或 Agent 指令。",
+                })
+                yield sse({"type": "done"})
+                return
+            task = asyncio.current_task()
+            if task is not None:
+                _chat_tasks[session_id] = task
+                _active_runs[session_id] = {
+                    "kind": "chat",
+                    "task": task,
+                    "started": now_ts(),
+                    "cancel_requested": False,
+                }
+            try:
+                async for event in CHAT_TRANSPORT.stream(session_id, user_msg, model):
+                    yield sse(event)
+            finally:
+                _chat_tasks.pop(session_id, None)
+                _active_runs.pop(session_id, None)
+        else:
+            agent_mode = True
+            current_message = user_msg
+            current_model = model
+            current_permission = permission_mode
+            current_attachments = attachments or []
+            current_suppress = suppress_user_message
+            current_peer_request = peer_request
+            current_accepted_turn_id = str(accepted_turn_id or "")
+            queued_item: dict[str, Any] | None = None
+            while True:
+                saw_done = False
+                saw_error = False
+                runtime_started = False
+                async for chunk in AGENT_TRANSPORT.stream(
+                    session_id,
+                    current_message,
+                    is_guidance if queued_item is None else False,
+                    current_model,
+                    current_permission,
+                    current_attachments,
+                    suppress_user_message=current_suppress,
+                    peer_request=current_peer_request,
+                    queued_item_id=str(queued_item.get("id") or "") if queued_item else "",
+                    accepted_turn_id=current_accepted_turn_id,
+                ):
+                    for payload in sse_payloads(chunk):
+                        event_type = str(payload.get("type") or "")
+                        if event_type == "runtime_started":
+                            runtime_started = True
+                            if queued_item is not None:
+                                agent_queue_store().mark_started(session_id, str(queued_item.get("id") or ""))
+                                yield sse({
+                                    "type": "queue_removed",
+                                    "session_id": session_id,
+                                    "item_id": str(queued_item.get("id") or ""),
+                                })
+                        elif event_type == "error":
+                            saw_error = True
+                        elif event_type == "done":
+                            saw_done = True
+                    yield chunk
+
+                current_accepted_turn_id = ""
+
+                if queued_item is not None and not runtime_started:
+                    agent_queue_store().pause_dispatch(session_id, str(queued_item.get("id") or ""))
+                run_status = str(safe_session(session_id).get("last_run_status") or "")
+                if not saw_done or saw_error or run_status != "completed":
+                    break
+                token = agent_queue_store().authorize_drain(session_id, str(uuid.uuid4()), "done")
+                if not token:
+                    break
+                queued_item = agent_queue_store().claim_authorized(session_id, token)
+                if queued_item is None:
+                    break
+                yield sse({
+                    "type": "queue_dispatch",
+                    "session_id": session_id,
+                    "item": {
+                        key: copy.deepcopy(queued_item.get(key))
+                        for key in ("id", "text", "attachments", "model", "permission_mode", "status", "created_at")
+                    },
+                })
+                current_message = str(queued_item.get("text") or "")
+                current_model = str(queued_item.get("model") or model or "")
+                current_permission = str(queued_item.get("permission_mode") or permission_mode or "")
+                current_attachments = copy.deepcopy(queued_item.get("attachments") or [])
+                current_suppress = False
+                current_peer_request = None
     finally:
+        if agent_mode:
+            agent_queue_store().pause_pending(session_id)
         try:
             lock.release()
         except RuntimeError:
@@ -2589,6 +4800,7 @@ async def stream_custom_cli_impl(
         if attachments:
             user_message["attachments"] = attachment_message_items(attachments, session_id)
         session["messages"] = list(session.get("messages", [])) + [user_message]
+    session["last_run_status"] = "running"
     session["updated"] = now_ts()
     sessions[session_id] = session
     save_sessions_to_disk()
@@ -2597,9 +4809,9 @@ async def stream_custom_cli_impl(
     watched_file_roots = file_change_watch_roots(cwd)
     before_file_state = snapshot_watch_files(watched_file_roots)
     command = format_custom_command(command_template, cfg, session, selected_permission_mode)
-    stdin_prompt = build_generic_cli_prompt(session, prompt, attachments)
+    stdin_prompt = build_generic_cli_prompt(session, prompt, attachments, read_agent_instructions())
     assistant_text = ""
-    thinking_text = f"正在通过 {active_shell_label('custom-cli')} 处理请求...\n"
+    thinking_text = ""
     started = time.monotonic()
 
     yield sse({
@@ -2608,10 +4820,9 @@ async def stream_custom_cli_impl(
         "mode": "custom-cli",
         "permission_mode": selected_permission_mode,
     })
-    yield sse({"type": "thinking", "content": thinking_text})
-
     proc = None
     stderr_task = None
+    coordinator_run_id = ""
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
@@ -2657,9 +4868,13 @@ async def stream_custom_cli_impl(
         return_code = await proc.wait()
         stderr_text = await stderr_task if stderr_task else ""
         if _active_runs.get(session_id, {}).get("cancel_requested"):
+            session["last_run_status"] = "cancelled"
+            session["unread"] = True
             assistant_text = assistant_text or "已停止当前任务，输入已恢复。"
             yield sse({"type": "text", "content": assistant_text})
         elif return_code != 0:
+            session["last_run_status"] = "failed"
+            session["unread"] = True
             detail = stderr_text or f"Custom CLI exited with code {return_code}"
             yield sse({"type": "error", "content": detail[:3000]})
             assistant_text = assistant_text or f"错误：{detail}"
@@ -2667,20 +4882,27 @@ async def stream_custom_cli_impl(
             assistant_text = "任务已完成，但自定义 CLI 没有返回文本输出。"
             yield sse({"type": "text", "content": assistant_text})
 
-        changed_summary = changed_files_summary(before_file_state, watched_file_roots)
-        if changed_summary:
-            assistant_text += changed_summary
-            yield sse({"type": "text", "content": changed_summary})
+        if not session.get("last_run_status") or session.get("last_run_status") == "running":
+            session["last_run_status"] = "completed"
+        session["unread"] = True
+
+        changed_files = changed_watch_files(before_file_state, watched_file_roots)
+        artifact_segments = []
+        for path in changed_files:
+            artifact = {"type": "artifact", "path": path, "name": Path(path).name, "status": "success"}
+            image = local_artifact_image(path, watched_file_roots)
+            if image is not None:
+                artifact["image"] = image
+            artifact_segments.append(artifact)
+        for segment in artifact_segments:
+            yield sse(segment)
 
         session = safe_session(session_id)
         session.setdefault("messages", []).append({
             "role": "assistant",
             "content": assistant_text,
             "model": selected_model,
-            "segments": [
-                {"type": "thinking", "content": thinking_text, "elapsed_seconds": max(0, round(time.monotonic() - started))},
-                {"type": "text", "content": assistant_text},
-            ],
+            "segments": ([{"type": "text", "content": assistant_text}] if assistant_text else []) + artifact_segments,
             "elapsed_seconds": max(0, round(time.monotonic() - started)),
         })
         session["updated"] = now_ts()
@@ -2688,6 +4910,8 @@ async def stream_custom_cli_impl(
         save_sessions_to_disk()
         yield sse({"type": "done"})
     except Exception as exc:
+        session["last_run_status"] = "failed"
+        session["unread"] = True
         detail = f"Custom CLI failed: {exc}"
         yield sse({"type": "error", "content": detail})
         yield sse({"type": "done"})
@@ -2710,6 +4934,10 @@ async def stream_chat_impl(
     retry_session_in_use: bool = False,
     suppress_user_message: bool = False,
     stall_recovery_count: int = 0,
+    process_factory: Any = None,
+    peer_request: dict[str, str] | None = None,
+    queued_item_id: str = "",
+    accepted_turn_id: str = "",
 ):
     settings = load_app_settings()
     if is_custom_shell(settings.get("shell", {})):
@@ -2727,9 +4955,34 @@ async def stream_chat_impl(
 
     cfg = deepseek_config(model)
     if not cfg["api_key"]:
-        yield sse({"type": "error", "content": f"未找到 {cfg['label']} API key，请在设置里配置 API Key 或环境变量。"})
+        detail = f"未找到 {cfg['label']} API key，请在设置里配置 API Key 或环境变量。"
+        if accepted_turn_id:
+            finalize_accepted_agent_turn_failure(session_id, accepted_turn_id, detail, cfg["model"])
+        yield sse({"type": "error", "content": detail})
         yield sse({"type": "done"})
         return
+
+    runtime = WindowsNativeRuntime(claude_launcher(), process_factory=process_factory) if process_factory else agent_runtime()
+    if isinstance(runtime, WslAgentRuntime):
+        runtime_probe = runtime.probe()
+        if not runtime_probe.ready:
+            yield sse({
+                "type": "runtime_status",
+                "runtime": runtime_probe.as_dict(),
+            })
+            yield sse({
+                "type": "error",
+                "content": "Agent 需要先完成 ViniperRuntime（WSL2）运行时设置。Chat 仍可正常使用。",
+            })
+            if accepted_turn_id:
+                finalize_accepted_agent_turn_failure(
+                    session_id,
+                    accepted_turn_id,
+                    "Agent 需要先完成 ViniperRuntime（WSL2）运行时设置。Chat 仍可正常使用。",
+                    cfg["model"],
+                )
+            yield sse({"type": "done"})
+            return
 
     session = safe_session(session_id)
     selected_model = cfg["model"]
@@ -2739,6 +4992,15 @@ async def stream_chat_impl(
     if is_guidance:
         prompt = f"[GUIDANCE] {prompt}"
     display_prompt = prompt
+    if peer_request:
+        prompt = build_native_send_instruction(
+            str(peer_request.get("target_peer_name") or ""),
+            str(peer_request.get("message") or user_msg),
+        )
+        display_prompt = (
+            f"发送给 {str(peer_request.get('target_display_name') or peer_request.get('target_peer_name') or '目标会话')}："
+            f"{str(peer_request.get('message') or user_msg)}"
+        )
 
     resume_existing = bool(session.get("claude_initialized"))
     if resume_existing:
@@ -2746,47 +5008,48 @@ async def stream_chat_impl(
     else:
         claude_session_id = str(uuid.uuid4())
     session["claude_session_id"] = claude_session_id
-    if not suppress_user_message:
+    defer_queued_user = bool(queued_item_id and not suppress_user_message)
+    if not accepted_turn_id and not suppress_user_message and not defer_queued_user:
         user_message = {"role": "user", "content": display_prompt}
         if attachments:
             user_message["attachments"] = attachment_message_items(attachments, session_id)
         session["messages"] = list(session.get("messages", [])) + [user_message]
     else:
         session["messages"] = list(session.get("messages", []))
+    session["last_run_status"] = "running"
     session["updated"] = now_ts()
     sessions[session_id] = session
     save_sessions_to_disk()
 
     context_prompt = append_attachment_prompt(prompt, attachments)
 
-    session_args = ["--resume", claude_session_id] if resume_existing else ["--session-id", claude_session_id]
     fallback_model = "deepseek-v4-flash" if selected_model != "deepseek-v4-flash" else ""
-
-    command = [
-        *claude_launcher(),
-        "-p",
-        context_prompt,
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-        "--model",
-        selected_model,
-        *session_args,
-        "--permission-mode",
-        selected_permission_mode,
-        *add_dir_args(session, prompt, attachments),
-    ]
-    if fallback_model:
-        command.extend(["--fallback-model", fallback_model])
-    session_name = str(session.get("name") or "").strip()
-    if session_name:
-        command.extend(["--name", session_name])
-    system_append = build_system_append(session)
-    if system_append:
-        command.extend(["--append-system-prompt", system_append])
+    system_prompt_path = prepare_agent_system_prompt(session)
+    usage_run_id = str(uuid.uuid4())
+    host_channel, host_settings_path, host_mcp_config_path = prepare_agent_host_channel(
+        runtime, session_id, usage_run_id,
+    )
 
     cwd = existing_workdir(str(session.get("workdir") or ""))
+    run_spec = AgentRunSpec(
+        session_id=session_id,
+        claude_session_id=claude_session_id,
+        session_name=stable_session_name(str(session.get("name") or "session"), session_id),
+        workdir=str(cwd),
+        model=selected_model,
+        permission_mode=selected_permission_mode,
+        resume=resume_existing,
+        add_dirs=tuple(agent_add_dirs(session, prompt, attachments)),
+        fallback_model=fallback_model,
+        system_prompt_file=str(system_prompt_path),
+        settings_file=str(host_settings_path),
+        mcp_config_file=str(host_mcp_config_path) if host_mcp_config_path else "",
+        permission_prompt_tool=(
+            PERMISSION_PROMPT_MCP_QUALIFIED_TOOL if host_mcp_config_path is not None else ""
+        ),
+        environment=build_claude_env(cfg, session),
+        bridge_keys=runtime_bridge_keys(),
+    )
     watched_file_roots = file_change_watch_roots(cwd)
     before_file_state = snapshot_watch_files(watched_file_roots)
     assistant_text = ""
@@ -2810,9 +5073,26 @@ async def stream_chat_impl(
     assistant_message_index: int | None = None
     last_progress_save = 0.0
     finalized = False
+    coordinator_run_id = usage_run_id
+    interaction_protocol_failure = ""
     run_started_at: float | None = None
     active_thinking_started_at: float | None = None
     active_thinking_segment_index: int | None = None
+    fallback_question_tool_ids: set[str] = set()
+    published_interaction_ids: set[str] = set()
+    compatibility_interactions: dict[str, dict[str, Any]] = {}
+    fallback_input_closed = False
+
+    if accepted_turn_id:
+        for index in range(len(session.get("messages", [])) - 1, -1, -1):
+            message = session["messages"][index]
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and str(message.get("turn_id") or "") == str(accepted_turn_id)
+            ):
+                assistant_message_index = index
+                break
 
     def elapsed_seconds_since(started_at: float) -> int:
         return max(0, int(round(time.monotonic() - started_at)))
@@ -2853,6 +5133,38 @@ async def stream_chat_impl(
                 assistant_segments[active_thinking_segment_index]["elapsed_seconds"] = 0
             refresh_active_thinking_elapsed()
 
+    def append_thinking_image(image: dict[str, Any]) -> None:
+        nonlocal active_thinking_started_at, active_thinking_segment_index
+        if active_thinking_segment_index is None or active_thinking_segment_index >= len(assistant_segments):
+            assistant_segments.append({"type": "thinking", "content": "", "images": [], "elapsed_seconds": 0})
+            active_thinking_segment_index = len(assistant_segments) - 1
+            active_thinking_started_at = time.monotonic()
+        segment = assistant_segments[active_thinking_segment_index]
+        if segment.get("type") != "thinking":
+            return
+        images = segment.setdefault("images", [])
+        if isinstance(images, list):
+            images.append(copy.deepcopy(image))
+        refresh_active_thinking_elapsed()
+
+    def append_activity_segment(activity_type: str, **payload: Any) -> None:
+        segment = {"type": activity_type}
+        segment.update({key: value for key, value in payload.items() if value is not None})
+        assistant_segments.append(segment)
+
+    def close_fallback_stream_input() -> None:
+        nonlocal fallback_input_closed
+        if fallback_input_closed or proc is None or proc.stdin is None:
+            return
+        fallback_input_closed = True
+        try:
+            if proc.stdin.can_write_eof():
+                proc.stdin.write_eof()
+            else:
+                proc.stdin.close()
+        except (AttributeError, NotImplementedError, RuntimeError):
+            proc.stdin.close()
+
     def ensure_assistant_message() -> dict[str, Any]:
         nonlocal assistant_message_index
         if (
@@ -2875,7 +5187,7 @@ async def stream_chat_impl(
         message = ensure_assistant_message()
         message["content"] = assistant_text
         message["model"] = selected_model
-        message["segments"] = assistant_segments
+        message["segments"] = copy.deepcopy(assistant_segments)
         message["elapsed_seconds"] = total_elapsed_seconds()
         if thinking_text:
             message["thinking"] = thinking_text
@@ -2884,7 +5196,7 @@ async def stream_chat_impl(
         sessions[session_id] = session
         save_sessions_to_disk()
 
-    def finalize_assistant(content: str | None = None, thinking: str | None = None) -> None:
+    def finalize_assistant(content: str | None = None, thinking: str | None = None, status: str | None = None) -> None:
         nonlocal finalized
         close_active_thinking()
         if content is not None and content != assistant_text and not assistant_segments:
@@ -2892,12 +5204,12 @@ async def stream_chat_impl(
         message = ensure_assistant_message()
         message["content"] = assistant_text if content is None else content
         message["model"] = selected_model
-        message["segments"] = assistant_segments
+        message["segments"] = finalize_transcript_segments(assistant_segments)
         message["elapsed_seconds"] = total_elapsed_seconds()
-        final_thinking = thinking_text if thinking is None else thinking
-        if final_thinking:
-            message["thinking"] = final_thinking
+        message.pop("thinking", None)
         message.pop("pending", None)
+        session["last_run_status"] = status or ("failed" if str(content or "").startswith("错误：") else "completed")
+        session["unread"] = True
         session["updated"] = now_ts()
         sessions[session_id] = session
         save_sessions_to_disk()
@@ -2909,24 +5221,84 @@ async def stream_chat_impl(
         "mode": "claude-code-cli",
         "permission_mode": selected_permission_mode,
     })
-    thinking_text = "正在通过 Claude Code 分析请求...\n"
-    append_assistant_segment("thinking", thinking_text)
-    save_assistant_progress(force=True)
-    yield sse({"type": "thinking", "content": thinking_text})
+    if not defer_queued_user:
+        save_assistant_progress(force=True)
 
     proc = None
     stderr_task = None
     try:
-        await kill_orphaned_claude_session(claude_session_id)
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=str(cwd),
-            env=build_claude_env(cfg),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        run_info = {"pid": proc.pid, "started": now_ts(), "prompt": prompt, "cancel_requested": False}
+        cleanup_stale = getattr(runtime, "cleanup_stale", None)
+        if cleanup_stale is not None:
+            await cleanup_stale(run_spec)
+        proc = await runtime.spawn_session(run_spec)
+        process_identity = proc.process_identity
+        coordinator_snapshot = coordinated_run_snapshot(session_id) or {}
+        coordinator_run_id = str(coordinator_snapshot.get("run_id") or usage_run_id)
+        if isinstance(runtime, WslAgentRuntime):
+            runtime_identity = None
+            for _attempt in range(20):
+                runtime_identity = await asyncio.to_thread(runtime.inspect_session_identity, proc.session_key)
+                if runtime_identity:
+                    break
+                await asyncio.sleep(0.025)
+            if runtime_identity:
+                agent_run_journal().begin({
+                    "session_id": session_id,
+                    "coordinator_run_id": coordinator_run_id,
+                    "owner_pid": os.getpid(),
+                    "runtime": "wsl2",
+                    "session_key": proc.session_key,
+                    "process_identity": process_identity,
+                    "runtime_pid": int(runtime_identity.get("runtime_pid") or 0),
+                    "runtime_pgid": int(runtime_identity.get("runtime_pgid") or 0),
+                    "host_channel": str(host_channel.root),
+                    "started_at": now_ts(),
+                })
+        run_info = {
+            "kind": "agent",
+            "pid": proc.pid,
+            "started": now_ts(),
+            "prompt": prompt,
+            "cancel_requested": False,
+            "stdin": proc.stdin,
+            "process_identity": process_identity,
+            "pending_interaction": None,
+            "awaiting_interaction_ack": None,
+            "runtime": runtime,
+            "runtime_process": proc,
+            "claude_session_id": claude_session_id,
+            "peer_name": run_spec.session_name,
+            "display_name": str(session.get("name") or run_spec.session_name),
+            "peer_capability": None,
+            "usage_run_id": usage_run_id,
+            "model": selected_model,
+            "permission_mode": selected_permission_mode,
+            "host_channel": host_channel,
+            # Managed WSL uses one run-private MCP permission prompt owner.
+            # Native migration/test adapters retain legacy stdout fixtures.
+            "host_hooks_enabled": isinstance(runtime, WslAgentRuntime),
+            "published_interaction_ids": published_interaction_ids,
+            "session_record": session,
+        }
         _active_runs[session_id] = run_info
+        if defer_queued_user:
+            user_message = {"role": "user", "content": display_prompt}
+            if attachments:
+                user_message["attachments"] = attachment_message_items(attachments, session_id)
+            session["messages"] = list(session.get("messages", [])) + [user_message]
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            save_assistant_progress(force=True)
+        yield sse({"type": "runtime_started", "session_id": session_id, "run_id": usage_run_id})
+        if proc.stdin is None:
+            raise RuntimeError("Claude Code stream-json stdin is unavailable")
+        await active_agent_input_channel.write(
+            session_id,
+            run_info,
+            build_stream_json_user_envelope(context_prompt, claude_session_id),
+            process_identity=process_identity,
+        )
         stderr_task = asyncio.create_task(read_stderr(proc))
 
         assert proc.stdout is not None
@@ -2935,27 +5307,133 @@ async def stream_chat_impl(
         started = run_started_at
         last_heartbeat = started
         last_process_output = started
+        published_ack_stage = ""
         while True:
+            for host_request in host_channel.pending():
+                interaction = agent_interaction_broker.create_host_request(
+                    session_id,
+                    process_identity,
+                    host_request,
+                    host_channel,
+                    workdir=str(cwd),
+                    run=run_info,
+                )
+                if interaction is None:
+                    yield sse({
+                        "type": "error",
+                        "content": "底层 CLI 返回了无法安全匹配的宿主交互请求，未自动允许。",
+                    })
+                    continue
+                interaction_id = str(interaction.get("request_id") or "")
+                agent_run_journal().mark_interaction(
+                    session_id,
+                    kind=str(interaction.get("kind") or ""),
+                    request_id=interaction_id,
+                )
+                compatibility_interactions.pop(interaction_id, None)
+                if interaction_id in published_interaction_ids:
+                    continue
+                if active_thinking_started_at is not None:
+                    close_active_thinking()
+                    yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                published_interaction_ids.add(interaction_id)
+                if interaction.get("kind") == "question":
+                    fallback_question_tool_ids.add(interaction_id)
+                run_info["pending_interaction"] = interaction_id
+                run_info["awaiting_interaction_ack"] = None
+                waiting_for = "interaction"
+                yield sse(interaction)
+            compatibility_now = time.monotonic()
+            for compatibility_id, candidate in list(compatibility_interactions.items()):
+                if compatibility_id in published_interaction_ids:
+                    compatibility_interactions.pop(compatibility_id, None)
+                    continue
+                if compatibility_now - float(candidate.get("observed_at") or compatibility_now) < HOST_HOOK_COMPATIBILITY_GRACE_SECONDS:
+                    continue
+                compatibility_interactions.pop(compatibility_id, None)
+                if run_info.get("host_hooks_enabled"):
+                    interaction_protocol_failure = "interaction_owner_request_missing"
+                    await runtime.cancel(session_id)
+                    break
+                interaction = agent_interaction_broker.create_request(
+                    session_id,
+                    process_identity,
+                    candidate.get("payload"),
+                    stdin=proc.stdin,
+                    workdir=str(cwd),
+                    run=run_info,
+                )
+                if interaction is None:
+                    yield sse({
+                        "type": "error",
+                        "content": "底层 CLI 返回了无法安全匹配的兼容交互请求，未自动允许。",
+                    })
+                    continue
+                interaction_id = str(interaction.get("request_id") or "")
+                if active_thinking_started_at is not None:
+                    close_active_thinking()
+                    yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                published_interaction_ids.add(interaction_id)
+                if interaction.get("kind") == "question":
+                    fallback_question_tool_ids.add(interaction_id)
+                interaction["session_id"] = session_id
+                run_info["pending_interaction"] = interaction_id
+                run_info["awaiting_interaction_ack"] = None
+                waiting_for = "interaction"
+                yield sse(interaction)
+            if interaction_protocol_failure:
+                break
+            ack_status = agent_interaction_broker.ack_status_for(session_id)
+            if ack_status and str(ack_status.get("state") or "") == "awaiting_cli_ack":
+                run_info["pending_interaction"] = None
+                run_info["awaiting_interaction_ack"] = str(ack_status.get("request_id") or "")
+                waiting_for = "awaiting_cli_ack"
+                ack_stage = str(ack_status.get("stage") or "response_committed")
+                if ack_stage != published_ack_stage:
+                    published_ack_stage = ack_stage
+                    yield sse({
+                        "type": "interaction_ack",
+                        "request_id": str(ack_status.get("request_id") or ""),
+                        "status": "awaiting_cli_ack",
+                        "stage": ack_stage,
+                    })
             elapsed = time.monotonic() - started
             remaining = RUN_TIMEOUT_SECONDS - elapsed if RUN_TIMEOUT_SECONDS > 0 else None
             if remaining is not None and remaining <= 0:
                 timed_out = True
-                await kill_process_tree(proc.pid)
+                await runtime.cancel(session_id)
                 break
             try:
-                read_timeout = 10 if remaining is None else min(10, remaining)
+                read_timeout = 0.2 if remaining is None else min(0.2, remaining)
                 raw_line = await stdout_reader.readline(read_timeout)
             except asyncio.TimeoutError:
                 now = time.monotonic()
+                expired_acks = agent_interaction_broker.expire_unacknowledged(
+                    now=time.time(),
+                    timeout_seconds=CLI_INTERACTION_ACK_TIMEOUT_SECONDS,
+                )
+                expired_ack = next((item for item in expired_acks if item.get("session_id") == session_id), None)
+                if expired_ack is not None:
+                    interaction_protocol_failure = str(expired_ack.get("reason") or "cli_ack_timeout")
+                    no_output_timeout = True
+                    no_output_stage = "awaiting_cli_ack"
+                    await agent_run_coordinator().acknowledge_interaction(
+                        session_id,
+                        str(expired_ack.get("request_id") or ""),
+                        success=False,
+                    )
+                    await runtime.cancel(session_id)
+                    break
                 if (
                     SAFETY_GUARDS_ENABLED
                     and
                     action_task
+                    and waiting_for != "interaction"
                     and ACTION_TASK_IDLE_TIMEOUT_SECONDS > 0
                     and now - last_process_output >= ACTION_TASK_IDLE_TIMEOUT_SECONDS
                 ):
                     action_idle_timeout = True
-                    await kill_process_tree(proc.pid)
+                    await runtime.cancel(session_id)
                     break
                 if (
                     waiting_for == "model"
@@ -2964,12 +5442,16 @@ async def stream_chat_impl(
                 ):
                     no_output_timeout = True
                     no_output_stage = "model"
-                    await kill_process_tree(proc.pid)
+                    await runtime.cancel(session_id)
                     break
-                if NO_OUTPUT_TIMEOUT_SECONDS > 0 and now - last_process_output >= NO_OUTPUT_TIMEOUT_SECONDS:
+                if (
+                    waiting_for != "interaction"
+                    and NO_OUTPUT_TIMEOUT_SECONDS > 0
+                    and now - last_process_output >= NO_OUTPUT_TIMEOUT_SECONDS
+                ):
                     no_output_timeout = True
                     no_output_stage = waiting_for
-                    await kill_process_tree(proc.pid)
+                    await runtime.cancel(session_id)
                     break
                 if (
                     SAFETY_GUARDS_ENABLED
@@ -2979,7 +5461,7 @@ async def stream_chat_impl(
                     and now - external_gui_started >= GUI_COMMAND_TIMEOUT_SECONDS
                 ):
                     external_gui_timeout = True
-                    await kill_process_tree(proc.pid)
+                    await runtime.cancel(session_id)
                     break
                 if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
                     yield sse({
@@ -3013,22 +5495,164 @@ async def stream_chat_impl(
                 yield sse({"type": "text", "content": text})
                 continue
 
+            daily_usage_ledger().record_event(usage_run_id, session_id, data)
+            usage_snapshot = context_usage_ledger().update_from_event(
+                session_id,
+                data,
+                model=selected_model,
+                fallback_limit=context_limit_for_model(selected_model),
+            )
+            if usage_snapshot is not None:
+                yield sse({"type": "usage", "usage": usage_snapshot.as_dict()})
+
             event_type = data.get("type")
+            if event_type == "system" and str(data.get("subtype") or "") == "compact_boundary":
+                compacting_snapshot = context_usage_ledger().mark_compact_boundary(
+                    session_id,
+                    data,
+                    model=selected_model,
+                    fallback_limit=context_limit_for_model(selected_model),
+                )
+                yield sse({
+                    "type": "compact_boundary",
+                    "session_id": session_id,
+                    "run_id": usage_run_id,
+                    "trigger": str(data.get("trigger") or "auto"),
+                    "pre_tokens": int(data.get("pre_tokens") or 0),
+                    "usage": compacting_snapshot.as_dict(),
+                })
+                continue
+            if event_type == "system" and str(data.get("subtype") or "") == "init":
+                cli_version = str(data.get("claude_code_version") or runtime.runtime_version())
+                runtime_capabilities = runtime.capabilities()
+                peer_capability = _native_peer_messaging.observe_init(
+                    session_id,
+                    cli_version,
+                    data,
+                    registry_supported=False,
+                )
+                run_info["peer_capability"] = peer_capability.as_dict()
+                yield sse({"type": "peer_capability", "peer": peer_capability.as_dict()})
+                continue
+
+            if event_type == "system" and str(data.get("subtype") or "") == "permission_denied":
+                try:
+                    denied_projection = project_permission_denied_event(
+                        data,
+                        session_id=session_id,
+                        run_id=usage_run_id,
+                    )
+                except ValueError:
+                    denied_projection = {
+                        "type": "tool_result",
+                        "tool_id": str(data.get("tool_use_id") or ""),
+                        "tool_use_id": str(data.get("tool_use_id") or ""),
+                        "status": "失败",
+                        "content": clean_stream_text(str(
+                            data.get("message") or data.get("decision_reason") or "权限请求已被拒绝"
+                        )),
+                        "permission_denied": True,
+                        "is_error": True,
+                    }
+                append_activity_segment(
+                    "tool_result",
+                    tool_id=str(denied_projection.get("tool_id") or ""),
+                    status="失败",
+                    content=str(denied_projection.get("content") or ""),
+                )
+                save_assistant_progress()
+                yield sse(denied_projection)
+                continue
+
+            peer_events = [
+                decorate_peer_event(item)
+                for item in (_native_peer_messaging.observe_event(session_id, data) or [])
+            ]
+            peer_tool_ids = {
+                str(item.get("tool_id") or "")
+                for item in peer_events
+                if str(item.get("tool_id") or "")
+            }
+            if peer_events:
+                if active_thinking_started_at is not None:
+                    close_active_thinking()
+                    yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                for peer_event in peer_events:
+                    append_activity_segment(
+                        str(peer_event.get("type") or "peer_event"),
+                        **{key: value for key, value in peer_event.items() if key != "type"},
+                    )
+                    yield sse(peer_event)
+                save_assistant_progress()
+
+            if str(event_type or "").strip().lower() == "control_request":
+                if run_info.get("host_hooks_enabled"):
+                    normalized_compatibility = normalize_control_request(data)
+                    if normalized_compatibility is None:
+                        yield sse({
+                            "type": "error",
+                            "content": "底层 CLI 返回了无法识别的结构化交互请求，未自动允许。",
+                        })
+                        continue
+                    compatibility_id = str(normalized_compatibility.get("request_id") or "")
+                    compatibility_interactions.setdefault(compatibility_id, {
+                        "payload": copy.deepcopy(data),
+                        "observed_at": time.monotonic(),
+                    })
+                    continue
+                interaction = agent_interaction_broker.create_request(
+                    session_id,
+                    process_identity,
+                    data,
+                    stdin=proc.stdin,
+                    workdir=str(cwd),
+                    run=run_info,
+                )
+                if interaction is None:
+                    yield sse({
+                        "type": "error",
+                        "content": "底层 CLI 返回了无法识别的结构化交互请求，未自动允许。",
+                    })
+                    continue
+                interaction_id = str(interaction.get("request_id") or "")
+                if interaction_id in published_interaction_ids:
+                    continue
+                if active_thinking_started_at is not None:
+                    close_active_thinking()
+                    yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                published_interaction_ids.add(interaction_id)
+                if interaction.get("kind") == "question":
+                    fallback_question_tool_ids.add(interaction_id)
+                interaction["session_id"] = session_id
+                run_info["pending_interaction"] = interaction_id
+                run_info["awaiting_interaction_ack"] = None
+                waiting_for = "interaction"
+                yield sse(interaction)
+                continue
+
             if event_type == "stream_event":
                 waiting_for = "model"
                 event = data.get("event") if isinstance(data.get("event"), dict) else {}
                 if event.get("type") == "content_block_delta":
                     delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                    fallback_question_pending = bool(run_info.get("pending_interaction"))
                     if delta.get("type") == "thinking_delta":
                         text = clean_stream_text(str(delta.get("thinking") or ""))
-                        if text:
+                        if text and not fallback_question_pending:
+                            if active_thinking_started_at is None:
+                                yield sse({"type": "thinking_start", "elapsed": 0})
                             thinking_text += text
                             append_assistant_segment("thinking", text)
                             save_assistant_progress()
                             yield sse({"type": "thinking", "content": text})
                     elif delta.get("type") == "text_delta":
                         text = clean_stream_text(str(delta.get("text") or ""))
+                        if fallback_question_pending:
+                            continue
                         assistant_text += text
+                        if active_thinking_started_at is not None:
+                            close_active_thinking()
+                            yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
                         append_assistant_segment("text", text)
                         save_assistant_progress()
                         yield sse({"type": "text", "content": text})
@@ -3042,26 +5666,129 @@ async def stream_chat_impl(
                     for block in content:
                         if not isinstance(block, dict):
                             continue
-                        if block.get("type") == "text":
+                        if block.get("type") == "thinking":
+                            full_thinking = clean_stream_text(str(block.get("thinking") or ""))
+                            if full_thinking and full_thinking != thinking_text:
+                                if full_thinking.startswith(thinking_text):
+                                    delta = full_thinking[len(thinking_text):]
+                                elif full_thinking not in thinking_text:
+                                    delta = ("\n" if thinking_text else "") + full_thinking
+                                else:
+                                    delta = ""
+                                if delta:
+                                    if active_thinking_started_at is None:
+                                        yield sse({"type": "thinking_start", "elapsed": 0})
+                                    thinking_text += delta
+                                    append_assistant_segment("thinking", delta)
+                                    save_assistant_progress()
+                                    yield sse({"type": "thinking", "content": delta})
+                        elif block.get("type") == "text":
                             full_text = clean_stream_text(str(block.get("text") or ""))
+                            if str(run_info.get("pending_interaction") or "") in fallback_question_tool_ids:
+                                continue
                             if full_text and full_text not in assistant_text:
                                 if full_text.startswith(assistant_text):
                                     delta = full_text[len(assistant_text):]
                                 else:
                                     delta = ("\n" if assistant_text else "") + full_text
                                 if delta:
+                                    if active_thinking_started_at is not None:
+                                        close_active_thinking()
+                                        yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
                                     assistant_text += delta
                                     append_assistant_segment("text", delta)
                                     save_assistant_progress()
                                     yield sse({"type": "text", "content": delta})
+                        elif block.get("type") == "image":
+                            image = normalize_image_block(block, alt=str(block.get("alt") or "Claude 输出图片"))
+                            if image is not None:
+                                if active_thinking_started_at is not None:
+                                    append_thinking_image(image)
+                                    outbound_image = {**image, "scope": "thinking"}
+                                else:
+                                    append_activity_segment("image", **{key: value for key, value in image.items() if key != "type"})
+                                    outbound_image = image
+                                save_assistant_progress()
+                                yield sse(outbound_image)
                         elif block.get("type") == "tool_use":
                             saw_tool_use = True
+                            if active_thinking_started_at is not None:
+                                close_active_thinking()
+                                yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
                             command_text = tool_command(block)
-                            text = tool_use_text(block)
-                            thinking_text += text
-                            append_assistant_segment("thinking", text)
+                            tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                            tool_id = str(block.get("id") or uuid.uuid4())
+                            tool_name = str(block.get("name") or "tool")
+                            if tool_name == "SendMessage" and tool_id in peer_tool_ids:
+                                continue
+                            if tool_name.casefold() == "askuserquestion" and isinstance(tool_input.get("questions"), list):
+                                if tool_id in published_interaction_ids:
+                                    fallback_question_tool_ids.add(tool_id)
+                                    continue
+                                if run_info.get("host_hooks_enabled"):
+                                    fallback_question_tool_ids.add(tool_id)
+                                    compatibility_interactions.setdefault(tool_id, {
+                                        "payload": {
+                                            "type": "tool_start",
+                                            "tool_id": tool_id,
+                                            "name": tool_name,
+                                            "input": copy.deepcopy(tool_input),
+                                        },
+                                        "observed_at": time.monotonic(),
+                                    })
+                                    continue
+                                interaction = agent_interaction_broker.create_request(
+                                    session_id,
+                                    process_identity,
+                                    {
+                                        "type": "tool_start",
+                                        "tool_id": tool_id,
+                                        "name": tool_name,
+                                        "input": tool_input,
+                                    },
+                                    stdin=proc.stdin,
+                                    workdir=str(cwd),
+                                    run=run_info,
+                                )
+                                if interaction is None:
+                                    yield sse({
+                                        "type": "error",
+                                        "content": "底层 CLI 返回了无法识别的问题请求，未自动继续。",
+                                    })
+                                    continue
+                                if tool_id not in published_interaction_ids:
+                                    if active_thinking_started_at is not None:
+                                        close_active_thinking()
+                                        yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                                    fallback_question_tool_ids.add(tool_id)
+                                    published_interaction_ids.add(tool_id)
+                                    interaction["session_id"] = session_id
+                                    run_info["pending_interaction"] = tool_id
+                                    run_info["awaiting_interaction_ack"] = None
+                                    waiting_for = "interaction"
+                                    yield sse(interaction)
+                                continue
+                            summary = clean_stream_text(" ".join(
+                                str(part) for part in (
+                                    tool_input.get("description") or "",
+                                    command_text or tool_input.get("file_path") or tool_input.get("path") or "",
+                                ) if part
+                            ))
+                            append_activity_segment(
+                                "tool_start",
+                                tool_id=tool_id,
+                                name=tool_name,
+                                summary=summary,
+                                status="running",
+                            )
                             save_assistant_progress()
-                            yield sse({"type": "thinking", "content": text})
+                            yield sse({
+                                "type": "tool_start",
+                                "tool_id": tool_id,
+                                "name": tool_name,
+                                "summary": summary,
+                                "status": "running",
+                            })
                             if SAFETY_GUARDS_ENABLED:
                                 if is_external_gui_command(command_text):
                                     external_gui_command = command_text
@@ -3069,25 +5796,96 @@ async def stream_chat_impl(
                                 if is_browser_open_command(command_text):
                                     if browser_open_seen:
                                         duplicate_open_command = command_text
-                                        await kill_process_tree(proc.pid)
+                                        await runtime.cancel(session_id)
                                         break
                                     browser_open_seen = True
                                 if is_foreground_server_command(command_text):
                                     blocked_command = command_text
-                                    await kill_process_tree(proc.pid)
+                                    await runtime.cancel(session_id)
                                     break
-                    waiting_for = "tool" if saw_tool_use else "model"
+                    waiting_for = "interaction" if run_info.get("pending_interaction") else ("tool" if saw_tool_use else "model")
                 continue
 
             if event_type == "user":
                 waiting_for = "model"
                 message = data.get("message") if isinstance(data.get("message"), dict) else {}
-                text = tool_result_text(message)
-                if text:
-                    thinking_text += text
-                    append_assistant_segment("thinking", text)
-                    save_assistant_progress()
-                    yield sse({"type": "thinking", "content": text})
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        tool_result_id = str(block.get("tool_use_id") or "")
+                        interaction_ack = agent_interaction_broker.confirm_cli_tool_result(
+                            session_id,
+                            tool_result_id,
+                            success=not bool(block.get("is_error")),
+                        )
+                        if interaction_ack is not None:
+                            accepted = bool(interaction_ack.get("accepted"))
+                            await agent_run_coordinator().acknowledge_interaction(
+                                session_id,
+                                tool_result_id,
+                                success=accepted,
+                            )
+                            yield sse({
+                                "type": "interaction_ack",
+                                "request_id": tool_result_id,
+                                "status": "accepted" if accepted else "failed",
+                                "stage": "cli_tool_result",
+                            })
+                            waiting_for = "model" if accepted else "done"
+                            if not accepted:
+                                interaction_protocol_failure = str(interaction_ack.get("reason") or "cli_ack_failed")
+                                yield sse({
+                                    "type": "error",
+                                    "content": "底层 CLI 未确认本次交互结果，任务已安全停止。",
+                                })
+                                await runtime.cancel(session_id)
+                                break
+                        if tool_result_id in peer_tool_ids:
+                            continue
+                        if tool_result_id in fallback_question_tool_ids:
+                            continue
+                        raw = block.get("content") or ""
+                        result_images: list[dict[str, Any]] = []
+                        if isinstance(raw, list):
+                            text_items: list[str] = []
+                            for item in raw:
+                                if not isinstance(item, dict):
+                                    continue
+                                image = normalize_image_block(item, alt="工具输出图片")
+                                if image is not None:
+                                    result_images.append(image)
+                                elif item.get("type") == "text":
+                                    text_items.append(str(item.get("text") or ""))
+                            raw = "\n".join(text_items)
+                        elif isinstance(raw, dict):
+                            image = normalize_image_block(raw, alt="工具输出图片")
+                            result_images = [image] if image is not None else []
+                            raw = ""
+                        detail = clean_stream_text(str(raw).strip())
+                        if len(detail) > TOOL_RESULT_DISPLAY_LIMIT:
+                            detail = detail[:TOOL_RESULT_DISPLAY_LIMIT] + "\n...[工具输出过长，显示已截断]"
+                        status = "失败" if block.get("is_error") else "完成"
+                        append_activity_segment(
+                            "tool_result",
+                            tool_id=tool_result_id,
+                            status=status,
+                            content=detail,
+                            images=result_images,
+                        )
+                        save_assistant_progress()
+                        yield sse({
+                            "type": "tool_result",
+                            "tool_id": tool_result_id,
+                            "status": status,
+                            "content": detail,
+                            "images": result_images,
+                        })
+                if interaction_protocol_failure:
+                    break
+                if isinstance(content, list) and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content):
+                    waiting_for = "model"
                 if external_gui_command:
                     external_gui_command = ""
                     external_gui_started = 0.0
@@ -3098,16 +5896,54 @@ async def stream_chat_impl(
                 final_result = clean_stream_text(str(data.get("result") or ""))
                 if data.get("is_error"):
                     error_text = final_result or clean_stream_text(str(data))
+                    if str(run_info.get("pending_interaction") or "") in fallback_question_tool_ids:
+                        final_result = ""
+                        continue
                     final_result = error_text
                     if not (
                         (is_missing_claude_session_error(error_text) and not retry_missing_session)
                         or (is_claude_session_in_use_error(error_text) and not retry_session_in_use)
                     ):
                         yield sse({"type": "error", "content": error_text})
+                if not run_info.get("pending_interaction"):
+                    close_fallback_stream_input()
                 continue
 
+        if active_thinking_started_at is not None:
+            close_active_thinking()
+            yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
         return_code = await proc.wait()
+        mark_finished = getattr(runtime, "mark_finished", None)
+        if mark_finished is not None:
+            mark_finished(session_id, proc)
         stderr_text = await stderr_task
+        unsettled_at_exit = agent_interaction_broker.unsettled_for(session_id)
+        if unsettled_at_exit and not interaction_protocol_failure:
+            ack = agent_interaction_broker.ack_status_for(session_id) or {}
+            interaction_protocol_failure = "process_exited_before_cli_ack"
+            await agent_run_coordinator().acknowledge_interaction(
+                session_id,
+                str(ack.get("request_id") or run_info.get("pending_interaction") or ""),
+                success=False,
+            )
+        agent_interaction_broker.invalidate(session_id, reason="process-exited")
+        if _active_runs.get(session_id) is not None:
+            _active_runs[session_id]["pending_interaction"] = None
+            _active_runs[session_id]["awaiting_interaction_ack"] = None
+
+        if interaction_protocol_failure and not no_output_timeout:
+            detail = (
+                "官方交互入口未接管底层结构化交互，任务已安全停止并恢复输入。"
+                if interaction_protocol_failure == "interaction_owner_request_missing"
+                else "底层 CLI 未完成本次交互确认，任务已安全停止并恢复输入。"
+            )
+            yield sse({"type": "error", "content": detail})
+            finalize_assistant(f"错误：{detail}")
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
 
         if external_gui_timeout:
             detail = (
@@ -3146,18 +5982,12 @@ async def stream_chat_impl(
             return
 
         if no_output_timeout:
-            if no_output_stage == "model" and stall_recovery_count < MODEL_STALL_RECOVERY_ATTEMPTS:
+            if no_output_stage == "model" and stall_recovery_count < MODEL_STALL_RECOVERY_ATTEMPTS and not peer_request:
                 detail = (
                     f"底层 Claude Code 在等待模型/API 响应时连续 {MODEL_IDLE_TIMEOUT_SECONDS} 秒没有输出。"
                     "这不是本地工具还在执行，而是模型请求无响应；我已停止该进程，并用同一个 Claude Code 会话自动恢复一次。"
                 )
-                thinking_text += f"\n{detail}\n"
-                append_assistant_segment("thinking", f"\n{detail}\n")
-                yield sse({"type": "thinking", "content": f"\n{detail}\n"})
-                if not assistant_text:
-                    assistant_text = "正在恢复底层 Claude Code 会话，请稍等。"
-                    append_assistant_segment("text", assistant_text)
-                    yield sse({"type": "text", "content": assistant_text})
+                yield sse({"type": "working_status", "content": "正在恢复底层 Claude Code 会话…", "detail": detail})
                 finalize_assistant()
                 session["updated"] = now_ts()
                 session["claude_initialized"] = True
@@ -3184,13 +6014,19 @@ async def stream_chat_impl(
                     yield chunk
                 return
 
-            detail = (
-                f"Claude Code 已连续 {MODEL_IDLE_TIMEOUT_SECONDS if no_output_stage == 'model' else NO_OUTPUT_TIMEOUT_SECONDS} 秒没有任何输出，"
-                "我已自动停止这次任务并恢复输入。"
-                f"最后等待阶段：{no_output_stage or 'unknown'}。"
-                "这通常表示底层模型请求、网络连接或外部工具进入了无响应状态；"
-                "已完成的文件会保留，你可以缩小任务范围后继续。"
-            )
+            if no_output_stage == "awaiting_cli_ack":
+                detail = (
+                    "底层 CLI 在收到交互回答后没有返回匹配的工具结果，"
+                    "本次任务已安全停止并恢复输入。"
+                )
+            else:
+                detail = (
+                    f"Claude Code 已连续 {MODEL_IDLE_TIMEOUT_SECONDS if no_output_stage == 'model' else NO_OUTPUT_TIMEOUT_SECONDS} 秒没有任何输出，"
+                    "我已自动停止这次任务并恢复输入。"
+                    f"最后等待阶段：{no_output_stage or 'unknown'}。"
+                    "这通常表示底层模型请求、网络连接或外部工具进入了无响应状态；"
+                    "已完成的文件会保留，你可以缩小任务范围后继续。"
+                )
             yield sse({"type": "error", "content": detail})
             finalize_assistant(f"错误：{detail}")
             session["updated"] = now_ts()
@@ -3244,7 +6080,7 @@ async def stream_chat_impl(
             assistant_text = "已停止当前任务，输入已恢复。"
             append_assistant_segment("text", assistant_text)
             yield sse({"type": "text", "content": assistant_text})
-            finalize_assistant(assistant_text)
+            finalize_assistant(assistant_text, status="cancelled")
             session["updated"] = now_ts()
             sessions[session_id] = session
             save_sessions_to_disk()
@@ -3253,7 +6089,7 @@ async def stream_chat_impl(
 
         if return_code != 0:
             detail = stderr_text or final_result or f"claude exited with code {return_code}"
-            if is_claude_session_in_use_error(detail) and not retry_session_in_use:
+            if is_claude_session_in_use_error(detail) and not retry_session_in_use and not peer_request:
                 remove_last_attempt_messages(session, display_prompt)
                 was_initialized = bool(session.get("claude_initialized"))
                 if not was_initialized:
@@ -3262,11 +6098,13 @@ async def stream_chat_impl(
                 session["updated"] = now_ts()
                 sessions[session_id] = session
                 save_sessions_to_disk()
-                await kill_orphaned_claude_session(claude_session_id)
+                cleanup_stale = getattr(runtime, "cleanup_stale", None)
+                if cleanup_stale is not None:
+                    await cleanup_stale(run_spec)
                 await asyncio.sleep(2 if not was_initialized else 5)
                 yield sse({
-                    "type": "thinking",
-                    "content": "\n底层 Claude Code 会话锁仍被占用，已清理残留进程并自动重试当前消息...\n",
+                    "type": "working_status",
+                    "content": "底层 Claude Code 会话锁仍被占用，正在清理并重试…",
                 })
                 async for chunk in stream_chat_impl(
                     session_id,
@@ -3281,7 +6119,7 @@ async def stream_chat_impl(
                     yield chunk
                 return
 
-            if is_missing_claude_session_error(detail) and not retry_missing_session:
+            if is_missing_claude_session_error(detail) and not retry_missing_session and not peer_request:
                 remove_last_attempt_messages(session, display_prompt)
                 session["claude_session_id"] = str(uuid.uuid4())
                 session["claude_initialized"] = False
@@ -3289,8 +6127,8 @@ async def stream_chat_impl(
                 sessions[session_id] = session
                 save_sessions_to_disk()
                 yield sse({
-                    "type": "thinking",
-                    "content": "\n底层 Claude Code 会话已失效，正在重建会话并重试当前消息...\n",
+                    "type": "working_status",
+                    "content": "底层 Claude Code 会话已失效，正在重建并重试…",
                 })
                 async for chunk in stream_chat_impl(
                     session_id,
@@ -3314,11 +6152,13 @@ async def stream_chat_impl(
             append_assistant_segment("text", final_result)
             yield sse({"type": "text", "content": final_result})
 
-        changed_summary = changed_files_summary(before_file_state, watched_file_roots)
-        if changed_summary:
-            assistant_text += changed_summary
-            append_assistant_segment("text", changed_summary)
-            yield sse({"type": "text", "content": changed_summary})
+        for path in changed_watch_files(before_file_state, watched_file_roots):
+            artifact = {"type": "artifact", "path": path, "name": Path(path).name, "status": "success"}
+            image = local_artifact_image(path, watched_file_roots)
+            if image is not None:
+                artifact["image"] = image
+            assistant_segments.append(artifact)
+            yield sse(artifact)
 
         finalize_assistant()
         session["updated"] = now_ts()
@@ -3328,7 +6168,7 @@ async def stream_chat_impl(
         yield sse({"type": "done"})
     except asyncio.CancelledError:
         if proc and proc.returncode is None:
-            await kill_process_tree(proc.pid)
+            await runtime.cancel(session_id)
         if stderr_task:
             stderr_task.cancel()
         force_release_session_lock(session_id)
@@ -3344,15 +6184,43 @@ async def stream_chat_impl(
         yield sse({"type": "error", "content": detail})
         yield sse({"type": "done"})
     finally:
+        had_unsettled_interaction = agent_interaction_broker.unsettled_for(session_id)
+        agent_interaction_broker.invalidate(session_id, reason="stream-finished")
+        if had_unsettled_interaction:
+            host_channel.cancel_all("stream-finished")
+        if proc and proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
         if proc and proc.returncode is None:
-            await kill_process_tree(proc.pid)
+            await runtime.cancel(session_id)
             if not finalized:
                 interruption_note = "连接中断，已停止底层 Claude Code 进程，避免任务在后台继续运行。"
                 final_content = f"{assistant_text}\n\n{interruption_note}".strip() if assistant_text else interruption_note
-                finalize_assistant(final_content)
+                finalize_assistant(
+                    final_content,
+                    status="cancelled" if _active_runs.get(session_id, {}).get("cancel_requested") else "failed",
+                )
         elif not finalized:
             save_assistant_progress(force=True)
+        mark_finished = getattr(runtime, "mark_finished", None)
+        if mark_finished is not None:
+            mark_finished(session_id, proc)
+        cleanup_agent_system_prompt(system_prompt_path)
         _active_runs.pop(session_id, None)
+        terminal = "completed" if finalized and str(session.get("last_run_status") or "") == "completed" else "failed"
+        if str(session.get("last_run_status") or "") == "cancelled":
+            terminal = "cancelled"
+        elif no_output_stage == "awaiting_cli_ack":
+            terminal = "timeout"
+        host_channel.finalize(terminal, reason=interaction_protocol_failure or terminal)
+        host_channel.cleanup()
+        agent_run_journal().finish(
+            session_id,
+            coordinator_run_id,
+            status=terminal,
+        )
 
 
 def list_skill_files() -> list[Path]:
@@ -3361,10 +6229,13 @@ def list_skill_files() -> list[Path]:
     for directory in unique_skill_dirs():
         if not directory.exists():
             continue
-        candidates = [
-            *(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".md"),
-            *(p for p in directory.glob("*/SKILL.md") if p.is_file()),
-        ]
+        candidates = sorted(
+            [
+                *(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".md"),
+                *(p for p in directory.glob("*/SKILL.md") if p.is_file()),
+            ],
+            key=lambda item: str(item).lower(),
+        )
         for path in candidates:
             try:
                 key = str(path.resolve())
@@ -3374,7 +6245,7 @@ def list_skill_files() -> list[Path]:
                 continue
             seen.add(key)
             files.append(path)
-    return sorted(files, key=lambda item: (skill_id_from_path(item).lower(), str(item).lower()))
+    return files
 
 
 def skill_metadata(content: str) -> dict[str, str]:
@@ -3405,16 +6276,24 @@ def get_skills() -> list[dict[str, str]]:
 
     skills: list[dict[str, str]] = []
     for path in list_skill_files():
-        name = skill_id_from_path(path)
-        category = name.split("_", 1)[0] if "_" in name else "其他"
+        record_id = skill_id_from_path(path)
+        source, _root = skill_source_for_path(path)
+        name = skill_name_from_path(path)
+        category = source
         title = name
         desc = ""
         content = path.read_text(encoding="utf-8", errors="replace")
         metadata = skill_metadata(content)
-        command = metadata.get("name") or (name.split("_", 1)[1] if "_" in name else name)
+        # Claude Code derives the slash command from the official skill
+        # directory name. Underscores are part of that stable identity.
+        command = name
+        if metadata.get("name"):
+            title = metadata["name"]
         if metadata.get("description"):
             desc = metadata["description"][:180]
-        found_title = False
+        # Frontmatter `name` is the display title for personal/project skills;
+        # the first H1 is only a fallback when that field is absent.
+        found_title = bool(metadata.get("name"))
         for raw in content.splitlines():
             line = raw.strip()
             if line.startswith("# ") and not found_title:
@@ -3423,22 +6302,77 @@ def get_skills() -> list[dict[str, str]]:
             elif not desc and line and not line.startswith("#") and not line.startswith("---"):
                 desc = line[:120]
                 break
-        skills.append(
-            {
-                "id": name,
+        record = {
+                "id": record_id,
                 "filename": path.name,
+                "slug": name,
                 "name": title,
                 "command": command,
                 "category": category,
                 "description": desc,
                 "path": skill_display_path(path),
+                "source": source,
                 "absolute_path": str(path),
             }
+        record.update(localized_skill_fields(record))
+        record["claude"] = copy.deepcopy(
+            _skill_sync_statuses.get(record_id) or status_display("viniper_only")
         )
+        skills.append(record)
 
     _skills_cache["time"] = now
     _skills_cache["items"] = skills
     return skills
+
+
+def sync_skills_to_claude(
+    *,
+    bridge_root: str | None = None,
+    user_skills_root: str = "",
+    command_runner: Any = None,
+    path_mapper: Any = None,
+    manifest_path: Path | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    global _skill_sync_statuses
+    target = str(bridge_root or claude_skill_bridge_root())
+    effective_user_root = str(user_skills_root or env_value("VINIPER_UI_CLAUDE_USER_SKILLS_ROOT", "").strip())
+    target_key = f"{target}|{effective_user_root}"
+    now = time.time()
+    with _skill_sync_lock:
+        cached = _skill_sync_cache.get("result")
+        if (
+            not force
+            and isinstance(cached, dict)
+            and cached
+            and _skill_sync_cache.get("target") == target_key
+            and now - float(_skill_sync_cache.get("time") or 0) < 30
+        ):
+            return copy.deepcopy(cached)
+
+        runtime = agent_runtime()
+        records = get_skills()
+        result = synchronize_skill_records(
+            records,
+            bridge_root=target,
+            path_mapper=path_mapper or runtime.map_path,
+            command_runner=command_runner or run_wsl_skill_bridge,
+            manifest_path=manifest_path or (DATA_DIR / "runtime" / "claude-skill-bridge.json"),
+            user_skills_root=effective_user_root,
+        )
+        statuses = result.get("statuses") if isinstance(result.get("statuses"), dict) else {}
+        _skill_sync_statuses = {
+            str(record_id): copy.deepcopy(value)
+            for record_id, value in statuses.items()
+            if isinstance(value, dict)
+        }
+        for record in records:
+            record_id = str(record.get("id") or "")
+            record["claude"] = copy.deepcopy(
+                _skill_sync_statuses.get(record_id) or status_display("viniper_only")
+            )
+        _skill_sync_cache.update({"time": now, "target": target_key, "result": copy.deepcopy(result)})
+        return copy.deepcopy(result)
 
 
 @app.get("/")
@@ -3479,6 +6413,7 @@ async def status():
     cfg = deepseek_config()
     update_source = read_update_source()
     settings = public_settings()
+    runtime_status = runtime_public_status()
     shell = settings.get("shell", {})
     shell_id = str(shell.get("id") or "claude-code")
     runtime_configured = bool(cfg["api_key"]) if shell_id == "claude-code" else bool(str(shell.get("custom_command") or "").strip())
@@ -3503,9 +6438,10 @@ async def status():
         "themes": THEME_OPTIONS,
         "accents": ACCENT_OPTIONS,
         "font_sizes": FONT_SIZE_OPTIONS,
-        "claude_available": claude_available(),
-        "permission_mode": DEFAULT_PERMISSION_MODE,
-        "permission_modes": PERMISSION_MODE_OPTIONS,
+        "claude_available": bool(runtime_status.get("ready")),
+        "runtime": runtime_status,
+        "permission_mode": allowed_permission_mode(str(settings.get("runtime", {}).get("permission_mode") or DEFAULT_PERMISSION_MODE)),
+        "permission_modes": [item for item in PERMISSION_MODE_OPTIONS if item["id"] in available_permission_mode_ids()],
         "data_dir": str(DATA_DIR),
         "update": {
             "configured": bool(update_source.get("manifest_url")),
@@ -3529,6 +6465,59 @@ async def get_settings():
     }
 
 
+@app.get("/api/usage/daily")
+async def get_daily_usage(days: int = Query(default=14, ge=7, le=90)):
+    return {"ok": True, **daily_usage_ledger().daily(days)}
+
+
+@app.get("/api/agent-instructions")
+async def get_agent_instructions():
+    return {"ok": True, **agent_instructions_store().read().as_dict()}
+
+
+@app.put("/api/agent-instructions")
+async def update_agent_instructions(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("content"), str):
+        raise HTTPException(status_code=400, detail="content must be a string")
+    try:
+        snapshot = agent_instructions_store().write(body["content"])
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="保存 AGENT.md 失败；原内容已保留。") from exc
+    return {"ok": True, **snapshot.as_dict()}
+
+
+@app.get("/api/runtime/status")
+async def get_runtime_status():
+    probe = await asyncio.to_thread(agent_runtime().probe)
+    return {"ok": True, "runtime": runtime_payload_from_probe(probe)}
+
+
+@app.post("/api/runtime/provision")
+async def provision_runtime():
+    if any(run.get("kind") == "agent" for run in _active_runs.values()):
+        raise HTTPException(status_code=409, detail="请等待所有 Agent 会话停止后再设置运行时")
+    result = await runtime_provisioner().provision()
+    if result.status == "ready":
+        await asyncio.to_thread(sync_skills_to_claude, force=True)
+    return {"ok": result.status == "ready", "runtime": result.as_dict()}
+
+
+@app.post("/api/runtime/platform-result")
+async def record_runtime_platform_result(request: Request):
+    body = await request.json()
+    result = runtime_provisioner().record_platform_result(bool(body.get("succeeded")))
+    return {"ok": result.status != "wsl_missing", "runtime": result.as_dict()}
+
+
+@app.post("/api/runtime/update")
+async def update_runtime():
+    result = await runtime_update_coordinator().ensure_current(APP_VERSION)
+    if result.status in {"current", "compatible"}:
+        await asyncio.to_thread(sync_skills_to_claude, force=True)
+    return {"ok": result.status in {"current", "compatible"}, "runtime_update": result.as_dict()}
+
+
 @app.put("/api/settings")
 async def update_settings(request: Request):
     body = await request.json()
@@ -3550,6 +6539,7 @@ async def update_settings(request: Request):
         "ok": True,
         "settings": public_settings(load_app_settings()),
         "models": effective_model_options(),
+        "permission_modes": [item for item in PERMISSION_MODE_OPTIONS if item["id"] in available_permission_mode_ids()],
     }
 
 
@@ -3658,10 +6648,17 @@ async def open_local_artifact(request: Request):
 @app.get("/api/diagnostics")
 async def diagnostics():
     cfg = deepseek_config()
-    claude_compat = claude_cli_compatibility()
     settings = load_app_settings()
     shell = settings.get("shell", {})
     shell_id = str(shell.get("id") or "claude-code")
+    runtime_probe = await asyncio.to_thread(agent_runtime().probe)
+    runtime_status = runtime_payload_from_probe(runtime_probe)
+    runtime_ready = bool(runtime_status.get("ready"))
+    runtime_version = str(runtime_status.get("version") or "")
+    runtime_detail = (
+        f"ViniperRuntime / Claude Code {runtime_version}" if runtime_ready and runtime_version
+        else ("ViniperRuntime 已就绪" if runtime_ready else f"ViniperRuntime：{runtime_status.get('status') or '未就绪'}")
+    )
     checks = [
         {
             "id": "python",
@@ -3672,14 +6669,14 @@ async def diagnostics():
         {
             "id": "claude",
             "label": "Claude Code CLI",
-            "ok": True if shell_id == "custom-cli" else claude_available(),
-            "detail": "not required for Custom CLI" if shell_id == "custom-cli" else ("available" if claude_available() else "not found on PATH"),
+            "ok": True if shell_id == "custom-cli" else runtime_ready,
+            "detail": "Custom CLI 不需要 ViniperRuntime" if shell_id == "custom-cli" else runtime_detail,
         },
         {
             "id": "claude_compatibility",
-            "label": "Claude Code compatibility",
-            "ok": True if shell_id == "custom-cli" else bool(claude_compat["ok"]),
-            "detail": "not required for Custom CLI" if shell_id == "custom-cli" else str(claude_compat["detail"]),
+            "label": "Claude Code 兼容性",
+            "ok": True if shell_id == "custom-cli" else runtime_ready,
+            "detail": "Custom CLI 使用独立兼容合同" if shell_id == "custom-cli" else runtime_detail,
         },
         {
             "id": "provider",
@@ -3689,9 +6686,9 @@ async def diagnostics():
         },
         {
             "id": "agent_shell",
-            "label": "Agent shell",
-            "ok": claude_available() if shell_id == "claude-code" else bool(str(shell.get("custom_command") or "").strip()),
-            "detail": "Claude Code" if shell_id == "claude-code" else str(shell.get("custom_command") or "not configured"),
+            "label": "Agent 执行壳",
+            "ok": runtime_ready if shell_id == "claude-code" else bool(str(shell.get("custom_command") or "").strip()),
+            "detail": runtime_detail if shell_id == "claude-code" else str(shell.get("custom_command") or "尚未配置"),
         },
         {
             "id": "data",
@@ -3756,11 +6753,11 @@ async def check_update(request: Request):
             "repository": source.get("repository", ""),
             "notes": str(manifest.get("notes") or manifest.get("changelog") or ""),
             "published_at": str(manifest.get("published_at") or ""),
+            "requires_installer": update_requires_installer(manifest),
             "asset": {
                 "key": asset.get("key", "app"),
                 "name": asset.get("name", ""),
                 "size": asset.get("size", 0),
-                "sha256": asset.get("sha256", ""),
             },
         }
     except Exception as exc:
@@ -3818,15 +6815,24 @@ async def install_update(request: Request):
             "restart_required": True,
             "restarting": bool(result.get("restarting")) and not bool(result.get("installer_opened")),
             "installer_opened": bool(result.get("installer_opened")),
+            "requires_installer": update_requires_installer(manifest),
             "message": message,
             "asset": result.get("asset", {}),
-            "sha256": result.get("sha256", ""),
             "dependencies": result.get("dependencies", ""),
         }
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"install update failed: {exc}")
+
+
+async def coordinated_agent_event_stream(session_id: str, run_id: str, after_sequence: int = 0):
+    async for payload in agent_run_coordinator().subscribe(
+        session_id,
+        run_id,
+        after_sequence=after_sequence,
+    ):
+        yield sse(payload)
 
 
 @app.post("/api/chat/{session_id}")
@@ -3838,27 +6844,294 @@ async def chat(session_id: str, request: Request):
     user_msg = str(body.get("message", "")).strip()
     if not user_msg:
         raise HTTPException(status_code=400, detail="message is required")
+    session = safe_session(session_id)
+    mode = normalize_session_mode(session.get("mode"))
+    peer_target_session_id = str(body.get("peer_target_session_id") or "").strip()
+    peer_request: dict[str, str] | None = None
+    if mode == "chat":
+        if body.get("attachments"):
+            raise HTTPException(status_code=400, detail="Chat sessions do not accept attachments")
+        if body.get("guidance"):
+            raise HTTPException(status_code=400, detail="Chat sessions do not accept guidance")
+        if str(body.get("permission_mode") or "").strip():
+            raise HTTPException(status_code=400, detail="Chat sessions do not accept permission mode")
+        if str(body.get("interaction_mode") or "").strip() not in {"", "chat"}:
+            raise HTTPException(status_code=400, detail="session mode is immutable")
+        for field in ("skill", "skill_command", "slash_command", "command"):
+            if str(body.get(field) or "").strip():
+                raise HTTPException(status_code=400, detail="Chat sessions do not accept Agent commands")
+        if peer_target_session_id:
+            raise HTTPException(status_code=400, detail="Chat sessions do not accept peer messages")
+    elif body.get("guidance"):
+        raise HTTPException(status_code=400, detail="运行中引导必须使用当前 Agent run 的 guidance 接口")
+    elif peer_target_session_id:
+        if body.get("attachments") or body.get("guidance"):
+            raise HTTPException(status_code=400, detail="原生跨会话消息不接受附件或 guidance")
+        peer_request = await prepare_native_peer_request(session_id, peer_target_session_id, user_msg)
     model = allowed_model(str(body.get("model") or ""))
-    permission_mode = allowed_permission_mode(str(body.get("permission_mode") or ""))
-    attachments = save_chat_attachments(session_id, body.get("attachments") or [])
+    permission_mode = None
+    if mode == "agent":
+        permission_mode = session_permission_mode(session)
+        requested_permission_mode = str(body.get("permission_mode") or "").strip()
+        if requested_permission_mode:
+            validated_permission_mode = require_permission_mode(requested_permission_mode)
+            if validated_permission_mode != permission_mode:
+                raise HTTPException(status_code=409, detail="permission_mode does not match this session")
+    attachments = [] if mode == "chat" else save_chat_attachments(session_id, body.get("attachments") or [])
+    if mode == "agent":
+        coordinator = agent_run_coordinator()
+        if coordinator.has_active(session_id):
+            raise HTTPException(status_code=409, detail="当前 Agent 会话已有任务在运行")
+        display_prompt = user_msg
+        if peer_request:
+            display_prompt = (
+                f"发送给 {str(peer_request.get('target_display_name') or peer_request.get('target_peer_name') or '目标会话')}："
+                f"{str(peer_request.get('message') or user_msg)}"
+            )
+        accepted_turn_id = persist_accepted_agent_turn(
+            session_id,
+            display_prompt,
+            model,
+            attachments,
+        )
+        try:
+            record = coordinator.start(
+                session_id,
+                lambda: stream_chat(
+                    session_id,
+                    user_msg,
+                    bool(body.get("guidance")),
+                    model,
+                    permission_mode,
+                    attachments,
+                    peer_request=peer_request,
+                    accepted_turn_id=accepted_turn_id,
+                ),
+                metadata={"model": model, "permission_mode": permission_mode, "input_ready": False},
+            )
+        except ActiveRunExists as exc:
+            raise HTTPException(status_code=409, detail="当前 Agent 会话已有任务在运行") from exc
+        return StreamingResponse(
+            coordinated_agent_event_stream(session_id, record.run_id),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Viniper-Run-Id": record.run_id,
+            },
+        )
+
     return StreamingResponse(
-        stream_chat(session_id, user_msg, bool(body.get("guidance")), model, permission_mode, attachments),
+        stream_chat(
+            session_id,
+            user_msg,
+            bool(body.get("guidance")),
+            model,
+            permission_mode,
+            attachments,
+            peer_request=peer_request,
+        ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
+@app.get("/api/chat/{session_id}/events")
+async def resume_agent_events(
+    session_id: str,
+    run_id: str = Query(min_length=1),
+    after_sequence: int = Query(default=0, ge=0),
+):
+    snapshot = coordinated_run_snapshot(session_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if str(snapshot.get("run_id") or "") != str(run_id):
+        raise HTTPException(status_code=409, detail="Agent run has changed")
+    return StreamingResponse(
+        coordinated_agent_event_stream(session_id, run_id, after_sequence),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Viniper-Run-Id": run_id},
+    )
+
+
+@app.get("/api/sessions/{session_id}/peers")
+async def get_native_peers(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"ok": True, "peer": await native_peer_status_payload(session_id)}
+
+
+@app.get("/api/chat/{session_id}/queue")
+async def get_agent_queue(session_id: str):
+    session = safe_session(session_id)
+    if normalize_session_mode(session.get("mode")) != "agent":
+        raise HTTPException(status_code=409, detail="Chat 不支持 Agent 待发送队列")
+    return {"ok": True, "session_id": session_id, "items": agent_queue_store().list(session_id)}
+
+
+@app.post("/api/chat/{session_id}/queue")
+async def enqueue_agent_message(session_id: str, request: Request):
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="queue body must be an object")
+    session = safe_session(session_id)
+    if normalize_session_mode(session.get("mode")) != "agent":
+        raise HTTPException(status_code=409, detail="Chat 不支持 Agent 待发送队列")
+    coordinated_context = agent_run_coordinator().run_metadata(session_id)
+    if not coordinated_context:
+        raise HTTPException(status_code=409, detail="当前 Agent 未运行，请直接发送")
+    message = str(body.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="待发送内容不能为空")
+    attachments = save_chat_attachments(session_id, body.get("attachments") or [])
+    item = agent_queue_store().enqueue(
+        session_id,
+        message,
+        model=str(coordinated_context.get("model") or allowed_model("")),
+        permission_mode=str(coordinated_context.get("permission_mode") or allowed_permission_mode(None)),
+        attachments=attachments,
+    )
+    return {"ok": True, "queued": True, "item": item}
+
+
+@app.patch("/api/chat/{session_id}/queue/{item_id}")
+async def edit_agent_queue_item(session_id: str, item_id: str, request: Request):
+    session = safe_session(session_id)
+    if normalize_session_mode(session.get("mode")) != "agent":
+        raise HTTPException(status_code=409, detail="Chat 不支持 Agent 待发送队列")
+    try:
+        body = await request.json()
+        item = agent_queue_store().edit(session_id, item_id, str(body.get("message") or ""))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "item": item}
+
+
+@app.delete("/api/chat/{session_id}/queue/{item_id}")
+async def cancel_agent_queue_item(session_id: str, item_id: str):
+    session = safe_session(session_id)
+    if normalize_session_mode(session.get("mode")) != "agent":
+        raise HTTPException(status_code=409, detail="Chat 不支持 Agent 待发送队列")
+    try:
+        item = agent_queue_store().cancel(session_id, item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "cancelled": True, "item_id": item.get("id")}
+
+
 @app.post("/api/chat/{session_id}/cancel")
 async def cancel_chat(session_id: str):
+    agent_queue_store().clear_authorization(session_id)
     run = _active_runs.get(session_id)
-    if not run:
+    snapshot = coordinated_run_snapshot(session_id)
+    coordinated_active = bool(snapshot and snapshot.get("active"))
+    if not run and not coordinated_active:
+        agent_interaction_broker.invalidate(session_id, reason="cancelled")
         force_release_session_lock(session_id)
         return {"ok": True, "cancelled": False}
 
-    run["cancel_requested"] = True
-    await kill_process_tree(int(run.get("pid") or 0))
+    if run:
+        run["cancel_requested"] = True
+    agent_interaction_broker.invalidate(session_id, reason="cancelled")
+    if run:
+        run["pending_interaction"] = None
+    if coordinated_active:
+        await agent_run_coordinator().request_cancel(session_id)
+    if run and run.get("kind") == "chat":
+        task = run.get("task") or _chat_tasks.get(session_id)
+        if isinstance(task, asyncio.Task) and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+    elif run:
+        runtime = run.get("runtime")
+        if runtime is not None:
+            await runtime.cancel(session_id)
+        else:
+            await kill_process_tree(int(run.get("pid") or 0))
+    if coordinated_active:
+        await agent_run_coordinator().cancel(session_id)
     force_release_session_lock(session_id)
     return {"ok": True, "cancelled": True}
+
+
+@app.post("/api/chat/{session_id}/guidance")
+async def guide_active_agent(session_id: str, request: Request):
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="guidance body must be an object")
+    if set(body) - {"message"}:
+        raise HTTPException(status_code=400, detail="运行中引导只接受纯文本 message")
+    message = str(body.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="运行中引导不能为空")
+    session = safe_session(session_id)
+    if normalize_session_mode(session.get("mode")) != "agent":
+        raise HTTPException(status_code=409, detail="Chat 不支持运行中引导")
+    run = _active_runs.get(session_id)
+    if not isinstance(run, dict) or run.get("kind") != "agent":
+        raise HTTPException(status_code=409, detail="当前会话没有正在运行的 Agent 任务")
+    if run.get("pending_interaction") or run.get("awaiting_interaction_ack") or agent_interaction_broker.unsettled_for(session_id):
+        raise HTTPException(status_code=409, detail="请先处理当前问题或权限请求")
+    try:
+        result = await active_agent_input_channel.send_guidance(session_id, message)
+    except ActiveAgentInputError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    run_session = run.get("session_record")
+    session = run_session if isinstance(run_session, dict) else safe_session(session_id)
+    session.setdefault("messages", []).append({
+        "role": "user",
+        "content": message,
+        "guidance": True,
+    })
+    session["updated"] = now_ts()
+    sessions[session_id] = session
+    save_sessions_to_disk()
+    return result
+
+
+@app.post("/api/chat/{session_id}/interaction")
+async def answer_chat_interaction(session_id: str, request: Request):
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="interaction body must be an object")
+    run = _active_runs.get(session_id)
+    if not run or run.get("kind") != "agent":
+        raise HTTPException(status_code=409, detail="没有正在等待交互的 Agent 任务")
+    try:
+        result = await agent_interaction_broker.resolve(
+            session_id,
+            str(body.get("request_id") or ""),
+            str(body.get("kind") or ""),
+            str(body.get("action") or ""),
+            stdin=run.get("stdin"),
+            run=run,
+            process_identity=str(run.get("process_identity") or ""),
+            answers=body.get("answers"),
+            value=body.get("value"),
+        )
+    except InteractionRequestError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    run["pending_interaction"] = None
+    request_id = str(body.get("request_id") or "")
+    if str(result.get("status") or "") == "awaiting_cli_ack":
+        run["awaiting_interaction_ack"] = request_id
+        await agent_run_coordinator().commit_interaction_response(session_id, request_id)
+    else:
+        run["awaiting_interaction_ack"] = None
+        await agent_run_coordinator().resolve_interaction(session_id, request_id)
+    return result
 
 
 @app.post("/api/sessions")
@@ -3867,29 +7140,39 @@ async def new_session(request: Request):
     if request.headers.get("content-type", "").startswith("application/json"):
         body = await request.json()
     sid = str(uuid.uuid4())[:8]
+    mode = normalize_session_mode(body.get("mode"))
     name = str(body.get("name") or "").strip()
     if not name:
-        name = next_session_name()
+        name = next_session_name(mode)
     sessions[sid] = {
         "id": sid,
+        "mode": mode,
         "messages": [],
         "created": now_ts(),
         "updated": now_ts(),
         "name": name,
         "workdir": str(body.get("workdir") or BASE_DIR),
         "pinned": False,
+        "unread": False,
+        "last_run_status": "",
         "claude_session_id": str(uuid.uuid4()),
         "claude_initialized": False,
         "summary": "",
+        "permission_mode": allowed_permission_mode(None),
     }
     save_sessions_to_disk()
     return {
         "session_id": sid,
+        "mode": mode,
         "name": sessions[sid]["name"],
         "workdir": sessions[sid]["workdir"],
         "pinned": False,
+        "unread": False,
+        "runtime_state": "idle",
         "updated": sessions[sid]["updated"],
         "revision": context_revision(sessions[sid]),
+        "context_usage": context_usage_payload(sid),
+        "permission_mode": sessions[sid]["permission_mode"],
     }
 
 
@@ -3899,13 +7182,20 @@ async def list_sessions():
         "sessions": [
             {
                 "id": sid,
+                "mode": normalize_session_mode(session.get("mode")),
                 "name": session.get("name") or sid,
                 "workdir": session.get("workdir") or "",
                 "count": len(session.get("messages", [])),
                 "created": session.get("created", 0),
                 "updated": session.get("updated", session.get("created", 0)),
                 "pinned": bool(session.get("pinned")),
+                "unread": bool(session.get("unread")),
+                "runtime_state": session_runtime_state(sid, session),
+                "pending_interaction": pending_interaction_for_session(sid),
+                "active_run": coordinated_run_snapshot(sid),
                 "revision": context_revision(session),
+                "context_usage": context_usage_payload(sid),
+                "permission_mode": str(session.get("permission_mode") or "default"),
             }
             for sid, session in sorted(sessions.items(), key=session_sort_key)
         ]
@@ -3913,12 +7203,19 @@ async def list_sessions():
 
 
 @app.get("/api/sessions/last")
-async def last_session():
+async def last_session(mode: str | None = None):
     if not sessions:
         return {"session": None}
-    candidates = [(sid, session) for sid, session in sessions.items() if session.get("messages")]
+    target_mode = normalize_session_mode(mode) if mode is not None else None
+    scoped = [
+        (sid, session) for sid, session in sessions.items()
+        if target_mode is None or normalize_session_mode(session.get("mode")) == target_mode
+    ]
+    if not scoped:
+        return {"session": None}
+    candidates = [(sid, session) for sid, session in scoped if session.get("messages")]
     if not candidates:
-        candidates = list(sessions.items())
+        candidates = scoped
     sid, session = max(
         candidates,
         key=lambda item: item[1].get("updated", item[1].get("created", 0)),
@@ -3926,13 +7223,20 @@ async def last_session():
     return clean_payload_value({
         "session": {
             "session_id": sid,
+            "mode": normalize_session_mode(session.get("mode")),
             "name": session.get("name", ""),
             "workdir": session.get("workdir", str(BASE_DIR)),
             "pinned": bool(session.get("pinned")),
+            "unread": bool(session.get("unread")),
+            "runtime_state": session_runtime_state(sid, session),
+            "pending_interaction": pending_interaction_for_session(sid),
+            "active_run": coordinated_run_snapshot(sid),
             "messages": session.get("messages", []),
             "message_count": len(session.get("messages", [])),
             "updated": session.get("updated", session.get("created", 0)),
             "revision": context_revision(session),
+            "context_usage": context_usage_payload(sid),
+            "permission_mode": str(session.get("permission_mode") or "default"),
         }
     })
 
@@ -3943,16 +7247,33 @@ async def get_session(session_id: str):
         raise HTTPException(status_code=404, detail="session not found")
     sanitize_goal_session_messages(session_id)
     session = safe_session(session_id)
+    session["unread"] = False
+    sessions[session_id] = session
+    save_sessions_to_disk()
     return clean_payload_value({
         "session_id": session_id,
+        "mode": normalize_session_mode(session.get("mode")),
         "name": session.get("name", ""),
         "workdir": session.get("workdir", str(BASE_DIR)),
         "pinned": bool(session.get("pinned")),
+        "unread": bool(session.get("unread")),
+        "runtime_state": session_runtime_state(session_id, session),
+        "pending_interaction": pending_interaction_for_session(session_id),
+        "active_run": coordinated_run_snapshot(session_id),
         "messages": session.get("messages", []),
         "message_count": len(session.get("messages", [])),
         "updated": session.get("updated", session.get("created", 0)),
         "revision": context_revision(session),
+        "context_usage": context_usage_payload(session_id),
+        "permission_mode": str(session.get("permission_mode") or "default"),
     })
+
+
+@app.get("/api/sessions/{session_id}/usage")
+async def get_session_usage(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"ok": True, "usage": context_usage_payload(session_id)}
 
 
 @app.put("/api/sessions/{session_id}")
@@ -3968,6 +7289,12 @@ async def update_session(session_id: str, request: Request):
         metadata_changed = True
     if "pinned" in body:
         session["pinned"] = bool(body.get("pinned"))
+    if "unread" in body:
+        session["unread"] = bool(body.get("unread"))
+    if "permission_mode" in body:
+        if normalize_session_mode(session.get("mode")) != "agent":
+            raise HTTPException(status_code=400, detail="Chat sessions do not accept permission mode")
+        session["permission_mode"] = require_permission_mode(body.get("permission_mode"))
     if metadata_changed:
         session["updated"] = now_ts()
     save_sessions_to_disk()
@@ -3976,27 +7303,42 @@ async def update_session(session_id: str, request: Request):
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str):
+    if _active_runs.get(session_id):
+        raise HTTPException(status_code=409, detail="运行中的会话必须先停止，才能删除。")
     existed = session_id in sessions
     sessions.pop(session_id, None)
     remove_session_runtime_data(session_id)
+    context_usage_ledger().remove(session_id)
     save_sessions_to_disk()
     return {"ok": True, "deleted": existed}
 
 
 @app.get("/api/skills")
 async def list_skills():
-    return {"skills": get_skills()}
+    sync = await asyncio.to_thread(sync_skills_to_claude)
+    public_sync = {
+        key: sync.get(key)
+        for key in ("ok", "linked", "updated", "unchanged", "conflicts", "viniper_only", "available", "idempotent")
+    }
+    return {"skills": get_skills(), "sync": public_sync}
 
 
-@app.get("/api/skills/{filename}")
+@app.get("/api/skills/{filename:path}")
 async def read_skill(filename: str):
-    if "/" in filename or "\\" in filename or not filename.endswith(".md"):
+    if not filename or not filename.endswith(".md"):
         raise HTTPException(status_code=400, detail="invalid skill filename")
-    path = PROJECT_SKILLS_DIR / filename
-    if not path.exists() or not path.is_file():
+    skill = next((item for item in get_skills() if item.get("id") == filename), None)
+    path = skill_file_from_record(skill) if skill else None
+    if not path:
         raise HTTPException(status_code=404, detail="skill not found")
     return {
-        "filename": filename,
+        "id": filename,
+        "filename": path.name,
+        "source": skill.get("source", "") if skill else "",
+        "display_name": skill.get("display_name", "") if skill else "",
+        "display_description": skill.get("display_description", "") if skill else "",
+        "display_category": skill.get("display_category", "") if skill else "",
+        "claude": copy.deepcopy(skill.get("claude") or status_display("viniper_only")) if skill else status_display("viniper_only"),
         "content": path.read_text(encoding="utf-8", errors="replace"),
     }
 
@@ -4154,69 +7496,60 @@ def context_lifecycle() -> ContextLifecycle:
 
 @app.post("/api/compress/{session_id}")
 async def compress_context(session_id: str, request: Request):
-    """Schedule one versioned compression for a session."""
+    """Compatibility endpoint; native Claude Code exclusively owns compaction."""
     session = safe_session(session_id)
-    messages = session.get("messages", [])
-    if not messages:
-        return {"ok": True, "compressed": False, "reason": "no messages", "status": "idle"}
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    model = allowed_model(str(body.get("model") or ""))
-    limit = context_limit_for_model(model)
-    threshold_tokens = int(limit * CONTEXT_COMPRESS_THRESHOLD)
-    total_chars = sum(len(str(message.get("content", ""))) + len(str(message.get("thinking", ""))) for message in messages)
-    estimated_tokens = total_chars // 3
-    usage_ratio = estimated_tokens / limit if limit else 0
-    revision = context_revision(session)
-
-    external_adapter = ExternalSummaryAdapter(
-        lambda snapshot, existing_summary: summarize_with_deepseek(snapshot, existing_summary, model),
-        semantic_key=f"external-summary:{model}",
-    )
-
-    async def persist(revision_value: str, summary: str, snapshot: list[dict[str, Any]]) -> bool:
-        return await persist_context_summary(
-            session_id,
-            revision_value,
-            summary,
-            snapshot,
-            threshold_tokens,
-        )
-
-    result = await context_lifecycle().request(
-        session_id,
-        revision,
-        messages,
-        str(session.get("summary") or ""),
-        usage_ratio,
-        persist,
-        external_adapter=external_adapter,
-    )
-    return result.as_dict()
+    return {
+        "ok": True,
+        "compressed": False,
+        "reason": "native_compaction_only",
+        "status": "idle",
+        "session_id": session_id,
+        "claude_session_id": str(session.get("claude_session_id") or ""),
+        "usage": context_usage_payload(session_id),
+    }
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 def _startup_cleanup() -> None:
-    """Clear stale pending flags and force-release any held session locks."""
-    load_sessions_from_disk()
+    """Reconcile exact journaled owners and make interrupted turns visible."""
+    loaded = load_sessions_from_disk()
+    sessions.clear()
+    sessions.update(loaded)
+    recovered = reconcile_orphaned_agent_runs(
+        sessions,
+        journal=agent_run_journal(),
+        runtime=agent_runtime(),
+        interaction_store=durable_interaction_store(),
+    )
     for sid, session in sessions.items():
         cleaned_messages = []
+        session_changed = False
         for msg in session.get("messages", []):
             if isinstance(msg, dict) and is_leaked_goal_control_message(msg):
+                session_changed = True
                 continue
-            msg.pop("pending", None)
+            if isinstance(msg, dict) and msg.get("pending"):
+                session_changed = True
+                detail = "应用在任务完成前重新启动；本轮已中断，可重新发送。"
+                msg["content"] = str(msg.get("content") or detail)
+                msg["segments"] = finalize_transcript_segments(msg.get("segments"))
+                if not msg["segments"] and msg["content"]:
+                    msg["segments"] = [{"type": "text", "content": msg["content"]}]
+                msg["error"] = "backend_restarted"
+                msg["retryable"] = True
+                msg.pop("pending", None)
+                msg.pop("thinking", None)
+                session["last_run_status"] = "failed"
+                session["unread"] = True
             cleaned_messages.append(msg)
         session["messages"] = cleaned_messages
-        if session.get("messages"):
+        if session_changed:
             session["updated"] = now_ts()
     save_sessions_to_disk()
     _session_locks.clear()
-    print(f"  Startup cleanup: {len(sessions)} sessions normalized.")
+    print(f"  Startup cleanup: {len(sessions)} sessions normalized; {len(recovered)} journal entries reconciled.")
 
 
 if __name__ == "__main__":

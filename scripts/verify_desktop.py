@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the Viniper UI desktop shell scaffold."""
+"""Verify the Viniper desktop shell scaffold."""
 
 from __future__ import annotations
 
@@ -68,20 +68,29 @@ def main() -> int:
     root_version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if package.get("version") != root_version:
         raise SystemExit("desktop package version must match VERSION")
-    if package.get("build", {}).get("productName") != "Viniper UI":
-        raise SystemExit("desktop package productName must be Viniper UI")
+    if package.get("build", {}).get("productName") != "Viniper":
+        raise SystemExit("desktop package productName must be Viniper")
     if package.get("build", {}).get("appId") != "com.viniper.ui.desktop":
         raise SystemExit("desktop package appId must match the taskbar AppUserModelID")
     if not package.get("build", {}).get("extraResources"):
-        raise SystemExit("desktop package must bundle the local Viniper UI service as extraResources")
+        raise SystemExit("desktop package must bundle the local Viniper service as extraResources")
+    filters = package.get("build", {}).get("extraResources", [{}])[0].get("filter", [])
+    runtime_modules = {
+        "server.py", "context_lifecycle.py", "context_usage.py", "daily_usage.py", "skill_sync.py",
+        "agent_instructions.py", "agent_runtime.py", "agent_host_bridge.py",
+        "agent_queue.py", "agent_run_coordinator.py", "native_peer.py", "wsl_runtime.py",
+    }
+    missing_modules = sorted(runtime_modules.difference(filters))
+    if missing_modules:
+        raise SystemExit(f"desktop package missing runtime modules: {missing_modules}")
 
     main_js = (DESKTOP / "main.js").read_text(encoding="utf-8")
     if "VINIPER_UI_OPEN_BROWSER" not in main_js:
         raise SystemExit("desktop shell must disable automatic browser launch when it starts the server")
     if "VINIPER_UI_DESKTOP_EXE" not in main_js:
         raise SystemExit("desktop shell must pass the packaged exe path to the local service")
-    if "shell.openExternal(\"https://www.skills.sh\")" not in main_js or "skillsWindow" in main_js:
-        raise SystemExit("skills.sh must open in the system browser, not an embedded app window")
+    if "skillsWindow" in main_js or "skills.sh" in main_js:
+        raise SystemExit("legacy skills.sh window/entry must remain removed")
     if "requestSingleInstanceLock" not in main_js:
         raise SystemExit("desktop shell must keep a single running instance")
     if "runDiagnosticsDialog" not in main_js:
@@ -97,7 +106,7 @@ def main() -> int:
         run(["node", "--check", str(DESKTOP / "main.js")])
         run(["node", "--check", str(DESKTOP / "preload.js")])
 
-    print("Viniper UI desktop scaffold verification passed.")
+    print("Viniper desktop scaffold verification passed.")
     return 0
 
 

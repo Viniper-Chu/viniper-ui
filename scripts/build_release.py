@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Build a clean Viniper UI release zip and GitHub update manifest."""
+"""Build a clean Viniper release zip and GitHub update manifest."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import re
 import shutil
 import sys
 import zipfile
@@ -20,6 +18,18 @@ BUILD = DIST / "build"
 
 APP_FILES = [
     "server.py",
+    "context_lifecycle.py",
+    "context_usage.py",
+    "daily_usage.py",
+    "skill_sync.py",
+    "agent_instructions.py",
+    "agent_runtime.py",
+    "agent_host_bridge.py",
+    "agent_queue.py",
+    "agent_run_coordinator.py",
+    "native_peer.py",
+    "wsl_runtime.py",
+    "profiles.json",
     "requirements.txt",
     "VERSION",
     "README.md",
@@ -34,22 +44,33 @@ APP_DIRS = [
     "scripts",
     "desktop",
 ]
-KEEP_RELEASE_VERSIONS = 2
 
 
-def version_tuple(value: str) -> tuple[int, int, int]:
-    match = re.search(r"v?(\d+)\.(\d+)\.(\d+)", value)
-    if not match:
-        return (0, 0, 0)
-    return tuple(int(part) for part in match.groups())
+def release_asset_url(repo: str, name: str) -> str:
+    if repo:
+        return f"https://github.com/{repo}/releases/latest/download/{name}"
+    return name
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def installer_manifest_assets(root: Path, version: str, repo: str) -> dict[str, dict[str, object]]:
+    release_dir = root / "desktop" / "release"
+    candidates = {
+        "installer_windows": release_dir / f"Viniper.Setup.{version}.exe",
+        "installer_macos_arm64": release_dir / f"Viniper.{version}-arm64-mac.zip",
+        "installer_macos_x64": release_dir / f"Viniper.{version}-x64-mac.zip",
+    }
+    assets: dict[str, dict[str, object]] = {}
+    for key, path in candidates.items():
+        if path.is_file():
+            assets[key] = {
+                "name": path.name,
+                "url": release_asset_url(repo, path.name),
+                "size": path.stat().st_size,
+            }
+    default_macos = assets.get("installer_macos_arm64") or assets.get("installer_macos_x64")
+    if default_macos:
+        assets["installer_macos"] = dict(default_macos)
+    return assets
 
 
 def write_text(path: Path, content: str) -> None:
@@ -85,27 +106,11 @@ def make_zip(source_dir: Path, zip_path: Path) -> None:
                 archive.write(path, path.relative_to(source_dir.parent))
 
 
-def prune_dist_versions(keep: int = KEEP_RELEASE_VERSIONS) -> None:
-    versioned: dict[str, list[Path]] = {}
-    for pattern in ["ViniperUI-v*.zip", "ViniperUI-v*.zip.sha256"]:
-        for path in DIST.glob(pattern):
-            match = re.search(r"v(\d+\.\d+\.\d+)", path.name)
-            if match:
-                versioned.setdefault(match.group(1), []).append(path)
-    ordered = sorted(versioned, key=version_tuple, reverse=True)
-    for version in ordered[keep:]:
-        for path in versioned.get(version, []):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build Viniper UI release artifacts.")
+    parser = argparse.ArgumentParser(description="Build Viniper release artifacts.")
     parser.add_argument("--version", help="Version to write into VERSION. Defaults to existing VERSION file.")
     parser.add_argument("--repo", default="", help="GitHub repository, for example owner/viniper-ui.")
-    parser.add_argument("--notes", default="Viniper UI release.", help="Release notes for latest.json.")
+    parser.add_argument("--notes", default="Viniper release.", help="Release notes for latest.json.")
     args = parser.parse_args()
 
     version = (args.version or (ROOT / "VERSION").read_text(encoding="utf-8").strip()).strip()
@@ -118,17 +123,35 @@ def main() -> int:
         shutil.rmtree(BUILD)
     BUILD.mkdir(parents=True)
 
-    app_root = BUILD / f"ViniperUI-v{version}" / "viniper-ui"
+    app_root = BUILD / f"Viniper-v{version}" / "viniper-ui"
     app_root.mkdir(parents=True)
 
     for item in APP_FILES:
         source = ROOT / item
-        if source.exists():
-            shutil.copy2(source, app_root / item)
+        try:
+            is_file = source.is_file()
+        except OSError as exc:
+            raise SystemExit(f"required release file is inaccessible: {source}: {exc}") from exc
+        if not is_file:
+            raise SystemExit(f"required release file missing: {source}")
+        try:
+            target = app_root / item
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        except OSError as exc:
+            raise SystemExit(f"required release file could not be copied: {source}: {exc}") from exc
     for item in APP_DIRS:
         source = ROOT / item
-        if source.exists():
+        try:
+            is_directory = source.is_dir()
+        except OSError as exc:
+            raise SystemExit(f"required release directory is inaccessible: {source}: {exc}") from exc
+        if not is_directory:
+            raise SystemExit(f"required release directory missing: {source}")
+        try:
             copy_clean_tree(source, app_root / item)
+        except OSError as exc:
+            raise SystemExit(f"required release directory could not be copied: {source}: {exc}") from exc
 
     if args.repo:
         manifest_url = f"https://github.com/{args.repo}/releases/latest/download/latest.json"
@@ -147,28 +170,26 @@ def main() -> int:
         )
 
     # Runtime data is created on first launch; release artifacts intentionally include none.
-    zip_path = DIST / f"ViniperUI-v{version}.zip"
+    zip_path = DIST / f"Viniper-v{version}.zip"
     make_zip(app_root.parent, zip_path)
-    digest = sha256_file(zip_path)
 
-    asset_url = f"https://github.com/{args.repo}/releases/latest/download/{zip_path.name}" if args.repo else zip_path.name
+    asset_url = release_asset_url(args.repo, zip_path.name)
+    assets: dict[str, dict[str, object]] = {
+        "app": {
+            "name": zip_path.name,
+            "url": asset_url,
+            "size": zip_path.stat().st_size,
+        }
+    }
+    assets.update(installer_manifest_assets(ROOT, version, args.repo))
     manifest = {
-        "name": "Viniper UI",
+        "name": "Viniper",
         "version": version,
         "published_at": datetime.now(timezone.utc).isoformat(),
         "notes": args.notes,
-        "assets": {
-            "app": {
-                "name": zip_path.name,
-                "url": asset_url,
-                "sha256": digest,
-                "size": zip_path.stat().st_size,
-            }
-        },
+        "assets": assets,
     }
     write_text(DIST / "latest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-    write_text(DIST / f"{zip_path.name}.sha256", f"{digest}  {zip_path.name}\n")
-    prune_dist_versions()
 
     print(f"Built {zip_path}")
     print(f"Built {DIST / 'latest.json'}")

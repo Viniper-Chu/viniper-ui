@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the full Viniper UI verification suite."""
+"""Run the full Viniper verification suite."""
 
 from __future__ import annotations
 
@@ -52,8 +52,13 @@ def get_json(url: str, timeout: float = 5.0) -> dict:
 
 
 def verify_local_api() -> None:
-    data_dir = Path(tempfile.mkdtemp(prefix="viniper-ui-verify-"))
+    residue_root = ROOT / "codex" / "运行残留"
+    residue_root.mkdir(parents=True, exist_ok=True)
+    data_dir = Path(tempfile.mkdtemp(prefix="viniper-ui-verify-", dir=residue_root))
     env = os.environ.copy()
+    # The verification server is disposable and must never refresh the formal
+    # desktop/Start Menu shortcuts or use the formal product data profile.
+    env["VINIPER_UI_PREVIEW"] = "1"
     env["VINIPER_UI_PORT"] = "17401"
     env["VINIPER_UI_OPEN_BROWSER"] = "0"
     env["VINIPER_UI_DATA_DIR"] = str(data_dir)
@@ -123,7 +128,7 @@ def verify_thin_shell_behavior() -> None:
     if "expand_skill_prompt(prompt)" in server_py:
         raise SystemExit("slash commands must pass through to the configured agent shell")
     if "/api/goals" in server_py or "goal-modal" in index_html or "goal-panel" in index_html:
-        raise SystemExit("Viniper UI goal mode must stay removed; /goal should pass through to Claude Code")
+        raise SystemExit("Viniper goal mode must stay removed; /goal should pass through to Claude Code")
     if 'command: "/goal"' not in app_js:
         raise SystemExit("slash suggestions must include Claude Code native /goal")
 
@@ -140,7 +145,7 @@ def main() -> int:
     run([sys.executable, "scripts/verify_desktop.py"])
     verify_claude_cli_if_available()
     verify_local_api()
-    print("Viniper UI full verification passed.")
+    print("Viniper full verification passed.")
     return 0
 
 

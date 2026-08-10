@@ -39,8 +39,9 @@ const BUNDLED_VERSION = readBundledVersion();
 const IS_PREVIEW = process.env.VINIPER_UI_PREVIEW === "1"
   || DESKTOP_METADATA.viniperProfile === "preview"
   || fs.existsSync(path.join(APP_ROOT, "PREVIEW"));
-const DISPLAY_NAME = IS_PREVIEW ? PREVIEW_PROFILE.product_name : "Viniper UI";
+const DISPLAY_NAME = IS_PREVIEW ? PREVIEW_PROFILE.product_name : "Viniper";
 const APP_USER_MODEL_ID = IS_PREVIEW ? PREVIEW_PROFILE.app_id : "com.viniper.ui.desktop";
+const TITLEBAR_HEIGHT = 32;
 
 let port = Number(process.env.VINIPER_UI_PORT || (IS_PREVIEW ? PREVIEW_PROFILE.port : 17373));
 let mainWindow = null;
@@ -52,6 +53,7 @@ let isStarting = false;
 let stdioBroken = false;
 let alwaysOnTop = false;
 let trayBadgeCount = 0;
+let wslEnablePromise = null;
 
 function handleStdioError(error) {
   if (error && error.code === "EPIPE") {
@@ -120,7 +122,7 @@ async function createSplashWindow() {
       display: grid;
       place-items: center;
       filter: drop-shadow(0 20px 34px rgba(0, 18, 22, 0.32));
-      animation: mark-breathe 1.7s ease-in-out 1.05s infinite;
+      animation: mark-arrive 1.18s cubic-bezier(0.2, 0.82, 0.18, 1) both;
     }
     .boot-icon {
       width: 100%;
@@ -129,7 +131,7 @@ async function createSplashWindow() {
       clip-path: inset(0 100% 0 0 round 22px);
       opacity: 0;
       transform: scale(0.94);
-      animation: v-reveal 1.05s cubic-bezier(0.18, 0.86, 0.24, 1) both;
+      animation: v-reveal 1.18s cubic-bezier(0.18, 0.86, 0.24, 1) both;
     }
     .boot-mark::after {
       content: "";
@@ -141,7 +143,7 @@ async function createSplashWindow() {
       mix-blend-mode: screen;
       opacity: 0;
       transform: translateX(-88px) skewX(-16deg);
-      animation: v-shine 1.05s ease-out 0.18s both;
+      animation: v-shine 1.02s ease-out 0.12s both;
       pointer-events: none;
     }
     @keyframes v-reveal {
@@ -169,12 +171,16 @@ async function createSplashWindow() {
       38% { opacity: 0.72; }
       100% { opacity: 0; transform: translateX(96px) skewX(-16deg); }
     }
-    @keyframes mark-breathe {
-      0%, 100% { transform: scale(1); filter: drop-shadow(0 20px 34px rgba(0,18,22,0.28)); }
-      50% { transform: scale(1.025); filter: drop-shadow(0 24px 42px rgba(0,18,22,0.36)); }
+    @keyframes mark-arrive {
+      0% { transform: scale(0.965); filter: drop-shadow(0 12px 22px rgba(0,18,22,0.18)); }
+      56% { transform: scale(1.022); filter: drop-shadow(0 25px 44px rgba(0,18,22,0.37)); }
+      100% { transform: scale(1); filter: drop-shadow(0 20px 34px rgba(0,18,22,0.28)); }
     }
     @media (prefers-reduced-motion: reduce) {
-      .boot-mark, .boot-icon, .boot-mark::after { animation: none !important; opacity: 1; clip-path: none; transform: none; }
+      .boot-mark { animation: reduced-fade 180ms ease-out both !important; }
+      .boot-icon { animation: none !important; opacity: 1; clip-path: none; transform: none; }
+      .boot-mark::after { display: none; }
+      @keyframes reduced-fade { from { opacity: 0; } to { opacity: 1; } }
     }
   </style>
 </head>
@@ -285,6 +291,8 @@ function logServerChunk(level, chunk) {
 }
 
 function previewUserDataDir() {
+  const configured = String(process.env.VINIPER_UI_DATA_DIR || "").trim();
+  if (configured) return path.resolve(configured);
   const dataDirName = PREVIEW_PROFILE.data_dir_name || "Viniper Preview";
   if (process.platform === "win32") {
     return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), dataDirName);
@@ -293,6 +301,13 @@ function previewUserDataDir() {
     return path.join(os.homedir(), "Library", "Application Support", dataDirName);
   }
   return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), dataDirName);
+}
+
+function formalUserDataDir() {
+  const configured = String(process.env.VINIPER_UI_DATA_DIR || "").trim();
+  if (configured) return path.resolve(configured);
+  // Keep the public 4.x desktop data identity while the visible brand becomes Viniper.
+  return path.join(app.getPath("appData"), "Viniper UI");
 }
 
 function sendRendererCommand(command, payload = {}) {
@@ -325,8 +340,13 @@ function openSettingsWindow() {
   sendRendererCommand("open-settings");
 }
 
-function openSkillsWindow() {
-  shell.openExternal("https://www.skills.sh");
+function setTitlebarTheme(theme = {}) {
+  if (mainWindow && !mainWindow.isDestroyed() && process.platform === "win32" && typeof mainWindow.setTitleBarOverlay === "function") {
+    const color = String(theme.color || "#f5f3ee");
+    const symbolColor = String(theme.symbolColor || "#302f2b");
+    mainWindow.setTitleBarOverlay({ color, symbolColor, height: TITLEBAR_HEIGHT });
+  }
+  return { ok: true };
 }
 
 function requestJson(urlPath, timeoutMs = 1500) {
@@ -510,13 +530,17 @@ async function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 1320,
     height: 900,
-    minWidth: 960,
+    minWidth: 900,
     minHeight: 680,
     title: DISPLAY_NAME,
     icon: appIcon(),
     backgroundColor: "#f6fbff",
     show: false,
-    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
+    autoHideMenuBar: true,
+    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
+    titleBarOverlay: process.platform === "win32"
+      ? { color: "#f5f3ee", symbolColor: "#302f2b", height: TITLEBAR_HEIGHT }
+      : undefined,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -551,6 +575,7 @@ async function createMainWindow() {
   const remainingSplashMs = Math.max(0, 1450 - (Date.now() - splashStartedAt));
   if (remainingSplashMs > 0) await delay(remainingSplashMs);
   mainWindow.setIcon(appIcon());
+  if (process.platform === "win32") mainWindow.setMenuBarVisibility(false);
   mainWindow.setAlwaysOnTop(alwaysOnTop, "floating");
   sendWindowState();
   mainWindow.show();
@@ -623,6 +648,38 @@ function createTray() {
   tray.on("click", showMainWindow);
 }
 
+function enableWslPlatform() {
+  if (process.platform !== "win32") {
+    return Promise.resolve({ ok: false, status: "unsupported", message: "仅 Windows 需要启用 WSL2。" });
+  }
+  if (wslEnablePromise) return wslEnablePromise;
+
+  const command = [
+    "$ErrorActionPreference='Stop'",
+    "$wsl=Join-Path $env:SystemRoot 'System32\\wsl.exe'",
+    "$process=Start-Process -FilePath $wsl -ArgumentList @('--install','--no-distribution') -Verb RunAs -Wait -PassThru",
+    "exit [int]$process.ExitCode"
+  ].join("; ");
+  wslEnablePromise = new Promise((resolve) => {
+    const child = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+      { stdio: "ignore", windowsHide: true }
+    );
+    child.once("error", () => resolve({
+      ok: false,
+      status: "failed",
+      message: "未能启动 Windows WSL 安装；可以稍后重试或打开诊断。"
+    }));
+    child.once("close", (code) => resolve(code === 0
+      ? { ok: true, status: "requested", message: "Windows 已接收 WSL 安装请求。" }
+      : { ok: false, status: "cancelled_or_failed", message: "WSL 安装未完成；可以稍后重试。" }));
+  }).finally(() => {
+    wslEnablePromise = null;
+  });
+  return wslEnablePromise;
+}
+
 function updateTrayMenu() {
   if (!tray) return;
   tray.setToolTip(trayBadgeCount > 0 ? `${DISPLAY_NAME} - ${trayBadgeCount} 条新回复` : DISPLAY_NAME);
@@ -640,7 +697,6 @@ function updateTrayMenu() {
     { label: "切换边栏", click: () => sendRendererCommand("toggle-sidebar") },
     { type: "separator" },
     { label: "设置", click: openSettingsWindow },
-    { label: "打开 skills.sh", click: openSkillsWindow },
     { label: "在浏览器打开", click: () => shell.openExternal(localUrl()) },
     { type: "separator" },
     { label: "运行自检", click: runDiagnosticsDialog },
@@ -666,7 +722,6 @@ function createApplicationMenu() {
         { label: "添加附件", accelerator: "CmdOrCtrl+O", click: () => sendRendererCommand("attach-file") },
         { label: "选择目录", accelerator: "CmdOrCtrl+Shift+O", click: () => sendRendererCommand("change-workdir") },
         { type: "separator" },
-        { label: "打开 skills.sh", click: openSkillsWindow },
         { label: `在浏览器打开 ${DISPLAY_NAME}`, click: () => shell.openExternal(localUrl()) },
         { type: "separator" },
         { role: "quit", label: "退出" }
@@ -708,7 +763,6 @@ function createApplicationMenu() {
         { type: "separator" },
         { label: "显示主窗口", click: showMainWindow },
         { label: "打开 settings", click: openSettingsWindow },
-        { label: "打开 skills.sh", click: openSkillsWindow }
       ]
     }
   ]));
@@ -717,14 +771,14 @@ function createApplicationMenu() {
 ipcMain.handle("viniper:get-window-state", () => ({ alwaysOnTop }));
 ipcMain.handle("viniper:set-always-on-top", (_event, enabled) => setAlwaysOnTop(Boolean(enabled)));
 ipcMain.handle("viniper:toggle-always-on-top", () => toggleAlwaysOnTop());
-ipcMain.handle("viniper:open-skills", () => {
-  openSkillsWindow();
-  return { ok: true };
-});
+ipcMain.handle("viniper:set-titlebar-theme", (_event, theme) => setTitlebarTheme(theme));
+ipcMain.handle("viniper:enable-wsl-platform", () => enableWslPlatform());
 ipcMain.on("viniper:conversation-completed", markConversationCompleted);
 
 if (IS_PREVIEW) {
   app.setPath("userData", previewUserDataDir());
+} else {
+  app.setPath("userData", formalUserDataDir());
 }
 
 if (!app.requestSingleInstanceLock()) {

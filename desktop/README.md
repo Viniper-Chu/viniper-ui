@@ -1,35 +1,35 @@
-# Viniper UI Desktop
+# Viniper Desktop
 
-This folder contains the desktop shell for Viniper UI. It keeps the current thin web UI and local Claude Code bridge, then wraps it in an Electron window with tray/background behavior.
+此目录是 Viniper 的 Electron 桌面壳。它负责原生窗口、托盘、单实例、启动动画、本地服务生命周期与正式/Preview Profile 接线，不改变 Claude Code 的工具与权限语义。
 
-## Development
+## 开发
 
-```bash
+```powershell
 cd desktop
 npm install
 npm start
 ```
 
-The desktop shell starts `../server.py` with `VINIPER_UI_OPEN_BROWSER=0`, waits for `http://127.0.0.1:17373/api/status`, and loads the existing UI into the app window.
+## 构建
 
-## Build
+从仓库根目录构建 Windows 安装器：
 
-```bash
-cd ..
-python scripts/build_desktop.py --target win
+```powershell
+python scripts/build_desktop.py --target win --skip-install
 ```
 
-On macOS:
+macOS 构建必须显式指定 `x64` 或 `arm64`：
 
 ```bash
-python3 scripts/build_desktop.py --target mac
+python3 scripts/build_desktop.py --target mac --arch x64
+python3 scripts/build_desktop.py --target mac --arch arm64
 ```
 
-Build output is written to `desktop/release/`.
+产物写入被 Git 忽略的 `desktop/release/`。正式构建使用显式白名单资源 staging，包内包含 `server.py`、Agent/上下文/用量/技能同步等运行模块、静态资源与原 Viniper 图标，不遍历 `codex/`、`.omx/`、数据目录或旧 release。
 
-## Notes
+## Profile 与数据
 
-- User data remains in the normal Viniper UI data directory, not inside the app bundle.
-- The window close button hides the app to the tray; the tray menu contains Quit.
-- The tray menu includes self-check and restart actions.
-- The desktop shell is intentionally thin. Claude Code execution, permissions, skills, sessions, model selection, settings, updates, and attachments still live in the existing local service.
+- 正式显示名：Viniper；App ID 继续使用 `com.viniper.ui.desktop` 以保持升级兼容。
+- Preview 显示名：Viniper Preview；端口、安装目录和 `%APPDATA%\Viniper Preview` 与正式版隔离。
+- 正式版继续使用 `%APPDATA%\Viniper UI` 兼容数据根；更新不得清空 sessions、settings、`AGENT.md`、skills、attachments 或凭据。
+- 窗口关闭默认隐藏到托盘；托盘提供显示、设置、自检、数据目录和退出等真实动作。

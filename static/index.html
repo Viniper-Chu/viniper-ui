@@ -21,7 +21,7 @@
       document.documentElement.dataset.accent = savedAccent;
       document.documentElement.dataset.fontSize = ["xs", "sm", "normal", "lg", "xl"].includes(savedFontSize) ? savedFontSize : "normal";
       if (Number.isFinite(savedSidebarWidth)) {
-        const narrow = window.matchMedia && window.matchMedia("(max-width: 720px)").matches;
+        const narrow = window.matchMedia && window.matchMedia("(max-width: 819px)").matches;
         const maxWidth = narrow ? Math.max(220, window.innerWidth - 56) : Math.min(760, Math.round(window.innerWidth * 0.65));
         const width = Math.min(maxWidth, Math.max(220, savedSidebarWidth));
         document.documentElement.style.setProperty("--sidebar-width", `${width}px`);
@@ -40,31 +40,64 @@
   </div>
 
   <div id="app">
-    <aside id="sidebar" aria-label="会话与项目">
-      <header class="sidebar-header">
-        <div class="brand-wrap">
-          <img class="brand-icon" src="/static/assets/viniper-icon.png?v=__APP_VERSION__" alt="" aria-hidden="true">
-          <div class="brand-copy">
-            <div class="brand">__APP_TITLE__</div>
-            <div id="status-line" class="subtle" role="status" aria-live="polite">正在连接</div>
-          </div>
-        </div>
-        <button id="new-chat-btn" class="icon-button new-chat-icon" title="新建会话" aria-label="新建会话">+</button>
-      </header>
-
-      <nav id="view-tabs" class="view-tabs" aria-label="工作区视图">
-        <button id="home-view-btn" class="view-tab active" type="button" aria-pressed="true">首页</button>
-        <button id="code-view-btn" class="view-tab" type="button" aria-pressed="false">代码</button>
+    <header id="topbar" class="titlebar-drag-region">
+      <nav id="global-nav" class="global-nav titlebar-no-drag" aria-label="全局导航">
+        <button id="menu-btn" class="icon-button topbar-nav-button" type="button" title="菜单" aria-label="菜单" aria-expanded="false"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M3 4.5h12M3 9h12M3 13.5h12"/></svg></button>
+        <button id="toggle-sidebar-btn" class="icon-button topbar-nav-button sidebar-toggle-button" type="button" title="显示/隐藏边栏" aria-label="显示/隐藏边栏" aria-pressed="true"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><rect x="3" y="3" width="12" height="12" rx="1.5"/><path d="M7 3v12"/></svg></button>
+        <button id="search-btn" class="icon-button topbar-nav-button" type="button" title="搜索" aria-label="搜索" aria-expanded="false"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><circle cx="7.7" cy="7.7" r="4.2"/><path d="m10.9 10.9 3.7 3.7"/></svg></button>
+        <button id="back-btn" class="icon-button topbar-nav-button" type="button" title="后退" aria-label="后退" disabled aria-disabled="true"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="m10.8 3.5-5.5 5.5 5.5 5.5"/><path d="M5.7 9h8.8"/></svg></button>
+        <button id="forward-btn" class="icon-button topbar-nav-button" type="button" title="前进" aria-label="前进" disabled aria-disabled="true"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="m7.2 3.5 5.5 5.5-5.5 5.5"/><path d="M3.5 9h8.8"/></svg></button>
       </nav>
+      <div class="topbar-actions">
+        <button id="always-on-top-btn" class="icon-button window-pin-button" type="button" title="置顶聊天窗口" aria-label="置顶聊天窗口" aria-pressed="false"><img class="window-pin-icon" src="/static/assets/viniper-icon.png?v=__APP_VERSION__" alt="" aria-hidden="true"></button>
+      </div>
+    </header>
+
+    <section id="global-menu" class="global-menu hidden" role="menu" aria-label="菜单" aria-hidden="true">
+      <button type="button" role="menuitem" data-menu-action="new-chat">新建聊天</button>
+      <button type="button" role="menuitem" data-menu-action="new-agent-session">新建会话</button>
+      <button type="button" role="menuitem" data-menu-action="skills">自定义与技能</button>
+      <button type="button" role="menuitem" data-menu-action="settings">设置</button>
+      <div class="global-menu-divider" role="separator"></div>
+      <button type="button" role="menuitem" data-menu-action="toggle-theme">切换主题</button>
+      <button type="button" role="menuitem" data-menu-action="diagnostics">运行自检</button>
+    </section>
+
+    <section id="search-panel" class="search-panel hidden" role="dialog" aria-label="搜索" aria-hidden="true">
+      <label class="search-panel-input" for="global-search-input"><span class="sr-only">搜索会话、技能或命令</span><span aria-hidden="true" class="search-inline-icon"><svg class="nav-icon" viewBox="0 0 18 18"><circle cx="7.7" cy="7.7" r="4.2"/><path d="m10.9 10.9 3.7 3.7"/></svg></span><input id="global-search-input" type="search" autocomplete="off" placeholder="搜索会话、技能或命令"></label>
+      <div id="search-results" class="search-results" role="listbox" aria-label="搜索结果"></div>
+    </section>
+
+    <section id="workspace-mode-bar" class="workspace-mode-bar" aria-label="工作表面">
+      <div id="workspace-mode-tabs-slot" class="workspace-mode-tabs-slot">
+        <nav id="view-tabs" class="view-tabs" aria-label="会话模式">
+          <button id="chat-view-btn" class="view-tab active" type="button" aria-pressed="true"><svg class="view-tab-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M3.5 8.1 9 3.5l5.5 4.6v6.2H10.8v-3.8H7.2v3.8H3.5z"></path></svg><span>Chat</span></button>
+          <button id="agent-view-btn" class="view-tab" type="button" aria-pressed="false"><svg class="view-tab-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="m6.8 5.2-3.2 3.8 3.2 3.8M11.2 5.2l3.2 3.8-3.2 3.8M10.1 3.8 7.9 14.2"></path></svg><span>Agent</span></button>
+        </nav>
+      </div>
+      <span class="workspace-mode-divider" aria-hidden="true"></span>
+      <div id="agent-session-header" class="topbar-title-group topbar-session-header hidden" aria-label="当前 Agent 会话">
+        <button id="session-title-button" class="session-title-button titlebar-no-drag" type="button" aria-label="重命名当前会话">
+          <span id="session-title">未命名会话</span>
+        </button>
+        <span id="workdir-display" class="session-workdir" role="note" aria-label="工作目录：使用默认目录" title="使用默认目录">默认工作目录</span>
+        <button id="session-header-menu-button" class="session-header-menu-button titlebar-no-drag" type="button" aria-label="会话操作" aria-haspopup="menu" aria-expanded="false">
+          <svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="m5 7 4 4 4-4"></path></svg>
+        </button>
+      </div>
+    </section>
+
+    <aside id="sidebar" aria-label="会话与项目">
+      <header class="sidebar-header" aria-hidden="true"></header>
 
       <nav class="sidebar-quick-nav" aria-label="快捷入口">
         <button id="new-session-nav-btn" class="sidebar-nav-item" type="button" data-action="new-session">
-          <span class="nav-glyph" aria-hidden="true">＋</span><span>新建会话</span><span class="nav-shortcut">Ctrl K</span>
+          <span class="nav-glyph" aria-hidden="true">＋</span><span id="new-session-nav-label">新建聊天</span><span class="nav-shortcut">Ctrl K</span>
         </button>
-        <button id="project-btn" class="sidebar-nav-item" type="button" data-action="project">
+        <button id="project-btn" class="sidebar-nav-item agent-only" type="button" data-action="project">
           <span class="nav-glyph" aria-hidden="true">⌂</span><span>项目与目录</span>
         </button>
-        <button id="customize-btn" class="sidebar-nav-item" type="button" data-action="customize">
+        <button id="customize-btn" class="sidebar-nav-item agent-only" type="button" data-action="customize">
           <span class="nav-glyph" aria-hidden="true">✦</span><span>自定义与技能</span>
         </button>
       </nav>
@@ -73,39 +106,29 @@
       <nav id="session-list" aria-label="会话列表"></nav>
 
       <footer class="sidebar-footer">
-        <div class="account-row">
+        <div class="brand">__APP_TITLE__</div>
+        <button id="account-menu-trigger" class="account-row" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="account-menu" title="打开账号与应用菜单">
           <img src="/static/assets/viniper-icon.png?v=__APP_VERSION__" alt="" aria-hidden="true">
-          <div><strong>Viniper</strong><span id="profile-label">预览环境</span></div>
-        </div>
-        <div class="sidebar-footer-actions">
-          <button id="skills-web-btn" class="panel-button footer-icon-button" type="button" title="打开技能库" aria-label="打开技能库"><span aria-hidden="true">✦</span></button>
-          <button id="settings-btn" class="panel-button settings-button" type="button" title="设置" aria-label="设置"><span class="gear-icon" aria-hidden="true"></span></button>
+          <span class="account-copy"><strong>Viniper</strong><span class="account-separator" aria-hidden="true">·</span><span id="profile-label">本地环境</span><span id="status-line" class="sr-only" role="status" aria-live="polite">正在连接</span></span>
+          <svg class="nav-icon account-chevron" viewBox="0 0 18 18" aria-hidden="true"><path d="m5 7 4 4 4-4"></path></svg>
+        </button>
+        <div id="account-menu" class="account-menu" role="menu" aria-label="账号与应用菜单" aria-hidden="true">
+          <button type="button" role="menuitem" data-account-action="settings"><svg class="nav-icon account-menu-icon" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="2.2"></circle><path d="M9 2.5v2M9 13.5v2M2.5 9h2M13.5 9h2M4.4 4.4l1.4 1.4M12.2 12.2l1.4 1.4M13.6 4.4l-1.4 1.4M5.8 12.2l-1.4 1.4"></path></svg><span>设置</span><span class="account-menu-shortcut">Ctrl+,</span></button>
+          <button type="button" role="menuitem" data-account-action="update"><svg class="nav-icon account-menu-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M14.2 7.2A5.4 5.4 0 1 0 14 11"></path><path d="M14.2 3.8v3.6h-3.6"></path></svg><span>检查更新</span></button>
+          <button type="button" role="menuitem" data-account-action="diagnostics"><svg class="nav-icon account-menu-icon" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="6.3"></circle><path d="M9 8v4M9 5.3v.2"></path></svg><span>诊断与详情</span></button>
         </div>
       </footer>
     </aside>
-    <div id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="拖动调整会话栏宽度" title="拖动调整会话栏宽度"><span class="sidebar-resizer-grip" aria-hidden="true"></span></div>
+    <div id="sidebar-resizer" role="separator" tabindex="0" aria-orientation="vertical" aria-label="折叠侧栏 Ctrl+B；拖动调整大小" title="折叠侧栏 Ctrl+B；拖动调整大小">
+      <span class="sidebar-resizer-grip" aria-hidden="true"></span>
+      <span id="sidebar-resizer-tooltip" class="sidebar-resizer-tooltip" role="tooltip">折叠侧栏 Ctrl+B<br>拖动调整大小</span>
+    </div>
 
     <main id="main" aria-label="主工作区">
-      <header id="topbar">
-        <div class="topbar-title-group">
-          <button id="toggle-sidebar-btn" class="icon-button sidebar-toggle-button" type="button" title="显示/隐藏边栏" aria-label="显示/隐藏边栏">☰</button>
-          <div class="title-stack">
-            <div id="session-title">新会话</div>
-            <div id="workdir-display" class="subtle"></div>
-          </div>
-        </div>
-        <div class="topbar-actions">
-          <label class="model-picker anchored-control" for="model-select"><span>模型</span><select id="model-select" aria-label="选择模型" aria-haspopup="listbox"></select></label>
-          <label class="permission-picker anchored-control" for="permission-select"><span>权限</span><select id="permission-select" aria-label="选择权限模式" aria-haspopup="listbox"></select></label>
-          <button id="change-workdir-btn" class="ghost-button" type="button">目录</button>
-          <button id="always-on-top-btn" class="ghost-button window-pin-button" type="button" title="置顶聊天窗口" aria-label="置顶聊天窗口">○ 窗口</button>
-        </div>
-      </header>
-
       <div class="main-stage">
         <section id="chat-container" aria-label="对话内容">
           <div id="messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
-          <div id="thinking" class="hidden"><span class="spinner"></span><span>正在生成</span></div>
+          <div id="thinking" class="hidden"><span class="spinner"></span><span class="working-label">正在工作…</span></div>
         </section>
 
         <aside id="workspace-rail" class="context-rail hidden" aria-label="工具与产物">
@@ -119,24 +142,91 @@
         </aside>
       </div>
 
+      <section id="skills-view" class="skills-view hidden" aria-label="自定义与技能">
+        <header class="skills-view-header">
+          <div><p class="skills-eyebrow">本地能力</p><h1>自定义与技能</h1><p class="subtle">浏览本地技能，并将其用于 Agent 会话。</p></div>
+          <button id="close-skills-view-btn" class="ghost-button" type="button">返回会话</button>
+        </header>
+        <div class="skills-layout">
+          <aside class="skills-catalog" aria-label="技能目录">
+            <label class="skills-search" for="skill-search"><span class="sr-only">搜索技能</span><input id="skill-search" type="search" placeholder="搜索技能"></label>
+            <div id="skills-categories" class="skills-categories" aria-label="技能分类"></div>
+            <div id="skills-list" class="skills-list"></div>
+          </aside>
+          <article id="skill-detail" class="skill-detail hidden">
+            <div class="skill-detail-head"><button id="back-to-skills" class="ghost-button" type="button">返回列表</button><button id="use-skill-btn" class="primary-button" type="button">用于 Agent</button></div>
+            <div id="skill-detail-content" class="skill-detail-content"></div>
+          </article>
+        </div>
+      </section>
+
       <section id="input-area" aria-label="消息输入">
-        <div id="context-files"></div>
-        <div id="composer" class="composer-shell">
-          <div class="composer-topline"><span class="composer-hint">输入任务，或使用 / 命令</span><span class="composer-shortcut">Enter 发送 · Shift Enter 换行</span></div>
-          <textarea id="user-input" rows="1" placeholder="输入消息" autofocus></textarea>
-          <div id="slash-suggestions" class="slash-suggestions hidden" role="listbox" aria-label="Slash commands"></div>
-          <div id="input-actions">
-            <div id="context-meter" class="context-meter" aria-label="上下文占用" title="上下文 0%"><div id="context-ring" class="context-ring" role="status" aria-live="polite" title="上下文 0%" aria-label="上下文占用，当前 0%" aria-busy="false"><span id="context-percent" class="context-tooltip">0%</span><span id="context-label" class="sr-only">上下文</span></div><span class="context-state-label">上下文</span></div>
-            <button id="file-btn" class="icon-button" title="添加附件" aria-label="添加附件">＋</button>
-            <input id="file-input" type="file" hidden multiple>
-            <div id="plus-menu" class="plus-menu hidden" role="menu" aria-label="添加"><button type="button" role="menuitem" data-plus-action="attach">添加附件</button></div>
-            <button id="stop-btn" class="stop-button hidden" type="button" title="停止当前任务" aria-label="停止当前任务">■</button>
-            <button id="send-btn" class="send-button" title="发送" aria-label="发送">↵</button>
+        <div id="context-files" class="hidden" aria-label="已添加的附件"></div>
+        <div class="composer-stack">
+          <div id="agent-queue-dock" class="agent-queue-dock hidden" aria-live="polite" aria-label="待发送队列"></div>
+          <div id="interaction-dock" class="interaction-dock" aria-live="polite"></div>
+          <div id="composer" class="composer-shell">
+            <div class="composer-topline"><span class="composer-hint">输入消息</span><span class="composer-shortcut">Enter 发送 · Shift+Enter 换行</span></div>
+            <textarea id="user-input" rows="1" placeholder="输入消息" autofocus></textarea>
+            <div id="slash-suggestions" class="slash-suggestions agent-only hidden" role="listbox" aria-label="Slash commands"></div>
+            <div id="submit-actions" class="submit-actions" aria-label="发送控制">
+              <button id="stop-btn" class="stop-button hidden" type="button" title="停止当前任务" aria-label="停止当前任务">■</button>
+              <button id="send-btn" class="send-button" title="发送" aria-label="发送">↵</button>
+            </div>
+          </div>
+          <div id="input-actions" class="composer-tools-row" aria-label="输入工具">
+            <div class="composer-tools-left">
+              <div class="permission-picker anchored-control agent-only" data-picker="permission">
+                <select id="permission-select" class="control-source-select" aria-label="选择权限模式" tabindex="-1"></select>
+                <button id="permission-picker-button" class="anchored-picker-button" type="button" aria-label="选择权限模式" aria-haspopup="listbox" aria-expanded="false">
+                  <span id="permission-picker-label">询问权限</span>
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5 6 3 3 3-3"></path></svg>
+                </button>
+                <div id="permission-menu" class="anchored-menu permission-menu hidden" role="listbox" aria-label="权限模式"></div>
+              </div>
+              <button id="file-btn" class="icon-button agent-only" title="添加附件" aria-label="添加附件">＋</button>
+              <input id="file-input" type="file" hidden multiple>
+              <div id="plus-menu" class="plus-menu hidden" role="menu" aria-label="添加"><button type="button" role="menuitem" data-plus-action="attach">添加附件</button></div>
+              <div class="peer-picker agent-only" data-peer-picker>
+                <button id="peer-picker-button" class="icon-button peer-picker-button" type="button" title="向另一个运行中的会话发送消息" aria-label="选择跨会话消息目标" aria-haspopup="listbox" aria-expanded="false" disabled>
+                  <svg viewBox="0 0 18 18" aria-hidden="true"><path d="M3.25 4.25h7.5v5.5h-4l-2.5 2v-2h-1z"></path><path d="M8.25 8.25h6.5v4.5h-1v2l-2.25-2H8.25z"></path></svg>
+                  <span id="peer-picker-label" class="peer-picker-label">会话消息</span>
+                </button>
+                <div id="peer-menu" class="anchored-menu peer-menu hidden" role="listbox" aria-label="选择目标会话"></div>
+              </div>
+            </div>
+            <div class="composer-tools-right">
+              <div class="model-picker anchored-control" data-picker="model">
+                <select id="model-select" class="control-source-select" aria-label="选择模型" tabindex="-1"></select>
+                <button id="model-picker-button" class="anchored-picker-button" type="button" aria-label="选择模型" aria-haspopup="listbox" aria-expanded="false" title="选择模型 Ctrl+Shift+I">
+                  <span id="model-picker-label">模型</span>
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m5 6 3 3 3-3"></path></svg>
+                </button>
+                <div id="model-menu" class="anchored-menu model-menu hidden" role="listbox" aria-label="模型"></div>
+              </div>
+              <div class="context-usage-control agent-only">
+                <button id="context-meter" class="context-meter" type="button" aria-label="查看上下文窗口用量" aria-haspopup="dialog" aria-expanded="false" title="上下文用量暂不可用"><span id="context-ring" class="context-ring" role="status" aria-live="polite"><span id="context-percent" class="context-tooltip">—</span><span id="context-label" class="sr-only">上下文用量暂不可用</span></span></button>
+                <div id="context-popover" class="context-popover hidden" role="dialog" aria-label="上下文窗口用量">
+                  <strong>上下文窗口</strong>
+                  <span id="context-usage-detail">暂时没有真实用量</span>
+                  <small id="context-usage-source">来源：不可用</small>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
-        <div class="input-footer-row"><span class="composer-status">本地会话 · 数据保存在当前 Preview 环境</span><button id="update-btn" class="ghost-button update-button version-corner" type="button" title="检查更新">更新</button></div>
+        <div class="input-footer-row"><span id="composer-status" class="composer-status">本地会话 · 数据保存在当前 Viniper 环境</span><button id="update-btn" class="ghost-button update-button version-corner" type="button" title="检查更新">更新</button></div>
       </section>
     </main>
+  </div>
+
+  <div id="session-context-menu" class="session-context-menu hidden" role="menu" aria-label="会话操作" aria-hidden="true">
+    <button type="button" role="menuitem" data-session-action="pin" data-session-pin data-menu-key="P"><svg class="session-menu-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="m7 3 6 1-1 4 3 3-4 1-4 5v-5L4 9l4-1z"></path></svg><span data-session-action-label></span><kbd>P</kbd></button>
+    <button type="button" role="menuitem" data-session-action="unread" data-menu-key="U"><svg class="session-menu-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M3 10c1.8-3 4.1-4.5 7-4.5S15.2 7 17 10c-1.8 3-4.1 4.5-7 4.5S4.8 13 3 10Z"></path><path d="m4 4 12 12"></path></svg><span data-session-action-label></span><kbd>U</kbd></button>
+    <button type="button" role="menuitem" data-session-action="rename" data-menu-key="R"><svg class="session-menu-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="m4 14-.5 3 3-.5L15 8l-2.5-2.5zM11.5 6.5 14 9"></path></svg><span data-session-action-label>重命名</span><kbd>R</kbd></button>
+    <button type="button" role="menuitem" data-session-action="project"><svg class="session-menu-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 6.5h13l-1 10h-11zM5 6.5l1-3h8l1 3"></path></svg><span data-session-action-label></span><kbd aria-hidden="true">›</kbd></button>
+    <div class="session-context-divider" role="separator"></div>
+    <button type="button" role="menuitem" class="danger" data-session-action="delete" data-menu-key="D"><svg class="session-menu-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12M8 3.5h4M6 6l.7 10h6.6L14 6M8.5 9v4.5M11.5 9v4.5"></path></svg><span data-session-action-label>删除</span><kbd>D</kbd></button>
   </div>
 
   <div id="drop-overlay" aria-hidden="true">
@@ -145,7 +235,7 @@
 
   <div id="new-session-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="new-session-title">
     <div class="modal-content">
-      <h2 id="new-session-title">新建会话</h2>
+      <h2 id="new-session-title">新建聊天</h2>
       <label for="new-session-name">名称</label>
       <input id="new-session-name" type="text" placeholder="例如：网页修复">
       <label for="new-session-workdir">工作目录</label>
@@ -231,119 +321,151 @@
     </div>
   </div>
 
-  <div id="permission-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="permission-title">
-    <div class="modal-content permission-modal-content">
-      <h2 id="permission-title">允许本次 Claude Code 操作？</h2>
-      <p class="modal-copy">这个请求看起来需要读取/修改文件、运行命令、打开程序或访问本地路径。按 Enter 允许本次操作，按 Esc 取消。</p>
-      <div class="permission-request">
-        <div class="permission-request-label">请求</div>
-        <div id="permission-summary"></div>
-      </div>
-      <div class="permission-workdir">
-        <span>目录</span>
-        <code id="permission-workdir"></code>
-      </div>
-      <div class="modal-actions">
-        <button id="deny-permission-btn" class="ghost-button" type="button">取消</button>
-        <button id="allow-once-btn" class="primary-button" type="button">仅本次允许</button>
-      </div>
-    </div>
-  </div>
-
   <div id="settings-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div class="modal-content settings-modal-content">
-      <div class="settings-head">
-        <div>
+      <div class="settings-shell">
+        <aside class="settings-sidebar">
           <h2 id="settings-title">设置</h2>
-          <p class="modal-copy">配置外观、模型供应商、Agent 壳和本地账号。API Key 只保存在这台电脑。</p>
-        </div>
-        <button id="close-settings-btn" class="icon-button" type="button" title="关闭" aria-label="关闭">×</button>
-      </div>
-
-      <div class="settings-layout">
-        <nav class="settings-nav" aria-label="设置分组">
-          <button class="settings-nav-item active" type="button" data-settings-nav="account">账号</button>
-          <button class="settings-nav-item" type="button" data-settings-nav="appearance">外观</button>
-          <button class="settings-nav-item" type="button" data-settings-nav="agent">Agent 壳</button>
-          <button class="settings-nav-item" type="button" data-settings-nav="workspace">工作目录</button>
-          <button class="settings-nav-item" type="button" data-settings-nav="provider">模型供应商</button>
-          <button class="settings-nav-item" type="button" data-settings-nav="diagnostics">诊断</button>
-        </nav>
-        <div class="settings-grid">
-        <section class="settings-section" data-settings-panel="account">
-          <h3>账号</h3>
-          <label for="settings-display-name">显示名称</label>
-          <input id="settings-display-name" type="text" autocomplete="name">
-          <label class="check-row">
-            <input id="settings-signed-in" type="checkbox">
-            <span>启用本地账号状态</span>
+          <label class="settings-search-box" for="settings-search">
+            <svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><circle cx="7.7" cy="7.7" r="4.2"></circle><path d="m10.9 10.9 3.7 3.7"></path></svg>
+            <input id="settings-search" type="search" autocomplete="off" placeholder="搜索设置">
           </label>
-        </section>
+          <div id="settings-search-results" class="settings-search-results hidden" aria-live="polite"></div>
+          <nav class="settings-nav" aria-label="设置分组">
+            <p class="settings-nav-group">设置</p>
+            <button class="settings-nav-item active" type="button" data-settings-nav="account" data-settings-section="general"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="6" r="2.6"></circle><path d="M3.8 15c.5-3 2.2-4.5 5.2-4.5s4.7 1.5 5.2 4.5"></path></svg><span>一般</span></button>
+            <button class="settings-nav-item" type="button" data-settings-nav="agent" data-settings-section="agent"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><rect x="3" y="4" width="12" height="10" rx="2"></rect><path d="M6 8h.01M12 8h.01M6.5 11h5"></path></svg><span>Agent</span></button>
+            <button class="settings-nav-item" type="button" data-settings-nav="provider" data-settings-section="models"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 2.7 14.5 6v6L9 15.3 3.5 12V6z"></path><path d="m3.8 6.2 5.2 3 5.2-3M9 9.2v5.7"></path></svg><span>模型</span></button>
+            <button class="settings-nav-item" type="button" data-settings-nav="workspace" data-settings-section="workspace"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M2.8 5.5h5l1.4 1.6h6v6.6H2.8z"></path></svg><span>工作区</span></button>
+            <button class="settings-nav-item" type="button" data-settings-nav="appearance" data-settings-section="appearance"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M9 2.8a6.2 6.2 0 1 0 0 12.4c1.3 0 1.4-1.7.5-2.2-.8-.5-.3-1.7.7-1.7h1.5c2.1 0 3.5-1.5 3.5-3.6C15.2 4.7 12.5 2.8 9 2.8Z"></path><circle cx="6.1" cy="6.4" r=".7"></circle><circle cx="9.2" cy="5.2" r=".7"></circle><circle cx="12" cy="6.8" r=".7"></circle></svg><span>外观</span></button>
+            <button class="settings-nav-item" type="button" data-settings-nav="diagnostics" data-settings-section="diagnostics"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="6.2"></circle><path d="M9 8v4M9 5.3v.2"></path></svg><span>诊断</span></button>
+            <p class="settings-nav-group">自定义</p>
+            <button class="settings-nav-item" type="button" data-settings-nav="agent-md" data-settings-section="agent-md"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="M4 2.8h7l3 3v9.4H4z"></path><path d="M11 2.8v3h3M6.5 9h5M6.5 12h4"></path></svg><span>AGENT.md</span></button>
+            <button class="settings-nav-item" type="button" data-settings-nav="skills" data-settings-section="skills"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="m9 2.7 1.3 3.2 3.4.2-2.6 2.2.9 3.4L9 9.8l-3 1.9.9-3.4-2.6-2.2 3.4-.2z"></path></svg><span>技能</span></button>
+          </nav>
+        </aside>
 
-        <section class="settings-section" data-settings-panel="appearance">
-          <h3>外观</h3>
-          <label for="settings-language">语言</label>
-          <select id="settings-language"></select>
-          <label for="settings-theme">主题</label>
-          <select id="settings-theme"></select>
-          <label for="settings-accent">颜色</label>
-          <select id="settings-accent"></select>
-          <label for="settings-font-size">文字大小</label>
-          <select id="settings-font-size"></select>
-        </section>
+        <section class="settings-main">
+          <button id="settings-close-btn" class="icon-button settings-close-button" type="button" title="关闭设置" aria-label="关闭设置"><svg class="nav-icon" viewBox="0 0 18 18" aria-hidden="true"><path d="m4.5 4.5 9 9M13.5 4.5l-9 9"></path></svg></button>
+          <div class="settings-center-content" tabindex="-1">
+            <section class="settings-section" data-settings-panel="account" data-settings-keywords="一般 显示名称 语言 快捷方式 更新 本机资料">
+              <header class="settings-panel-header"><h3>一般</h3><p>管理这台电脑上的显示资料和桌面应用入口。</p></header>
+              <div class="settings-field-row" id="settings-row-display-name" data-settings-label="显示名称 本机资料">
+                <div><label for="settings-display-name">显示名称</label><p>仅用于 Viniper 本机界面，不代表 Claude 云端账号。</p></div>
+                <input id="settings-display-name" type="text" autocomplete="name">
+              </div>
+              <div class="settings-field-row" id="settings-row-local-profile" data-settings-label="本机资料 状态">
+                <div><label for="settings-signed-in">本机资料状态</label><p>只控制本地环境行的显示状态。</p></div>
+                <label class="check-row"><input id="settings-signed-in" type="checkbox"><span>显示为已配置</span></label>
+              </div>
+              <div class="settings-field-row" id="settings-row-language" data-settings-label="语言 简体中文">
+                <div><label for="settings-language">语言</label><p>Viniper 用户界面语言。</p></div>
+                <select id="settings-language"></select>
+              </div>
+              <div class="settings-field-row" id="settings-row-shortcut" data-settings-label="桌面 快捷方式">
+                <div><span class="settings-field-label">桌面快捷方式</span><p>沿用已安装版本的原 Viniper 图标与入口属性。</p></div>
+                <button id="create-desktop-shortcut-btn" class="ghost-button" type="button">创建桌面快捷方式</button>
+              </div>
+              <div class="settings-field-row" id="settings-row-update" data-settings-label="应用 更新 版本">
+                <div><span class="settings-field-label">应用更新</span><p id="settings-update-status">检查当前 Viniper 更新状态。</p></div>
+                <button id="settings-check-update-btn" class="ghost-button" type="button">检查更新</button>
+              </div>
+            </section>
 
-        <section class="settings-section" data-settings-panel="agent">
-          <h3>Agent 壳</h3>
-          <label for="settings-shell">壳</label>
-          <select id="settings-shell"></select>
-          <label for="settings-custom-command">Custom CLI command</label>
-          <textarea id="settings-custom-command" rows="3" spellcheck="false" placeholder="example-agent --model {model}"></textarea>
-          <label for="settings-custom-env">Extra environment</label>
-          <textarea id="settings-custom-env" rows="4" spellcheck="false" placeholder="OPENAI_API_KEY=...&#10;OPENAI_BASE_URL=..."></textarea>
-          <p class="settings-help">Claude Code 使用原始 stream-json 薄透传。Custom CLI 会把提示词写入 stdin，并把 stdout 流式显示到会话。可用占位符：{model}、{base_url}、{workdir}、{session_id}、{permission_mode}。</p>
-          <button id="create-desktop-shortcut-btn" class="panel-button" type="button">创建桌面快捷方式</button>
-          <p class="settings-help">快捷方式会指向已安装的软件版 __APP_TITLE__，而不是网页启动脚本。</p>
-        </section>
+            <section class="settings-section settings-panel-muted" data-settings-panel="agent" data-settings-keywords="Agent WSL2 Claude Code 运行时 壳 权限">
+              <header class="settings-panel-header"><h3>Agent</h3><p>配置真实 Agent 运行时、执行壳和默认权限。</p></header>
+              <div id="settings-runtime-status" class="settings-status-block" role="status">正在读取 ViniperRuntime 状态…</div>
+              <div class="settings-runtime-actions" aria-label="Agent 运行时操作">
+                <button id="settings-runtime-setup-btn" class="primary-button" type="button">安装运行时</button>
+                <button id="settings-runtime-update-btn" class="ghost-button hidden" type="button">检查 Claude Code 更新</button>
+                <button id="settings-runtime-diagnostics-btn" class="ghost-button" type="button">打开诊断</button>
+              </div>
+              <div class="settings-field-row" id="settings-row-shell" data-settings-label="Agent 壳 Claude Code 自定义 CLI">
+                <div><label for="settings-shell">Agent 壳</label><p>Claude Code 使用结构化 stream-json；自定义 CLI 从 stdin 接收提示。</p></div>
+                <select id="settings-shell"></select>
+              </div>
+              <div class="settings-field-stack" id="settings-row-custom-command" data-settings-label="自定义 CLI 命令">
+                <label for="settings-custom-command">自定义 CLI 命令</label>
+                <textarea id="settings-custom-command" rows="3" spellcheck="false" placeholder="example-agent --model {model}"></textarea>
+              </div>
+              <div class="settings-field-stack" id="settings-row-custom-env" data-settings-label="环境变量 自定义 CLI">
+                <label for="settings-custom-env">额外环境变量</label>
+                <textarea id="settings-custom-env" rows="4" spellcheck="false" placeholder="VARIABLE=value"></textarea>
+                <p class="settings-help">可用占位符：{model}、{base_url}、{workdir}、{session_id}、{permission_mode}。敏感值不会出现在诊断正文中。</p>
+              </div>
+              <div class="settings-field-row" id="settings-row-permission" data-settings-label="权限 默认 询问 自动 计划">
+                <div><label for="settings-permission-default">默认权限</label><p>应用于下一次 Agent 工作；会话 composer 仍可临时选择。</p></div>
+                <select id="settings-permission-default"></select>
+              </div>
+              <div class="settings-field-row" id="settings-row-auto-mode" data-settings-label="权限 自动模式">
+                <div><label for="settings-enable-auto-mode">自动模式</label><p>仅在当前 Claude Code 与模型能力支持时加入权限选择器。</p></div>
+                <input id="settings-enable-auto-mode" type="checkbox">
+              </div>
+              <div class="settings-field-row" id="settings-row-bypass-mode" data-settings-label="权限 跳过权限">
+                <div><label for="settings-allow-bypass-permissions">允许跳过权限模式</label><p>仅用于用户明确选择的受信任隔离环境。</p></div>
+                <input id="settings-allow-bypass-permissions" type="checkbox">
+              </div>
+            </section>
 
-        <section class="settings-section" data-settings-panel="workspace">
-          <h3>工作目录</h3>
-          <label for="settings-default-root">默认新建位置</label>
-          <div class="path-input-row">
-            <input id="settings-default-root" type="text" placeholder="例如：D:\">
-            <button id="browse-settings-default-root-btn" class="ghost-button" type="button">浏览</button>
+            <section class="settings-section settings-panel-muted" data-settings-panel="provider" data-settings-keywords="模型 供应商 DeepSeek API Key Base URL 环境变量">
+              <header class="settings-panel-header"><h3>模型</h3><p>管理当前兼容服务、默认模型和上下文规格。</p></header>
+              <div class="settings-field-row" id="settings-row-provider-label" data-settings-label="供应商 名称"><label for="settings-provider-label">供应商名称</label><input id="settings-provider-label" type="text" placeholder="DeepSeek"></div>
+              <div class="settings-field-row" id="settings-row-base-url" data-settings-label="Base URL 地址"><label for="settings-base-url">Base URL</label><input id="settings-base-url" type="url" placeholder="https://api.deepseek.com/anthropic"></div>
+              <div class="settings-field-row" id="settings-row-api-key" data-settings-label="API Key 密钥"><div><label for="settings-api-key">API Key</label><p>留空会保留已保存的密钥。</p></div><input id="settings-api-key" type="password" autocomplete="off" placeholder="留空表示保持当前密钥"></div>
+              <div class="settings-field-row" id="settings-row-api-key-env" data-settings-label="API Key 环境变量"><label for="settings-api-key-env">API Key 环境变量</label><input id="settings-api-key-env" type="text" placeholder="ANTHROPIC_AUTH_TOKEN"></div>
+              <div class="settings-field-row" id="settings-row-base-url-env" data-settings-label="Base URL 环境变量"><label for="settings-base-url-env">Base URL 环境变量</label><input id="settings-base-url-env" type="text" placeholder="ANTHROPIC_BASE_URL"></div>
+              <div class="settings-field-row" id="settings-row-model-env" data-settings-label="模型 环境变量"><label for="settings-model-env">模型环境变量</label><input id="settings-model-env" type="text" placeholder="ANTHROPIC_MODEL"></div>
+              <div class="settings-field-row" id="settings-row-default-model" data-settings-label="默认模型"><label for="settings-provider-model">默认模型</label><select id="settings-provider-model"></select></div>
+              <div class="settings-field-stack" id="settings-row-models" data-settings-label="模型列表 上下文长度">
+                <label for="settings-models">模型列表</label>
+                <textarea id="settings-models" rows="6" spellcheck="false" placeholder="model-id | 显示名称 | 上下文长度"></textarea>
+                <p class="settings-help">每行一个模型，例如：deepseek-v4-pro[1m] | DeepSeek V4 Pro | 200000</p>
+              </div>
+            </section>
+
+            <section class="settings-section settings-panel-muted" data-settings-panel="workspace" data-settings-keywords="工作区 默认目录 新建位置 文件夹">
+              <header class="settings-panel-header"><h3>工作区</h3><p>设置 Agent 新会话默认使用的本地目录。</p></header>
+              <div class="settings-field-row" id="settings-row-default-root" data-settings-label="默认新建位置 目录">
+                <div><label for="settings-default-root">默认新建位置</label><p>不会改写现有会话的工作目录。</p></div>
+                <div class="path-input-row"><input id="settings-default-root" type="text" placeholder="例如：D:\"><button id="browse-settings-default-root-btn" class="ghost-button" type="button">浏览</button></div>
+              </div>
+            </section>
+
+            <section class="settings-section settings-panel-muted" data-settings-panel="appearance" data-settings-keywords="外观 主题 颜色 字体 文字大小">
+              <header class="settings-panel-header"><h3>外观</h3><p>调整 Viniper 的主题、强调色和界面文字。</p></header>
+              <div class="settings-field-row" id="settings-row-theme" data-settings-label="主题 浅色 深色"><label for="settings-theme">主题</label><select id="settings-theme"></select></div>
+              <div class="settings-field-row" id="settings-row-accent" data-settings-label="颜色 强调色"><label for="settings-accent">颜色</label><select id="settings-accent"></select></div>
+              <div class="settings-field-row" id="settings-row-font-size" data-settings-label="字体 文字大小"><label for="settings-font-size">文字大小</label><select id="settings-font-size"></select></div>
+            </section>
+
+            <section class="settings-section settings-panel-muted" data-settings-panel="diagnostics" data-settings-keywords="诊断 自检 运行时 详情">
+              <header class="settings-panel-header"><h3>诊断</h3><p>运行现有本地检查并查看可公开的应用与运行时状态。</p></header>
+              <button id="run-diagnostics-btn" class="ghost-button" type="button">运行自检</button>
+              <div id="diagnostics-panel" class="diagnostics-panel" aria-live="polite"></div>
+            </section>
+
+            <section class="settings-section settings-panel-muted" data-settings-panel="agent-md" data-settings-keywords="AGENT.md 全局指令 Markdown 自定义 Agent">
+              <header class="settings-panel-header"><h3>AGENT.md</h3><p>Viniper Agent 每次开始或恢复工作前都会读取。Chat 不读取；工作目录中的 CLAUDE.md 与 AGENTS.md 可同时生效。</p></header>
+              <div class="settings-file-meta"><span>文件位置</span><code id="agent-md-path">尚未创建</code></div>
+              <label class="sr-only" for="agent-md-editor">全局 Agent 指令</label>
+              <textarea id="agent-md-editor" class="agent-md-editor" rows="18" spellcheck="false" placeholder="# 全局 Agent 指令&#10;&#10;在这里写入仅对 Viniper Agent 生效的 Markdown 指令。"></textarea>
+              <p class="settings-help">按 UTF-8 保存；下次 Agent 工作开始时生效，无需重启。</p>
+            </section>
+
+            <section class="settings-section settings-panel-muted" data-settings-panel="skills" data-settings-keywords="技能 自定义 本地技能库">
+              <header class="settings-panel-header"><h3>技能</h3><p>打开现有本地技能库，浏览真实可用的技能说明并用于 Agent。</p></header>
+              <button id="open-settings-skills-btn" class="ghost-button" type="button">打开自定义与技能</button>
+            </section>
           </div>
-          <p class="settings-help">新建会话或切换目录时点击“新建”，会默认在这里创建文件夹。</p>
+
+          <div id="settings-action-bar" class="settings-action-bar hidden" role="status" aria-live="polite">
+            <span id="settings-save-status">有未保存的更改</span>
+            <div class="settings-action-buttons">
+              <button id="cancel-settings-btn" class="ghost-button" type="button">放弃更改</button>
+              <button id="save-settings-btn" class="primary-button" type="button">保存</button>
+            </div>
+          </div>
         </section>
-
-        <section class="settings-section" data-settings-panel="provider">
-          <h3>模型供应商</h3>
-          <label for="settings-provider-label">供应商名称</label>
-          <input id="settings-provider-label" type="text" placeholder="DeepSeek">
-          <label for="settings-base-url">Base URL</label>
-          <input id="settings-base-url" type="url" placeholder="https://api.deepseek.com/anthropic">
-          <label for="settings-api-key">API Key</label>
-          <input id="settings-api-key" type="password" placeholder="留空表示保持当前密钥">
-          <label for="settings-api-key-env">API Key 环境变量</label>
-          <input id="settings-api-key-env" type="text" placeholder="ANTHROPIC_AUTH_TOKEN">
-          <label for="settings-base-url-env">Base URL 环境变量</label>
-          <input id="settings-base-url-env" type="text" placeholder="ANTHROPIC_BASE_URL">
-          <label for="settings-model-env">模型环境变量</label>
-          <input id="settings-model-env" type="text" placeholder="ANTHROPIC_MODEL">
-          <label for="settings-provider-model">默认模型</label>
-          <select id="settings-provider-model"></select>
-          <label for="settings-models">模型列表</label>
-          <textarea id="settings-models" rows="5" spellcheck="false" placeholder="model-id | 显示名称 | 上下文长度"></textarea>
-          <p class="settings-help">每行一个模型，例如：deepseek-v4-pro[1m] | DeepSeek V4 Pro | 200000</p>
-        </section>
-        </div>
-      </div>
-
-      <div id="diagnostics-panel" class="diagnostics-panel"></div>
-
-      <div class="modal-actions">
-        <button id="run-diagnostics-btn" class="ghost-button" type="button">运行自检</button>
-        <button id="cancel-settings-btn" class="ghost-button" type="button">取消</button>
-        <button id="save-settings-btn" class="primary-button" type="button">保存设置</button>
       </div>
     </div>
   </div>
