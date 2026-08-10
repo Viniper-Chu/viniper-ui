@@ -12,7 +12,7 @@ from unittest.mock import patch
 import httpx
 
 import server
-from agent_runtime import AgentRunSpec, WslAgentRuntime
+from agent_runtime import AgentRunSpec, RuntimeCapabilities, WslAgentRuntime
 from daily_usage import DailyUsageLedger, SOURCE, extract_usage
 
 
@@ -300,11 +300,11 @@ class AgentDailyUsageWiringTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PermissionModeContractTests(unittest.TestCase):
-    def test_three_current_chinese_options_map_unchanged_into_wsl_cli(self) -> None:
+    def test_desktop_permission_values_map_to_current_wsl_cli_aliases(self) -> None:
         expected = {
-            "default": ("询问权限", "Claude 在需要权限时暂停并询问"),
+            "default": ("手动", "Claude 在需要权限时暂停并询问"),
             "acceptEdits": ("自动接受编辑", "自动允许文件编辑，其他高风险操作仍会询问"),
-            "plan": ("计划模式", "先规划，减少直接执行动作"),
+            "plan": ("计划", "先规划，减少直接执行动作"),
         }
         options = {item["id"]: item for item in server.PERMISSION_MODE_OPTIONS}
         settings = {
@@ -315,7 +315,11 @@ class PermissionModeContractTests(unittest.TestCase):
             }
         }
         runtime = WslAgentRuntime()
-        with patch.object(server, "load_app_settings", return_value=settings):
+        capabilities = RuntimeCapabilities(permission_modes=("manual", "acceptEdits", "plan", "bypassPermissions", "auto", "dontAsk"))
+        with (
+            patch.object(server, "load_app_settings", return_value=settings),
+            patch.object(runtime, "capabilities", return_value=capabilities),
+        ):
             for mode, (label, description) in expected.items():
                 with self.subTest(mode=mode):
                     self.assertEqual(server.allowed_permission_mode(mode), mode)
@@ -331,7 +335,7 @@ class PermissionModeContractTests(unittest.TestCase):
                     )
                     command = runtime.build_command(spec)
                     index = command.index("--permission-mode")
-                    self.assertEqual(command[index + 1], mode)
+                    self.assertEqual(command[index + 1], "manual" if mode == "default" else mode)
             self.assertEqual(server.allowed_permission_mode("auto"), "default")
             self.assertEqual(server.allowed_permission_mode("bypassPermissions"), "default")
 

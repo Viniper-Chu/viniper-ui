@@ -90,9 +90,9 @@ class V15StaticContracts(unittest.TestCase):
     def test_permission_fallback_copy_and_real_ids_match_latest_reference(self) -> None:
         app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         expected = [
-            ("default", "询问权限", "Claude 在需要权限时暂停并询问"),
+            ("default", "手动", "Claude 在需要权限时暂停并询问"),
             ("acceptEdits", "自动接受编辑", "自动允许文件编辑，其他高风险操作仍会询问"),
-            ("plan", "计划模式", "先规划，减少直接执行动作"),
+            ("plan", "计划", "先规划，减少直接执行动作"),
         ]
         positions = []
         for mode_id, label, description in expected:
@@ -227,9 +227,9 @@ class V15RendererHarness(unittest.TestCase):
             [
                 {
                     "id": "default",
-                    "label": "询问权限",
+                    "label": "手动",
                     "description": "Claude 在需要权限时暂停并询问",
-                    "title": "询问权限：Claude 在需要权限时暂停并询问",
+                    "title": "手动：Claude 在需要权限时暂停并询问",
                 },
                 {
                     "id": "acceptEdits",
@@ -239,9 +239,9 @@ class V15RendererHarness(unittest.TestCase):
                 },
                 {
                     "id": "plan",
-                    "label": "计划模式",
+                    "label": "计划",
                     "description": "先规划，减少直接执行动作",
-                    "title": "计划模式：先规划，减少直接执行动作",
+                    "title": "计划：先规划，减少直接执行动作",
                 },
             ],
         )

@@ -108,6 +108,48 @@ const state = {
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
+const SessionScrollRegistry = {
+  records: new Map(),
+  projectionTokens: new Map(),
+  get(sessionId) {
+    const id = String(sessionId || "");
+    return id && this.records.has(id) ? this.records.get(id) : true;
+  },
+  set(sessionId, follow) {
+    const id = String(sessionId || "");
+    const value = Boolean(follow);
+    if (id) this.records.set(id, value);
+    if (id && id === String(state.sessionId || "")) state.followOutput = value;
+    return value;
+  },
+  activate(sessionId) {
+    const value = this.get(sessionId);
+    state.followOutput = value;
+    return value;
+  },
+  beginProjection(sessionId) {
+    const id = String(sessionId || "");
+    if (!id) return null;
+    const token = {};
+    this.projectionTokens.set(id, token);
+    return token;
+  },
+  finishProjection(sessionId, token) {
+    const id = String(sessionId || "");
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (this.projectionTokens.get(id) === token) this.projectionTokens.delete(id);
+    }));
+  },
+  isProjecting(sessionId) {
+    return this.projectionTokens.has(String(sessionId || ""));
+  },
+  remove(sessionId) {
+    const id = String(sessionId || "");
+    this.records.delete(id);
+    this.projectionTokens.delete(id);
+  },
+};
+
 const SessionRunRegistry = {
   records: new Map(),
   get(sessionId) {
@@ -530,7 +572,7 @@ const CONTEXT_CRITICAL_THRESHOLD = 0.82;
 const PERMISSION_MODES = [
   {
     id: "default",
-    label: "询问权限",
+    label: "手动",
     description: "Claude 在需要权限时暂停并询问"
   },
   {
@@ -540,18 +582,18 @@ const PERMISSION_MODES = [
   },
   {
     id: "plan",
-    label: "计划模式",
+    label: "计划",
     description: "先规划，减少直接执行动作"
-  },
-  {
-    id: "auto",
-    label: "自动模式",
-    description: "仅在当前 Claude Code 与模型支持时可用"
   },
   {
     id: "bypassPermissions",
     label: "跳过权限",
     description: "仅在设置中明确启用后可用"
+  },
+  {
+    id: "auto",
+    label: "自动",
+    description: "仅在当前 Claude Code 与模型支持时可用"
   }
 ];
 const CLAUDE_NATIVE_SLASH_COMMANDS = [
@@ -1452,7 +1494,9 @@ function bindEvents() {
     setSlashSuggestionIndex(Number(button.dataset.slashIndex || 0));
   });
   $("#chat-container").addEventListener("scroll", () => {
-    if (state.isStreaming) state.followOutput = isNearChatBottom();
+    if (state.isStreaming && !SessionScrollRegistry.isProjecting(state.sessionId)) {
+      SessionScrollRegistry.set(state.sessionId, isNearChatBottom());
+    }
   });
 
   $("#send-btn").addEventListener("click", () => sendMessage());
@@ -1489,6 +1533,13 @@ function bindEvents() {
   $("#search-btn")?.addEventListener("click", () => {
     if (state.searchOpen) closeSearchPanel({ restoreFocus: true });
     else openSearchPanel();
+  });
+  $("#session-history-toggle")?.addEventListener("click", () => {
+    const wrap = $("#session-history-search-wrap");
+    setSessionHistorySearchVisible(Boolean(wrap?.classList.contains("hidden")), { focus: true });
+  });
+  $("#session-history-search")?.addEventListener("input", () => {
+    void loadSessionList();
   });
   $("#back-btn")?.addEventListener("click", () => navigateHistory("back"));
   $("#forward-btn")?.addEventListener("click", () => navigateHistory("forward"));
@@ -3174,7 +3225,7 @@ function persistSelectedModel() {
 function orderedPermissionModes(declared, visible) {
   const fallbackById = new Map(PERMISSION_MODES.map((item) => [item.id, item]));
   const declaredById = new Map((Array.isArray(declared) ? declared : []).map((item) => [item.id, item]));
-  return ["default", "acceptEdits", "plan", "auto", "bypassPermissions"]
+  return ["default", "acceptEdits", "plan", "bypassPermissions", "auto"]
     .filter((id) => visible.has(id))
     .map((id) => ({ ...(fallbackById.get(id) || {}), ...(declaredById.get(id) || {}) }))
     .filter((item) => item.id);
@@ -3450,6 +3501,7 @@ async function createSession({ silent = false, name = "", workdir = "", mode = s
   const data = await response.json();
   clearContextCompressionTimer();
   state.sessionId = data.session_id;
+  SessionScrollRegistry.set(state.sessionId, true);
   state.sessionMode = data.mode === "agent" ? "agent" : "chat";
   state.viewMode = state.sessionMode;
   setViewMode(state.sessionMode);
@@ -3667,6 +3719,7 @@ async function deleteSessionRecord(sessionId, title) {
   const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || `HTTP ${response.status}`);
   if (storageGet(LAST_SESSION_KEY) === sessionId) storageRemove(LAST_SESSION_KEY);
+  SessionScrollRegistry.remove(sessionId);
   await loadSessionList();
   if (sessionId === state.sessionId) await switchMode(state.viewMode, { history: false, quiet: true });
 }
@@ -3714,6 +3767,20 @@ function handleSessionMenuKeydown(event) {
   }
 }
 
+function setSessionHistorySearchVisible(visible, { focus = false } = {}) {
+  const wrap = $("#session-history-search-wrap");
+  const toggle = $("#session-history-toggle");
+  const input = $("#session-history-search");
+  if (!wrap || !toggle || !input) return;
+  wrap.classList.toggle("hidden", !visible);
+  toggle.setAttribute("aria-expanded", String(Boolean(visible)));
+  if (visible && focus) input.focus();
+  if (!visible && input.value) {
+    input.value = "";
+    void loadSessionList();
+  }
+}
+
 async function loadSessionList() {
   let sessions;
   try {
@@ -3728,9 +3795,17 @@ async function loadSessionList() {
   const list = $("#session-list");
   const currentMode = state.viewMode === "agent" ? "agent" : "chat";
   sessions = sessions.filter((session) => (session.mode === "chat" ? "chat" : "agent") === currentMode);
+  const historyQuery = String($("#session-history-search")?.value || "").trim().toLocaleLowerCase();
+  if (historyQuery) {
+    sessions = sessions.filter((session) => {
+      const title = String(session.name || session.id || "").toLocaleLowerCase();
+      const workdir = String(session.workdir || "").toLocaleLowerCase();
+      return title.includes(historyQuery) || workdir.includes(historyQuery);
+    });
+  }
 
   if (!sessions.length) {
-    list.innerHTML = `<div class="empty-list">暂无会话</div>`;
+    list.innerHTML = `<div class="empty-list">${historyQuery ? "未找到匹配会话" : "暂无会话"}</div>`;
     return;
   }
 
@@ -3855,6 +3930,8 @@ function applySession(sessionId, data) {
   resetCurrentSessionRuntimeUi();
   if (state.sessionId !== sessionId) clearContextCompressionTimer();
   state.sessionId = sessionId;
+  const scrollProjectionToken = SessionScrollRegistry.beginProjection(sessionId);
+  SessionScrollRegistry.activate(sessionId);
   state.sessionMode = data.mode === "agent" ? "agent" : "chat";
   state.viewMode = state.sessionMode;
   setViewMode(state.sessionMode);
@@ -3961,6 +4038,7 @@ function applySession(sessionId, data) {
       void resumeAgentRun(sessionId, activeRunSnapshot);
     }
   }
+  SessionScrollRegistry.finishProjection(sessionId, scrollProjectionToken);
 }
 
 function restorePendingInteractionCard(payload, expectedSessionId = state.sessionId) {
@@ -4373,7 +4451,7 @@ function messageTemplate(roleClass, label, content, thinking = "", segments = []
   const isPending = roleClass === "assistant" && Boolean(meta?.pending) && Boolean(activeRun);
   const body = roleClass === "assistant" && displaySegments.length
     ? renderMessageSegments(displaySegments, {
-      totalElapsedSeconds: meta?.elapsed_seconds ?? meta?.elapsedSeconds,
+        totalElapsedSeconds: meta?.thinking_elapsed_seconds ?? meta?.thinkingElapsedSeconds,
         activeThinking: isPending,
         hideThinking: !isPending
       })
@@ -4752,7 +4830,10 @@ function renderMessageSegments(segments = [], options = {}) {
       ? renderThinkingPanel(content, segmentOptions)
       : `<div class="msg-text-segment" data-segment-index="${index}">${renderAssistantContentHtml(content)}</div>`;
   }).join("");
-  return body;
+  const completedThinkingSummary = options.hideThinking && Number.isFinite(totalElapsed) && totalElapsed > 0
+    ? `<div class="thinking-complete-summary" role="status">${thinkingIconSvg()}<span>已思考 ${escapeHtml(formatDuration(totalElapsed))}</span></div>`
+    : "";
+  return `${completedThinkingSummary}${body}`;
 }
 
 function normalizeInteractionRequest(payload = {}) {
@@ -5971,7 +6052,7 @@ async function sendMessage() {
 
   input.value = "";
   autoResize(input);
-  state.followOutput = true;
+  SessionScrollRegistry.set(runSessionId, true);
   const abortController = new AbortController();
   const runRecord = SessionRunRegistry.start(runSessionId, {
     mode: runMode,
@@ -6229,7 +6310,7 @@ async function doRetrySend(
     attachments = [];
   }
 
-  state.followOutput = true;
+  SessionScrollRegistry.set(runSessionId, true);
   const abortController = new AbortController();
   const runRecord = SessionRunRegistry.start(runSessionId, {
     mode: runMode,
@@ -7155,7 +7236,7 @@ function scrollBottom({ force = false } = {}) {
   requestAnimationFrame(() => {
     const container = $("#chat-container");
     if (!container) return;
-    if (!force && state.isStreaming && !state.followOutput) return;
+    if (!force && state.isStreaming && !SessionScrollRegistry.get(state.sessionId)) return;
     container.scrollTop = container.scrollHeight;
   });
 }

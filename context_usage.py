@@ -35,6 +35,25 @@ def _has_usage(source: Mapping[str, Any]) -> bool:
     return any(key in source for aliases in USAGE_KEYS.values() for key in aliases)
 
 
+def _usage_from_event(event: Mapping[str, Any]) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None]:
+    """Return the real current-window usage and its optional context metadata."""
+    context_window = event.get("context_window") if isinstance(event.get("context_window"), Mapping) else None
+    event_usage = event.get("usage") if isinstance(event.get("usage"), Mapping) else None
+    if context_window is None and event_usage is not None:
+        candidate = event_usage.get("context_window")
+        context_window = candidate if isinstance(candidate, Mapping) else None
+    if context_window is not None:
+        current_usage = context_window.get("current_usage")
+        if isinstance(current_usage, Mapping) and _has_usage(current_usage):
+            return current_usage, context_window
+
+    message = event.get("message") if isinstance(event.get("message"), Mapping) else None
+    message_usage = message.get("usage") if message is not None and isinstance(message.get("usage"), Mapping) else None
+    if message_usage is not None and _has_usage(message_usage):
+        return message_usage, context_window
+    return None, context_window
+
+
 @dataclass(frozen=True)
 class ContextUsageSnapshot:
     session_id: str
@@ -121,23 +140,18 @@ class ContextUsageLedger:
         model: str,
         fallback_limit: int,
     ) -> ContextUsageSnapshot | None:
-        context_window = event.get("context_window") if isinstance(event.get("context_window"), dict) else None
-        if context_window is None and isinstance(event.get("usage"), dict):
-            candidate = event["usage"].get("context_window")
-            context_window = candidate if isinstance(candidate, dict) else None
-        if not isinstance(context_window, dict):
+        usage, context_window = _usage_from_event(event)
+        if usage is None:
             return None
-        usage = context_window.get("current_usage")
-        if not isinstance(usage, dict) or not _has_usage(usage):
-            return None
-        selected_model = str(model or event.get("model") or "")
+        message = event.get("message") if isinstance(event.get("message"), Mapping) else {}
+        selected_model = str(model or event.get("model") or message.get("model") or "")
         values = {name: _integer(usage, aliases) for name, aliases in USAGE_KEYS.items()}
         used_tokens = (
             values["input_tokens"]
             + values["cache_creation_input_tokens"]
             + values["cache_read_input_tokens"]
         )
-        context_limit = _integer(context_window, CONTEXT_LIMIT_KEYS, max(0, int(fallback_limit or 0)))
+        context_limit = _integer(context_window or {}, CONTEXT_LIMIT_KEYS, max(0, int(fallback_limit or 0)))
         if not context_limit:
             context_limit = max(0, int(fallback_limit or 0))
         ratio = min(used_tokens / context_limit, 1.0) if context_limit else 0.0

@@ -1195,9 +1195,14 @@ body.drag-over #drop-overlay {
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 
 /* --- SCROLLBAR --- */
-::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 99px; }
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 99px;
+  background: var(--scrollbar);
+  background-clip: content-box;
+}
 
 /* --- RESPONSIVE --- */
 @media (max-width: 1100px) {
@@ -1411,7 +1416,14 @@ button, select, input, textarea, label, .session-main { -webkit-app-region: no-d
 .sidebar-nav-item:hover { background: var(--color-hover); color: var(--text); }
 .nav-glyph { color: var(--accent); text-align: center; font-size: 17px; }
 .nav-shortcut { color: var(--muted); font-size: 11px; }
-.sidebar-section-heading { display: flex; justify-content: space-between; align-items: baseline; padding: 9px 16px 5px; color: var(--text-soft); font-size: 12px; font-weight: 720; letter-spacing: 0.04em; text-transform: uppercase; }
+.sidebar-section-heading { display: flex; justify-content: space-between; align-items: center; min-height: 28px; padding: 5px 12px 3px 16px; color: var(--text-soft); font-size: 12px; font-weight: 720; letter-spacing: 0.04em; text-transform: uppercase; }
+.session-history-toggle { display: inline-grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
+.session-history-toggle:hover, .session-history-toggle:focus-visible, .session-history-toggle[aria-expanded="true"] { background: var(--color-hover); color: var(--text); }
+.session-history-toggle svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.45; stroke-linecap: round; }
+.session-history-search-wrap { padding: 1px 12px 6px; }
+.session-history-search-wrap.hidden { display: none; }
+#session-history-search { width: 100%; height: 30px; padding: 0 9px; border: 1px solid var(--line); border-radius: 7px; outline: none; background: var(--color-surface); color: var(--text); font: inherit; font-size: var(--fs-sm); }
+#session-history-search:focus { border-color: var(--line-strong); box-shadow: 0 0 0 2px rgba(107, 105, 99, 0.08); }
 #session-list { flex: 1; min-height: 0; overflow: auto; padding: 0 8px 12px; }
 .session-group { margin: 0 0 12px; }
 .session-group h2 { margin: 7px 8px 4px; color: var(--muted); font-size: 11px; font-weight: 720; letter-spacing: 0.08em; text-transform: uppercase; }
@@ -1831,6 +1843,20 @@ body.sidebar-gesture-active #sidebar-resizer, body.sidebar-resizing #sidebar-res
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
+}
+.thinking-complete-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0 8px;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+}
+.thinking-complete-summary .thinking-icon {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
 }
 
 /* v16 same-run guidance is a compact transcript marker, not a user bubble. */

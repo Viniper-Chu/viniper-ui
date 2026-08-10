@@ -265,6 +265,7 @@ class ProvisionAndUpdateTests(unittest.IsolatedAsyncioTestCase):
             state_path = Path(tmp) / "update-state.json"
             runtime = FakeRuntime([
                 RuntimeProbe(status="ready", version="2.1.225", user="viniper"),
+                RuntimeProbe(status="ready", version="2.1.225", user="viniper"),
                 RuntimeProbe(status="ready", version="2.1.226", user="viniper"),
             ])
             active = {"session-a"}
@@ -287,6 +288,29 @@ class ProvisionAndUpdateTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(after_restart.status, "current")
             self.assertEqual(runtime.update_calls, 1)
             self.assertEqual(coordinator.status()["app_version"], "5.0.0")
+
+    async def test_new_app_version_reports_current_when_cli_version_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "update-state.json"
+            state_path.write_text(
+                json.dumps({"status": "current", "app_version": "5.0.0", "version": "2.1.226"}),
+                encoding="utf-8",
+            )
+            runtime = FakeRuntime([
+                RuntimeProbe(status="ready", version="2.1.226", user="viniper"),
+                RuntimeProbe(status="ready", version="2.1.226", user="viniper"),
+            ])
+            coordinator = RuntimeUpdateCoordinator(runtime, state_path, lambda: set())
+
+            checked = await coordinator.ensure_current("5.0.1")
+            self.assertEqual(checked.status, "current")
+            self.assertEqual(checked.detail, "Claude Code is already current")
+            self.assertEqual(runtime.update_calls, 1)
+            self.assertEqual(coordinator.status()["app_version"], "5.0.1")
+
+            repeated = await coordinator.ensure_current("5.0.1")
+            self.assertEqual(repeated.status, "current")
+            self.assertEqual(runtime.update_calls, 1)
 
     async def test_update_failure_is_recoverable_and_keeps_previous_version(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

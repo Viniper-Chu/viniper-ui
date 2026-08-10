@@ -1,8 +1,8 @@
-# Viniper 5.0 Claude Desktop 风格设计真源
+# Viniper 5.0.1 Claude Desktop 风格设计真源
 
 状态：`APPROVED_REFERENCE / V17_PROTOCOL_REPAIR / RELEASE_AUTHORIZED_AFTER_ACCEPTANCE`
 
-本文件是 Viniper 5.0.0 当前产品界面与 Chat/Agent 交互模式的唯一设计真源。用户已明确批准以所提供的 Claude Desktop 结构说明、当前打开的 Claude 真实窗口和补充截图为目标，旧版视觉方案不再具有约束力；仅在结构或交互已经一致时复用实现。功能契约、Viniper 原有图标与快捷方式继承规则继续保留。2026-08-08 的最新用户指令进一步要求：页面眉头与 Claude 一致、技能库归入“自定义与技能”、原“首页/代码”改为真正不同的 `Chat / Agent`、删除丑陋的鼠标悬浮动画，并补齐 Claude 式侧栏分隔控件与可工作的顶部全局导航。
+本文件是 Viniper 5.0.1 当前产品界面与 Chat/Agent 交互模式的唯一设计真源。用户已明确批准以所提供的 Claude Desktop 结构说明、当前打开的 Claude 真实窗口和补充截图为目标，旧版视觉方案不再具有约束力；仅在结构或交互已经一致时复用实现。功能契约、Viniper 原有图标与快捷方式继承规则继续保留。2026-08-08 的最新用户指令进一步要求：页面眉头与 Claude 一致、技能库归入“自定义与技能”、原“首页/代码”改为真正不同的 `Chat / Agent`、删除丑陋的鼠标悬浮动画，并补齐 Claude 式侧栏分隔控件与可工作的顶部全局导航。
 
 ## 1. Evidence Reviewed
 
@@ -244,14 +244,15 @@ Viniper 是本地 agent shell 的安静桌面工作区。界面应让会话、�
 
 - Chat 空会话使用居中欢迎区：原 Viniper 图标 + `今天想聊什么？` + 简短建议；不得出现旧版“准备好了”大卡片。Agent 空态遵循下方独立工作表面契约，不复用 Chat 欢迎语或快捷胶囊。
 - 有消息后欢迎区消失，正文列宽 720–820px，工具、思考、正文和文件产物通过类型标题、留白和浅边界区分。
-- 不强制锁底；用户主动向上滚动时不抢滚动位置。
+- `#chat-container` 是会话正文唯一滚动容器。原生滚动条保持约 10 CSS px 命中区、约 6 CSS px 细 thumb；用户可直接拖动。流式输出只在当前 session 已接近底部时自动跟随，用户主动上翻后不抢回，回到底部才恢复；不同 session 的跟随状态互不覆盖。
+- 左侧会话区提供可显示/隐藏的持久历史搜索，匹配标题与工作目录。结果仍来自 `/api/sessions` / `state.sessionIndex`，点击只重开既有 session，不复制会话、不重置其运行、权限、上下文或滚动状态。
 
 ### 思考与执行过程
 
 - Chat 等待模型时，在当前 assistant turn 内显示一行 Claude 式轻状态：`正在思考…` 与真实经过时间；不显示旧版中央全局 spinner 或大块常驻 thinking 卡片。
-- Chat 完成后只保留最终回复；运行中的 `正在思考…` 与原始 thinking block 必须在最终文本出现或 turn 完成时移除，不提供完成后的思考 disclosure，也不把思考正文写入新的持久化会话数据。
+- Chat 完成后保留最终回复与一行紧凑 `已思考 X 秒` 摘要；运行中的 `正在思考…` 与原始 thinking block 必须在最终文本出现或 turn 完成时移除，不提供完成后的思考 disclosure，也不把思考正文写入新的持久化会话数据。耗时只累计真实 thinking 区间，工具执行或普通等待不计入。
 - Agent 使用 Claude Code 式时间顺序活动流：思考状态、工具开始、工具结果、文件产物、最终回复彼此分段。活动项默认紧凑，详细命令/输出可展开。
-- Agent 的思考同样是瞬时运行态：流式期间可显示单行 `正在思考…` 与真实经过时间；最终文本开始输出或运行结束后删除思考正文和计时行，只保留最终回复、必要工具摘要、工具结果状态与文件产物。旧会话中的历史 thinking 数据只做非破坏性隐藏，不批量改写用户会话文件。
+- Agent 的思考同样是瞬时运行态：流式期间可显示单行 `正在思考…` 与真实经过时间；最终文本开始输出或运行结束后删除思考正文，只保留紧凑 `已思考 X 秒` 摘要、最终回复、必要工具摘要、工具结果状态与文件产物。后端用 monotonic 时钟累计每段真实 thinking 区间并持久化 `thinking_elapsed_seconds`；工具间隔不计入，A/B 并行分别累计。旧会话中的历史 thinking 数据只做非破坏性隐藏，不批量改写用户会话文件。
 - Agent 的 `tool_start/tool_result` 必须来自服务端结构化 SSE 与持久化 segment；不得通过扫描 `[Claude Code 工具]`、`运行`、`命令` 等可伪造文本推断。
 - 最终回复与思考/工具活动严格分离。复制正文不混入隐藏 thinking、工具标记或计时标签。
 - loading、elapsed、completed、failed、cancelled 必须由真实事件驱动；断线恢复后仍能从持久化 segment 重建同一顺序。
@@ -263,7 +264,7 @@ Viniper 是本地 agent shell 的安静桌面工作区。界面应让会话、�
 - 服务端为每个活动运行维护唯一 pending interaction，以 `session_id + request_id` 关联请求与回答。前端提交只能命中当前会话、当前请求且尚未回答的交互；重复、过期、串会话或停止后的回答必须明确拒绝，不能落到另一个 CLI 进程。
 - `AskUserQuestion` 卡片显示问题、简短 header、`当前题 / 总题数`、编号选项和说明；支持单选、多选、其他文本、上一步/下一步/提交/跳过（仅当上游允许）。方向键、数字键、Enter、Esc 与鼠标执行同一状态机。
 - 权限卡片显示真实工具名、操作摘要、目标路径/命令与工作目录；至少提供 `拒绝` 与 `仅本次允许`。只有 CLI 请求明确携带可持久化的权限建议且后端能原样回传时，才显示 `以后允许`；前端不得自行写 Claude 配置或把一次允许升级成整轮 `bypassPermissions`。
-- 权限模式由 session 真源保存：Desktop 主选择器固定提供 `default / acceptEdits / plan`；`auto` 只有当前账号、模型、Provider 和 CLI 均真实支持且设置启用时出现；`bypassPermissions` 只有设置显式允许并且 CLI 启动参数真实生效时出现；CLI-only `dontAsk` 永不进入 Desktop 选择器。切换模式只影响当前 session 与其后续 run/resume，不修改其他 session。
+- 权限模式由 session 真源保存，Desktop 顺序固定为 `Manual / Accept edits / Plan / Bypass permissions / Auto`，简体中文分别为“手动 / 自动接受编辑 / 计划 / 跳过权限 / 自动”。稳定持久值仍为 `default`，当前 CLI 暴露 `manual` 时仅在启动参数边界做 alias 映射。`bypassPermissions` 只有设置显式允许并且 CLI 的 allow/permission 参数真实生效时出现；`auto` 只有当前账号、模型、Provider 和 CLI 均真实支持且设置启用时出现，DeepSeek/第三方 Provider 默认 fail-closed；CLI-only `dontAsk` 永不进入 Desktop 选择器。现有 session 的选择彼此独立；非 Plan 选择按 workdir 记忆为后续新 session 初值，Plan 只作用于当前 session，均不覆盖已存在会话。
 - 是否弹窗由 CLI 决定；自动允许或绕过模式没有真实请求时不得显示假卡。等待期间保持同一条流式连接与停止能力，composer 的新发送被禁用；用户提交成功后活跃卡立即退出可交互 Dock，内部保留 awaiting-ACK 状态；matching CLI ACK 成功后只留下紧凑历史结果，ACK 失败时才恢复不可操作的失败记录。
 - 点击停止必须终止对应 CLI、使 pending interaction 失效并把卡片标为已取消。应用刷新或后端重启导致进程不可恢复时，卡片显示已失效并允许重新发送任务，不能伪装继续执行。
 
@@ -275,7 +276,7 @@ Viniper 是本地 agent shell 的安静桌面工作区。界面应让会话、�
 - 大圆角外框内：文本区居上；下排左侧为附件/添加，右侧依次为模型、权限、上下文轻状态、发送/停止。
 - 空文本时发送为弱化状态；可发送时为圆形陶土橙主按钮。运行中同一位置替换为停止按钮，避免布局跳动。
 - 上下文圆圈只读，hover/focus 显示一行短提示，不展开摘要正文。
-- 圆圈只读取当前 session 的 `context_window.current_usage`，口径为 input + cache creation + cache read；无真实值时显示不可用，不用累计 token 或 output token 补假值。收到真实 `compact_boundary` 后，transcript 与 composer 同时显示克制的“正在压缩上下文”，下一次真实 usage 到达后结束并刷新圆圈；不得由 renderer 在固定百分比调用外部摘要服务。
+- 圆圈只投影当前 session 的真实当前窗口 usage。解析优先接受 `context_window.current_usage`，并兼容当前 Claude Code transcript 的 `assistant.message.usage`；两者统一按 input + cache creation + cache read 计算 used，output 只作输出统计、不进入圆圈。重复 frame 按同一真值替换/去重，不累计；无真实值时显示不可用。收到真实 `system/compact_boundary` 后，transcript 与 composer 同时显示克制的“正在压缩上下文”，下一次真实 usage 到达后结束并刷新圆圈；不得由 renderer 在固定百分比调用外部摘要服务、切换 Claude session ID 或触发外部摘要。
 - Chat composer 只保留模型、纯文本输入和发送/停止；占位文案为“输入消息”。
 - Agent composer 才显示附件、权限、上下文、斜杠命令提示和工作目录相关状态；占位文案为“输入任务，或使用 / 命令”。
 
@@ -362,7 +363,7 @@ Viniper 是本地 agent shell 的安静桌面工作区。界面应让会话、�
 
 - 顶部标题带与其下方内容面使用同一画布背景，不使用水平分隔线、阴影或伪元素制造接缝；Windows 原生标题按钮安全区仍保留。
 - 助手消息直接渲染 Markdown 正文，不显示模型名、头像、彩色角色标题或可见的总耗时；系统摘要可以保留明确的系统标签。
-- 当前思考显示为单行扁平的静音文本：16px 对话点图标、简体中文状态和可选的克制计时。最终文本出现或 turn 完成后该行及原始思考正文完全消失；无完成后 `思考过程` disclosure、卡片边框、黄色强调、呼吸动画或几何变化。
+- 当前思考显示为单行扁平的静音文本：16px 对话点图标、简体中文状态和可选的克制计时。最终文本出现或 turn 完成后原始思考正文完全消失，只保留一行按真实 thinking 区间累计的 `已思考 X 秒`；无完成后 `思考过程` disclosure、卡片边框、黄色强调、呼吸动画或几何变化。
 - 结构化 `tool_start` 与匹配的 `tool_result` 必须合并为同一条工具摘要；不得把开始和结果渲染成两条彩色时间线。摘要使用 16px 工具图标、一个极小状态点和静音文本，运行中状态可以仅让状态点克制脉冲。
 - 工具输出优先进入既有 workspace rail 或可展开详情，不在正文中复制为第二张结果卡。产物也使用单条紧凑文件摘要；所有条目仍由结构化事件驱动，不从普通文本关键词推断工具活动。
 - Chat 用户消息沿用 Claude Desktop 的右侧聊天气泡；Agent 用户任务采用 Claude Code 式左对齐、最大约 75% 宽度、左下角收窄的轻量气泡。最终助手输出在两种模式中都保持无外框的正文列。

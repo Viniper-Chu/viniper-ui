@@ -20,6 +20,16 @@ import server  # noqa: E402
 
 
 class UpdateReleaseRevisionTests(unittest.TestCase):
+    def test_5_0_0_revision_2_updates_once_to_5_0_1_revision_1(self) -> None:
+        manifest = {"version": "5.0.1", "release_revision": 1}
+        previous = server.update_decision(manifest, current_version="5.0.0", current_release_revision=2)
+        current = server.update_decision(manifest, current_version="5.0.1", current_release_revision=1)
+        self.assertTrue(previous["automatic"])
+        self.assertEqual(previous["reason"], "newer_version")
+        self.assertFalse(current["automatic"])
+        self.assertFalse(current["manual_install_required"])
+        self.assertEqual(current["reason"], "current")
+
     def test_same_visible_version_updates_once_by_internal_revision(self) -> None:
         manifest = {"version": "5.0.0", "release_revision": 1}
         older = server.update_decision(manifest, current_version="5.0.0", current_release_revision=0)

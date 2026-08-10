@@ -125,7 +125,7 @@ def normalize_session_mode(value: Any) -> str:
 PERMISSION_MODE_OPTIONS = [
     {
         "id": "default",
-        "label": "询问权限",
+        "label": "手动",
         "description": "Claude 在需要权限时暂停并询问",
     },
     {
@@ -135,18 +135,18 @@ PERMISSION_MODE_OPTIONS = [
     },
     {
         "id": "plan",
-        "label": "计划模式",
+        "label": "计划",
         "description": "先规划，减少直接执行动作",
-    },
-    {
-        "id": "auto",
-        "label": "自动模式",
-        "description": "由 Claude Code 的可用自动模式判断动作",
     },
     {
         "id": "bypassPermissions",
         "label": "跳过权限",
         "description": "跳过 Claude Code 权限确认，仅在设置中明确启用后提供",
+    },
+    {
+        "id": "auto",
+        "label": "自动",
+        "description": "由 Claude Code 的可用自动模式判断动作",
     },
 ]
 PERMISSION_MODE_IDS = {item["id"] for item in PERMISSION_MODE_OPTIONS}
@@ -1029,6 +1029,7 @@ def default_settings() -> dict[str, Any]:
             "kind": "wsl2",
             "cross_session_inbound": "permissions",
             "permission_mode": "default",
+            "permission_mode_by_workdir": {},
             "enable_auto_mode": False,
             "allow_bypass_permissions": False,
         },
@@ -1122,6 +1123,17 @@ def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
     if permission_mode in {"ask", "manual"}:
         permission_mode = "default"
     runtime["permission_mode"] = permission_mode if permission_mode in PERMISSION_MODE_IDS else "default"
+    raw_preferences = runtime.get("permission_mode_by_workdir")
+    preferences: dict[str, str] = {}
+    if isinstance(raw_preferences, dict):
+        for raw_workdir, raw_mode in raw_preferences.items():
+            workdir_key = str(raw_workdir or "").strip()
+            stored_mode = str(raw_mode or "").strip()
+            if stored_mode in {"ask", "manual"}:
+                stored_mode = "default"
+            if workdir_key and stored_mode in PERMISSION_MODE_IDS and stored_mode not in {"plan", "dontAsk"}:
+                preferences[workdir_key] = stored_mode
+    runtime["permission_mode_by_workdir"] = preferences
     runtime["enable_auto_mode"] = bool(runtime.get("enable_auto_mode"))
     runtime["allow_bypass_permissions"] = bool(runtime.get("allow_bypass_permissions"))
     return settings
@@ -1936,6 +1948,34 @@ def available_permission_mode_ids() -> set[str]:
     if bool(settings.get("allow_bypass_permissions")):
         available.add("bypassPermissions")
     return available
+
+
+def permission_workdir_key(workdir: Any) -> str:
+    return str(workdir or "").strip().replace("\\", "/").rstrip("/").casefold()
+
+
+def remembered_workdir_permission_mode(workdir: Any) -> str:
+    settings = load_app_settings().get("runtime", {})
+    preferences = settings.get("permission_mode_by_workdir")
+    stored = preferences.get(permission_workdir_key(workdir)) if isinstance(preferences, dict) else None
+    return allowed_permission_mode(str(stored or settings.get("permission_mode") or DEFAULT_PERMISSION_MODE))
+
+
+def remember_workdir_permission_mode(workdir: Any, permission_mode: str) -> None:
+    mode = "default" if str(permission_mode or "") in {"ask", "manual"} else str(permission_mode or "")
+    key = permission_workdir_key(workdir)
+    if not key or mode in {"plan", "dontAsk"} or mode not in PERMISSION_MODE_IDS:
+        return
+    settings = load_app_settings()
+    runtime = settings.setdefault("runtime", {})
+    preferences = runtime.setdefault("permission_mode_by_workdir", {})
+    if not isinstance(preferences, dict):
+        preferences = {}
+        runtime["permission_mode_by_workdir"] = preferences
+    if preferences.get(key) == mode:
+        return
+    preferences[key] = mode
+    save_app_settings(settings)
 
 
 def allowed_permission_mode(permission_mode: str | None) -> str:
@@ -4522,8 +4562,31 @@ class ChatTransport:
         thinking_text = ""
         segments: list[dict[str, Any]] = []
         thinking_started = False
+        thinking_interval_started_at: float | None = None
+        thinking_elapsed_total = 0.0
         started = time.monotonic()
         last_save = 0.0
+
+        def thinking_elapsed_seconds() -> int:
+            active = 0.0
+            if thinking_interval_started_at is not None:
+                active = max(0.0, time.monotonic() - thinking_interval_started_at)
+            return max(0, int(round(thinking_elapsed_total + active)))
+
+        def begin_thinking() -> None:
+            nonlocal thinking_started, thinking_interval_started_at
+            if thinking_started:
+                return
+            thinking_started = True
+            thinking_interval_started_at = time.monotonic()
+
+        def finish_thinking() -> int:
+            nonlocal thinking_started, thinking_interval_started_at, thinking_elapsed_total
+            if thinking_interval_started_at is not None:
+                thinking_elapsed_total += max(0.0, time.monotonic() - thinking_interval_started_at)
+            thinking_started = False
+            thinking_interval_started_at = None
+            return thinking_elapsed_seconds()
 
         def append_segment(segment_type: str, content: str) -> None:
             if not content:
@@ -4539,7 +4602,7 @@ class ChatTransport:
             if not force and now - last_save < 1.0:
                 return
             last_save = now
-            session.setdefault("messages", []).append({
+            message = {
                 "role": "assistant",
                 "content": assistant_text,
                 "thinking": thinking_text,
@@ -4547,7 +4610,11 @@ class ChatTransport:
                 "segments": copy.deepcopy(segments),
                 "elapsed_seconds": max(0, round(now - started)),
                 "pending": True,
-            })
+            }
+            thinking_elapsed = thinking_elapsed_seconds()
+            if thinking_elapsed > 0:
+                message["thinking_elapsed_seconds"] = thinking_elapsed
+            session.setdefault("messages", []).append(message)
             session["updated"] = now_ts()
             sessions[session_id] = session
             save_sessions_to_disk()
@@ -4562,6 +4629,11 @@ class ChatTransport:
                         "segments": copy.deepcopy(segments),
                         "elapsed_seconds": max(0, round(time.monotonic() - started)),
                     })
+                    thinking_elapsed = thinking_elapsed_seconds()
+                    if thinking_elapsed > 0:
+                        message["thinking_elapsed_seconds"] = thinking_elapsed
+                    else:
+                        message.pop("thinking_elapsed_seconds", None)
                     return
 
         save_progress(force=True)
@@ -4576,7 +4648,7 @@ class ChatTransport:
                 if event_type == "content_block_start":
                     block = event.get("content_block") if isinstance(event.get("content_block"), dict) else {}
                     if block.get("type") == "thinking" and not thinking_started:
-                        thinking_started = True
+                        begin_thinking()
                         yield {"type": "thinking_start", "elapsed": 0}
                     continue
                 if event_type == "content_block_delta":
@@ -4586,7 +4658,7 @@ class ChatTransport:
                         text = clean_stream_text(str(delta.get("thinking") or ""))
                         if text:
                             if not thinking_started:
-                                thinking_started = True
+                                begin_thinking()
                                 yield {"type": "thinking_start", "elapsed": 0}
                             thinking_text += text
                             append_segment("thinking", text)
@@ -4596,8 +4668,7 @@ class ChatTransport:
                         text = clean_stream_text(str(delta.get("text") or ""))
                         if text:
                             if thinking_started:
-                                thinking_started = False
-                                yield {"type": "thinking_complete", "elapsed": max(0, round(time.monotonic() - started))}
+                                yield {"type": "thinking_complete", "elapsed": finish_thinking()}
                             assistant_text += text
                             append_segment("text", text)
                             update_pending()
@@ -4607,7 +4678,7 @@ class ChatTransport:
                     text = clean_stream_text(str(event.get("content") or event.get("thinking") or ""))
                     if text:
                         if not thinking_started:
-                            thinking_started = True
+                            begin_thinking()
                             yield {"type": "thinking_start", "elapsed": 0}
                         thinking_text += text
                         append_segment("thinking", text)
@@ -4618,20 +4689,17 @@ class ChatTransport:
                     text = clean_stream_text(str(event.get("content") or event.get("text") or ""))
                     if text:
                         if thinking_started:
-                            thinking_started = False
-                            yield {"type": "thinking_complete", "elapsed": max(0, round(time.monotonic() - started))}
+                            yield {"type": "thinking_complete", "elapsed": finish_thinking()}
                         assistant_text += text
                         append_segment("text", text)
                         update_pending()
                         yield {"type": "text", "content": text}
                     continue
                 if event_type == "message_stop" and thinking_started:
-                    thinking_started = False
-                    yield {"type": "thinking_complete", "elapsed": max(0, round(time.monotonic() - started))}
+                    yield {"type": "thinking_complete", "elapsed": finish_thinking()}
 
             if thinking_started:
-                thinking_started = False
-                yield {"type": "thinking_complete", "elapsed": max(0, round(time.monotonic() - started))}
+                yield {"type": "thinking_complete", "elapsed": finish_thinking()}
             update_pending()
             for message in reversed(session.get("messages", [])):
                 if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
@@ -4644,8 +4712,13 @@ class ChatTransport:
             session["updated"] = now_ts()
             sessions[session_id] = session
             save_sessions_to_disk()
-            yield {"type": "done"}
+            done = {"type": "done"}
+            if thinking_elapsed_seconds() > 0:
+                done["thinking_elapsed_seconds"] = thinking_elapsed_seconds()
+            yield done
         except asyncio.CancelledError:
+            if thinking_started:
+                finish_thinking()
             update_pending()
             for message in reversed(session.get("messages", [])):
                 if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
@@ -4661,6 +4734,8 @@ class ChatTransport:
             save_sessions_to_disk()
             raise
         except Exception as exc:
+            if thinking_started:
+                finish_thinking()
             update_pending()
             for message in reversed(session.get("messages", [])):
                 if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
@@ -4675,7 +4750,10 @@ class ChatTransport:
             sessions[session_id] = session
             save_sessions_to_disk()
             yield {"type": "error", "content": f"Chat 请求失败：{exc}"}
-            yield {"type": "done"}
+            done = {"type": "done"}
+            if thinking_elapsed_seconds() > 0:
+                done["thinking_elapsed_seconds"] = thinking_elapsed_seconds()
+            yield done
 
 
 class AgentTransport:
@@ -5145,6 +5223,7 @@ async def stream_chat_impl(
     run_started_at: float | None = None
     active_thinking_started_at: float | None = None
     active_thinking_segment_index: int | None = None
+    thinking_elapsed_total = 0.0
     fallback_question_tool_ids: set[str] = set()
     published_interaction_ids: set[str] = set()
     compatibility_interactions: dict[str, dict[str, Any]] = {}
@@ -5167,6 +5246,12 @@ async def stream_chat_impl(
     def total_elapsed_seconds() -> int:
         return elapsed_seconds_since(message_started_at)
 
+    def thinking_elapsed_seconds() -> int:
+        active = 0.0
+        if active_thinking_started_at is not None:
+            active = max(0.0, time.monotonic() - active_thinking_started_at)
+        return max(0, int(round(thinking_elapsed_total + active)))
+
     def refresh_active_thinking_elapsed() -> None:
         if active_thinking_started_at is None or active_thinking_segment_index is None:
             return
@@ -5177,8 +5262,10 @@ async def stream_chat_impl(
             segment["elapsed_seconds"] = elapsed_seconds_since(active_thinking_started_at)
 
     def close_active_thinking() -> None:
-        nonlocal active_thinking_started_at, active_thinking_segment_index
+        nonlocal active_thinking_started_at, active_thinking_segment_index, thinking_elapsed_total
         refresh_active_thinking_elapsed()
+        if active_thinking_started_at is not None:
+            thinking_elapsed_total += max(0.0, time.monotonic() - active_thinking_started_at)
         active_thinking_started_at = None
         active_thinking_segment_index = None
 
@@ -5256,6 +5343,11 @@ async def stream_chat_impl(
         message["model"] = selected_model
         message["segments"] = copy.deepcopy(assistant_segments)
         message["elapsed_seconds"] = total_elapsed_seconds()
+        current_thinking_elapsed = thinking_elapsed_seconds()
+        if current_thinking_elapsed > 0:
+            message["thinking_elapsed_seconds"] = current_thinking_elapsed
+        else:
+            message.pop("thinking_elapsed_seconds", None)
         if thinking_text:
             message["thinking"] = thinking_text
         message["pending"] = True
@@ -5273,6 +5365,11 @@ async def stream_chat_impl(
         message["model"] = selected_model
         message["segments"] = finalize_transcript_segments(assistant_segments)
         message["elapsed_seconds"] = total_elapsed_seconds()
+        completed_thinking_elapsed = thinking_elapsed_seconds()
+        if completed_thinking_elapsed > 0:
+            message["thinking_elapsed_seconds"] = completed_thinking_elapsed
+        else:
+            message.pop("thinking_elapsed_seconds", None)
         message.pop("thinking", None)
         message.pop("pending", None)
         session["last_run_status"] = status or ("failed" if str(content or "").startswith("错误：") else "completed")
@@ -5402,7 +5499,7 @@ async def stream_chat_impl(
                     continue
                 if active_thinking_started_at is not None:
                     close_active_thinking()
-                    yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                    yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
                 published_interaction_ids.add(interaction_id)
                 if interaction.get("kind") == "question":
                     fallback_question_tool_ids.add(interaction_id)
@@ -5439,7 +5536,7 @@ async def stream_chat_impl(
                 interaction_id = str(interaction.get("request_id") or "")
                 if active_thinking_started_at is not None:
                     close_active_thinking()
-                    yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                    yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
                 published_interaction_ids.add(interaction_id)
                 if interaction.get("kind") == "question":
                     fallback_question_tool_ids.add(interaction_id)
@@ -5643,7 +5740,7 @@ async def stream_chat_impl(
             if peer_events:
                 if active_thinking_started_at is not None:
                     close_active_thinking()
-                    yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                    yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
                 for peer_event in peer_events:
                     append_activity_segment(
                         str(peer_event.get("type") or "peer_event"),
@@ -5686,7 +5783,7 @@ async def stream_chat_impl(
                     continue
                 if active_thinking_started_at is not None:
                     close_active_thinking()
-                    yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                    yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
                 published_interaction_ids.add(interaction_id)
                 if interaction.get("kind") == "question":
                     fallback_question_tool_ids.add(interaction_id)
@@ -5719,7 +5816,7 @@ async def stream_chat_impl(
                         assistant_text += text
                         if active_thinking_started_at is not None:
                             close_active_thinking()
-                            yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                            yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
                         append_assistant_segment("text", text)
                         save_assistant_progress()
                         yield sse({"type": "text", "content": text})
@@ -5761,7 +5858,7 @@ async def stream_chat_impl(
                                 if delta:
                                     if active_thinking_started_at is not None:
                                         close_active_thinking()
-                                        yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                                        yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
                                     assistant_text += delta
                                     append_assistant_segment("text", delta)
                                     save_assistant_progress()
@@ -5781,7 +5878,7 @@ async def stream_chat_impl(
                             saw_tool_use = True
                             if active_thinking_started_at is not None:
                                 close_active_thinking()
-                                yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                                yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
                             command_text = tool_command(block)
                             tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
                             tool_id = str(block.get("id") or uuid.uuid4())
@@ -5826,7 +5923,7 @@ async def stream_chat_impl(
                                 if tool_id not in published_interaction_ids:
                                     if active_thinking_started_at is not None:
                                         close_active_thinking()
-                                        yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+                                        yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
                                     fallback_question_tool_ids.add(tool_id)
                                     published_interaction_ids.add(tool_id)
                                     interaction["session_id"] = session_id
@@ -5978,7 +6075,7 @@ async def stream_chat_impl(
 
         if active_thinking_started_at is not None:
             close_active_thinking()
-            yield sse({"type": "thinking_complete", "elapsed": total_elapsed_seconds()})
+            yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
         return_code = await proc.wait()
         mark_finished = getattr(runtime, "mark_finished", None)
         if mark_finished is not None:
@@ -7234,6 +7331,7 @@ async def new_session(request: Request):
     name = str(body.get("name") or "").strip()
     if not name:
         name = next_session_name(mode)
+    workdir = str(body.get("workdir") or BASE_DIR)
     sessions[sid] = {
         "id": sid,
         "mode": mode,
@@ -7241,14 +7339,14 @@ async def new_session(request: Request):
         "created": now_ts(),
         "updated": now_ts(),
         "name": name,
-        "workdir": str(body.get("workdir") or BASE_DIR),
+        "workdir": workdir,
         "pinned": False,
         "unread": False,
         "last_run_status": "",
         "claude_session_id": str(uuid.uuid4()),
         "claude_initialized": False,
         "summary": "",
-        "permission_mode": allowed_permission_mode(None),
+        "permission_mode": remembered_workdir_permission_mode(workdir) if mode == "agent" else allowed_permission_mode(None),
     }
     save_sessions_to_disk()
     return {
@@ -7385,6 +7483,7 @@ async def update_session(session_id: str, request: Request):
         if normalize_session_mode(session.get("mode")) != "agent":
             raise HTTPException(status_code=400, detail="Chat sessions do not accept permission mode")
         session["permission_mode"] = require_permission_mode(body.get("permission_mode"))
+        remember_workdir_permission_mode(session.get("workdir"), session["permission_mode"])
     if metadata_changed:
         session["updated"] = now_ts()
     save_sessions_to_disk()

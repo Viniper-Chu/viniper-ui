@@ -47,6 +47,15 @@ REQUIRED_CLAUDE_FLAGS = (
     "--permission-prompt-tool",
     "--verbose",
 )
+KNOWN_PERMISSION_MODES = (
+    "manual",
+    "default",
+    "acceptEdits",
+    "plan",
+    "bypassPermissions",
+    "auto",
+    "dontAsk",
+)
 
 
 def parse_version(value: str) -> tuple[int, int, int]:
@@ -80,6 +89,7 @@ class RuntimeCapabilities:
     agent_registry: bool = False
     native_send_message: bool = False
     auto_permission: bool = False
+    permission_modes: tuple[str, ...] = ()
     platform: str = "unknown"
     reason: str = ""
 
@@ -213,7 +223,39 @@ def _completed(command: Sequence[str], timeout: int = 30, env: Mapping[str, str]
     )
 
 
-def _claude_arguments(spec: AgentRunSpec, path_mapper: Callable[[str], str]) -> list[str]:
+def _permission_modes_from_help(help_text: str) -> tuple[str, ...]:
+    match = re.search(r"--permission-mode\b(?P<body>.*?)(?=\n\s*--|\Z)", str(help_text or ""), re.DOTALL)
+    if not match:
+        return ()
+    body = match.group("body")
+    located = [
+        (body.find(mode), mode)
+        for mode in KNOWN_PERMISSION_MODES
+        if body.find(mode) >= 0
+    ]
+    return tuple(mode for _position, mode in sorted(located))
+
+
+def _cli_permission_mode(semantic_mode: str, choices: Sequence[str] | None) -> str:
+    semantic = "default" if str(semantic_mode or "") in {"", "ask", "manual"} else str(semantic_mode)
+    available = tuple(str(item) for item in (choices or ()))
+    if semantic == "default":
+        if "manual" in available:
+            return "manual"
+        if not available or "default" in available:
+            return "default"
+        raise ValueError("Claude Code does not expose a Manual/default permission mode")
+    if available and semantic not in available:
+        raise ValueError(f"Claude Code does not expose permission mode {semantic}")
+    return semantic
+
+
+def _claude_arguments(
+    spec: AgentRunSpec,
+    path_mapper: Callable[[str], str],
+    *,
+    permission_choices: Sequence[str] | None = None,
+) -> list[str]:
     args = [
         "-p",
         "--input-format",
@@ -228,9 +270,10 @@ def _claude_arguments(spec: AgentRunSpec, path_mapper: Callable[[str], str]) -> 
         "--resume" if spec.resume else "--session-id",
         spec.claude_session_id,
     ]
-    if spec.permission_mode == "bypassPermissions":
+    cli_permission_mode = _cli_permission_mode(spec.permission_mode, permission_choices)
+    if cli_permission_mode == "bypassPermissions":
         args.append("--allow-dangerously-skip-permissions")
-    args.extend(["--permission-mode", spec.permission_mode])
+    args.extend(["--permission-mode", cli_permission_mode])
     for directory in spec.add_dirs:
         args.extend(["--add-dir", path_mapper(str(directory))])
     if spec.fallback_model:
@@ -463,6 +506,7 @@ class WslAgentRuntime(AgentRuntime):
         else:
             status = "ready"
             detail = "managed WSL runtime is ready"
+        permission_modes = _permission_modes_from_help(help_text)
         capabilities = RuntimeCapabilities(
             stream_json=not any(flag in missing_flags for flag in ("--input-format", "--output-format")),
             structured_input="--input-format" not in missing_flags,
@@ -476,7 +520,8 @@ class WslAgentRuntime(AgentRuntime):
             agent_view=agent_view_available,
             agent_registry=False,
             native_send_message=False,
-            auto_permission="auto" in help_text,
+            auto_permission="auto" in permission_modes,
+            permission_modes=permission_modes,
             platform="wsl2",
             reason="" if status == "ready" else detail,
         )
@@ -593,7 +638,11 @@ class WslAgentRuntime(AgentRuntime):
     def build_command(self, spec: AgentRunSpec) -> list[str]:
         session_key = self._session_key(spec)
         linux_cwd = self.map_path(spec.workdir)
-        claude_args = _claude_arguments(spec, lambda value: self.map_path(value))
+        claude_args = _claude_arguments(
+            spec,
+            lambda value: self.map_path(value),
+            permission_choices=self.capabilities().permission_modes,
+        )
         return [
             "wsl.exe",
             "--distribution",

@@ -18,6 +18,7 @@ from agent_runtime import (
     RuntimeProbe,
     SESSION_HELPER_VERSION,
     WslAgentRuntime,
+    parse_version,
     version_at_least,
 )
 
@@ -436,9 +437,14 @@ class RuntimeUpdateCoordinator:
                     user=after.user or before.user,
                     previous_version=before.version,
                 )
+            unchanged = parse_version(after.version) == parse_version(before.version)
             status = ProvisionStatus(
-                status="compatible",
-                detail="Claude Code latest compatibility check passed",
+                status="current" if unchanged else "compatible",
+                detail=(
+                    "Claude Code is already current"
+                    if unchanged
+                    else "Claude Code latest compatibility check passed"
+                ),
                 recoverable=False,
                 version=after.version,
                 user=after.user,

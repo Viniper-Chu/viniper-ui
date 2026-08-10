@@ -102,7 +102,16 @@
         </button>
       </nav>
 
-      <div class="sidebar-section-heading"><span>会话</span><span class="subtle">最近使用</span></div>
+      <div class="sidebar-section-heading">
+        <span>会话</span>
+        <button id="session-history-toggle" class="session-history-toggle" type="button" aria-expanded="false" aria-controls="session-history-search-wrap" title="搜索历史会话">
+          <svg viewBox="0 0 18 18" aria-hidden="true"><circle cx="8" cy="8" r="4.5"></circle><path d="m11.5 11.5 3 3"></path></svg>
+          <span class="sr-only">搜索历史会话</span>
+        </button>
+      </div>
+      <div id="session-history-search-wrap" class="session-history-search-wrap hidden">
+        <input id="session-history-search" type="search" autocomplete="off" spellcheck="false" placeholder="搜索标题或工作目录" aria-label="搜索历史会话">
+      </div>
       <nav id="session-list" aria-label="会话列表"></nav>
 
       <footer class="sidebar-footer">
