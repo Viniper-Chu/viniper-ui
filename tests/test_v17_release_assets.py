@@ -7,6 +7,7 @@ GitHub.  They exercise the actual release builder and verifier seams.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -35,6 +36,7 @@ class ReleaseBuilderInstallerManifestTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root / "server.py").write_text("print('fixture')\n", encoding="utf-8")
         (self.root / "VERSION").write_text("5.0.0\n", encoding="utf-8")
+        (self.root / "RELEASE_REVISION").write_text("1\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -54,7 +56,7 @@ class ReleaseBuilderInstallerManifestTests(unittest.TestCase):
         builder.ROOT = self.root
         builder.DIST = self.root / "dist"
         builder.BUILD = builder.DIST / "build"
-        builder.APP_FILES = ["server.py", "VERSION"]
+        builder.APP_FILES = ["server.py", "VERSION", "RELEASE_REVISION"]
         builder.APP_DIRS = []
         with mock.patch.object(
             sys,
@@ -100,6 +102,11 @@ class ReleaseBuilderInstallerManifestTests(unittest.TestCase):
         manifest = self.run_builder(with_installers=False)
         self.assertEqual(set(manifest["assets"]), {"app"})
 
+    def test_manifest_carries_non_display_release_revision(self) -> None:
+        manifest = self.run_builder(with_installers=False)
+        self.assertEqual(manifest["version"], "5.0.0")
+        self.assertEqual(manifest["release_revision"], 1)
+
     def test_release_builder_fails_closed_when_required_source_is_missing(self) -> None:
         builder = load_script("v17_build_release_missing_fixture", "scripts/build_release.py")
         builder.ROOT = self.root
@@ -118,6 +125,7 @@ class ReleaseVerifierUploadClosureTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.dist = self.root / "dist"
         self.release = self.root / "desktop" / "release"
+        (self.root / "RELEASE_REVISION").write_text("1\n", encoding="utf-8")
         self.dist.mkdir(parents=True)
         self.release.mkdir(parents=True)
         self.app = self.dist / "Viniper-v5.0.0.zip"
@@ -137,6 +145,7 @@ class ReleaseVerifierUploadClosureTests(unittest.TestCase):
         self.manifest = {
             "name": "Viniper",
             "version": "5.0.0",
+            "release_revision": 1,
             "assets": {
                 "app": self.asset(self.app),
                 "installer_windows": self.asset(self.windows),
@@ -185,6 +194,18 @@ class ReleaseVerifierUploadClosureTests(unittest.TestCase):
                 self.macos_x64_map,
             },
         )
+
+    def test_release_revision_must_match_the_packaged_source(self) -> None:
+        verifier = self.verifier()
+        self.manifest["release_revision"] = 2
+        with self.assertRaises(SystemExit):
+            verifier.verify_release_assets(
+                self.manifest,
+                "5.0.0",
+                root=self.root,
+                dist=self.dist,
+                require_windows=True,
+            )
 
     def test_required_macos_arches_fail_closed_when_one_is_missing(self) -> None:
         verifier = self.verifier()
@@ -329,6 +350,54 @@ class FormalDesktopResourceStagingTests(unittest.TestCase):
         source = (ROOT / "scripts" / "build_desktop.py").read_text(encoding="utf-8")
         self.assertIn("prepare_resource_staging", source)
         self.assertIn('"--config", str(builder_config)', source)
+
+    def test_formal_executable_metadata_uses_product_version(self) -> None:
+        builder = self.builder()
+        executable = self.desktop / "release" / "win-unpacked" / "Viniper.exe"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"fixture")
+        icon = self.root / "static" / "assets" / "viniper-icon.ico"
+        icon.parent.mkdir(parents=True)
+        icon.write_bytes(b"icon")
+        (self.root / "VERSION").write_text("5.0.0\n", encoding="utf-8")
+
+        with (
+            mock.patch.object(builder, "DESKTOP", self.desktop),
+            mock.patch.object(builder, "ROOT", self.root),
+            mock.patch.object(builder.sys, "platform", "win32"),
+            mock.patch.object(builder, "rcedit_tool", return_value=self.root / "rcedit.exe"),
+            mock.patch.object(builder, "run") as run_mock,
+        ):
+            builder.patch_windows_icon()
+
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[command.index("--set-file-version") + 1], "5.0.0")
+        self.assertEqual(command[command.index("--set-product-version") + 1], "5.0.0")
+
+    def test_command_logging_survives_cp1252_with_unicode_staging_path(self) -> None:
+        builder = self.builder()
+        sink = io.BytesIO()
+        cp1252_stdout = io.TextIOWrapper(sink, encoding="cp1252", errors="strict")
+        completed = mock.Mock(stdout="", returncode=0)
+        command = [
+            "npm",
+            "run",
+            "pack",
+            "--",
+            "--config",
+            r"D:\repo\codex\运行残留\electron-builder.formal.json",
+        ]
+
+        with (
+            mock.patch.object(builder.sys, "stdout", cp1252_stdout),
+            mock.patch.object(builder.subprocess, "run", return_value=completed) as run_mock,
+        ):
+            builder.run(command, cwd=self.root)
+
+        cp1252_stdout.flush()
+        self.assertIn("运行残留".encode("utf-8"), sink.getvalue())
+        run_mock.assert_called_once()
+        cp1252_stdout.detach()
 
 
 if __name__ == "__main__":

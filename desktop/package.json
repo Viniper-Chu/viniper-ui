@@ -49,6 +49,7 @@
           "profiles.json",
           "requirements.txt",
           "VERSION",
+          "RELEASE_REVISION",
           "PREVIEW",
           "README.md",
           "LICENSE",

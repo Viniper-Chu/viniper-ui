@@ -32,6 +32,7 @@ APP_FILES = [
     "profiles.json",
     "requirements.txt",
     "VERSION",
+    "RELEASE_REVISION",
     "README.md",
     "LICENSE",
     "start.bat",
@@ -116,6 +117,12 @@ def main() -> int:
     version = (args.version or (ROOT / "VERSION").read_text(encoding="utf-8").strip()).strip()
     if not version:
         raise SystemExit("version is required")
+    try:
+        release_revision = int((ROOT / "RELEASE_REVISION").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError) as exc:
+        raise SystemExit("RELEASE_REVISION must be a positive integer") from exc
+    if release_revision <= 0:
+        raise SystemExit("RELEASE_REVISION must be a positive integer")
 
     write_text(ROOT / "VERSION", f"{version}\n")
     DIST.mkdir(exist_ok=True)
@@ -185,6 +192,7 @@ def main() -> int:
     manifest = {
         "name": "Viniper",
         "version": version,
+        "release_revision": release_revision,
         "published_at": datetime.now(timezone.utc).isoformat(),
         "notes": args.notes,
         "assets": assets,

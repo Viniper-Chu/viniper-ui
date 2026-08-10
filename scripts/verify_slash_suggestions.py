@@ -23,7 +23,7 @@ def main() -> int:
     require(app_js, "CLAUDE_NATIVE_SLASH_COMMANDS", "app.js must define native Claude Code slash command suggestions")
     require(app_js, 'command: "/goal"', "slash suggestions must include Claude Code native /goal")
     if "parseGoalSlashCommand" in app_js or "openGoalModal" in app_js:
-        raise SystemExit("/goal must pass through to Claude Code instead of opening Viniper UI goal mode")
+        raise SystemExit("/goal must pass through to Claude Code instead of opening Viniper goal mode")
     require(app_js, "renderSlashSuggestions", "app.js must render slash suggestions while typing")
     require(app_js, "acceptSlashSuggestion", "app.js must accept a selected slash suggestion")
     require(app_js, "handleSlashSuggestionKeydown", "app.js must support keyboard navigation for slash suggestions")
@@ -32,7 +32,7 @@ def main() -> int:
     require(app_js, 'command: `/${skill.command || skill.name || skill.id}`', "skill commands must be included in slash suggestions")
     require(style_css, ".slash-suggestions", "style.css must style the slash suggestions popup")
 
-    print("Viniper UI slash suggestion verification passed.")
+    print("Viniper slash suggestion verification passed.")
     return 0
 
 

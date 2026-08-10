@@ -29,8 +29,19 @@ def tool(name: str) -> str:
     return resolved
 
 
+def write_stdout_utf8(text: str) -> None:
+    """Write build output without depending on the runner's legacy code page."""
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return
+    buffer.write(text.encode("utf-8", errors="replace"))
+    buffer.flush()
+
+
 def run(command: list[str], cwd: Path = ROOT, timeout: int | None = None) -> None:
-    print(f"+ {' '.join(command)}")
+    write_stdout_utf8(f"+ {' '.join(command)}\n")
     completed = subprocess.run(
         command,
         cwd=str(cwd),
@@ -42,9 +53,10 @@ def run(command: list[str], cwd: Path = ROOT, timeout: int | None = None) -> Non
         timeout=timeout,
     )
     if completed.stdout:
-        sys.stdout.buffer.write(completed.stdout.encode("utf-8", errors="replace"))
-        if not completed.stdout.endswith("\n"):
-            sys.stdout.buffer.write(b"\n")
+        output = completed.stdout
+        if not output.endswith("\n"):
+            output += "\n"
+        write_stdout_utf8(output)
     if completed.returncode != 0:
         raise SystemExit(f"command failed: {' '.join(command)}")
 
@@ -212,6 +224,7 @@ def patch_windows_icon() -> None:
         return
     exe_path = DESKTOP / "release" / "win-unpacked" / "Viniper.exe"
     icon_path = ROOT / "static" / "assets" / "viniper-icon.ico"
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     if not exe_path.exists():
         raise SystemExit(f"missing packaged executable: {exe_path}")
     if not icon_path.exists():
@@ -233,6 +246,10 @@ def patch_windows_icon() -> None:
         "--set-version-string",
         "OriginalFilename",
         "Viniper.exe",
+        "--set-file-version",
+        version,
+        "--set-product-version",
+        version,
     ], timeout=60)
 
 

@@ -88,7 +88,7 @@ def main() -> int:
         root = Path(temp_dir)
         verify_app_setting_wins(root / "settings-wins")
         verify_legacy_gateway_migrates(root / "legacy-migration")
-    print("Viniper UI provider routing verification passed.")
+    print("Viniper provider routing verification passed.")
     return 0
 
 

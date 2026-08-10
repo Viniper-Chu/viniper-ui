@@ -52,6 +52,7 @@ def verify_windows_icon(path: Path) -> None:
 
 def main() -> int:
     required = [
+        ROOT / "RELEASE_REVISION",
         DESKTOP / "package.json",
         DESKTOP / "package-lock.json",
         DESKTOP / "main.js",
@@ -83,6 +84,8 @@ def main() -> int:
     missing_modules = sorted(runtime_modules.difference(filters))
     if missing_modules:
         raise SystemExit(f"desktop package missing runtime modules: {missing_modules}")
+    if "RELEASE_REVISION" not in filters:
+        raise SystemExit("desktop package missing RELEASE_REVISION")
 
     main_js = (DESKTOP / "main.js").read_text(encoding="utf-8")
     if "VINIPER_UI_OPEN_BROWSER" not in main_js:

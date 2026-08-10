@@ -69,6 +69,7 @@ from wsl_runtime import RuntimeUpdateCoordinator, WslRuntimeProvisioner
 
 PROFILE_NAME = "agent-shell"
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+RELEASE_REVISION_FILE = VERSION_FILE.with_name("RELEASE_REVISION")
 PROFILE_FILE = Path(__file__).resolve().parent / "profiles.json"
 
 
@@ -94,7 +95,21 @@ def read_app_version() -> str:
         return "0.1.0"
 
 
+def read_release_revision() -> int:
+    raw = env_value("VINIPER_UI_RELEASE_REVISION", "").strip()
+    if not raw:
+        try:
+            raw = RELEASE_REVISION_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            return 0
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
 APP_VERSION = read_app_version()
+APP_RELEASE_REVISION = read_release_revision()
 PREVIEW_MODE = env_value("VINIPER_UI_PREVIEW", "").strip() == "1" or VERSION_FILE.with_name("PREVIEW").exists()
 PREVIEW_PROFILE = read_profile_config().get("preview", {})
 if not isinstance(PREVIEW_PROFILE, dict):
@@ -1414,6 +1429,49 @@ def is_newer_version(candidate: str, current: str = APP_VERSION) -> bool:
     right = version_key(current)
     width = max(len(left), len(right))
     return left + (0,) * (width - len(left)) > right + (0,) * (width - len(right))
+
+
+def update_decision(
+    manifest: dict[str, Any],
+    *,
+    current_version: str = APP_VERSION,
+    current_release_revision: int = APP_RELEASE_REVISION,
+) -> dict[str, Any]:
+    candidate_version = str(manifest.get("version") or "").strip()
+    try:
+        candidate_revision = max(0, int(manifest.get("release_revision") or 0))
+    except (TypeError, ValueError):
+        candidate_revision = 0
+    current_revision = max(0, int(current_release_revision or 0))
+    candidate_key = version_key(candidate_version)
+    current_key = version_key(current_version)
+    width = max(len(candidate_key), len(current_key))
+    candidate_key += (0,) * (width - len(candidate_key))
+    current_key += (0,) * (width - len(current_key))
+
+    if candidate_key > current_key:
+        automatic = True
+        manual_install_required = False
+        reason = "newer_version"
+    elif candidate_key == current_key and candidate_revision > current_revision:
+        automatic = True
+        manual_install_required = False
+        reason = "newer_release_revision"
+    elif candidate_key < current_key:
+        automatic = False
+        manual_install_required = True
+        reason = "manual_downgrade_only"
+    else:
+        automatic = False
+        manual_install_required = False
+        reason = "current"
+    return {
+        "automatic": automatic,
+        "manual_install_required": manual_install_required,
+        "reason": reason,
+        "current_release_revision": current_revision,
+        "latest_release_revision": candidate_revision,
+    }
 
 
 def fetch_json_url(url: str) -> dict[str, Any]:
@@ -4156,7 +4214,7 @@ def build_goal_turn_prompt(goal: dict[str, Any], turn_number: int) -> str:
     max_turns = int(goal.get("max_turns") or GOAL_DEFAULT_MAX_TURNS)
     phase = "初始审计" if turn_number <= 1 else ("递进深化" if turn_number < max_turns else "最终收束")
     return (
-        "Viniper UI Goal Mode is a hidden outer controller for the current conversation. "
+        "Viniper Goal Mode is a hidden outer controller for the current conversation. "
         "Continue the user's long-running goal through the configured agent shell. "
         "The visible reply should be useful and concise. Use tools when needed. Do not invent completed work.\n\n"
         f"{goal_skill_section()}\n"
@@ -4195,7 +4253,8 @@ def is_leaked_goal_control_message(message: dict[str, Any]) -> bool:
     if message.get("role") != "user":
         return False
     content = str(message.get("content") or "")
-    return "[GUIDANCE]" in content and "Viniper UI Goal Mode" in content and "Original goal:" in content
+    legacy_or_current_brand = "Viniper Goal Mode" in content or "Viniper UI Goal Mode" in content
+    return "[GUIDANCE]" in content and legacy_or_current_brand and "Original goal:" in content
 
 
 def sanitize_goal_session_messages(session_id: str) -> None:
@@ -6424,6 +6483,7 @@ async def status():
         "active_profile": ACTIVE_PROFILE,
         "product_name": APP_TITLE,
         "version": APP_VERSION,
+        "release_revision": APP_RELEASE_REVISION,
         "preview": PREVIEW_MODE,
         "configured": runtime_configured,
         "provider": cfg["provider"],
@@ -6742,13 +6802,25 @@ async def check_update(request: Request):
         manifest = await asyncio.to_thread(fetch_json_url, manifest_url)
         latest_version = str(manifest.get("version") or "")
         asset = choose_update_asset(manifest)
-        update_available = is_newer_version(latest_version, APP_VERSION)
+        decision = update_decision(manifest)
+        update_available = bool(decision["automatic"])
+        if decision["manual_install_required"]:
+            update_message = "检测到更低的公开版本号。自动降级已关闭，请从正式 Release 手动运行 Viniper 安装器。"
+        elif update_available:
+            update_message = "发现可用更新。"
+        else:
+            update_message = "当前已经是最新版本。"
         return {
             "ok": True,
             "configured": True,
             "current_version": APP_VERSION,
             "latest_version": latest_version,
             "update_available": update_available,
+            "manual_install_required": bool(decision["manual_install_required"]),
+            "update_reason": decision["reason"],
+            "current_release_revision": decision["current_release_revision"],
+            "latest_release_revision": decision["latest_release_revision"],
+            "message": update_message,
             "manifest_url": manifest_url,
             "repository": source.get("repository", ""),
             "notes": str(manifest.get("notes") or manifest.get("changelog") or ""),
@@ -6788,7 +6860,17 @@ async def install_update(request: Request):
     try:
         manifest = await asyncio.to_thread(fetch_json_url, manifest_url)
         latest_version = str(manifest.get("version") or "")
-        if not is_newer_version(latest_version, APP_VERSION) and not body.get("force"):
+        decision = update_decision(manifest)
+        if decision["manual_install_required"]:
+            return {
+                "ok": True,
+                "updated": False,
+                "current_version": APP_VERSION,
+                "latest_version": latest_version,
+                "manual_install_required": True,
+                "message": "检测到更低的公开版本号。为避免自动降级，请从正式 Release 手动运行 Viniper 安装器；现有会话和设置不会被清空。",
+            }
+        if not decision["automatic"]:
             return {
                 "ok": True,
                 "updated": False,

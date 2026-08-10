@@ -67,6 +67,7 @@ class ProfileAndPreviewSafetyTests(unittest.TestCase):
         self.assertIn("native_peer.py", resource_filter)
         self.assertIn("skill_sync.py", resource_filter)
         self.assertIn("wsl_runtime.py", resource_filter)
+        self.assertIn("RELEASE_REVISION", resource_filter)
         self.assertIn("profiles.json", resource_filter)
         self.assertIn("static/**", resource_filter)
         self.assertIn("!codex/**", resource_filter)
@@ -121,6 +122,21 @@ class ProfileAndPreviewSafetyTests(unittest.TestCase):
         self.assertIn('return path.join(app.getPath("appData"), "Viniper UI")', desktop)
         self.assertIn('app.setPath("userData", formalUserDataDir())', desktop)
         self.assertIn('app.setPath("userData", previewUserDataDir())', desktop)
+
+    def test_formal_visible_brand_is_viniper_without_ui_suffix(self) -> None:
+        package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(package["build"]["productName"], "Viniper")
+        self.assertEqual(package["build"]["nsis"]["shortcutName"], "Viniper")
+        self.assertEqual(package["build"]["win"]["artifactName"], "Viniper.Setup.${version}.${ext}")
+        for relative in (
+            "LICENSE",
+            "start.bat",
+            "scripts/verify_provider_routing.py",
+            "scripts/verify_slash_suggestions.py",
+        ):
+            self.assertNotIn("Viniper UI", (ROOT / relative).read_text(encoding="utf-8"), relative)
+        server = (ROOT / "server.py").read_text(encoding="utf-8")
+        self.assertIn('"Viniper Goal Mode is a hidden outer controller', server)
 
     def test_runtime_profile_updates_visible_environment_copy(self) -> None:
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
@@ -288,6 +304,7 @@ asyncio.run(run())
                 "profiles.json",
                 "requirements.txt",
                 "VERSION",
+                "RELEASE_REVISION",
             ):
                 (resources / name).write_text("# fixture\n", encoding="utf-8")
             icon = resources / "static" / "assets" / "viniper-icon.ico"

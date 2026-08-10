@@ -107,6 +107,7 @@ def verify_zip(zip_path: Path) -> None:
             "wsl_runtime.py",
             "requirements.txt",
             "VERSION",
+            "RELEASE_REVISION",
             "desktop/package.json",
             "desktop/package-lock.json",
             "desktop/main.js",
@@ -158,6 +159,13 @@ def verify_release_assets(
 ) -> list[Path]:
     if manifest.get("version") != version:
         raise SystemExit("latest.json version does not match VERSION")
+    revision_path = root / "RELEASE_REVISION"
+    try:
+        release_revision = int(revision_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError) as exc:
+        raise SystemExit("RELEASE_REVISION is missing or invalid") from exc
+    if release_revision <= 0 or manifest.get("release_revision") != release_revision:
+        raise SystemExit("latest.json release_revision does not match RELEASE_REVISION")
     assets = manifest.get("assets")
     if not isinstance(assets, dict):
         raise SystemExit("latest.json assets must be an object")

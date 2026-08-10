@@ -244,6 +244,7 @@ def verify_candidate(output: Path) -> dict[str, object]:
         resources / "profiles.json",
         resources / "requirements.txt",
         resources / "VERSION",
+        resources / "RELEASE_REVISION",
         resources / "static" / "assets" / "viniper-icon.ico",
     ]
     missing = [str(path.relative_to(output)) for path in required if not path.is_file()]
