@@ -238,12 +238,15 @@ app.whenReady().then(async () => {
     };
     titleButton.click();
     await Promise.resolve();
+    const inlineTitleInput = document.querySelector("#session-title-inline-input");
     const renameClick = {
-      modalOpen: !document.querySelector("#rename-session-modal").classList.contains("hidden"),
-      inputValue: document.querySelector("#rename-session-name").value,
+      inlineOpen: Boolean(inlineTitleInput),
+      inputRole: inlineTitleInput?.getAttribute("role") || "",
+      inputValue: inlineTitleInput?.value || "",
+      selected: Boolean(inlineTitleInput && inlineTitleInput.selectionStart === 0 && inlineTitleInput.selectionEnd === inlineTitleInput.value.length),
       putCallsBeforeConfirm: calls.filter((call) => call.method === "PUT").length
     };
-    document.querySelector("#cancel-rename-session-btn").click();
+    inlineTitleInput?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     await Promise.resolve();
 
     const headerMenuButton = document.querySelector("#session-header-menu-button");

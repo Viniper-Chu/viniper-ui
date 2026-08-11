@@ -202,7 +202,7 @@ app.whenReady().then(async () => {
     });
     const compacting = {
       a: Boolean(api.SessionRunRegistry.get("A")?.contextCompacting),
-      notice: document.querySelector(".context-notice")?.textContent || "",
+      notice: document.querySelector("#session-inline-status")?.textContent || "",
     };
     api.SessionRunRegistry.applyEvent("A", {
       type: "usage",

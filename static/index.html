@@ -136,6 +136,10 @@
     <main id="main" aria-label="主工作区">
       <div class="main-stage">
         <section id="chat-container" aria-label="对话内容">
+          <div id="session-inline-status" class="session-inline-status hidden" role="status" aria-live="polite" aria-hidden="true"></div>
+          <nav id="message-trace-rail" class="message-trace-rail hidden" aria-label="消息追溯" aria-hidden="true">
+            <div id="message-trace-track" class="message-trace-track"></div>
+          </nav>
           <div id="messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
           <div id="thinking" class="hidden"><span class="spinner"></span><span class="working-label">正在工作…</span></div>
         </section>
@@ -149,6 +153,11 @@
             <div class="workspace-panel-header"><h2 id="artifact-area-title">产物</h2><span class="workspace-panel-state">空</span></div>
           </section>
         </aside>
+      </div>
+
+      <div id="message-trace-preview" class="message-trace-preview hidden" role="tooltip" aria-hidden="true">
+        <strong id="message-trace-preview-title" class="message-trace-preview-title"></strong>
+        <span id="message-trace-preview-summary" class="message-trace-preview-summary"></span>
       </div>
 
       <section id="skills-view" class="skills-view hidden" aria-label="自定义与技能">
@@ -303,6 +312,18 @@
       <div class="modal-actions">
         <button id="folder-picker-cancel-btn" class="ghost-button" type="button">取消</button>
         <button id="folder-picker-use-btn" class="primary-button" type="button">使用此目录</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="text-input-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="text-input-title">
+    <div class="modal-content text-input-modal-content">
+      <h2 id="text-input-title">输入</h2>
+      <label id="text-input-label" for="text-input-value">名称</label>
+      <input id="text-input-value" type="text" autocomplete="off">
+      <div class="modal-actions">
+        <button id="cancel-text-input-btn" class="ghost-button" type="button">取消</button>
+        <button id="confirm-text-input-btn" class="primary-button" type="button">确定</button>
       </div>
     </div>
   </div>

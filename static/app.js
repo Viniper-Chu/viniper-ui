@@ -75,6 +75,7 @@ const state = {
   sessionPinned: false,
   sessionUnread: false,
   sessionRuntimeState: "idle",
+  inlineStatus: { sessionId: "", kind: "", message: "", timer: null },
   settings: null,
   settingsDirty: false,
   settingsActiveSection: "account",
@@ -98,6 +99,7 @@ const state = {
   pendingInteraction: null,
   pendingDeleteResolver: null,
   pendingRenameResolver: null,
+  pendingTextInputResolver: null,
   sessionSwitchGeneration: 0,
   sessionSwitchPending: false,
   retrySend: { count: 0, max: 3, delayMs: 3000 },
@@ -492,8 +494,57 @@ const SessionTransportRegistry = {
   }
 };
 
+function renderSessionInlineStatus() {
+  const node = $("#session-inline-status");
+  if (!node) return;
+  const item = state.inlineStatus || {};
+  const visible = Boolean(item.message && String(item.sessionId || "") === String(state.sessionId || ""));
+  node.classList.toggle("hidden", !visible);
+  node.setAttribute("aria-hidden", visible ? "false" : "true");
+  node.dataset.statusKind = visible ? String(item.kind || "info") : "";
+  node.textContent = visible ? item.message : "";
+}
+
+function clearInlineStatus(sessionId = state.sessionId, kind = "") {
+  const item = state.inlineStatus || {};
+  if (sessionId && String(item.sessionId || "") !== String(sessionId)) return;
+  if (kind && String(item.kind || "") !== String(kind)) return;
+  if (item.timer) window.clearTimeout(item.timer);
+  state.inlineStatus = { sessionId: "", kind: "", message: "", timer: null };
+  renderSessionInlineStatus();
+}
+
+function showInlineStatus(message, { sessionId = state.sessionId, kind = "info", timeout = 0 } = {}) {
+  const id = String(sessionId || "");
+  if (!id || id !== String(state.sessionId || "")) return false;
+  const current = state.inlineStatus || {};
+  if (current.timer) window.clearTimeout(current.timer);
+  state.inlineStatus = { sessionId: id, kind: String(kind || "info"), message: String(message || ""), timer: null };
+  if (timeout > 0) {
+    state.inlineStatus.timer = window.setTimeout(() => clearInlineStatus(id), timeout);
+  }
+  renderSessionInlineStatus();
+  return true;
+}
+
+function updateSessionPauseStatus() {
+  const id = String(state.sessionId || "");
+  const record = id ? SessionRunRegistry.get(id) : null;
+  const paused = String(state.sessionRuntimeState || "") === "paused" || String(record?.status || "") === "paused";
+  if (paused) {
+    const current = state.inlineStatus || {};
+    if (current.kind !== "paused" || String(current.sessionId) !== id) {
+      state.inlineStatus = { sessionId: id, kind: "paused", message: "已暂停 · 输入消息可继续", timer: null };
+    }
+  } else if (state.inlineStatus?.kind === "paused" && String(state.inlineStatus.sessionId) === id) {
+    clearInlineStatus(id, "paused");
+  }
+  renderSessionInlineStatus();
+}
+
 function resetCurrentSessionRuntimeUi() {
   state.pendingInteraction = null;
+  clearInlineStatus();
   clearInteractionDock();
   $("#thinking")?.classList.add("hidden");
   $("#stop-btn")?.classList.add("hidden");
@@ -565,6 +616,7 @@ function syncCurrentSessionRuntimeUi() {
     const control = $(selector);
     if (control) control.disabled = active;
   });
+  updateSessionPauseStatus();
   renderPeerMenu();
 }
 const APP_TITLE = String(typeof window !== "undefined" && window.VINIPER_APP_TITLE || "Viniper");
@@ -1535,7 +1587,12 @@ function bindEvents() {
       const container = $("#chat-container");
       SessionScrollRegistry.set(state.sessionId, isNearChatBottom(), container?.scrollTop);
     }
+    updateMessageTraceRail();
   });
+  window.addEventListener("resize", updateMessageTraceRail);
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest("#message-trace-rail")) hideMessageTracePreview();
+  }, true);
 
   $("#send-btn").addEventListener("click", () => sendMessage());
   $("#stop-btn").addEventListener("click", cancelCurrentTask);
@@ -1654,7 +1711,7 @@ function bindEvents() {
   }, true);
   $("#session-title-button")?.addEventListener("click", () => {
     if (state.viewMode !== "agent" || !state.sessionId) return;
-    void renameSessionRecord(state.sessionId, state.sessionName || state.sessionId);
+    startInlineSessionRename();
   });
   $("#session-header-menu-button")?.addEventListener("click", (event) => {
     if (state.viewMode !== "agent" || !state.sessionId) return;
@@ -1775,6 +1832,14 @@ function bindEvents() {
   $("#folder-picker-new-btn").addEventListener("click", createFolderInPicker);
   $("#folder-picker-cancel-btn").addEventListener("click", closeFolderPicker);
   $("#folder-picker-use-btn").addEventListener("click", usePickedFolder);
+  $("#cancel-text-input-btn")?.addEventListener("click", () => closeTextInputModal(null));
+  $("#confirm-text-input-btn")?.addEventListener("click", () => closeTextInputModal($("#text-input-value")?.value.trim() || null));
+  $("#text-input-value")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      closeTextInputModal($("#text-input-value")?.value.trim() || null);
+    }
+  });
   $("#workdir-input").addEventListener("keydown", (event) => {
     if (event.key === "Enter") saveWorkdir();
   });
@@ -1801,6 +1866,10 @@ function bindEvents() {
       return;
     }
     if (event.key === "Escape") {
+      if (!$("#message-trace-preview")?.classList.contains("hidden")) {
+        hideMessageTracePreview();
+        return;
+      }
       if (state.peerMenuOpen) {
         setPeerMenuOpen(false, { restoreFocus: true });
         return;
@@ -1847,6 +1916,7 @@ function bindEvents() {
       closeNewSessionModal();
       closeDeleteSessionModal(false);
       closeRenameSessionModal(null);
+      closeTextInputModal(null);
     }
   });
   if (window.matchMedia) {
@@ -2181,7 +2251,7 @@ async function setSessionPinned(sessionId, pinned) {
     }
     await loadSessionList();
   } catch (error) {
-    alert(`会话置顶失败：${error.message}`);
+    showInlineStatus(`会话置顶失败：${error.message}`, { kind: "error", timeout: 5200 });
     await loadSessionList();
   }
 }
@@ -2419,11 +2489,11 @@ async function checkForUpdates({ silent = false } = {}) {
       return data;
     }
     if (!silent) {
-      alert(data.message || (data.configured === false ? "还没有配置更新源。" : "当前已经是最新版本。"));
+      showInlineStatus(data.message || (data.configured === false ? "还没有配置更新源。" : "当前已经是最新版本。"), { kind: "info", timeout: 4200 });
     }
     return data;
   } catch (error) {
-    if (!silent) alert(`检查更新失败：${error.message}`);
+    if (!silent) showInlineStatus(`检查更新失败：${error.message}`, { kind: "error", timeout: 5200 });
     return null;
   } finally {
     if (button) button.disabled = false;
@@ -2449,7 +2519,7 @@ function closeUpdateModal() {
 async function installUpdate() {
   const info = state.updateInfo?.update_available ? state.updateInfo : await checkForUpdates({ silent: true });
   if (!info?.update_available) {
-    alert("当前没有可安装的新版本。");
+    showInlineStatus("当前没有可安装的新版本。", { kind: "info", timeout: 4200 });
     return;
   }
 
@@ -2478,7 +2548,7 @@ async function installUpdate() {
     }
     renderUpdateButton();
     if (!data.restarting) {
-      alert(data.message || `更新已安装，请重新打开 ${APP_TITLE}。`);
+      showInlineStatus(data.message || `更新已安装，请重新打开 ${APP_TITLE}。`, { kind: "info", timeout: 5200 });
     }
   } catch (error) {
     $("#update-notes").textContent = `更新失败：${error.message}`;
@@ -2998,6 +3068,34 @@ function closeFolderPicker() {
   state.folderPicker.targetSelector = "";
 }
 
+function showTextInputModal({ title = "输入", label = "名称", placeholder = "", value = "" } = {}) {
+  const modal = $("#text-input-modal");
+  const heading = $("#text-input-title");
+  const labelNode = $("#text-input-label");
+  const input = $("#text-input-value");
+  if (!modal || !input) return Promise.resolve(null);
+  if (heading) heading.textContent = title;
+  if (labelNode) labelNode.textContent = label;
+  input.value = value;
+  input.placeholder = placeholder;
+  modal.classList.remove("hidden");
+  input.focus();
+  input.select();
+  return new Promise((resolve) => {
+    state.pendingTextInputResolver = resolve;
+  });
+}
+
+function closeTextInputModal(value = null) {
+  const modal = $("#text-input-modal");
+  if (modal) modal.classList.add("hidden");
+  if (state.pendingTextInputResolver) {
+    const resolve = state.pendingTextInputResolver;
+    state.pendingTextInputResolver = null;
+    resolve(value ? String(value).trim() : null);
+  }
+}
+
 async function loadFolderPickerPath(path) {
   const query = path ? `?path=${encodeURIComponent(path)}` : "";
   $("#folder-picker-list").innerHTML = `<div class="folder-empty">正在读取文件夹</div>`;
@@ -3044,18 +3142,18 @@ async function createFolder(parent, name) {
 }
 
 async function createFolderInPicker() {
-  const name = prompt("新建文件夹名称");
+  const name = await showTextInputModal({ title: "新建文件夹", label: "文件夹名称", placeholder: "输入新文件夹名称" });
   if (!name) return;
   try {
     const path = await createFolder(state.folderPicker.currentPath || state.folderPicker.defaultRoot, name);
     await loadFolderPickerPath(path);
   } catch (error) {
-    alert(`新建文件夹失败：${error.message}`);
+    showInlineStatus(`新建文件夹失败：${error.message}`, { kind: "error", timeout: 5200 });
   }
 }
 
 async function createDefaultFolderForInput(targetSelector) {
-  const name = prompt("新建文件夹名称");
+  const name = await showTextInputModal({ title: "新建文件夹", label: "文件夹名称", placeholder: "输入新文件夹名称" });
   if (!name) return;
   try {
     const data = await fetchFolderRoots();
@@ -3066,7 +3164,7 @@ async function createDefaultFolderForInput(targetSelector) {
       if (target.id === "settings-default-root") markSettingsDirty();
     }
   } catch (error) {
-    alert(`新建文件夹失败：${error.message}`);
+    showInlineStatus(`新建文件夹失败：${error.message}`, { kind: "error", timeout: 5200 });
   }
 }
 
@@ -3663,10 +3761,11 @@ function sessionMenuRecord(sessionId) {
 function renderSessionHeader() {
   const header = $("#agent-session-header");
   const titleButton = $("#session-title-button");
+  const inlineInput = $("#session-title-inline-input");
   const title = $("#session-title");
   const path = $("#workdir-display");
   const menuButton = $("#session-header-menu-button");
-  if (!header || !titleButton || !title || !path || !menuButton) return;
+  if (!header || (!titleButton && !inlineInput) || !path || !menuButton) return;
   const visible = state.viewMode === "agent" && Boolean(state.sessionId);
   header.classList.toggle("hidden", !visible);
   header.setAttribute("aria-hidden", visible ? "false" : "true");
@@ -3678,15 +3777,120 @@ function renderSessionHeader() {
   const name = String(state.sessionName || "未命名会话");
   const fullPath = String(state.workdir || "");
   const pathLabel = fullPath ? shortenPath(fullPath) : "默认工作目录";
-  title.textContent = name;
-  titleButton.title = `单击重命名：${name}`;
-  titleButton.setAttribute("aria-label", `重命名当前会话：${name}`);
+  if (titleButton && title) {
+    title.textContent = name;
+    titleButton.title = `单击重命名：${name}`;
+    titleButton.setAttribute("aria-label", `重命名当前会话：${name}`);
+  }
+  if (inlineInput) {
+    inlineInput.value = state.sessionName || "";
+    inlineInput.setAttribute("aria-label", `编辑当前会话名称：${name}`);
+  }
   path.textContent = pathLabel;
   path.title = fullPath || "使用默认工作目录";
   path.setAttribute("aria-label", `工作目录：${fullPath || "使用默认工作目录"}`);
   menuButton.dataset.sessionMenu = String(state.sessionId);
   menuButton.setAttribute("aria-label", `${name}的会话操作`);
   menuButton.setAttribute("aria-expanded", state.sessionMenuSessionId === String(state.sessionId) ? "true" : "false");
+}
+
+function createSessionTitleButton() {
+  const button = document.createElement("button");
+  button.id = "session-title-button";
+  button.className = "session-title-button titlebar-no-drag";
+  button.type = "button";
+  button.setAttribute("aria-label", "重命名当前会话");
+  button.innerHTML = '<span id="session-title">未命名会话</span>';
+  button.addEventListener("click", () => startInlineSessionRename());
+  return button;
+}
+
+function restoreInlineSessionTitle(errorMessage = "") {
+  const input = $("#session-title-inline-input");
+  const header = $("#agent-session-header");
+  if (input) input.replaceWith(createSessionTitleButton());
+  renderSessionHeader();
+  if (!errorMessage || !header) return;
+  const note = document.createElement("span");
+  note.className = "session-title-inline-error";
+  note.setAttribute("role", "status");
+  note.textContent = errorMessage;
+  header.appendChild(note);
+  window.setTimeout(() => note.remove(), 4200);
+}
+
+async function persistSessionName(sessionId, nextName) {
+  const id = String(sessionId || "");
+  const name = String(nextName || "").trim();
+  if (!id || !name) throw new Error("会话名称不能为空");
+  const response = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.detail || `保存失败：${response.status}`);
+  const indexed = state.sessionIndex.find((item) => String(item.id) === id);
+  if (indexed) indexed.name = name;
+  if (id === String(state.sessionId || "")) state.sessionName = name;
+  renderSessionHeader();
+  await loadSessionList();
+  return name;
+}
+
+function startInlineSessionRename() {
+  if (state.viewMode !== "agent" || !state.sessionId || $("#session-title-inline-input")) return false;
+  const button = $("#session-title-button");
+  if (!button) return false;
+  const editingSessionId = String(state.sessionId);
+  const original = String(state.sessionName || "未命名会话");
+  const input = document.createElement("input");
+  input.id = "session-title-inline-input";
+  input.className = "session-title-inline-input titlebar-no-drag";
+  input.classList.add("is-editing");
+  input.type = "text";
+  input.value = original;
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.setAttribute("role", "textbox");
+  input.setAttribute("aria-label", `编辑当前会话名称：${original}`);
+  button.replaceWith(input);
+  input.focus();
+  input.select();
+  let settled = false;
+  const finish = async (save) => {
+    if (settled) return;
+    settled = true;
+    if (!save) {
+      restoreInlineSessionTitle();
+      return;
+    }
+    const nextName = input.value.trim() || original;
+    try {
+      await persistSessionName(editingSessionId, nextName);
+      // A user can switch sessions while the PUT is in flight.  Only restore
+      // the editor that belongs to the session which started the request; a
+      // newer session's title/input must not be replaced by this completion.
+      if (String(state.sessionId || "") === editingSessionId && $("#session-title-inline-input") === input) {
+        restoreInlineSessionTitle();
+      }
+    } catch (error) {
+      if (String(state.sessionId || "") === editingSessionId && $("#session-title-inline-input") === input) {
+        restoreInlineSessionTitle(error.message || "会话名称保存失败");
+      }
+    }
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void finish(true);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      void finish(false);
+    }
+  });
+  input.addEventListener("blur", () => { void finish(true); });
+  return true;
 }
 
 function setSessionMenuItemLabel(menu, action, label) {
@@ -3761,17 +3965,7 @@ async function setSessionUnread(sessionId, unread) {
 async function renameSessionRecord(sessionId, currentName = "") {
   const nextName = await showRenameSessionModal(currentName);
   if (nextName === null) return;
-  const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: nextName })
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  if (sessionId === state.sessionId) {
-    state.sessionName = nextName;
-    renderSessionHeader();
-  }
-  await loadSessionList();
+  await persistSessionName(sessionId, nextName);
 }
 
 async function openSessionProjectMapping(sessionId) {
@@ -3811,7 +4005,7 @@ async function executeSessionMenuAction(action) {
     else if (action === "project") await openSessionProjectMapping(sessionId);
     else if (action === "delete") await deleteSessionRecord(sessionId, session.name || sessionId);
   } catch (error) {
-    alert(error.message || String(error));
+    showInlineStatus(error.message || String(error), { kind: "error", timeout: 5200 });
     await loadSessionList();
   }
 }
@@ -4182,7 +4376,7 @@ async function saveWorkdir() {
     renderCurrentSession();
     await loadSessionList();
   } catch (error) {
-    alert(`目录切换失败：${error.message}`);
+    showInlineStatus(`目录切换失败：${error.message}`, { kind: "error", timeout: 5200 });
   }
 }
 
@@ -4191,6 +4385,145 @@ function renderCurrentSession() {
   $("#chat-container")?.classList.toggle("chat-empty-state", emptyChat);
   updateModeChrome();
   updateContextMeter();
+  updateMessageTraceRail();
+}
+
+function hideMessageTracePreview() {
+  const preview = $("#message-trace-preview");
+  if (!preview) return;
+  preview.classList.add("hidden");
+  preview.setAttribute("aria-hidden", "true");
+}
+
+function messageTracePreviewCopy(article, index) {
+  const role = article?.dataset?.role === "user" ? "用户" : "助手";
+  const nodes = role === "用户"
+    ? Array.from(article?.querySelectorAll?.(".user-text") || [])
+    : Array.from(article?.querySelectorAll?.(".msg-text-segment") || []);
+  const text = nodes.map((node) => String(node.textContent || "").trim()).filter(Boolean).join(" ");
+  const lines = text.split(/\s*\n\s*|(?<=[。！？.!?])\s+/).map((line) => line.trim()).filter(Boolean);
+  const title = (lines.shift() || `${role}第 ${index + 1} 条消息`).slice(0, 72);
+  const summary = (lines.join(" ") || (text && text !== title ? text.slice(title.length).trim() : "点击刻度跳转到该轮消息")).slice(0, 180);
+  return { title, summary };
+}
+
+function showMessageTracePreview(index) {
+  const rail = $("#message-trace-rail");
+  const preview = $("#message-trace-preview");
+  const titleNode = $("#message-trace-preview-title");
+  const summaryNode = $("#message-trace-preview-summary");
+  const messages = $("#messages");
+  const container = $("#chat-container");
+  const article = Array.from(messages?.children || []).filter((node) => node?.classList?.contains("message"))[index];
+  const tick = rail?.querySelector?.(`[data-trace-index="${Number(index)}"]`);
+  if (!rail || !preview || !titleNode || !summaryNode || !container || !article || !tick || state.sessionMode !== "agent") return false;
+  const copy = messageTracePreviewCopy(article, index);
+  titleNode.textContent = copy.title;
+  summaryNode.textContent = copy.summary;
+  preview.classList.remove("hidden");
+  preview.setAttribute("aria-hidden", "false");
+  const railRect = rail.getBoundingClientRect();
+  const tickRect = tick.getBoundingClientRect();
+  const inputRect = $("#input-area")?.getBoundingClientRect?.();
+  const viewportBottom = Math.min(window.innerHeight - 10, Number(inputRect?.top || window.innerHeight) - 10);
+  let left = railRect.right + 10;
+  let top = tickRect.top - 8;
+  const cardRect = preview.getBoundingClientRect();
+  if (left + cardRect.width > window.innerWidth - 10) left = Math.max(10, railRect.left - cardRect.width - 10);
+  if (top + cardRect.height > viewportBottom) top = Math.max(10, viewportBottom - cardRect.height);
+  if (top < 10) top = Math.min(Math.max(10, tickRect.bottom + 8), viewportBottom - cardRect.height);
+  preview.style.left = `${Math.round(left)}px`;
+  preview.style.top = `${Math.round(top)}px`;
+  return true;
+}
+
+function updateMessageTraceRail() {
+  const rail = $("#message-trace-rail");
+  const track = $("#message-trace-track");
+  const container = $("#chat-container");
+  const messages = $("#messages");
+  if (!rail || !track || !container || !messages) return false;
+
+  const articles = Array.from(messages.children || []).filter((node) => node?.classList?.contains("message"));
+  const visible = state.sessionMode === "agent" && articles.length > 0;
+  hideMessageTracePreview();
+  rail.classList.toggle("hidden", !visible);
+  rail.setAttribute("aria-hidden", visible ? "false" : "true");
+  container.classList.toggle("has-message-trace", visible);
+  while (track.firstChild) track.removeChild(track.firstChild);
+  if (!visible) return false;
+
+  const contentHeight = Math.max(1, messages.scrollHeight, container.clientHeight);
+  const viewport = container.getBoundingClientRect();
+  const viewportCenter = viewport.top + (viewport.height / 2);
+  let nearestIndex = 0;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+
+  articles.forEach((article, index) => {
+    article.dataset.traceIndex = String(index);
+    const midpoint = Number(article.offsetTop || 0) + (Number(article.offsetHeight || 0) / 2);
+    const percent = Math.min(100, Math.max(0, (midpoint / contentHeight) * 100));
+    const tick = document.createElement("button");
+    tick.type = "button";
+    tick.className = "message-trace-tick";
+    tick.dataset.traceIndex = String(index);
+    const roleLabel = article.dataset.role === "user" ? "用户" : "助手";
+    tick.title = `跳转到第 ${index + 1} 条${roleLabel}消息`;
+    tick.setAttribute("aria-label", tick.title);
+    tick.style.top = `${percent}%`;
+    tick.addEventListener("pointerenter", () => showMessageTracePreview(index));
+    tick.addEventListener("focus", () => showMessageTracePreview(index));
+    tick.addEventListener("pointerleave", hideMessageTracePreview);
+    tick.addEventListener("blur", () => {
+      if (!rail.contains(document.activeElement)) hideMessageTracePreview();
+    });
+    tick.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        hideMessageTracePreview();
+        tick.blur();
+      }
+    });
+    tick.addEventListener("click", () => {
+      hideMessageTracePreview();
+      const target = articles[index];
+      if (!target) return;
+      const token = SessionScrollRegistry.beginProjection(state.sessionId);
+      try {
+        const max = Math.max(0, container.scrollHeight - container.clientHeight);
+        // offsetTop is relative to the article's offset parent, not reliably
+        // to #chat-container after the rail/composer grid is laid out.  Use
+        // the two live rects in the shared CSS/DIP space and adjust from the
+        // current scroll position so the real target message is centered.
+        const targetRect = target.getBoundingClientRect();
+        const containerRect = container.getBoundingClientRect();
+        const targetCenter = targetRect.top + (targetRect.height / 2);
+        const viewportCenter = containerRect.top + (container.clientHeight / 2);
+        const targetTop = Math.min(max, Math.max(0, container.scrollTop + targetCenter - viewportCenter));
+        container.scrollTop = targetTop;
+        SessionScrollRegistry.set(state.sessionId, isNearChatBottom(), container.scrollTop);
+      } finally {
+        SessionScrollRegistry.finishProjection(state.sessionId, token);
+      }
+      updateMessageTraceRail();
+    });
+    track.appendChild(tick);
+
+    const rect = article.getBoundingClientRect();
+    const distance = Math.abs((rect.top + (rect.height / 2)) - viewportCenter);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestIndex = index;
+    }
+  });
+
+  Array.from(track.children).forEach((tick, index) => {
+    const active = index === nearestIndex;
+    tick.classList.toggle("active", active);
+    if (active) tick.setAttribute("aria-current", "true");
+    else tick.removeAttribute("aria-current");
+  });
+  return true;
 }
 
 function dailyUsageNumber(value) {
@@ -4452,6 +4785,7 @@ function renderWelcome() {
     `;
   if (agent && runtimeView.ready) refreshDailyUsageForEmptyAgent();
   updateContextRail();
+  updateMessageTraceRail();
 }
 
 function renderAllMessages() {
@@ -4464,16 +4798,17 @@ function renderAllMessages() {
   }
 
   $("#chat-container")?.classList.remove("chat-empty-state");
-  $("#messages").innerHTML = state.messages.map((message) => {
+  $("#messages").innerHTML = state.messages.map((message, index) => {
     const roleClass = message.role === "system" ? "system" : message.role;
     const label = message.role === "user"
       ? ""
       : (message.role === "system" ? "上下文摘要" : "");
     const content = message.content;
-    return messageTemplate(roleClass, label, content, message.thinking || "", message.segments || [], message);
+    return messageTemplate(roleClass, label, content, message.thinking || "", message.segments || [], { ...message, traceIndex: index });
   }).join("");
   updateStoredThinkingTimer();
   updateContextRail();
+  updateMessageTraceRail();
   if (SessionRunRegistry.get(state.sessionId)?.active) renderSessionRun(state.sessionId);
 }
 
@@ -4502,9 +4837,10 @@ function addMessage(role, content, meta = {}) {
     message.content,
     message.thinking || "",
     message.segments || [],
-    message,
+    { ...message, traceIndex: state.messages.length - 1 },
   ));
   updateContextRail();
+  updateMessageTraceRail();
   return $("#messages .message:last-child .msg-content");
 }
 
@@ -4540,11 +4876,12 @@ function messageTemplate(roleClass, label, content, thinking = "", segments = []
     ? String(meta?.runSessionId || meta?.run_session_id || (isPending ? state.sessionId : "") || "")
     : "";
   const runAttr = runSessionId ? ` data-run-session-id="${escapeAttr(runSessionId)}"` : "";
+  const traceIndex = Number.isInteger(Number(meta?.traceIndex)) ? ` data-trace-index="${Number(meta.traceIndex)}"` : "";
   const runStatus = roleClass === "assistant" && meta?.retryable
     ? `<p class="message-run-status" role="status">发送失败，可重试</p>`
     : "";
   return `
-    <article class="message ${renderedRoleClass}" data-role="${escapeAttr(renderedRoleClass)}"${pendingAttr}${runAttr}>
+    <article class="message ${renderedRoleClass}" data-role="${escapeAttr(renderedRoleClass)}"${traceIndex}${pendingAttr}${runAttr}>
       ${header}
       ${displayThinking && roleClass === "assistant" && !displaySegments.length && isPending ? renderThinkingPanel(displayThinking, { activeThinking: true }) : ""}
       <div class="msg-content">${body}</div>
@@ -5545,6 +5882,7 @@ function renderSessionRun(sessionId) {
       }
     }
     scrollBottom();
+    updateMessageTraceRail();
     return true;
   } finally {
     SessionScrollRegistry.finishProjection(id, scrollProjectionToken);
@@ -5702,6 +6040,20 @@ function projectCoordinatedRunEvent(sessionId, payload = {}, { accepted = false 
     }
   } else if (type === "run_status" && payload.status === "cancelled") {
     SessionRunRegistry.update(id, { cancelRequested: true, waitingInput: false, pendingInteraction: null, status: "cancelled" });
+  } else if (type === "run_status" && payload.status === "paused") {
+    SessionRunRegistry.update(id, {
+      active: false,
+      waitingInput: false,
+      pendingInteraction: null,
+      status: "paused",
+      workingLabel: String(payload.message || "已暂停 · 输入消息可继续"),
+    });
+  } else if (type === "run_status" && payload.status === "running") {
+    SessionRunRegistry.update(id, {
+      active: true,
+      status: "running",
+      cancelRequested: false,
+    });
   } else if (type === "queue_dispatch") {
     const item = payload.item || {};
     SessionQueueRegistry.upsert(id, { ...item, status: "dispatching" });
@@ -5983,7 +6335,7 @@ async function sendAgentGuidance(sessionId, input = $("#user-input")) {
   if (!text) return false;
   if (run.waitingInput || run.pendingInteraction) {
     if (String(state.sessionId) === runSessionId) {
-      $("#status-line").textContent = "请先处理当前问题或权限请求";
+      showInlineStatus("请先处理当前问题或权限请求", { kind: "error", timeout: 4200 });
       input.focus();
     }
     return false;
@@ -6008,12 +6360,12 @@ async function sendAgentGuidance(sessionId, input = $("#user-input")) {
         autoResize(input);
       }
       addMessage("user", text, { guidance: true });
-      $("#status-line").textContent = "已将修正发送到当前运行";
+      showInlineStatus("已将修正发送到当前运行", { kind: "info", timeout: 3200 });
     }
     return true;
   } catch (error) {
     if (initiatingRunIsCurrent() && String(state.sessionId) === runSessionId) {
-      $("#status-line").textContent = `引导未发送：${error.message || error}`;
+      showInlineStatus(`引导未发送：${error.message || error}`, { kind: "error", timeout: 5200 });
       input.focus();
     }
     return false;
@@ -6033,14 +6385,14 @@ async function enqueueAgentMessage(sessionId, input = $("#user-input")) {
   const files = [...state.contextFiles];
   const tooLarge = files.find((file) => file.size > MAX_ATTACHMENT_BYTES);
   if (tooLarge) {
-    $("#status-line").textContent = `附件过大：${tooLarge.name} 超过 ${formatBytes(MAX_ATTACHMENT_BYTES)}`;
+    showInlineStatus(`附件过大：${tooLarge.name} 超过 ${formatBytes(MAX_ATTACHMENT_BYTES)}`, { kind: "error", timeout: 6200 });
     return false;
   }
   let attachments = [];
   try {
     attachments = await Promise.all(files.map(fileToAttachment));
   } catch (error) {
-    $("#status-line").textContent = `附件读取失败：${error.message || error}`;
+    showInlineStatus(`附件读取失败：${error.message || error}`, { kind: "error", timeout: 5200 });
     return false;
   }
   run.queuePending = true;
@@ -6068,12 +6420,12 @@ async function enqueueAgentMessage(sessionId, input = $("#user-input")) {
         state.contextFiles.splice(0, state.contextFiles.length, ...remaining);
         renderContextFiles();
       }
-      $("#status-line").textContent = "已加入待发送队列";
+      showInlineStatus("已加入待发送队列", { kind: "info", timeout: 3200 });
     }
     return true;
   } catch (error) {
     if (initiatingRunIsCurrent() && String(state.sessionId) === runSessionId) {
-      $("#status-line").textContent = `加入队列失败：${error.message || error}`;
+      showInlineStatus(`加入队列失败：${error.message || error}`, { kind: "error", timeout: 5200 });
       input.focus();
     }
     return false;
@@ -6108,18 +6460,18 @@ async function sendMessage() {
   let attachments = [];
   if (agent) {
     if (peerTarget && files.length) {
-      $("#status-line").textContent = "跨会话消息不支持附件；请先移除附件或取消会话目标";
+      showInlineStatus("跨会话消息不支持附件；请先移除附件或取消会话目标", { kind: "error", timeout: 5200 });
       return;
     }
     const tooLarge = files.find((file) => file.size > MAX_ATTACHMENT_BYTES);
     if (tooLarge) {
-      alert(`附件过大：${tooLarge.name} 超过 ${formatBytes(MAX_ATTACHMENT_BYTES)}。大文件请直接告诉 Claude Code 文件路径来读取。`);
+      showInlineStatus(`附件过大：${tooLarge.name} 超过 ${formatBytes(MAX_ATTACHMENT_BYTES)}。大文件请直接告诉 Claude Code 文件路径来读取。`, { kind: "error", timeout: 6200 });
       return;
     }
     try {
       attachments = await Promise.all(files.map(fileToAttachment));
     } catch (error) {
-      alert(`附件读取失败：${error.message || error}`);
+      showInlineStatus(`附件读取失败：${error.message || error}`, { kind: "error", timeout: 5200 });
       return;
     }
     if (files.length) clearContextFiles();
@@ -6686,8 +7038,6 @@ function updateContextMeter({ announce = false, schedule = true } = {}) {
 
   if (stats.compacting) {
     showContextNotice(stats);
-    const notice = $(".context-notice");
-    if (notice) notice.textContent = "正在压缩上下文…";
   } else if (announce && stats.shouldCompress) {
     showContextNotice(stats);
   } else if (!stats.shouldCompress) {
@@ -6705,21 +7055,14 @@ function setContextPopoverOpen(open) {
 }
 
 function showContextNotice(stats = contextStats()) {
-  let notice = $(".context-notice");
-  if (!notice) {
-    notice = document.createElement("div");
-    notice.className = "context-notice";
-    notice.setAttribute("role", "status");
-    notice.setAttribute("aria-live", "polite");
-    const messagesEl = $("#messages");
-    if (messagesEl) messagesEl.prepend(notice);
-  }
-  notice.textContent = `上下文接近压缩线，Claude Code 将在处理新消息时判断。`;
+  const message = stats.compacting
+    ? "正在压缩上下文…"
+    : "上下文接近压缩线，Claude Code 将在处理新消息时判断。";
+  showInlineStatus(message, { kind: "context" });
 }
 
 function hideContextNotice() {
-  const notice = $(".context-notice");
-  if (notice) notice.remove();
+  clearInlineStatus(state.sessionId, "context");
 }
 
 function shortContextReason(value) {
@@ -6761,9 +7104,7 @@ async function requestContextCompression(sessionId = state.sessionId, compressio
     compressionState.status = "failed";
     compressionState.reason = shortContextReason(error.message || String(error));
     if (state.sessionId === sessionId) {
-      showContextNotice(contextStats());
-      const errorNotice = $(".context-notice");
-      if (errorNotice) errorNotice.textContent = `上下文整理失败：${compressionState.reason}`;
+      showInlineStatus(`上下文整理失败：${compressionState.reason}`, { kind: "error", timeout: 5200 });
     }
     return null;
   } finally {
@@ -7325,14 +7666,7 @@ function scrollBottom({ force = false } = {}) {
 }
 
 function showCompressedBanner(message = "已压缩上下文") {
-  const existing = $(".compressed-banner");
-  if (existing) existing.remove();
-  const banner = document.createElement("div");
-  banner.className = "compressed-banner";
-  banner.textContent = message;
-  const messagesEl = $("#messages");
-  if (messagesEl) messagesEl.appendChild(banner);
-  setTimeout(() => banner.remove(), 4000);
+  showInlineStatus(message, { kind: "context", timeout: 4000 });
 }
 
 if (typeof globalThis !== "undefined") {
@@ -7345,6 +7679,9 @@ if (typeof globalThis !== "undefined") {
     resetCurrentSessionRuntimeUi,
     createStreamRenderer,
     renderSessionRun,
+    renderAllMessages,
+    renderCurrentSession,
+    updateMessageTraceRail,
     respondToInteraction,
     projectCoordinatedRunEvent,
     setViewMode,
@@ -7359,6 +7696,13 @@ if (typeof globalThis !== "undefined") {
     globalMenuFocusIndex,
     accountMenuTransition,
     renderSessionHeader,
+    startInlineSessionRename,
+    persistSessionName,
+    renderSessionInlineStatus,
+    showInlineStatus,
+    clearInlineStatus,
+    showTextInputModal,
+    closeTextInputModal,
     openSessionMenu,
     closeSessionMenu,
     executeSessionMenuAction,

@@ -581,13 +581,6 @@ body.preview-mode .brand::after {
 .context-meter[data-compression-state="running"] .context-ring { animation: contextPulse 1.1s ease-in-out infinite; }
 .context-meter[data-compression-state="failed"] .context-ring { box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 24%, transparent); }
 @keyframes contextPulse { 50% { transform: scale(1.12); opacity: 0.72; } }
-.context-notice, .compressed-banner {
-  max-width: 900px; margin: 0 auto 12px; padding: 10px 14px;
-  border: 1px solid rgba(255,159,10,0.35); border-radius: var(--radius);
-  background: rgba(255,159,10,0.06); color: var(--text-soft); font-size: var(--fs-sm);
-}
-.compressed-banner { border-color: rgba(52,199,89,0.35); background: rgba(52,199,89,0.06); color: var(--green); }
-
 /* --- TOPBAR ACTIONS --- */
 .topbar-title-group {
   display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1 1 220px;
@@ -1563,7 +1556,6 @@ body.sidebar-collapsed #main { grid-column: 1 / -1; }
 .context-tooltip { display: none; }
 .context-meter.warn .context-ring { border-color: var(--accent); }
 .context-meter.critical .context-ring { border-color: var(--red); }
-.context-notice { margin: 0 0 12px; padding: 8px 10px; border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line)); border-radius: 9px; background: color-mix(in srgb, var(--accent) 9%, var(--color-surface)); color: var(--text-soft); font-size: 12px; }
 .send-button, .stop-button { width: 34px; height: 34px; display: inline-grid; place-items: center; border-radius: 10px; background: var(--accent); color: var(--button-on-accent); font-size: 17px; font-weight: 720; }
 .send-button:hover, .stop-button:hover { background: var(--accent-strong); }
 .send-button:disabled, .stop-button:disabled { cursor: not-allowed; opacity: 0.42; }
@@ -2163,8 +2155,8 @@ body[data-view-mode="agent"] #workdir-display { display: none !important; }
 }
 #main.agent-view #messages:has(> .agent-welcome) {
   display: flex;
-  flex: 1 1 auto;
-  height: 100%;
+  flex: 1 1 0;
+  height: auto;
   min-height: 0;
   flex-direction: column;
 }
@@ -2173,8 +2165,13 @@ body[data-view-mode="agent"] #workdir-display { display: none !important; }
   flex: 1 1 auto;
   align-items: center;
   justify-content: center;
-  height: 100%;
+  height: auto;
   min-height: 0;
+  padding: 0 8px;
+}
+#main.agent-view .welcome.agent-welcome {
+  min-height: 0;
+  height: auto;
   padding: 0 8px;
 }
 #main.agent-view .agent-welcome .welcome-icon {
@@ -4061,4 +4058,143 @@ body.sidebar-collapsed #sidebar-resizer {
   .skills-layout { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .skills-view[data-page="list"] .skill-detail { display: none; }
   .skills-view[data-page="detail"] .skills-catalog { display: none; }
+}
+
+/* Agent message trace: a navigation projection in the existing chat scroll
+   owner.  It never becomes a second overflow container. */
+#chat-container { position: relative; }
+#message-trace-rail {
+  position: absolute;
+  inset: 18px auto 24px 6px;
+  z-index: 4;
+  width: 16px;
+  pointer-events: none;
+}
+#message-trace-rail.hidden { display: none; }
+.message-trace-track {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+.message-trace-tick {
+  position: absolute;
+  left: 2px;
+  width: 11px;
+  height: 3px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--muted) 46%, transparent);
+  opacity: .72;
+  pointer-events: auto;
+  cursor: pointer;
+  transform: translateY(-50%);
+  transition: background-color .12s ease, opacity .12s ease;
+}
+.message-trace-tick:hover,
+.message-trace-tick:focus-visible,
+.message-trace-tick.active {
+  width: 14px;
+  background: color-mix(in srgb, var(--text) 78%, transparent);
+  opacity: 1;
+}
+.message-trace-tick:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--text) 38%, transparent);
+  outline-offset: 3px;
+}
+.message-trace-preview {
+  position: fixed;
+  z-index: 20;
+  width: min(300px, 32vw);
+  max-height: 118px;
+  overflow: hidden;
+  box-sizing: border-box;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--color-surface);
+  color: var(--text-soft);
+  box-shadow: 0 8px 24px rgba(37, 35, 31, .12);
+  pointer-events: none;
+}
+.message-trace-preview.hidden { display: none; }
+.message-trace-preview-title,
+.message-trace-preview-summary {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  text-overflow: ellipsis;
+}
+.message-trace-preview-title {
+  margin-bottom: 3px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 680;
+  line-height: 1.35;
+  -webkit-line-clamp: 1;
+}
+.message-trace-preview-summary {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.42;
+  -webkit-line-clamp: 3;
+}
+#main.agent-view #chat-container.has-message-trace { padding-left: 34px; }
+
+@media (max-width: 900px) {
+  #main.agent-view #chat-container.has-message-trace { padding-left: 30px; }
+  #message-trace-rail { left: 5px; }
+}
+
+/* v5.0.2 session chrome: the Agent title edits in place; the left-list
+   rename modal remains a separate, explicit action.  Runtime notices stay in
+   the conversation surface instead of browser alerts or legacy toast cards. */
+.session-title-inline-input {
+  width: min(31vw, 360px);
+  min-width: 72px;
+  height: 28px;
+  padding: 2px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  outline: 0;
+  background: var(--color-surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 590;
+}
+.session-title-inline-input.is-editing,
+.session-title-inline-input:focus {
+  border-color: #2f70d9;
+  box-shadow: 0 0 0 2px rgba(47, 112, 217, .24);
+}
+.session-title-inline-error {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--red);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-inline-status {
+  position: relative;
+  inset: auto;
+  z-index: 1;
+  width: min(860px, calc(100% - 28px));
+  max-width: 860px;
+  margin: 0 auto 8px;
+  padding: 2px 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  pointer-events: none;
+}
+.session-inline-status[data-status-kind="paused"] { color: var(--text-soft); }
+.session-inline-status[data-status-kind="error"] { color: var(--red); }
+.session-inline-status.hidden { display: none; }
+@media (max-width: 900px) {
+  .session-title-inline-input { width: min(38vw, 280px); }
+  .session-inline-status { width: calc(100% - 28px); max-width: none; margin-inline: 14px; }
 }

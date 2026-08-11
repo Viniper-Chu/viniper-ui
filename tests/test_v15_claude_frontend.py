@@ -164,8 +164,10 @@ class V15RendererHarness(unittest.TestCase):
             "other": "D:/shared/work/project",
         })
         self.assertEqual(payload["renameClick"], {
-            "modalOpen": True,
+            "inlineOpen": True,
+            "inputRole": "textbox",
             "inputValue": "会话 Alpha",
+            "selected": True,
             "putCallsBeforeConfirm": 0,
         })
 
