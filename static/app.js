@@ -1768,8 +1768,14 @@ function bindEvents() {
   $("#save-settings-btn").addEventListener("click", saveSettings);
   $("#run-diagnostics-btn").addEventListener("click", runDiagnostics);
   $("#settings-models").addEventListener("input", renderSettingsModelSelect);
-  $("#settings-enable-auto-mode")?.addEventListener("change", () => renderSettingsPermissionOptions());
-  $("#settings-allow-bypass-permissions")?.addEventListener("change", () => renderSettingsPermissionOptions());
+  $("#settings-enable-auto-mode")?.addEventListener("change", () => {
+    renderSettingsPermissionOptions();
+    renderPermissionSelect();
+  });
+  $("#settings-allow-bypass-permissions")?.addEventListener("change", () => {
+    renderSettingsPermissionOptions();
+    renderPermissionSelect();
+  });
   $(".settings-center-content")?.addEventListener("input", (event) => {
     if (event.target.matches("input, select, textarea")) markSettingsDirty();
   });
@@ -3381,21 +3387,40 @@ function permissionModeOptions() {
     : PERMISSION_MODES;
   const runtimeSettings = state.settings?.runtime || state.status?.settings?.runtime || {};
   const capabilities = state.status?.runtime?.capabilities || {};
+  const settingsModal = $("#settings-modal");
+  const settingsDraftOpen = Boolean(settingsModal && !settingsModal.classList.contains("hidden"));
+  const draftAutoGate = settingsDraftOpen ? $("#settings-enable-auto-mode") : null;
+  const draftBypassGate = settingsDraftOpen ? $("#settings-allow-bypass-permissions") : null;
+  const runtimePermissionModes = new Set(Array.isArray(capabilities.permission_modes) ? capabilities.permission_modes : []);
   const declaredIds = new Set(declared.map((item) => item.id));
   const visible = new Set(["default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"]);
   if (!declaredIds.has("dontAsk")) visible.delete("dontAsk");
   return orderedPermissionModes(declared, visible).map((mode) => ({
     ...mode,
-    enabled: mode.enabled !== false
-      && (mode.id !== "auto" || (Boolean(runtimeSettings.enable_auto_mode) && Boolean(capabilities.auto_permission) && mode.enabled !== false))
-      && (mode.id !== "bypassPermissions" || (Boolean(runtimeSettings.allow_bypass_permissions) && mode.enabled !== false)),
-    reason: mode.reason || (
-      mode.id === "auto" && (!runtimeSettings.enable_auto_mode || !capabilities.auto_permission)
-        ? "请先满足 Claude Code 自动模式的设置与运行时能力"
-        : mode.id === "bypassPermissions" && !runtimeSettings.allow_bypass_permissions
-          ? "请先在设置中明确启用跳过权限"
-          : ""
-    )
+    // The server descriptor is authoritative outside the settings draft.  In
+    // the open settings modal, however, the bypass checkbox is the user's
+    // pending gate change; permit that one local transition only when the
+    // runtime has explicitly declared bypass support.  Auto remains fully
+    // server/provider-gated and can never be enabled by a draft checkbox.
+    enabled: (mode.id === "bypassPermissions"
+      && settingsDraftOpen
+      && Boolean(draftBypassGate?.checked)
+      && runtimePermissionModes.has("bypassPermissions"))
+      || (mode.enabled !== false
+      && (mode.id !== "auto" || (Boolean(draftAutoGate ? draftAutoGate.checked : runtimeSettings.enable_auto_mode) && Boolean(capabilities.auto_permission) && mode.enabled !== false))
+      && (mode.id !== "bypassPermissions" || (Boolean(draftBypassGate ? draftBypassGate.checked : runtimeSettings.allow_bypass_permissions) && mode.enabled !== false))),
+    reason: mode.id === "bypassPermissions"
+      && settingsDraftOpen
+      && Boolean(draftBypassGate?.checked)
+      && runtimePermissionModes.has("bypassPermissions")
+      ? ""
+      : mode.reason || (
+        mode.id === "auto" && (!(draftAutoGate ? draftAutoGate.checked : runtimeSettings.enable_auto_mode) || !capabilities.auto_permission)
+          ? "请先满足 Claude Code 自动模式的设置与运行时能力"
+          : mode.id === "bypassPermissions" && !(draftBypassGate ? draftBypassGate.checked : runtimeSettings.allow_bypass_permissions)
+            ? "请先在设置中明确启用跳过权限"
+            : ""
+      )
   }));
 }
 
@@ -3407,6 +3432,8 @@ function settingsPermissionModeOptions() {
   const visible = new Set(["default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"]);
   if (!declaredIds.has("dontAsk")) visible.delete("dontAsk");
   const runtimeSettings = state.settings?.runtime || state.status?.settings?.runtime || {};
+  const capabilities = state.status?.runtime?.capabilities || {};
+  const runtimePermissionModes = new Set(Array.isArray(capabilities.permission_modes) ? capabilities.permission_modes : []);
   // During settings editing the checkbox is the local draft gate.  It may
   // only make an already server-enabled mode more restrictive; a server
   // disabled descriptor/reason always remains authoritative.
@@ -3418,16 +3445,23 @@ function settingsPermissionModeOptions() {
     : Boolean(runtimeSettings.allow_bypass_permissions);
   return orderedPermissionModes(declared, visible).map((mode) => ({
     ...mode,
-    enabled: mode.enabled !== false
+    enabled: (mode.id === "bypassPermissions"
+      && bypassGate
+      && runtimePermissionModes.has("bypassPermissions"))
+      || (mode.enabled !== false
       && (mode.id !== "auto" || autoGate)
-      && (mode.id !== "bypassPermissions" || bypassGate),
-    reason: mode.reason || (
-      mode.id === "auto" && !autoGate
-        ? "请先在设置中启用自动模式"
-        : mode.id === "bypassPermissions" && !bypassGate
-          ? "请先在设置中明确启用跳过权限"
-          : ""
-    ),
+      && (mode.id !== "bypassPermissions" || bypassGate)),
+    reason: mode.id === "bypassPermissions"
+      && bypassGate
+      && runtimePermissionModes.has("bypassPermissions")
+      ? ""
+      : mode.reason || (
+        mode.id === "auto" && !autoGate
+          ? "请先在设置中启用自动模式"
+          : mode.id === "bypassPermissions" && !bypassGate
+            ? "请先在设置中明确启用跳过权限"
+            : ""
+      ),
   }));
 }
 
@@ -4492,7 +4526,17 @@ function syncMessageTraceGeometry() {
   const bottom = inputRect
     ? Math.max(8, Math.round(mainRect.bottom - inputRect.top + 14))
     : Math.max(8, Math.round(mainRect.bottom - containerRect.bottom + 14));
-  const left = Math.max(4, Math.round(messagesRect.left - mainRect.left - 22));
+  const titleRect = $("#session-title")?.getBoundingClientRect?.();
+  const fallbackLeft = messagesRect.left - mainRect.left - 22;
+  // Align the tick's left edge (the tick has a 2px inset inside the rail) to
+  // the visible Agent title's first glyph.  This keeps the trace axis stable
+  // when the sidebar is resized/collapsed and avoids drifting toward the
+  // variable-width message column.  Chat/empty states retain a safe fallback.
+  const titleAxisLeft = titleRect && titleRect.width > 0
+    ? titleRect.left - mainRect.left - 2
+    : fallbackLeft;
+  const left = Math.max(4, Math.round(titleAxisLeft));
+  rail.dataset.axisSource = titleRect && titleRect.width > 0 ? "agent-title" : "message-column-fallback";
   rail.style.setProperty("--message-trace-top", `${top}px`);
   rail.style.setProperty("--message-trace-bottom", `${bottom}px`);
   rail.style.setProperty("--message-trace-left", `${left}px`);

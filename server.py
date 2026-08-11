@@ -6840,6 +6840,27 @@ async def update_runtime():
     return {"ok": result.status in {"current", "compatible"}, "runtime_update": result.as_dict()}
 
 
+def enforce_bypass_permission_gate(settings: dict[str, Any]) -> list[str]:
+    """Fail closed when the user disables the global bypass gate.
+
+    The gate is user-scoped, while permission mode is session-scoped.  Turning
+    the gate off must therefore atomically normalize only sessions that still
+    claim bypassPermissions; all other session modes remain untouched.
+    """
+    runtime = settings.get("runtime") if isinstance(settings, dict) else {}
+    if not isinstance(runtime, dict) or bool(runtime.get("allow_bypass_permissions")):
+        return []
+    changed: list[str] = []
+    for session_id, session in sessions.items():
+        if not isinstance(session, dict) or session.get("permission_mode") != "bypassPermissions":
+            continue
+        session["permission_mode"] = "default"
+        changed.append(str(session_id))
+    if changed:
+        save_sessions_to_disk()
+    return changed
+
+
 @app.put("/api/settings")
 async def update_settings(request: Request):
     body = await request.json()
@@ -6857,6 +6878,7 @@ async def update_settings(request: Request):
         merged["provider"]["api_key"] = ""
 
     save_app_settings(merged)
+    enforce_bypass_permission_gate(load_app_settings())
     return {
         "ok": True,
         "settings": public_settings(load_app_settings()),

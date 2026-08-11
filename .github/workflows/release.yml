@@ -4,6 +4,21 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: "源码提交或分支（必须是已验收源码）"
+        required: true
+        default: "main"
+        type: string
+      target_release_tag:
+        description: "要更新的既有 Release tag"
+        required: true
+        default: "v5.0.2"
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.target_release_tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -14,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.build_ref || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -22,13 +39,13 @@ jobs:
 
       - name: Build update package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           python - <<'PY'
           import os
           import re
           from pathlib import Path
 
-          version = os.environ["GITHUB_REF_NAME"]
+          version = os.environ["RELEASE_TAG"].removeprefix("v")
           text = Path("CHANGELOG.md").read_text(encoding="utf-8")
           pattern = rf"^##\s+{re.escape(version)}[^\n]*\n(?P<body>.*?)(?=^##\s+v|\Z)"
           match = re.search(pattern, text, flags=re.M | re.S)
@@ -42,7 +59,7 @@ jobs:
 
       - name: Upload update package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           mkdir release-update
           cp "dist/Viniper-v${VERSION}.zip" release-update/
           cp dist/latest.json release-update/
@@ -60,6 +77,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.build_ref || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -80,7 +99,7 @@ jobs:
       - name: Stage exact Windows desktop installer
         shell: pwsh
         run: |
-          $Version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $Version = $env:RELEASE_TAG.TrimStart("v")
           $Output = "release-windows"
           New-Item -ItemType Directory -Path $Output | Out-Null
           Copy-Item -LiteralPath "desktop/release/Viniper.Setup.$Version.exe" -Destination $Output
@@ -103,6 +122,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.build_ref || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -121,7 +142,7 @@ jobs:
 
       - name: Stage exact macOS desktop package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           OUTPUT="release-macos-${{ matrix.arch }}"
           mkdir "$OUTPUT"
           cp "desktop/release/Viniper.${VERSION}-${{ matrix.arch }}-mac.zip" "$OUTPUT/"
@@ -160,8 +181,8 @@ jobs:
           manifest_path = root / "latest.json"
           manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
           repo = os.environ["GITHUB_REPOSITORY"]
-          tag = os.environ["GITHUB_REF_NAME"]
-          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          tag = os.environ["RELEASE_TAG"]
+          version = os.environ["RELEASE_TAG"].removeprefix("v")
 
           def required_asset(path):
               if not path.is_file() or path.stat().st_size <= 0:
@@ -209,8 +230,9 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: release-artifacts/*
-          name: Viniper ${{ github.ref_name }}
+          name: Viniper ${{ env.RELEASE_TAG }}
           body_path: release-artifacts/release-notes.md
           make_latest: true
           overwrite_files: false

@@ -4145,7 +4145,7 @@ body.sidebar-collapsed #sidebar-resizer {
 
 @media (max-width: 900px) {
   #main.agent-view #chat-container.has-message-trace { padding-left: 30px; }
-  #message-trace-rail { left: 5px; }
+  #message-trace-rail { left: var(--message-trace-left, 5px); }
 }
 
 /* v5.0.2 session chrome: the Agent title edits in place; the left-list

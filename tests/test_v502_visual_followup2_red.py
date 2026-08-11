@@ -36,6 +36,16 @@ class VisualFollowup2RedTests(unittest.TestCase):
             "PRODUCT_FAIL: trace tick placement is still derived from variable message heights",
         )
 
+    def test_trace_axis_uses_agent_title_with_safe_fallback(self) -> None:
+        app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        style = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+        geometry = app[app.index("function syncMessageTraceGeometry"): app.index("function updateMessageTraceRail")]
+        self.assertIn('$("#session-title")', geometry, "PRODUCT_FAIL: trace rail does not read the visible Agent title axis")
+        self.assertRegex(geometry, r"titleRect\.left\s*-\s*mainRect\.left\s*-\s*2", "PRODUCT_FAIL: trace tick left edge is not aligned to title text")
+        self.assertIn('rail.dataset.axisSource', geometry, "PRODUCT_FAIL: trace axis source is not observable in DOM evidence")
+        self.assertRegex(geometry, r"Math\.max\(4,\s*Math\.round\(titleAxisLeft\)\)", "PRODUCT_FAIL: missing non-negative fallback for compact/collapsed layouts")
+        self.assertIn('#message-trace-rail { left: var(--message-trace-left, 5px); }', style, "PRODUCT_FAIL: narrow media rule overrides the title-aligned rail")
+
     def test_context_ring_has_neutral_progress_and_track(self) -> None:
         css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
         final_css = css[css.rfind("/* v5.0.2 Claude surface"):]
@@ -107,6 +117,9 @@ class VisualFollowup2RedTests(unittest.TestCase):
                 self.assertLessEqual(compact_delta, 12.0)
                 self.assertLessEqual(contracts["dense"]["expected"], 12.0)
                 self.assertEqual(viewport["scrollOwnerCount"], 1)
+                self.assertEqual(viewport["traceAxis"]["source"], "agent-title")
+                self.assertIsNotNone(viewport["traceAxis"]["delta"])
+                self.assertLessEqual(viewport["traceAxis"]["delta"], 4.0, "PRODUCT_FAIL: trace tick axis drifts from Agent title")
                 self.assertEqual(viewport["ringInfo"]["circleCount"], 2)
                 self.assertEqual(viewport["ringInfo"]["progressLinecap"], "round")
                 self.assertNotIn("matrix(1, 0, 0, 1", viewport["ringInfo"]["progressTransform"])

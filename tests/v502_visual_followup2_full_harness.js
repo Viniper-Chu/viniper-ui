@@ -144,11 +144,23 @@ async function main() {
           inputWidths.long = shortInput.getBoundingClientRect().width;
           shortInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
         }
-        const traceRect = document.querySelector("#message-trace-rail")?.getBoundingClientRect();
-        const screenshot = {
+         const traceRect = document.querySelector("#message-trace-rail")?.getBoundingClientRect();
+         const titleRect = document.querySelector("#session-title")?.getBoundingClientRect();
+         const firstTickRect = ticks[0]?.getBoundingClientRect();
+         const titleAxisDelta = titleRect && firstTickRect
+           ? Math.abs(firstTickRect.left - titleRect.left)
+           : null;
+         const screenshot = {
           width: innerWidth,
           height: innerHeight,
-          traceRect: traceRect ? { left: traceRect.left, top: traceRect.top, width: traceRect.width, height: traceRect.height } : null,
+           traceRect: traceRect ? { left: traceRect.left, top: traceRect.top, width: traceRect.width, height: traceRect.height } : null,
+           titleRect: titleRect ? { left: titleRect.left, top: titleRect.top, width: titleRect.width, height: titleRect.height } : null,
+           traceAxis: {
+             source: document.querySelector("#message-trace-rail")?.dataset.axisSource || "",
+             firstTickLeft: firstTickRect?.left ?? null,
+             titleLeft: titleRect?.left ?? null,
+             delta: titleAxisDelta
+           },
           tickCount: ticks.length,
           ys,
           deltas,
