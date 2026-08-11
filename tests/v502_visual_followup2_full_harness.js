@@ -84,25 +84,53 @@ async function main() {
     for (const [width, height] of [[1280, 800], [900, 700]]) {
       win.setContentSize(width, height);
       await delay(140);
+      const baseMessagesJson = JSON.stringify(variedMessages(`${width}x${height}`));
+      const compactMessagesJson = JSON.stringify(variedMessages(`${width}x${height}-compact`).slice(0, 3));
       const payload = await win.webContents.executeJavaScript(`(async () => {
         const api = globalThis.__VINIPER_TEST_API__;
-        api.state.messages = ${JSON.stringify(variedMessages(`${width}x${height}`))};
+        const measureTicks = async (messages) => {
+          api.state.messages = messages;
+          api.renderSessionHeader();
+          api.renderAllMessages();
+          api.renderCurrentSession();
+          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          const nodes = [...document.querySelectorAll(".message-trace-tick")];
+          const ys = nodes.map((node) => { const r = node.getBoundingClientRect(); return r.top + r.height / 2; });
+          const deltas = ys.slice(1).map((y, i) => y - ys[i]);
+          const expected = deltas.length ? (ys[ys.length - 1] - ys[0]) / deltas.length : 0;
+          const maxDeltaError = deltas.reduce((max, value) => Math.max(max, Math.abs(value - expected)), 0);
+          return { ys, deltas, expected, maxDeltaError, tickCount: nodes.length };
+        };
+        const baseSpacing = await measureTicks(${baseMessagesJson});
+        const compactSpacing = await measureTicks(${compactMessagesJson});
+        const denseSpacing = await measureTicks(Array.from({ length: 80 }, (_, index) => ({
+          role: index % 2 ? "assistant" : "user",
+          content: "dense " + index,
+          segments: index % 2 ? [{ type: "text", content: "dense " + index }] : []
+        })));
         api.state.sessionName = "短标题";
-        api.renderSessionHeader();
-        api.renderAllMessages();
-        api.renderCurrentSession();
-        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
         const container = document.querySelector("#chat-container");
+        await measureTicks(${baseMessagesJson});
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
         const ticks = [...document.querySelectorAll(".message-trace-tick")];
-        const ys = ticks.map((node) => { const r = node.getBoundingClientRect(); return r.top + r.height / 2; });
-        const deltas = ys.slice(1).map((y, i) => y - ys[i]);
-        const expected = deltas.length ? (ys[ys.length - 1] - ys[0]) / deltas.length : 0;
-        const maxDeltaError = deltas.reduce((max, value) => Math.max(max, Math.abs(value - expected)), 0);
+        const ys = baseSpacing.ys;
+        const deltas = baseSpacing.deltas;
+        const expected = baseSpacing.expected;
+        const maxDeltaError = baseSpacing.maxDeltaError;
         const ring = document.querySelector("#context-meter .context-ring");
         const ringStyle = ring ? getComputedStyle(ring) : null;
+        const progress = document.querySelector(".context-ring-progress-circle");
+        const trackCircle = document.querySelector(".context-ring-track-circle");
         const ringInfo = ring && ringStyle ? {
           backgroundImage: ringStyle.backgroundImage,
           borderColor: ringStyle.borderColor,
+          circleCount: document.querySelectorAll("#context-ring circle").length,
+          progressDasharray: progress?.style.strokeDasharray || "",
+          progressDashoffset: progress?.style.strokeDashoffset || "",
+          progressLinecap: getComputedStyle(progress).strokeLinecap,
+          progressTransform: getComputedStyle(progress).transform,
+          trackStroke: getComputedStyle(trackCircle).stroke,
+          progressStroke: getComputedStyle(progress).stroke,
           title: ring.title,
           ariaLabel: ring.getAttribute("aria-label")
         } : null;
@@ -126,6 +154,7 @@ async function main() {
           deltas,
           expected,
           maxDeltaError,
+          spacingContracts: { compact: compactSpacing, base: baseSpacing, dense: denseSpacing },
           ringInfo,
           inputWidths,
           scrollOwnerCount: document.querySelectorAll("#chat-container").length,

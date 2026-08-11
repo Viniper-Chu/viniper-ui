@@ -539,18 +539,11 @@ body.preview-mode .brand::after {
   place-items: center;
   border: 0;
   border-radius: 50%;
-  background: conic-gradient(var(--green) var(--context-percent), color-mix(in srgb, var(--track) 78%, transparent) 0);
-  box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--line) 72%, transparent);
+  background: transparent;
+  box-shadow: none;
   position: relative;
   cursor: default;
   transition: box-shadow 0.15s ease, opacity 0.15s ease;
-}
-.context-ring::after {
-  content: "";
-  position: absolute;
-  inset: 3px;
-  border-radius: inherit;
-  background: var(--panel);
 }
 #context-percent {
   position: absolute;
@@ -576,8 +569,8 @@ body.preview-mode .brand::after {
   opacity: 1;
   transform: translateX(50%);
 }
-.context-meter.warn .context-ring { background: conic-gradient(var(--yellow) var(--context-percent), var(--track) 0); }
-.context-meter.critical .context-ring { background: conic-gradient(var(--red) var(--context-percent), var(--track) 0); }
+.context-meter.warn .context-ring,
+.context-meter.critical .context-ring { background: transparent; }
 .context-meter[data-compression-state="running"] .context-ring { animation: contextPulse 1.1s ease-in-out infinite; }
 .context-meter[data-compression-state="failed"] .context-ring { box-shadow: 0 0 0 3px color-mix(in srgb, var(--red) 24%, transparent); }
 @keyframes contextPulse { 50% { transform: scale(1.12); opacity: 0.72; } }
@@ -1551,11 +1544,14 @@ body.sidebar-collapsed #main { grid-column: 1 / -1; }
 #input-actions { position: absolute; right: 12px; bottom: 10px; display: flex; align-items: center; gap: 6px; }
 #context-meter { display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 2px 6px; color: var(--muted); }
 .context-state-label { font-size: 11px; }
-.context-ring { width: 22px; height: 22px; display: grid; place-items: center; border: 2px solid color-mix(in srgb, var(--accent) 24%, var(--line)); border-radius: 50%; background: conic-gradient(var(--accent) var(--context-percent, 0%), color-mix(in srgb, var(--muted) 16%, transparent) 0); }
-.context-ring::before { content: ""; width: 14px; height: 14px; border-radius: 50%; background: var(--color-surface); }
+.context-ring { width: 22px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 50%; background: transparent; }
+.context-ring-svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.context-ring-svg circle { fill: none; stroke-width: 2.2; }
+.context-ring-track-circle { stroke: color-mix(in srgb, var(--muted) 24%, var(--line)); }
+.context-ring-progress-circle { stroke: color-mix(in srgb, var(--text) 72%, var(--muted)); stroke-linecap: round; transform: rotate(-90deg); transform-origin: 50% 50%; }
 .context-tooltip { display: none; }
-.context-meter.warn .context-ring { border-color: var(--accent); }
-.context-meter.critical .context-ring { border-color: var(--red); }
+.context-meter.warn .context-ring,
+.context-meter.critical .context-ring { border-color: transparent; }
 .send-button, .stop-button { width: 34px; height: 34px; display: inline-grid; place-items: center; border-radius: 10px; background: var(--accent); color: var(--button-on-accent); font-size: 17px; font-weight: 720; }
 .send-button:hover, .stop-button:hover { background: var(--accent-strong); }
 .send-button:disabled, .stop-button:disabled { cursor: not-allowed; opacity: 0.42; }
@@ -4210,17 +4206,26 @@ body.sidebar-collapsed #sidebar-resizer {
 #input-actions .context-ring {
   --context-ring-progress: color-mix(in srgb, var(--text) 72%, var(--muted));
   --context-ring-track: color-mix(in srgb, var(--muted) 22%, var(--line));
-  background: conic-gradient(from 0deg, var(--context-ring-progress) 0 var(--context-percent, 0%), var(--context-ring-track) 0);
-  border-color: var(--context-ring-track);
+  background: transparent;
+  border-color: transparent;
   animation: none;
   transform: none;
+}
+#input-actions .context-ring-track-circle { stroke: var(--context-ring-track); }
+#input-actions .context-ring-progress-circle {
+  stroke: var(--context-ring-progress);
+  stroke-linecap: round;
+  stroke-dasharray: 56.5487;
+  stroke-dashoffset: 56.5487;
+  transform: rotate(-90deg);
+  transform-origin: 50% 50%;
 }
 #input-actions .context-meter.warn .context-ring,
 #input-actions .context-meter.critical .context-ring,
 .context-meter.warn #input-actions .context-ring,
 .context-meter.critical #input-actions .context-ring {
-  background: conic-gradient(from 0deg, var(--context-ring-progress) 0 var(--context-percent, 0%), var(--context-ring-track) 0);
-  border-color: var(--context-ring-track);
+  background: transparent;
+  border-color: transparent;
   animation: none;
 }
 .context-meter[data-compression-state="running"] #input-actions .context-ring,

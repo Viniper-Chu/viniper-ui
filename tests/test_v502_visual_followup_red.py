@@ -54,7 +54,14 @@ class VisualFollowupRedTests(unittest.TestCase):
 
     def test_context_ring_is_single_colour_clockwise_from_twelve(self) -> None:
         final_ring = self.css[self.css.rfind("/* v5.0.2 Claude surface"):]
-        self.assertRegex(final_ring, r"conic-gradient\(from\s+0deg", "PRODUCT_FAIL: context ring has no explicit 12 o'clock start")
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        self.assertIn('class="context-ring-track-circle"', html)
+        self.assertIn('class="context-ring-progress-circle"', html)
+        self.assertRegex(final_ring, r"stroke-dasharray\s*:")
+        self.assertRegex(final_ring, r"stroke-dashoffset\s*:")
+        self.assertRegex(final_ring, r"stroke-linecap\s*:\s*round")
+        self.assertRegex(final_ring, r"transform:\s*rotate\(-90deg\)", "PRODUCT_FAIL: SVG ring does not start at 12 o'clock")
+        self.assertNotRegex(final_ring, r"conic-gradient", "PRODUCT_FAIL: context ring still uses a conic disk")
         self.assertNotRegex(final_ring, r"var\(--(?:yellow|red)\)", "PRODUCT_FAIL: warning classes still recolour the ring")
         self.assertNotRegex(final_ring, r"contextPulse|animation\s*:\s*(?!none\b)\S+", "PRODUCT_FAIL: context ring still pulses/changes colour")
 

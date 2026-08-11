@@ -4518,17 +4518,21 @@ function updateMessageTraceRail() {
 
   const viewport = container.getBoundingClientRect();
   const viewportCenter = viewport.top + (viewport.height / 2);
+  const trackRect = track.getBoundingClientRect();
+  const availableHeight = Math.max(0, trackRect.height);
+  const traceTargetStep = 12;
+  const traceStep = articles.length > 1
+    ? Math.min(traceTargetStep, availableHeight / (articles.length - 1))
+    : 0;
   let nearestIndex = 0;
   let nearestDistance = Number.POSITIVE_INFINITY;
 
   articles.forEach((article, index) => {
     article.dataset.traceIndex = String(index);
-    // The rail is a navigation index, not a miniature copy of the document's
-    // variable-height geometry. Equal index spacing remains stable when
-    // tool output, folding, or viewport size changes article heights.
-    const percent = articles.length > 1
-      ? (index / (articles.length - 1)) * 100
-      : 50;
+    // The rail is a compact navigation index, not a miniature copy of the
+    // document's variable-height geometry. Keep short transcripts tight like
+    // Claude Code; only compress the step when many ticks cannot fit.
+    const top = articles.length > 1 ? index * traceStep : Math.min(availableHeight / 2, 6);
     const tick = document.createElement("button");
     tick.type = "button";
     tick.className = "message-trace-tick";
@@ -4536,7 +4540,7 @@ function updateMessageTraceRail() {
     const roleLabel = article.dataset.role === "user" ? "用户" : "助手";
     tick.title = `跳转到第 ${index + 1} 条${roleLabel}消息`;
     tick.setAttribute("aria-label", tick.title);
-    tick.style.top = `${percent}%`;
+    tick.style.top = `${top}px`;
     tick.addEventListener("pointerenter", () => showMessageTracePreview(index));
     tick.addEventListener("focus", () => showMessageTracePreview(index));
     tick.addEventListener("pointerleave", hideMessageTracePreview);
@@ -7130,7 +7134,16 @@ function updateContextMeter({ announce = false, schedule = true } = {}) {
   $("#context-percent").textContent = percentText;
   const ring = meter.querySelector(".context-ring");
   if (ring) {
+    const progress = ring.querySelector(".context-ring-progress-circle");
+    const radius = Number(progress?.getAttribute("r")) || 9;
+    const circumference = 2 * Math.PI * radius;
+    const ratio = stats.available ? Math.max(0, Math.min(1, Number(stats.percent) / 100)) : 0;
     ring.style.setProperty("--context-percent", `${stats.percent}%`);
+    if (progress) {
+      progress.style.strokeDasharray = `${circumference}`;
+      progress.style.strokeDashoffset = `${circumference * (1 - ratio)}`;
+      progress.dataset.percent = String(stats.available ? stats.percent : 0);
+    }
     ring.title = usageTooltip;
     ring.setAttribute("aria-label", usageTooltip);
     ring.setAttribute("aria-busy", stats.compacting ? "true" : "false");

@@ -28,6 +28,8 @@ class VisualFollowup2RedTests(unittest.TestCase):
             r"(?:index\s*/\s*\(\s*articles\.length\s*-\s*1\s*\)|traceStep|equal.*spacing)",
             "PRODUCT_FAIL: trace ticks still use message geometry instead of equal navigable-index spacing",
         )
+        self.assertRegex(body, r"traceTargetStep\s*=\s*12", "PRODUCT_FAIL: compact trace target spacing is not fixed at 12px")
+        self.assertRegex(body, r"Math\.min\(traceTargetStep", "PRODUCT_FAIL: trace spacing can expand to fill the whole rail")
         self.assertNotRegex(
             body,
             r"midpoint\s*=.*offsetTop.*offsetHeight.*percent",
@@ -39,8 +41,11 @@ class VisualFollowup2RedTests(unittest.TestCase):
         final_css = css[css.rfind("/* v5.0.2 Claude surface"):]
         self.assertRegex(final_css, r"--context-ring-progress\s*:")
         self.assertRegex(final_css, r"--context-ring-track\s*:")
+        self.assertRegex(final_css, r"stroke-linecap\s*:\s*round")
+        self.assertRegex(final_css, r"stroke-dasharray\s*:")
+        self.assertRegex(final_css, r"transform:\s*rotate\(-90deg\)")
+        self.assertNotRegex(final_css, r"conic-gradient")
         self.assertNotRegex(final_css, r"--context-ring-progress\s*:\s*var\(--accent\)")
-        self.assertNotRegex(final_css, r"conic-gradient\([^)]*var\(--accent\)")
         self.assertRegex(final_css, r"color-mix\(in srgb, var\(--text\)")
 
     def test_inline_rename_width_is_content_sized_and_capped_by_available_slot(self) -> None:
@@ -95,8 +100,17 @@ class VisualFollowup2RedTests(unittest.TestCase):
                     1.0,
                     "PRODUCT_FAIL: real DOM rail ticks are not equally spaced",
                 )
+                contracts = viewport["spacingContracts"]
+                self.assertEqual(contracts["compact"]["tickCount"], 3)
+                compact_delta = contracts["compact"]["deltas"][0]
+                self.assertGreaterEqual(compact_delta, 10.0)
+                self.assertLessEqual(compact_delta, 12.0)
+                self.assertLessEqual(contracts["dense"]["expected"], 12.0)
                 self.assertEqual(viewport["scrollOwnerCount"], 1)
-                self.assertIn("conic-gradient", viewport["ringInfo"]["backgroundImage"])
+                self.assertEqual(viewport["ringInfo"]["circleCount"], 2)
+                self.assertEqual(viewport["ringInfo"]["progressLinecap"], "round")
+                self.assertNotIn("matrix(1, 0, 0, 1", viewport["ringInfo"]["progressTransform"])
+                self.assertNotIn("conic-gradient", viewport["ringInfo"]["backgroundImage"])
                 self.assertIn("64,000 / 128,000", viewport["ringInfo"]["ariaLabel"])
                 self.assertGreater(viewport["inputWidths"]["long"], viewport["inputWidths"]["short"])
 
