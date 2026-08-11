@@ -4060,12 +4060,16 @@ body.sidebar-collapsed #sidebar-resizer {
   .skills-view[data-page="detail"] .skills-catalog { display: none; }
 }
 
-/* Agent message trace: a navigation projection in the existing chat scroll
-   owner.  It never becomes a second overflow container. */
-#chat-container { position: relative; }
+/* Agent message trace: a fixed navigation projection beside the existing
+   chat scroll owner.  The rail itself is outside #chat-container so it stays
+   in the viewport while the conversation scrolls; #chat-container remains
+   the only scrolling owner. */
 #message-trace-rail {
   position: absolute;
-  inset: 18px auto 24px 6px;
+  top: var(--message-trace-top, 18px);
+  right: auto;
+  bottom: var(--message-trace-bottom, 24px);
+  left: var(--message-trace-left, 6px);
   z-index: 4;
   width: 16px;
   pointer-events: none;
@@ -4152,7 +4156,9 @@ body.sidebar-collapsed #sidebar-resizer {
    rename modal remains a separate, explicit action.  Runtime notices stay in
    the conversation surface instead of browser alerts or legacy toast cards. */
 .session-title-inline-input {
-  width: min(31vw, 360px);
+  field-sizing: content;
+  width: var(--session-title-inline-width, auto);
+  max-width: var(--session-title-inline-max-width, 420px);
   min-width: 72px;
   height: 28px;
   padding: 2px 7px;
@@ -4195,6 +4201,54 @@ body.sidebar-collapsed #sidebar-resizer {
 .session-inline-status[data-status-kind="error"] { color: var(--red); }
 .session-inline-status.hidden { display: none; }
 @media (max-width: 900px) {
-  .session-title-inline-input { width: min(38vw, 280px); }
+  .session-title-inline-input { max-width: min(var(--session-title-inline-max-width, 420px), 52vw); }
   .session-inline-status { width: calc(100% - 28px); max-width: none; margin-inline: 14px; }
 }
+
+/* v5.0.2 Claude surface: usage is one neutral clockwise ring and activity
+   summaries stay light enough to sit in the transcript without becoming cards. */
+#input-actions .context-ring {
+  --context-ring-progress: color-mix(in srgb, var(--text) 72%, var(--muted));
+  --context-ring-track: color-mix(in srgb, var(--muted) 22%, var(--line));
+  background: conic-gradient(from 0deg, var(--context-ring-progress) 0 var(--context-percent, 0%), var(--context-ring-track) 0);
+  border-color: var(--context-ring-track);
+  animation: none;
+  transform: none;
+}
+#input-actions .context-meter.warn .context-ring,
+#input-actions .context-meter.critical .context-ring,
+.context-meter.warn #input-actions .context-ring,
+.context-meter.critical #input-actions .context-ring {
+  background: conic-gradient(from 0deg, var(--context-ring-progress) 0 var(--context-percent, 0%), var(--context-ring-track) 0);
+  border-color: var(--context-ring-track);
+  animation: none;
+}
+.context-meter[data-compression-state="running"] #input-actions .context-ring,
+#input-actions .context-meter[data-compression-state="running"] .context-ring {
+  animation: none;
+  transform: none;
+}
+.activity-segment {
+  min-height: 22px;
+  margin: 0 0 4px;
+  padding: 2px 0;
+  gap: 6px;
+  background: transparent;
+  box-shadow: none;
+}
+.tool-summary,
+.artifact-summary {
+  min-height: 22px;
+  margin: 0 0 4px;
+  padding: 2px 0;
+  gap: 6px;
+  background: transparent;
+  box-shadow: none;
+  font-size: var(--fs-xs);
+}
+.tool-summary-icon,
+.artifact-summary-icon { width: 14px; height: 14px; flex-basis: 14px; stroke-width: 1.25; }
+.tool-status-dot { width: 5px; height: 5px; flex-basis: 5px; background: var(--muted); }
+.tool-summary-success .tool-status-dot,
+.tool-summary-error .tool-status-dot { background: var(--muted); }
+.tool-summary-pending .tool-status-dot { animation: none; opacity: .8; }

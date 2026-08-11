@@ -445,8 +445,14 @@ def run_renderer_harness() -> dict:
     env = dict(os.environ)
     env.pop("ELECTRON_RUN_AS_NODE", None)
     env["VINIPER_V501_CP1_EVIDENCE_ROOT"] = str(EVIDENCE_ROOT)
+    user_data_dir = EVIDENCE_ROOT / "electron-user-data"
     completed = subprocess.run(
-        [str(electron), "--disable-error-dialog", str(ROOT / "tests" / "v501_checkpoint1_renderer_harness.js")],
+        [
+            str(electron),
+            "--disable-error-dialog",
+            f"--user-data-dir={user_data_dir}",
+            str(ROOT / "tests" / "v501_checkpoint1_renderer_harness.js"),
+        ],
         cwd=ROOT,
         env=env,
         text=True,
@@ -460,7 +466,12 @@ def run_renderer_harness() -> dict:
     process_path.write_text(
         json.dumps(
             {
-                "command": [str(electron), "--disable-error-dialog", str(ROOT / "tests" / "v501_checkpoint1_renderer_harness.js")],
+                "command": [
+                    str(electron),
+                    "--disable-error-dialog",
+                    f"--user-data-dir={user_data_dir}",
+                    str(ROOT / "tests" / "v501_checkpoint1_renderer_harness.js"),
+                ],
                 "returncode": completed.returncode,
                 "stdout": completed.stdout,
                 "stderr": completed.stderr,
@@ -565,11 +576,11 @@ class R2R4R5ElectronRedTests(unittest.TestCase):
             "PRODUCT_FAIL R3: renderer does not preserve official order and CLI dontAsk extension",
         )
 
-    def test_r4_completed_message_has_summary_and_no_thinking_body(self) -> None:
+    def test_r4_completed_message_has_turn_summary_and_no_thinking_body(self) -> None:
         self.assertTrue(self.payload["thinking_summary"]["bodyRemoved"])
         self.assertTrue(
             self.payload["thinking_summary"]["summaryVisible"],
-            "PRODUCT_FAIL R4: persisted total thinking elapsed has no completed summary",
+            "PRODUCT_FAIL R4: persisted whole-turn elapsed has no completed summary",
         )
 
     def test_r5_sidebar_filters_title_and_workdir_then_reopens(self) -> None:

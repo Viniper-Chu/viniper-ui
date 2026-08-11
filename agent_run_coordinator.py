@@ -365,7 +365,14 @@ class DurableInteractionStore:
             self._save(payload)
             return copy.deepcopy(record)
 
-    def fail_owner(self, session_id: str, run_id: str, *, reason: str) -> dict[str, Any]:
+    def fail_owner(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        reason: str,
+        failure_code: str = "",
+    ) -> dict[str, Any]:
         with self._lock:
             payload = self._load()
             request_id = str(payload["active"].get(str(session_id)) or "")
@@ -379,6 +386,8 @@ class DurableInteractionStore:
             record["state"] = "failed"
             record["terminal"] = True
             record["failure_message"] = str(reason or "任务中断；请求未执行")
+            if failure_code:
+                record["failure_code"] = str(failure_code)
             record["updated_at"] = time.time()
             self._save(payload)
             return copy.deepcopy(record)
@@ -473,6 +482,12 @@ class DurableInteractionStore:
                 else [str(item) for item in record.get("allowed_actions") or []]
             ),
         }
+        if record.get("action"):
+            public["response_action"] = str(record.get("action") or "")
+        if record.get("failure_code"):
+            public["failure_code"] = str(record.get("failure_code") or "")
+        if state == "failed" and record.get("response"):
+            public["decision"] = "deny" if cls.response_behavior(record.get("response")) == "deny" else "allow"
         context = record.get("context") if isinstance(record.get("context"), dict) else {}
         for field in cls._PUBLIC_CONTEXT_FIELDS:
             if field in context and context[field] not in (None, ""):
@@ -615,7 +630,13 @@ class AgentRunCoordinator:
                 cursor = max(cursor, int(event.get("sequence") or 0))
                 yield copy.deepcopy(event)
 
-    async def commit_interaction_response(self, session_id: str, request_id: str) -> None:
+    async def commit_interaction_response(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        response_action: str = "",
+    ) -> None:
         record = self._records.get(str(session_id))
         if record is None or record.terminal:
             return
@@ -628,13 +649,24 @@ class AgentRunCoordinator:
         record.pending_interaction = None
         record.awaiting_interaction_ack = {"request_id": str(request_id)}
         record.status = "awaiting_cli_ack"
-        await self._publish(record, {
+        payload = {
             "type": "interaction_response_committed",
             "request_id": str(request_id),
             "session_id": record.session_id,
-        })
+        }
+        if response_action:
+            payload["response_action"] = str(response_action)
+        await self._publish(record, payload)
 
-    async def acknowledge_interaction(self, session_id: str, request_id: str, *, success: bool) -> None:
+    async def acknowledge_interaction(
+        self,
+        session_id: str,
+        request_id: str,
+        *,
+        success: bool,
+        reason: str = "",
+        failure_code: str = "",
+    ) -> None:
         record = self._records.get(str(session_id))
         if record is None or record.terminal:
             return
@@ -648,12 +680,17 @@ class AgentRunCoordinator:
         record.status = "running" if success else "failed"
         if not success:
             record.had_error = True
-        await self._publish(record, {
+        payload = {
             "type": "interaction_resolved",
             "request_id": str(request_id),
             "success": bool(success),
             "session_id": record.session_id,
-        })
+        }
+        if reason:
+            payload["reason"] = str(reason)
+        if failure_code:
+            payload["failure_code"] = str(failure_code)
+        await self._publish(record, payload)
 
     async def resolve_interaction(self, session_id: str, request_id: str) -> None:
         """Compatibility path for non-hook interactions accepted on stdin."""

@@ -34,7 +34,7 @@ from context_lifecycle import (
     NativeContextAdapter,
 )
 from context_usage import ContextUsageLedger, ContextUsageSnapshot
-from daily_usage import DailyUsageLedger
+from daily_usage import DailyUsageLedger, merge_turn_usage
 from agent_runtime import (
     AUTO_COMPACT_WINDOW_ENV,
     AgentRunSpec,
@@ -194,6 +194,7 @@ RUN_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_RUN_TIMEOUT", "0"))
 HEARTBEAT_INTERVAL_SECONDS = int(env_value("VINIPER_UI_HEARTBEAT_INTERVAL", "15"))
 NO_OUTPUT_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_NO_OUTPUT_TIMEOUT", str(40 * 60)))
 CLI_INTERACTION_ACK_TIMEOUT_SECONDS = float(env_value("VINIPER_UI_CLI_ACK_TIMEOUT", "30"))
+CLI_ACK_TIMEOUT_FAILURE_MESSAGE = "用户已允许，但 CLI 未确认；请求未执行或状态未知。"
 HOST_HOOK_COMPATIBILITY_GRACE_SECONDS = float(env_value("VINIPER_UI_HOOK_COMPAT_GRACE", "0.35"))
 MODEL_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_MODEL_IDLE_TIMEOUT", str(25 * 60)))
 MODEL_STALL_RECOVERY_ATTEMPTS = int(env_value("VINIPER_UI_MODEL_STALL_RECOVERY_ATTEMPTS", "2"))
@@ -3230,6 +3231,7 @@ class AgentInteractionBroker:
             "type", "kind", "request_id", "tool_use_id", "session_id", "run_id",
             "tool_name", "summary", "workdir", "allowed_actions", "questions", "display",
             "agent_id", "response", "interaction_state", "terminal", "failure_message",
+            "failure_code", "response_action", "decision",
             "blocked_path", "decision_reason", "decision_reason_type", "title",
             "display_name", "description", "risk",
         }
@@ -3398,7 +3400,8 @@ class AgentInteractionBroker:
                     store.fail_owner(
                         sid,
                         str(record.get("run_id") or ""),
-                        reason="Claude 未确认本次交互；请求未执行。",
+                        reason=CLI_ACK_TIMEOUT_FAILURE_MESSAGE,
+                        failure_code="cli_ack_timeout",
                     )
                 except ValueError:
                     pass
@@ -5160,6 +5163,33 @@ async def stream_custom_cli_impl(
         _active_runs.pop(session_id, None)
 
 
+def _unresolved_parallel_tool_count(segments: list[dict[str, Any]]) -> int:
+    """Count tool starts in a turn that have no matching tool result."""
+    starts: list[str] = []
+    results: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        segment_type = str(segment.get("type") or "")
+        tool_id = str(segment.get("tool_id") or segment.get("tool_use_id") or "")
+        if segment_type in {"tool_start", "tool_use"}:
+            starts.append(tool_id)
+        elif segment_type in {"tool_result", "tool_result_summary"}:
+            results.append(tool_id)
+    if not starts:
+        return 0
+    matched = list(results)
+    unresolved = 0
+    for tool_id in starts:
+        if tool_id and tool_id in matched:
+            matched.remove(tool_id)
+        elif not tool_id and matched:
+            matched.pop(0)
+        else:
+            unresolved += 1
+    return unresolved
+
+
 async def stream_chat_impl(
     session_id: str,
     user_msg: str,
@@ -5324,6 +5354,7 @@ async def stream_chat_impl(
     active_thinking_started_at: float | None = None
     active_thinking_segment_index: int | None = None
     thinking_elapsed_total = 0.0
+    turn_usage: dict[str, int] | None = None
     fallback_question_tool_ids: set[str] = set()
     published_interaction_ids: set[str] = set()
     compatibility_interactions: dict[str, dict[str, Any]] = {}
@@ -5338,6 +5369,9 @@ async def stream_chat_impl(
                 and str(message.get("turn_id") or "") == str(accepted_turn_id)
             ):
                 assistant_message_index = index
+                stored_turn_usage = message.get("turn_usage")
+                if isinstance(stored_turn_usage, dict):
+                    turn_usage = copy.deepcopy(stored_turn_usage)
                 break
 
     def elapsed_seconds_since(started_at: float) -> int:
@@ -5443,6 +5477,10 @@ async def stream_chat_impl(
         message["model"] = selected_model
         message["segments"] = copy.deepcopy(assistant_segments)
         message["elapsed_seconds"] = total_elapsed_seconds()
+        if turn_usage:
+            message["turn_usage"] = copy.deepcopy(turn_usage)
+        else:
+            message.pop("turn_usage", None)
         current_thinking_elapsed = thinking_elapsed_seconds()
         if current_thinking_elapsed > 0:
             message["thinking_elapsed_seconds"] = current_thinking_elapsed
@@ -5465,6 +5503,10 @@ async def stream_chat_impl(
         message["model"] = selected_model
         message["segments"] = finalize_transcript_segments(assistant_segments)
         message["elapsed_seconds"] = total_elapsed_seconds()
+        if turn_usage:
+            message["turn_usage"] = copy.deepcopy(turn_usage)
+        else:
+            message.pop("turn_usage", None)
         completed_thinking_elapsed = thinking_elapsed_seconds()
         if completed_thinking_elapsed > 0:
             message["thinking_elapsed_seconds"] = completed_thinking_elapsed
@@ -5685,6 +5727,8 @@ async def stream_chat_impl(
                         session_id,
                         str(expired_ack.get("request_id") or ""),
                         success=False,
+                        reason=CLI_ACK_TIMEOUT_FAILURE_MESSAGE,
+                        failure_code="cli_ack_timeout",
                     )
                     await runtime.cancel(session_id)
                     break
@@ -5760,6 +5804,16 @@ async def stream_chat_impl(
                 continue
 
             daily_usage_ledger().record_event(usage_run_id, session_id, data)
+            merged_turn_usage = merge_turn_usage(turn_usage, data)
+            if merged_turn_usage != turn_usage:
+                turn_usage = merged_turn_usage
+                save_assistant_progress(force=True)
+                yield sse({
+                    "type": "turn_usage",
+                    "session_id": session_id,
+                    "run_id": usage_run_id,
+                    "turn_usage": copy.deepcopy(turn_usage),
+                })
             usage_snapshot = context_usage_ledger().update_from_event(
                 session_id,
                 data,
@@ -6280,9 +6334,12 @@ async def stream_chat_impl(
 
             if no_output_stage == "awaiting_cli_ack":
                 detail = (
+                    f"{CLI_ACK_TIMEOUT_FAILURE_MESSAGE}"
                     "底层 CLI 在收到交互回答后没有返回匹配的工具结果，"
                     "本次任务已安全停止并恢复输入。"
                 )
+                if _unresolved_parallel_tool_count(assistant_segments) > 0:
+                    detail += " 交互链路未完成，后续并行工具结果未返回。"
             else:
                 detail = (
                     f"Claude Code 已连续 {MODEL_IDLE_TIMEOUT_SECONDS if no_output_stage == 'model' else NO_OUTPUT_TIMEOUT_SECONDS} 秒没有任何输出，"
@@ -7418,7 +7475,11 @@ async def answer_chat_interaction(session_id: str, request: Request):
     request_id = str(body.get("request_id") or "")
     if str(result.get("status") or "") == "awaiting_cli_ack":
         run["awaiting_interaction_ack"] = request_id
-        await agent_run_coordinator().commit_interaction_response(session_id, request_id)
+        await agent_run_coordinator().commit_interaction_response(
+            session_id,
+            request_id,
+            response_action=str(body.get("action") or ""),
+        )
     else:
         run["awaiting_interaction_ack"] = None
         await agent_run_coordinator().resolve_interaction(session_id, request_id)

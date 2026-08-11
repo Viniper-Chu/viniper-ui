@@ -95,7 +95,7 @@ $item = $folder.ParseName((Split-Path -Leaf $path))
         package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
         self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "5.0.2")
         self.assertEqual(package["version"], "5.0.2")
-        self.assertEqual((ROOT / "RELEASE_REVISION").read_text(encoding="utf-8").strip(), "1")
+        self.assertEqual((ROOT / "RELEASE_REVISION").read_text(encoding="utf-8").strip(), "2")
 
     def test_release_source_scan_excludes_local_evidence_and_build_outputs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="release-scan-", dir=ROOT / "codex" / "运行残留") as temp:

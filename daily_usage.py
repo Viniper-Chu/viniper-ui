@@ -18,6 +18,7 @@ TOKEN_FIELDS = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
 )
+TURN_TOKEN_FIELDS = TOKEN_FIELDS
 USAGE_KEYS = {
     "input_tokens": ("input_tokens", "inputTokens"),
     "output_tokens": ("output_tokens", "outputTokens"),
@@ -90,6 +91,76 @@ def extract_usage(event: Mapping[str, Any]) -> dict[str, int] | None:
         field: max(usage_counts[field], model_counts[field])
         for field in TOKEN_FIELDS
     }
+
+
+def _model_usage_counts(source: Any) -> dict[str, int] | None:
+    """Normalize a Claude ``modelUsage`` map without counting models twice."""
+    if not isinstance(source, Mapping):
+        return None
+    if _has_usage(source):
+        return _counts(source)
+    totals = {field: 0 for field in TOKEN_FIELDS}
+    found = False
+    for candidate in source.values():
+        if not isinstance(candidate, Mapping) or not _has_usage(candidate):
+            continue
+        found = True
+        values = _counts(candidate)
+        for field in TOKEN_FIELDS:
+            totals[field] += values[field]
+    return totals if found else None
+
+
+def extract_turn_usage(event: Mapping[str, Any]) -> dict[str, int] | None:
+    """Extract one Claude turn's cumulative token counters.
+
+    Claude Code emits usage at the top level on result frames and under
+    ``message.usage`` on assistant frames.  ``modelUsage`` may be either a
+    single usage object or a map keyed by model.  The values in one frame are
+    merged by per-field maximum, so a frame repeated by SSE/reconnect is
+    idempotent and the cache fields remain visible in the footer.
+    """
+    if not isinstance(event, Mapping):
+        return None
+    candidates: list[dict[str, int]] = []
+    for source in (
+        event.get("usage"),
+        (event.get("message") or {}).get("usage") if isinstance(event.get("message"), Mapping) else None,
+    ):
+        if isinstance(source, Mapping) and _has_usage(source):
+            candidates.append(_counts(source))
+    for source in (
+        event.get("modelUsage"),
+        event.get("model_usage"),
+        (event.get("message") or {}).get("modelUsage") if isinstance(event.get("message"), Mapping) else None,
+        (event.get("message") or {}).get("model_usage") if isinstance(event.get("message"), Mapping) else None,
+    ):
+        values = _model_usage_counts(source)
+        if values is not None:
+            candidates.append(values)
+    if not candidates:
+        return None
+    values = {
+        field: max(candidate.get(field, 0) for candidate in candidates)
+        for field in TURN_TOKEN_FIELDS
+    }
+    values["total_tokens"] = sum(values.values())
+    values["total"] = values["total_tokens"]
+    return values
+
+
+def merge_turn_usage(current: Mapping[str, Any] | None, event: Mapping[str, Any]) -> dict[str, int] | None:
+    """Max-merge cumulative turn usage, making duplicate frames harmless."""
+    observed = extract_turn_usage(event)
+    if observed is None and not isinstance(current, Mapping):
+        return None
+    merged = {
+        field: max(0, int((current or {}).get(field, 0) or 0), int((observed or {}).get(field, 0) or 0))
+        for field in TURN_TOKEN_FIELDS
+    }
+    merged["total_tokens"] = sum(merged.values())
+    merged["total"] = merged["total_tokens"]
+    return merged
 
 
 def _default_clock() -> dt.datetime:

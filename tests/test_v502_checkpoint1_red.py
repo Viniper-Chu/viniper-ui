@@ -160,7 +160,11 @@ class R2ElectronScrollRedTests(unittest.TestCase):
         completed = None
         try:
             completed = subprocess.run(
-                [str(electron), str(harness)],
+                [
+                    str(electron),
+                    f"--user-data-dir={evidence / 'electron-user-data'}",
+                    str(harness),
+                ],
                 cwd=ROOT,
                 env=env,
                 capture_output=True,

@@ -40,6 +40,15 @@ class UpdateReleaseRevisionTests(unittest.TestCase):
         self.assertFalse(current["manual_install_required"])
         self.assertEqual(current["reason"], "current")
 
+    def test_same_visible_version_revision_two_is_newer_once(self) -> None:
+        manifest = {"version": "5.0.2", "release_revision": 2}
+        newer = server.update_decision(manifest, current_version="5.0.2", current_release_revision=1)
+        current = server.update_decision(manifest, current_version="5.0.2", current_release_revision=2)
+        self.assertTrue(newer["automatic"])
+        self.assertEqual(newer["reason"], "newer_release_revision")
+        self.assertFalse(current["automatic"])
+        self.assertEqual(current["reason"], "current")
+
     def test_lower_visible_version_never_becomes_an_automatic_downgrade(self) -> None:
         manifest = {"version": "5.0.0", "release_revision": 1}
         decision = server.update_decision(manifest, current_version="5.0.1", current_release_revision=0)

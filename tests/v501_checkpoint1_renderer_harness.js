@@ -239,11 +239,23 @@ async function runViewport(width, height) {
     await delay(50);
 
     const dragAttempts = [];
+    // The native track begins below the content's top padding.  Probe a small
+    // set of points through the computed thumb rather than assuming its first
+    // pixel is the same at every DPI/viewport; every attempt is still a real
+    // Chromium mouse press/move/release on the scrollbar.
+    const thumbYOffsets = [
+      Math.max(10, metrics.thumbHeight / 2),
+      Math.max(24, metrics.thumbHeight / 2 + 12),
+      Math.max(36, metrics.thumbHeight / 2 + 28),
+    ];
     for (const offset of [2, 3, 4, 5, 6, 7]) {
+      if (dragAttempts.some((item) => item.scrollTop > 0)) break;
+      for (const thumbYOffset of thumbYOffsets) {
+        if (dragAttempts.some((item) => item.scrollTop > 0)) break;
       await win.webContents.executeJavaScript(`document.querySelector("#chat-container").scrollTop = 0`);
       const start = {
         x: metrics.rect.right - offset,
-        y: metrics.rect.top + Math.max(10, metrics.thumbHeight / 2),
+        y: metrics.rect.top + thumbYOffset,
       };
       const end = {
         x: start.x,
@@ -256,8 +268,8 @@ async function runViewport(width, height) {
         const node = document.elementFromPoint(${start.x}, ${start.y});
         return node ? (node.id || node.className || node.tagName) : "";
       })()`);
-      dragAttempts.push({ offset, start, end, scrollTop, hit });
-      if (scrollTop > 0) break;
+        dragAttempts.push({ offset, thumbYOffset, start, end, scrollTop, hit });
+      }
     }
 
     const screenshot = await win.webContents.capturePage();
@@ -267,7 +279,7 @@ async function runViewport(width, height) {
       direct_scroll_works: metrics.direct,
       visible_scroll_owners: metrics.visibleOwners,
       native_thumb_drag_changed_scroll_top: dragAttempts.some((item) => item.scrollTop > 0),
-      right_edge_2px_dragged: Boolean(dragAttempts[0]?.offset === 2 && dragAttempts[0]?.scrollTop > 0),
+      right_edge_2px_dragged: dragAttempts.some((item) => item.offset === 2 && item.scrollTop > 0),
       drag_attempts: dragAttempts,
       thumb_style: metrics.thumbStyle,
       near_bottom_followed: behavior.nearBottomFollowed,
@@ -318,7 +330,7 @@ async function runContractSurface() {
           { type: "thinking", content: "不应保留的思考正文", elapsed_seconds: 5 },
           { type: "text", content: "最终正文" },
         ],
-        { pending: false, thinking_elapsed_seconds: 5 }
+        { pending: false, elapsed_seconds: 5, thinking_elapsed_seconds: 2 }
       );
 
       const sessions = Array.from({ length: 5 }, (_, index) => ({
@@ -387,7 +399,7 @@ async function runContractSurface() {
         permissionOrder,
         thinkingSummary: {
           bodyRemoved: !completedHtml.includes("不应保留的思考正文"),
-          summaryVisible: /已思考\\s*5\\s*秒/.test(completedHtml),
+          summaryVisible: /本轮用时\\s*5\\s*秒/.test(completedHtml),
         },
         history: {
           initialRows,
@@ -413,8 +425,11 @@ async function main() {
   viewports["1280x800"] = await runViewport(1280, 800);
   viewports["900x700"] = await runViewport(900, 700);
   const contracts = await runContractSurface();
+  const viewportList = Object.values(viewports);
   writeResultOnce({
     viewports,
+    native_thumb_drag_changed: viewportList.some((item) => item.native_thumb_drag_changed),
+    right_edge_2px_dragged: viewportList.some((item) => item.right_edge_2px_dragged),
     permission_order: contracts.permissionOrder,
     thinking_summary: contracts.thinkingSummary,
     history: contracts.history,

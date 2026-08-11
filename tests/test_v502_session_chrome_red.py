@@ -54,7 +54,11 @@ class SessionChromeContractTests(unittest.TestCase):
             harness = ROOT / "tests" / "v502_session_chrome_harness.js"
             self.assertTrue(electron.exists(), "HARNESS_FAIL: bundled Electron executable is missing")
             completed = subprocess.run(
-                [str(electron), str(harness)],
+                [
+                    str(electron),
+                    f"--user-data-dir={evidence / 'electron-user-data'}",
+                    str(harness),
+                ],
                 cwd=ROOT,
                 env=env,
                 capture_output=True,

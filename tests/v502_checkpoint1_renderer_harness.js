@@ -5,6 +5,7 @@
 // delivered through the Electron DevTools Protocol Input domain.
 const fs = require("fs");
 const path = require("path");
+const { pathToFileURL } = require("url");
 const { app, BrowserWindow } = require("electron");
 
 app.disableHardwareAcceleration();
@@ -127,6 +128,11 @@ async function prepareWindow(width, height) {
     }
     chat.classList.remove("chat-empty-state");
   })()`);
+  const iconUrl = pathToFileURL(path.join(root, "static", "assets", "viniper-icon.png")).href;
+  await win.webContents.executeJavaScript(`(() => {
+    const icon = ${JSON.stringify(iconUrl)};
+    document.querySelectorAll('img[src^="/static/assets/viniper-icon.png"]').forEach((node) => node.src = icon);
+  })()`);
   win.showInactive();
   await delay(120);
   return win;
@@ -248,14 +254,18 @@ async function runViewport(width, height) {
     })()`);
 
     const dragAttempts = [];
+    const thumbYOffsets = [22, 34, 50, 66];
     for (const offset of [2, 3, 4, 5]) {
-      await win.webContents.executeJavaScript(`document.querySelector("#chat-container").scrollTop = 0`);
-      const start = { x: base.rect.right - offset, y: base.rect.top + 22 };
-      const end = { x: start.x, y: Math.min(base.rect.bottom - 18, start.y + 180) };
-      await dispatchThumbDrag(win, start, end);
-      const dragResult = await win.webContents.executeJavaScript(`(() => { const c = document.querySelector("#chat-container"); const node = document.elementFromPoint(${start.x}, ${start.y}); return { scrollTop: c.scrollTop, hit: node ? (node.id || node.className || node.tagName) : "" }; })()`);
-      dragAttempts.push({ offset, start, end, ...dragResult });
-      if (dragResult.scrollTop > 0) break;
+      if (dragAttempts.some((item) => item.scrollTop > 0)) break;
+      for (const thumbYOffset of thumbYOffsets) {
+        if (dragAttempts.some((item) => item.scrollTop > 0)) break;
+        await win.webContents.executeJavaScript(`document.querySelector("#chat-container").scrollTop = 0`);
+        const start = { x: base.rect.right - offset, y: base.rect.top + thumbYOffset };
+        const end = { x: start.x, y: Math.min(base.rect.bottom - 18, start.y + 180) };
+        await dispatchThumbDrag(win, start, end);
+        const dragResult = await win.webContents.executeJavaScript(`(() => { const c = document.querySelector("#chat-container"); const node = document.elementFromPoint(${start.x}, ${start.y}); return { scrollTop: c.scrollTop, hit: node ? (node.id || node.className || node.tagName) : "" }; })()`);
+        dragAttempts.push({ offset, thumbYOffset, start, end, ...dragResult });
+      }
     }
     const screenshot = await win.webContents.capturePage();
     fs.writeFileSync(path.join(evidenceRoot, `r2-${width}x${height}.png`), screenshot.toPNG());

@@ -213,6 +213,7 @@ const SessionRunRegistry = {
       elapsedOverride: null,
       completed: false,
       usage: null,
+      turnUsage: meta.turnUsage || meta.turn_usage ? { ...(meta.turnUsage || meta.turn_usage) } : null,
       contextCompacting: false,
       peerCapability: null,
       error: false,
@@ -274,6 +275,7 @@ const SessionRunRegistry = {
       pendingInteraction: record.pendingInteraction ? { ...record.pendingInteraction } : null,
       awaitingInteractionAck: record.awaitingInteractionAck ? { ...record.awaitingInteractionAck } : null,
       usage: record.usage ? { ...record.usage } : null,
+      turnUsage: record.turnUsage ? { ...record.turnUsage } : null,
       peerCapability: record.peerCapability ? { ...record.peerCapability } : null,
     };
   },
@@ -351,6 +353,7 @@ const SessionRunRegistry = {
           ...record.pendingInteraction,
           request_id: requestId,
           interaction_state: "awaiting_cli_ack",
+          response_action: String(payload.response_action || record.pendingInteraction.response_action || ""),
           allowed_actions: [],
         };
         record.pendingInteraction = null;
@@ -382,6 +385,8 @@ const SessionRunRegistry = {
           interaction_state: "failed",
           terminal: true,
           allowed_actions: [],
+          failure_code: String(payload.failure_code || awaiting.failure_code || ""),
+          response_action: String(payload.response_action || awaiting.response_action || ""),
           failure_message: String(payload.reason || payload.message || "任务中断；请求未执行"),
         };
         record.status = "failed";
@@ -393,6 +398,8 @@ const SessionRunRegistry = {
     } else if (type === "usage") {
       record.usage = normalizeContextUsage(payload.usage);
       record.contextCompacting = Boolean(record.usage?.compacting);
+    } else if (type === "turn_usage") {
+      record.turnUsage = normalizeTurnUsage(payload.turn_usage || payload.turnUsage);
     } else if (type === "peer_capability") {
       record.peerCapability = normalizePeerStatus(payload.peer || {});
     } else if (type === "heartbeat") {
@@ -565,6 +572,7 @@ function syncCurrentSessionRuntimeUi() {
   const interactionLocked = Boolean(record?.waitingInput || (record?.pendingInteraction && !interactionTerminal)
     || ["waiting_input", "awaiting_cli_ack"].includes(String(record?.status || "")));
   const guidance = Boolean(active && agent && !interactionLocked);
+  const runningHint = Boolean(active && agent);
   const guidancePending = Boolean(guidance && record?.guidancePending);
   const queuePending = Boolean(guidance && record?.queuePending);
 
@@ -591,7 +599,7 @@ function syncCurrentSessionRuntimeUi() {
   stop?.classList.toggle("hidden", !active);
   if (input) {
     input.disabled = locked;
-    input.placeholder = guidance
+    input.placeholder = runningHint
       ? "输入后按 Enter 排队，Ctrl+Enter 引导当前任务"
       : (agent ? "输入任务，或使用 / 命令" : "输入消息");
   }
@@ -604,7 +612,7 @@ function syncCurrentSessionRuntimeUi() {
     send.setAttribute("aria-label", label);
   }
   if (shortcut) {
-    shortcut.textContent = guidance
+    shortcut.textContent = runningHint
       ? "Enter 排队 · Ctrl+Enter 引导 · Shift+Enter 换行"
       : "Enter 发送 · Shift+Enter 换行";
   }
@@ -3838,6 +3846,36 @@ async function persistSessionName(sessionId, nextName) {
   return name;
 }
 
+function sizeInlineSessionTitleInput(input) {
+  if (!input) return;
+  const header = $("#agent-session-header");
+  const workdir = $("#workdir-display");
+  const menu = $("#session-header-menu-button");
+  const headerRect = header?.getBoundingClientRect?.();
+  const menuRect = menu?.getBoundingClientRect?.();
+  const style = getComputedStyle(input);
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (context) context.font = style.font || `${style.fontSize} ${style.fontFamily}`;
+  const measured = context
+    ? context.measureText(String(input.value || "未命名会话")).width
+    : Number(input.scrollWidth || 0);
+  const headerLeft = Number(headerRect?.left || 0);
+  const headerRight = Number(headerRect?.right || 0);
+  const menuWidth = Number(menuRect?.width || 24);
+  const workdirStyle = workdir ? getComputedStyle(workdir) : null;
+  const workdirMin = workdirStyle && workdirStyle.display !== "none"
+    ? Math.max(42, Number.parseFloat(workdirStyle.minWidth) || 42)
+    : 0;
+  const titleEnd = headerRight - menuWidth - workdirMin - 12;
+  const available = headerRect && titleEnd > headerLeft
+    ? Math.max(72, titleEnd - headerLeft - 8)
+    : 420;
+  const width = Math.min(available, Math.max(72, Math.ceil(measured + 18)));
+  input.style.setProperty("--session-title-inline-width", `${width}px`);
+  input.style.width = `${width}px`;
+}
+
 function startInlineSessionRename() {
   if (state.viewMode !== "agent" || !state.sessionId || $("#session-title-inline-input")) return false;
   const button = $("#session-title-button");
@@ -3857,6 +3895,9 @@ function startInlineSessionRename() {
   button.replaceWith(input);
   input.focus();
   input.select();
+  sizeInlineSessionTitleInput(input);
+  input.addEventListener("input", () => sizeInlineSessionTitleInput(input));
+  window.requestAnimationFrame(() => sizeInlineSessionTitleInput(input));
   let settled = false;
   const finish = async (save) => {
     if (settled) return;
@@ -4437,6 +4478,27 @@ function showMessageTracePreview(index) {
   return true;
 }
 
+function syncMessageTraceGeometry() {
+  const rail = $("#message-trace-rail");
+  const main = $("#main");
+  const container = $("#chat-container");
+  const messages = $("#messages");
+  if (!rail || !main || !container || !messages) return false;
+  const mainRect = main.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  const messagesRect = messages.getBoundingClientRect();
+  const inputRect = $("#input-area")?.getBoundingClientRect?.();
+  const top = Math.max(8, Math.round(containerRect.top - mainRect.top + 14));
+  const bottom = inputRect
+    ? Math.max(8, Math.round(mainRect.bottom - inputRect.top + 14))
+    : Math.max(8, Math.round(mainRect.bottom - containerRect.bottom + 14));
+  const left = Math.max(4, Math.round(messagesRect.left - mainRect.left - 22));
+  rail.style.setProperty("--message-trace-top", `${top}px`);
+  rail.style.setProperty("--message-trace-bottom", `${bottom}px`);
+  rail.style.setProperty("--message-trace-left", `${left}px`);
+  return true;
+}
+
 function updateMessageTraceRail() {
   const rail = $("#message-trace-rail");
   const track = $("#message-trace-track");
@@ -4450,10 +4512,10 @@ function updateMessageTraceRail() {
   rail.classList.toggle("hidden", !visible);
   rail.setAttribute("aria-hidden", visible ? "false" : "true");
   container.classList.toggle("has-message-trace", visible);
+  if (visible) syncMessageTraceGeometry();
   while (track.firstChild) track.removeChild(track.firstChild);
   if (!visible) return false;
 
-  const contentHeight = Math.max(1, messages.scrollHeight, container.clientHeight);
   const viewport = container.getBoundingClientRect();
   const viewportCenter = viewport.top + (viewport.height / 2);
   let nearestIndex = 0;
@@ -4461,8 +4523,12 @@ function updateMessageTraceRail() {
 
   articles.forEach((article, index) => {
     article.dataset.traceIndex = String(index);
-    const midpoint = Number(article.offsetTop || 0) + (Number(article.offsetHeight || 0) / 2);
-    const percent = Math.min(100, Math.max(0, (midpoint / contentHeight) * 100));
+    // The rail is a navigation index, not a miniature copy of the document's
+    // variable-height geometry. Equal index spacing remains stable when
+    // tool output, folding, or viewport size changes article heights.
+    const percent = articles.length > 1
+      ? (index / (articles.length - 1)) * 100
+      : 50;
     const tick = document.createElement("button");
     tick.type = "button";
     tick.className = "message-trace-tick";
@@ -4859,9 +4925,13 @@ function messageTemplate(roleClass, label, content, thinking = "", segments = []
     ? SessionRunRegistry.get(state.sessionId)?.active
     : false;
   const isPending = roleClass === "assistant" && Boolean(meta?.pending) && Boolean(activeRun);
-  const body = roleClass === "assistant" && displaySegments.length
+  const body = roleClass === "assistant" && (displaySegments.length || activeRun || Number.isFinite(Number(meta?.elapsed_seconds ?? meta?.elapsedSeconds)))
     ? renderMessageSegments(displaySegments, {
-        totalElapsedSeconds: meta?.thinking_elapsed_seconds ?? meta?.thinkingElapsedSeconds,
+        totalElapsedSeconds: meta?.elapsed_seconds
+          ?? meta?.elapsedSeconds
+          ?? (activeRun ? runElapsedSeconds(SessionRunRegistry.get(state.sessionId)) : undefined),
+        turnUsage: meta?.turn_usage ?? meta?.turnUsage
+          ?? (activeRun ? SessionRunRegistry.get(state.sessionId)?.turnUsage : undefined),
         activeThinking: isPending,
         hideThinking: !isPending
       })
@@ -4958,14 +5028,18 @@ function updateLiveTimeNode(node, prefix) {
   const base = Math.max(0, Number(node.dataset.elapsedBase || 0));
   const renderedAt = Number(node.dataset.renderedAt || Date.now());
   const elapsed = Math.max(0, Math.round(base + ((Date.now() - renderedAt) / 1000)));
-  node.textContent = `${prefix} ${formatDuration(elapsed)}`;
+  const tokenLabel = node.dataset.tokenLabel ? ` · ${node.dataset.tokenLabel} tokens` : "";
+  const text = `${prefix} ${formatDuration(elapsed)}${tokenLabel}`;
+  const label = node.querySelector?.("[data-live-time-label]");
+  if (label) label.textContent = text;
+  else node.textContent = text;
 }
 
 function updateStoredThinkingTimes() {
   const pendingMessages = $$(".message.assistant[data-pending='true']");
   for (const article of pendingMessages) {
     const total = article.querySelector("[data-live-total='true']");
-    if (total) updateLiveTimeNode(total, "总计");
+    if (total) updateLiveTimeNode(total, "本轮用时");
     for (const node of Array.from(article.querySelectorAll("[data-live-thinking='true']"))) {
       updateLiveTimeNode(node, "思考中");
     }
@@ -4978,6 +5052,12 @@ function updateStoredThinkingTimer() {
     state.storedThinkingTimer = null;
   }
   if (!$(".message.assistant[data-pending='true']")) return;
+  updateStoredThinkingTimes();
+  state.storedThinkingTimer = window.setInterval(updateStoredThinkingTimes, 1000);
+}
+
+function ensureStoredThinkingTimer() {
+  if (state.storedThinkingTimer || !$(".message.assistant[data-pending='true']")) return;
   updateStoredThinkingTimes();
   state.storedThinkingTimer = window.setInterval(updateStoredThinkingTimes, 1000);
 }
@@ -5188,6 +5268,12 @@ function renderPeerIncoming(segment = {}, index = 0) {
 
 function renderMessageSegments(segments = [], options = {}) {
   const displaySegments = mergeActivitySegments(segments);
+  const turnUsage = normalizeTurnUsage(options.turnUsage || options.turn_usage);
+  const compactTokenLabel = turnUsage && turnUsage.total_tokens > 0
+    ? formatCompactTokenCount(turnUsage.total_tokens)
+    : "";
+  const tokenLabel = compactTokenLabel ? ` · ${compactTokenLabel}` : "";
+  const tokenAttr = compactTokenLabel ? ` data-token-label="${escapeAttr(compactTokenLabel)}"` : "";
   const explicitTotalElapsed = Number(options.totalElapsedSeconds);
   const derivedTotalElapsed = displaySegments.reduce((sum, segment) => {
     const elapsed = Number(segment?.elapsed_seconds ?? segment?.elapsedSeconds);
@@ -5241,10 +5327,14 @@ function renderMessageSegments(segments = [], options = {}) {
       ? renderThinkingPanel(content, segmentOptions)
       : `<div class="msg-text-segment" data-segment-index="${index}">${renderAssistantContentHtml(content)}</div>`;
   }).join("");
-  const completedThinkingSummary = options.hideThinking && Number.isFinite(totalElapsed) && totalElapsed > 0
-    ? `<div class="thinking-complete-summary" role="status">${thinkingIconSvg()}<span>已思考 ${escapeHtml(formatDuration(totalElapsed))}</span></div>`
+  const liveTotalAttrs = liveTimeAttrs(true, totalElapsed).replace("data-live-time", "data-live-total");
+  const activeTotalSummary = options.activeThinking && Number.isFinite(totalElapsed) && totalElapsed >= 0
+    ? `<div class="thinking-complete-summary thinking-live-total" role="status" data-turn-duration="${Math.round(totalElapsed)}"${liveTotalAttrs}${tokenAttr}>${thinkingIconSvg()}<span data-live-time-label>本轮用时 ${escapeHtml(formatDuration(totalElapsed))}${escapeHtml(tokenLabel)}${tokenLabel ? " tokens" : ""}</span></div>`
     : "";
-  return `${completedThinkingSummary}${body}`;
+  const completedThinkingSummary = !options.activeThinking && options.hideThinking && Number.isFinite(totalElapsed) && totalElapsed > 0
+    ? `<div class="thinking-complete-summary" role="status" data-turn-duration="${Math.round(totalElapsed)}">${thinkingIconSvg()}<span>本轮用时 ${escapeHtml(formatDuration(totalElapsed))}${escapeHtml(tokenLabel)}${tokenLabel ? " tokens" : ""}</span></div>`
+    : "";
+  return `${body}${activeTotalSummary || completedThinkingSummary}`;
 }
 
 function normalizeInteractionRequest(payload = {}) {
@@ -5265,6 +5355,9 @@ function normalizeInteractionRequest(payload = {}) {
     interaction_state: interactionState,
     terminal: Boolean(payload.terminal),
     failure_message: String(payload.failure_message || ""),
+    failure_code: String(payload.failure_code || ""),
+    response_action: String(payload.response_action || payload.action || ""),
+    decision: String(payload.decision || ""),
     agent_id: payload.agent_id ?? null,
     response: payload.response ?? null,
   };
@@ -5798,6 +5891,7 @@ function renderAssistantContentHtml(text) {
 function runElapsedSeconds(record) {
   const local = Math.max(0, Math.round((performance.now() - Number(record?.startedAt || performance.now())) / 1000));
   const observed = Number(record?.elapsedOverride);
+  if (record?.completed && Number.isFinite(observed)) return Math.max(0, observed);
   return Number.isFinite(observed) ? Math.max(local, Math.max(0, observed)) : local;
 }
 
@@ -5833,6 +5927,8 @@ function syncRunMessageToState(sessionId) {
   if (!message) return null;
   message.run_session_id = id;
   message.segments = record.segments.map((segment) => ({ ...segment }));
+  if (record.turnUsage) message.turn_usage = { ...record.turnUsage };
+  else delete message.turn_usage;
   message.content = message.segments
     .filter((segment) => segment.type === "text")
     .map((segment) => String(segment.content || ""))
@@ -5869,8 +5965,14 @@ function renderSessionRun(sessionId) {
     });
     container.innerHTML = renderMessageSegments(segments, {
       activeThinking: Boolean(record.active && !record.completed),
+      hideThinking: Boolean(!record.active || record.completed),
       totalElapsedSeconds: runElapsedSeconds(record),
+      turnUsage: record.turnUsage,
     });
+    if (record.active && !record.completed) article.dataset.pending = "true";
+    else article.removeAttribute("data-pending");
+    if (record.active && !record.completed) ensureStoredThinkingTimer();
+    else updateStoredThinkingTimer();
     article.classList?.toggle?.("error", Boolean(record.error));
     if (record.pendingInteraction) {
       mountInteractionCard(record.pendingInteraction, createStreamRenderer(id));
@@ -5937,6 +6039,10 @@ function createStreamRenderer(sessionId) {
     },
     setUsage(usage) {
       SessionRunRegistry.applyEvent(id, { type: "usage", usage });
+      sync();
+    },
+    setTurnUsage(turnUsage) {
+      SessionRunRegistry.applyEvent(id, { type: "turn_usage", turn_usage: turnUsage });
       sync();
     },
     setPeerCapability(peer) {
@@ -6613,6 +6719,8 @@ async function sendMessage() {
         if (runIsVisible()) {
           updateContextMeter({ schedule: false });
         }
+      } else if (payload.type === "turn_usage") {
+        renderRun("setTurnUsage", payload.turn_usage || payload.turnUsage);
       } else if (payload.type === "working_status") {
         renderRun("setWorkingStatus", payload.content || "正在工作…", payload);
       } else if (payload.type === "error") {
@@ -6853,6 +6961,8 @@ async function doRetrySend(
         if (runIsVisible()) {
           updateContextMeter({ schedule: false });
         }
+      } else if (payload.type === "turn_usage") {
+        renderRun("setTurnUsage", payload.turn_usage || payload.turnUsage);
       } else if (payload.type === "working_status") {
         renderRun("setWorkingStatus", payload.content || "正在工作…", payload);
       } else if (payload.type === "error") {
@@ -7012,23 +7122,26 @@ function updateContextMeter({ announce = false, schedule = true } = {}) {
 
   const stats = contextStats();
   const percentText = stats.available ? `${stats.percent}%` : "—";
+  const number = new Intl.NumberFormat("zh-CN");
+  const sourceLabels = { real: "Claude 实际用量", unavailable: "不可用" };
+  const usageTooltip = stats.available
+    ? `已用 ${number.format(stats.tokens)} / ${number.format(stats.limit)} 令牌 · ${stats.percent}% · 来源：${sourceLabels[stats.source] || "不可用"}`
+    : "上下文用量暂不可用";
   $("#context-percent").textContent = percentText;
   const ring = meter.querySelector(".context-ring");
   if (ring) {
     ring.style.setProperty("--context-percent", `${stats.percent}%`);
-    ring.title = stats.available ? `上下文窗口 ${stats.percent}%` : "上下文用量暂不可用";
-    ring.setAttribute("aria-label", stats.available ? `上下文窗口已用 ${stats.percent}%` : "上下文用量暂不可用");
+    ring.title = usageTooltip;
+    ring.setAttribute("aria-label", usageTooltip);
     ring.setAttribute("aria-busy", stats.compacting ? "true" : "false");
   }
   $("#context-label").textContent = stats.available ? `上下文窗口已用 ${stats.percent}%` : "上下文用量暂不可用";
-  meter.title = stats.available ? `上下文窗口 ${stats.percent}%` : "上下文用量暂不可用";
+  meter.title = usageTooltip;
   meter.setAttribute("aria-label", meter.title);
 
-  const number = new Intl.NumberFormat("zh-CN");
   $("#context-usage-detail").textContent = stats.available
     ? `${number.format(stats.tokens)} / ${number.format(stats.limit)} 令牌（${stats.percent}%）`
     : "暂时没有真实用量";
-  const sourceLabels = { real: "Claude 实际用量", unavailable: "不可用" };
   $("#context-usage-source").textContent = `来源：${sourceLabels[stats.source] || "不可用"}`;
 
   meter.classList.toggle("warn", stats.shouldCompress && !stats.critical);
@@ -7121,6 +7234,28 @@ function formatDuration(seconds) {
   if (hours > 0) return `${hours}小时 ${String(minutes).padStart(2, "0")}分 ${String(secs).padStart(2, "0")}秒`;
   if (minutes > 0) return `${minutes}分 ${String(secs).padStart(2, "0")}秒`;
   return `${secs}秒`;
+}
+
+function normalizeTurnUsage(value) {
+  if (!value || typeof value !== "object") return null;
+  const fields = ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"];
+  const usage = {};
+  let observed = false;
+  for (const field of fields) {
+    const amount = Math.max(0, Number(value[field]) || 0);
+    usage[field] = amount;
+    observed ||= Object.prototype.hasOwnProperty.call(value, field);
+  }
+  if (!observed && !Number.isFinite(Number(value.total_tokens))) return null;
+  usage.total_tokens = Math.max(0, Number(value.total_tokens) || fields.reduce((sum, field) => sum + usage[field], 0));
+  return usage;
+}
+
+function formatCompactTokenCount(value) {
+  const total = Math.max(0, Math.round(Number(value) || 0));
+  if (total >= 1000000) return `${(total / 1000000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (total >= 1000) return `${(total / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(total);
 }
 
 function renderThinkingPanel(thinking, options = {}) {

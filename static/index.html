@@ -137,12 +137,13 @@
       <div class="main-stage">
         <section id="chat-container" aria-label="对话内容">
           <div id="session-inline-status" class="session-inline-status hidden" role="status" aria-live="polite" aria-hidden="true"></div>
-          <nav id="message-trace-rail" class="message-trace-rail hidden" aria-label="消息追溯" aria-hidden="true">
-            <div id="message-trace-track" class="message-trace-track"></div>
-          </nav>
           <div id="messages" role="log" aria-live="polite" aria-relevant="additions text"></div>
           <div id="thinking" class="hidden"><span class="spinner"></span><span class="working-label">正在工作…</span></div>
         </section>
+
+        <nav id="message-trace-rail" class="message-trace-rail hidden" aria-label="消息追溯" aria-hidden="true">
+          <div id="message-trace-track" class="message-trace-track"></div>
+        </nav>
 
         <aside id="workspace-rail" class="context-rail hidden" aria-label="工具与产物">
           <div class="rail-heading"><span>工作区</span><button class="rail-close" type="button" aria-label="关闭工作区">×</button></div>
