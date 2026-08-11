@@ -29,8 +29,8 @@ EVIDENCE_ROOT.mkdir(parents=True, exist_ok=True)
 
 # Keep this test process away from both formal and Preview user data even when
 # it imports the production server module.
-os.environ.setdefault("VINIPER_UI_DATA_DIR", str(EVIDENCE_ROOT / "import-data"))
-os.environ.setdefault("VINIPER_UI_OPEN_BROWSER", "0")
+os.environ["VINIPER_UI_DATA_DIR"] = str(EVIDENCE_ROOT / "import-data")
+os.environ["VINIPER_UI_OPEN_BROWSER"] = "0"
 
 import agent_runtime  # noqa: E402
 import server  # noqa: E402
@@ -523,11 +523,12 @@ class R2R4R5ElectronRedTests(unittest.TestCase):
 
     def test_r3_policy_order_gates_and_renderer_match(self) -> None:
         expected = [
-            ("default", "手动"),
+            ("default", "询问权限"),
             ("acceptEdits", "自动接受编辑"),
-            ("plan", "计划"),
+            ("plan", "计划模式"),
+            ("auto", "自动模式"),
             ("bypassPermissions", "跳过权限"),
-            ("auto", "自动"),
+            ("dontAsk", "不询问"),
         ]
         self.assertEqual(
             [(item["id"], item["label"]) for item in server.PERMISSION_MODE_OPTIONS],
@@ -535,7 +536,10 @@ class R2R4R5ElectronRedTests(unittest.TestCase):
             "PRODUCT_FAIL R3: server policy order/copy differs from the Desktop contract",
         )
         runtime = Mock()
-        runtime.capabilities.return_value = RuntimeCapabilities(auto_permission=True)
+        runtime.capabilities.return_value = RuntimeCapabilities(
+            auto_permission=True,
+            permission_modes=("manual", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"),
+        )
         disabled = server.normalize_settings(
             {"runtime": {"permission_mode": "default", "enable_auto_mode": False, "allow_bypass_permissions": False}}
         )
@@ -557,10 +561,9 @@ class R2R4R5ElectronRedTests(unittest.TestCase):
             self.assertNotIn("bypassPermissions", server.available_permission_mode_ids())
         self.assertEqual(
             self.payload["permission_order"],
-            ["default", "acceptEdits", "plan", "bypassPermissions", "auto"],
-            "PRODUCT_FAIL R3: renderer reorders Auto ahead of Bypass permissions",
+            ["default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"],
+            "PRODUCT_FAIL R3: renderer does not preserve official order and CLI dontAsk extension",
         )
-        self.assertNotIn("dontAsk", self.payload["permission_order"])
 
     def test_r4_completed_message_has_summary_and_no_thinking_body(self) -> None:
         self.assertTrue(self.payload["thinking_summary"]["bodyRemoved"])

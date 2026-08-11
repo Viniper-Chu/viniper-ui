@@ -3,7 +3,7 @@ const state = {
   sessionName: "",
   workdir: "",
   contextRevision: "",
-  contextUsage: { used_tokens: 0, context_limit: 0, ratio: 0, source: "unavailable", updated_at: 0, model: "" },
+  contextUsage: { used_tokens: 0, context_limit: 0, effective_context_window: 0, ratio: 0, source: "unavailable", updated_at: 0, model: "" },
   dailyUsage: {
     status: "idle",
     rangeDays: 30,
@@ -111,21 +111,52 @@ const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 const SessionScrollRegistry = {
   records: new Map(),
   projectionTokens: new Map(),
+  ensure(sessionId) {
+    const id = String(sessionId || "");
+    if (!id) return null;
+    const existing = this.records.get(id);
+    if (existing && typeof existing === "object") return existing;
+    const record = { follow: existing === undefined ? true : Boolean(existing), scrollTop: null };
+    this.records.set(id, record);
+    return record;
+  },
   get(sessionId) {
     const id = String(sessionId || "");
-    return id && this.records.has(id) ? this.records.get(id) : true;
+    return this.ensure(id)?.follow ?? true;
   },
-  set(sessionId, follow) {
+  getRecord(sessionId) {
+    return this.records.get(String(sessionId || "")) || null;
+  },
+  set(sessionId, follow, scrollTop = undefined) {
     const id = String(sessionId || "");
+    const record = this.ensure(id);
     const value = Boolean(follow);
-    if (id) this.records.set(id, value);
+    if (record) {
+      record.follow = value;
+      if (Number.isFinite(Number(scrollTop))) record.scrollTop = Math.max(0, Number(scrollTop));
+    }
     if (id && id === String(state.sessionId || "")) state.followOutput = value;
     return value;
   },
+  setScrollTop(sessionId, scrollTop) {
+    const record = this.ensure(sessionId);
+    if (!record || !Number.isFinite(Number(scrollTop))) return null;
+    record.scrollTop = Math.max(0, Number(scrollTop));
+    return record.scrollTop;
+  },
   activate(sessionId) {
-    const value = this.get(sessionId);
-    state.followOutput = value;
-    return value;
+    const record = this.ensure(sessionId);
+    state.followOutput = record?.follow ?? true;
+    return state.followOutput;
+  },
+  restore(sessionId) {
+    const record = this.getRecord(sessionId);
+    const container = $("#chat-container");
+    if (!record || !container) return null;
+    const max = Math.max(0, container.scrollHeight - container.clientHeight);
+    const target = record.follow ? max : Math.min(max, Math.max(0, Number(record.scrollTop) || 0));
+    container.scrollTop = target;
+    return target;
   },
   beginProjection(sessionId) {
     const id = String(sessionId || "");
@@ -567,12 +598,11 @@ const CONTEXT_LIMITS = {
   "deepseek-v4-flash": 128000,    // DeepSeek V4 Flash
 };
 const DEFAULT_CONTEXT_LIMIT = 128000;
-const COMPRESS_THRESHOLD = 0.65;  // Compress when history tokens reach 65% of limit
-const CONTEXT_CRITICAL_THRESHOLD = 0.82;
+const DEFAULT_AUTO_COMPACT_THRESHOLD = 0.95;
 const PERMISSION_MODES = [
   {
     id: "default",
-    label: "手动",
+    label: "询问权限",
     description: "Claude 在需要权限时暂停并询问"
   },
   {
@@ -582,8 +612,13 @@ const PERMISSION_MODES = [
   },
   {
     id: "plan",
-    label: "计划",
+    label: "计划模式",
     description: "先规划，减少直接执行动作"
+  },
+  {
+    id: "auto",
+    label: "自动模式",
+    description: "仅在当前 Claude Code 与模型支持时可用"
   },
   {
     id: "bypassPermissions",
@@ -591,9 +626,11 @@ const PERMISSION_MODES = [
     description: "仅在设置中明确启用后可用"
   },
   {
-    id: "auto",
-    label: "自动",
-    description: "仅在当前 Claude Code 与模型支持时可用"
+    id: "dontAsk",
+    label: "不询问",
+    description: "CLI 模式：未预批准的工具会被自动拒绝",
+    cli_only: true,
+    separator_before: true
   }
 ];
 const CLAUDE_NATIVE_SLASH_COMMANDS = [
@@ -1494,8 +1531,9 @@ function bindEvents() {
     setSlashSuggestionIndex(Number(button.dataset.slashIndex || 0));
   });
   $("#chat-container").addEventListener("scroll", () => {
-    if (state.isStreaming && !SessionScrollRegistry.isProjecting(state.sessionId)) {
-      SessionScrollRegistry.set(state.sessionId, isNearChatBottom());
+    if (!SessionScrollRegistry.isProjecting(state.sessionId)) {
+      const container = $("#chat-container");
+      SessionScrollRegistry.set(state.sessionId, isNearChatBottom(), container?.scrollTop);
     }
   });
 
@@ -2706,7 +2744,7 @@ function parseModelsText(text) {
 
 function renderSettingsOptions(select, options, selected) {
   select.innerHTML = options.map((item) => `
-    <option value="${escapeAttr(item.id)}"${item.available === false ? " disabled" : ""}>
+    <option value="${escapeAttr(item.id)}"${item.available === false || item.enabled === false ? " disabled" : ""} title="${escapeAttr(item.reason || item.title || item.description || "")}">
       ${escapeHtml(item.label || item.id)}
     </option>
   `).join("");
@@ -3225,7 +3263,7 @@ function persistSelectedModel() {
 function orderedPermissionModes(declared, visible) {
   const fallbackById = new Map(PERMISSION_MODES.map((item) => [item.id, item]));
   const declaredById = new Map((Array.isArray(declared) ? declared : []).map((item) => [item.id, item]));
-  return ["default", "acceptEdits", "plan", "bypassPermissions", "auto"]
+  return ["default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"]
     .filter((id) => visible.has(id))
     .map((id) => ({ ...(fallbackById.get(id) || {}), ...(declaredById.get(id) || {}) }))
     .filter((item) => item.id);
@@ -3238,10 +3276,21 @@ function permissionModeOptions() {
   const runtimeSettings = state.settings?.runtime || state.status?.settings?.runtime || {};
   const capabilities = state.status?.runtime?.capabilities || {};
   const declaredIds = new Set(declared.map((item) => item.id));
-  const visible = new Set(["default", "acceptEdits", "plan"]);
-  if (declaredIds.has("auto") && runtimeSettings.enable_auto_mode && capabilities.auto_permission) visible.add("auto");
-  if (declaredIds.has("bypassPermissions") && runtimeSettings.allow_bypass_permissions) visible.add("bypassPermissions");
-  return orderedPermissionModes(declared, visible);
+  const visible = new Set(["default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"]);
+  if (!declaredIds.has("dontAsk")) visible.delete("dontAsk");
+  return orderedPermissionModes(declared, visible).map((mode) => ({
+    ...mode,
+    enabled: mode.enabled !== false
+      && (mode.id !== "auto" || (Boolean(runtimeSettings.enable_auto_mode) && Boolean(capabilities.auto_permission) && mode.enabled !== false))
+      && (mode.id !== "bypassPermissions" || (Boolean(runtimeSettings.allow_bypass_permissions) && mode.enabled !== false)),
+    reason: mode.reason || (
+      mode.id === "auto" && (!runtimeSettings.enable_auto_mode || !capabilities.auto_permission)
+        ? "请先满足 Claude Code 自动模式的设置与运行时能力"
+        : mode.id === "bypassPermissions" && !runtimeSettings.allow_bypass_permissions
+          ? "请先在设置中明确启用跳过权限"
+          : ""
+    )
+  }));
 }
 
 function settingsPermissionModeOptions() {
@@ -3249,10 +3298,31 @@ function settingsPermissionModeOptions() {
     ? state.status.permission_modes
     : PERMISSION_MODES;
   const declaredIds = new Set(declared.map((item) => item.id));
-  const visible = new Set(["default", "acceptEdits", "plan"]);
-  if (declaredIds.has("auto") && $("#settings-enable-auto-mode")?.checked && state.status?.runtime?.capabilities?.auto_permission) visible.add("auto");
-  if (declaredIds.has("bypassPermissions") && $("#settings-allow-bypass-permissions")?.checked) visible.add("bypassPermissions");
-  return orderedPermissionModes(declared, visible);
+  const visible = new Set(["default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"]);
+  if (!declaredIds.has("dontAsk")) visible.delete("dontAsk");
+  const runtimeSettings = state.settings?.runtime || state.status?.settings?.runtime || {};
+  // During settings editing the checkbox is the local draft gate.  It may
+  // only make an already server-enabled mode more restrictive; a server
+  // disabled descriptor/reason always remains authoritative.
+  const autoGate = $("#settings-enable-auto-mode")
+    ? Boolean($("#settings-enable-auto-mode").checked)
+    : Boolean(runtimeSettings.enable_auto_mode);
+  const bypassGate = $("#settings-allow-bypass-permissions")
+    ? Boolean($("#settings-allow-bypass-permissions").checked)
+    : Boolean(runtimeSettings.allow_bypass_permissions);
+  return orderedPermissionModes(declared, visible).map((mode) => ({
+    ...mode,
+    enabled: mode.enabled !== false
+      && (mode.id !== "auto" || autoGate)
+      && (mode.id !== "bypassPermissions" || bypassGate),
+    reason: mode.reason || (
+      mode.id === "auto" && !autoGate
+        ? "请先在设置中启用自动模式"
+        : mode.id === "bypassPermissions" && !bypassGate
+          ? "请先在设置中明确启用跳过权限"
+          : ""
+    ),
+  }));
 }
 
 function renderSettingsPermissionOptions(selected = $("#settings-permission-default")?.value || state.permissionMode) {
@@ -3260,7 +3330,7 @@ function renderSettingsPermissionOptions(selected = $("#settings-permission-defa
   if (!select) return;
   const options = settingsPermissionModeOptions();
   const value = options.some((item) => item.id === selected) ? selected : "default";
-  renderSettingsOptions(select, options.map((item) => ({ id: item.id, label: item.label })), value);
+  renderSettingsOptions(select, options, value);
 }
 
 function sanitizePermissionMode(mode) {
@@ -3279,7 +3349,7 @@ function renderPermissionSelect() {
   }
   select.innerHTML = modes
     .map((mode) => `
-      <option value="${escapeAttr(mode.id)}" title="${escapeAttr(mode.description || "")}">
+      <option value="${escapeAttr(mode.id)}" ${mode.enabled === false ? "disabled" : ""} title="${escapeAttr(mode.reason || mode.description || "")} ">
         ${escapeHtml(mode.label)}
       </option>
     `)
@@ -3293,10 +3363,10 @@ function renderPermissionMenu() {
   if (!menu) return;
   const modes = permissionModeOptions();
   state.permissionMenuIndex = Math.max(0, modes.findIndex((mode) => mode.id === state.permissionMode));
-  menu.innerHTML = modes.map((mode, index) => `
-    <button type="button" class="anchored-menu-option${mode.id === state.permissionMode ? " selected" : ""}" role="option" aria-selected="${mode.id === state.permissionMode ? "true" : "false"}" aria-label="${escapeAttr(`${mode.label}：${mode.description || ""}`)}" title="${escapeAttr(`${mode.label}：${mode.description || ""}`)}" data-permission-mode="${escapeAttr(mode.id)}" data-menu-index="${index}">
+  menu.innerHTML = modes.map((mode, index) => `${mode.separator_before ? `<div class="permission-menu-divider" data-permission-divider="cli" role="separator">CLI 模式</div>` : ""}
+    <button type="button" class="anchored-menu-option${mode.id === state.permissionMode ? " selected" : ""}" role="option" aria-selected="${mode.id === state.permissionMode ? "true" : "false"}" aria-disabled="${mode.enabled === false ? "true" : "false"}" ${mode.enabled === false ? "disabled" : ""} aria-label="${escapeAttr(`${mode.label}：${mode.reason || mode.description || ""}`)}" title="${escapeAttr(`${mode.label}：${mode.reason || mode.description || ""}`)}" data-permission-mode="${escapeAttr(mode.id)}" data-menu-index="${index}" data-reason="${escapeAttr(mode.reason || "")}">
       <span class="anchored-menu-check" aria-hidden="true">${mode.id === state.permissionMode ? "✓" : ""}</span>
-      <span class="anchored-menu-copy"><strong>${escapeHtml(mode.label)}</strong>${mode.description ? `<small>${escapeHtml(mode.description)}</small>` : ""}</span>
+      <span class="anchored-menu-copy"><strong>${escapeHtml(mode.label)}</strong>${(mode.enabled === false ? (mode.reason || mode.description) : (mode.description || mode.reason)) ? `<small${mode.enabled === false && mode.reason ? ' class="permission-disabled-reason"' : ""}>${escapeHtml(mode.enabled === false ? (mode.reason || mode.description) : (mode.description || mode.reason))}</small>` : ""}</span>
     </button>
   `).join("");
   const label = $("#permission-picker-label");
@@ -3304,7 +3374,12 @@ function renderPermissionMenu() {
 }
 
 function selectPermissionMode(mode, { closeMenu = false, restoreFocus = false } = {}) {
-  const value = sanitizePermissionMode(mode);
+  const requested = sanitizePermissionMode(mode);
+  const descriptor = permissionModeOptions().find((item) => item.id === requested);
+  if (!descriptor || descriptor.enabled === false) {
+    return state.permissionMode;
+  }
+  const value = requested;
   state.permissionMode = value;
   const select = $("#permission-select");
   if (select) select.value = value;
@@ -3542,7 +3617,7 @@ async function restoreLastSession() {
       rememberSession(data.session.session_id);
       await loadSessionList();
       setNavigationLocation({ kind: "session", mode: state.sessionMode, sessionId: data.session.session_id }, { push: false });
-      scrollBottom();
+      SessionScrollRegistry.restore(data.session.session_id);
       return;
     }
   } catch {}
@@ -3873,7 +3948,7 @@ async function switchSession(sessionId, { quiet = false, history = true } = {}) 
     await loadSessionList();
     if (generation !== state.sessionSwitchGeneration) return false;
     setNavigationLocation({ kind: "session", mode: state.sessionMode, sessionId }, { push: history });
-    scrollBottom();
+    SessionScrollRegistry.restore(sessionId);
     if (!quiet) $("#user-input").focus();
     return true;
   } finally {
@@ -4430,7 +4505,6 @@ function addMessage(role, content, meta = {}) {
     message,
   ));
   updateContextRail();
-  scrollBottom();
   return $("#messages .message:last-child .msg-content");
 }
 
@@ -5439,37 +5513,42 @@ function renderSessionRun(sessionId) {
   const id = String(sessionId || "");
   const record = SessionRunRegistry.get(id);
   if (!record || String(state.sessionId) !== id) return false;
-  syncRunMessageToState(id);
-  const article = runArticleForSession(id);
-  const container = article?.querySelector?.(".msg-content");
-  if (!article || !container) return false;
-  const segments = record.segments.map((segment) => {
-    if (segment.type !== "thinking") return { ...segment };
-    const elapsed = segment.activeThinking && Number.isFinite(segment.startedAt)
-      ? Math.max(0, Math.round((performance.now() - segment.startedAt) / 1000))
-      : Number(segment.elapsedSeconds ?? segment.elapsed_seconds);
-    return {
-      ...segment,
-      elapsedSeconds: Number.isFinite(elapsed) ? Math.max(0, elapsed) : undefined,
-      activeThinking: Boolean(segment.activeThinking && record.active && !record.completed),
-    };
-  });
-  container.innerHTML = renderMessageSegments(segments, {
-    activeThinking: Boolean(record.active && !record.completed),
-    totalElapsedSeconds: runElapsedSeconds(record),
-  });
-  article.classList?.toggle?.("error", Boolean(record.error));
-  if (record.pendingInteraction) {
-    mountInteractionCard(record.pendingInteraction, createStreamRenderer(id));
-  } else {
-    const dock = interactionDockNode();
-    const card = dock?.querySelector?.(".inline-interaction-card");
-    if (card && String(card.dataset.interactionSessionId || id) === id && !card.dataset.interactionState) {
-      clearInteractionDock();
+  const scrollProjectionToken = SessionScrollRegistry.beginProjection(id);
+  try {
+    syncRunMessageToState(id);
+    const article = runArticleForSession(id);
+    const container = article?.querySelector?.(".msg-content");
+    if (!article || !container) return false;
+    const segments = record.segments.map((segment) => {
+      if (segment.type !== "thinking") return { ...segment };
+      const elapsed = segment.activeThinking && Number.isFinite(segment.startedAt)
+        ? Math.max(0, Math.round((performance.now() - segment.startedAt) / 1000))
+        : Number(segment.elapsedSeconds ?? segment.elapsed_seconds);
+      return {
+        ...segment,
+        elapsedSeconds: Number.isFinite(elapsed) ? Math.max(0, elapsed) : undefined,
+        activeThinking: Boolean(segment.activeThinking && record.active && !record.completed),
+      };
+    });
+    container.innerHTML = renderMessageSegments(segments, {
+      activeThinking: Boolean(record.active && !record.completed),
+      totalElapsedSeconds: runElapsedSeconds(record),
+    });
+    article.classList?.toggle?.("error", Boolean(record.error));
+    if (record.pendingInteraction) {
+      mountInteractionCard(record.pendingInteraction, createStreamRenderer(id));
+    } else {
+      const dock = interactionDockNode();
+      const card = dock?.querySelector?.(".inline-interaction-card");
+      if (card && String(card.dataset.interactionSessionId || id) === id && !card.dataset.interactionState) {
+        clearInteractionDock();
+      }
     }
+    scrollBottom();
+    return true;
+  } finally {
+    SessionScrollRegistry.finishProjection(id, scrollProjectionToken);
   }
-  scrollBottom();
-  return true;
 }
 
 function markRunError(sessionId, value = true) {
@@ -6493,11 +6572,13 @@ function normalizeContextUsage(value) {
   const source = ["real", "unavailable"].includes(value?.source) ? value.source : "unavailable";
   const tokens = Math.max(0, Number(value?.used_tokens) || 0);
   const limit = Math.max(0, Number(value?.context_limit) || 0);
+  const effectiveWindow = Math.max(0, Number(value?.effective_context_window) || limit);
   const rawRatio = Number(value?.ratio);
   const ratio = Number.isFinite(rawRatio) ? Math.min(Math.max(rawRatio, 0), 1) : (limit ? Math.min(tokens / limit, 1) : 0);
   return {
     used_tokens: tokens,
     context_limit: limit,
+    effective_context_window: effectiveWindow,
     ratio,
     source,
     updated_at: Number(value?.updated_at) || 0,
@@ -6507,24 +6588,30 @@ function normalizeContextUsage(value) {
     cache_read_input_tokens: Math.max(0, Number(value?.cache_read_input_tokens) || 0),
     output_tokens: Math.max(0, Number(value?.output_tokens) || 0),
     compacting: Boolean(value?.compacting),
+    effective_auto_compact_threshold: Number(value?.effective_auto_compact_threshold) > 0
+      ? Math.min(Math.max(Number(value.effective_auto_compact_threshold), 0.5), 0.99)
+      : DEFAULT_AUTO_COMPACT_THRESHOLD,
   };
 }
 
 function contextStats() {
   const usage = normalizeContextUsage(state.contextUsage);
   const tokens = usage.used_tokens;
-  const limit = usage.context_limit;
+  const limit = usage.effective_context_window || usage.context_limit;
   const ratio = usage.ratio;
+  const autoCompactThreshold = usage.effective_auto_compact_threshold || DEFAULT_AUTO_COMPACT_THRESHOLD;
   return {
     tokens,
     limit,
+    effectiveContextWindow: limit,
     ratio,
+    autoCompactThreshold,
     percent: Math.round(ratio * 100),
     source: usage.source,
     compacting: usage.compacting,
     available: usage.source !== "unavailable" && limit > 0,
-    shouldCompress: usage.source !== "unavailable" && ratio >= COMPRESS_THRESHOLD,
-    critical: usage.source !== "unavailable" && ratio >= CONTEXT_CRITICAL_THRESHOLD
+    shouldCompress: usage.source !== "unavailable" && ratio >= autoCompactThreshold,
+    critical: usage.source !== "unavailable" && ratio >= autoCompactThreshold
   };
 }
 
@@ -6627,9 +6714,7 @@ function showContextNotice(stats = contextStats()) {
     const messagesEl = $("#messages");
     if (messagesEl) messagesEl.prepend(notice);
   }
-  notice.textContent = stats.critical
-    ? `上下文已到 ${stats.percent}%，后台整理已排队。`
-    : `上下文已到 ${stats.percent}%，后台整理将在需要时运行。`;
+  notice.textContent = `上下文接近压缩线，Claude Code 将在处理新消息时判断。`;
 }
 
 function hideContextNotice() {
@@ -6648,9 +6733,7 @@ async function requestContextCompression(sessionId = state.sessionId, compressio
   compressionState.status = "running";
   compressionState.reason = "";
   if (state.sessionId === sessionId) {
-    showContextNotice({ ...contextStats(), critical: true, percent: contextStats().percent });
-    const notice = $(".context-notice");
-    if (notice) notice.textContent = "上下文接近上限，正在后台整理。";
+    showContextNotice(contextStats());
   }
 
   try {
@@ -6678,7 +6761,7 @@ async function requestContextCompression(sessionId = state.sessionId, compressio
     compressionState.status = "failed";
     compressionState.reason = shortContextReason(error.message || String(error));
     if (state.sessionId === sessionId) {
-      showContextNotice({ ...contextStats(), critical: true, percent: contextStats().percent });
+      showContextNotice(contextStats());
       const errorNotice = $(".context-notice");
       if (errorNotice) errorNotice.textContent = `上下文整理失败：${compressionState.reason}`;
     }
@@ -7236,7 +7319,7 @@ function scrollBottom({ force = false } = {}) {
   requestAnimationFrame(() => {
     const container = $("#chat-container");
     if (!container) return;
-    if (!force && state.isStreaming && !SessionScrollRegistry.get(state.sessionId)) return;
+    if (!force && !SessionScrollRegistry.get(state.sessionId)) return;
     container.scrollTop = container.scrollHeight;
   });
 }

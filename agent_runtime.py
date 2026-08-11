@@ -27,6 +27,9 @@ MINIMUM_CLAUDE_VERSION = (2, 1, 224)
 SESSION_RUNNER = "/usr/local/bin/viniper-run-session"
 SESSION_CANCELLER = "/usr/local/bin/viniper-cancel-session"
 SESSION_HELPER_VERSION = "3"
+AUTO_COMPACT_WINDOW_ENV = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
+AUTO_COMPACT_PCT_ENV = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+DEFAULT_AUTO_COMPACT_WINDOW = 128000
 REQUIRED_CLAUDE_FLAGS = (
     "-p",
     "--input-format",
@@ -89,6 +92,8 @@ class RuntimeCapabilities:
     agent_registry: bool = False
     native_send_message: bool = False
     auto_permission: bool = False
+    auto_compact: bool = False
+    effective_context_window: int = 0
     permission_modes: tuple[str, ...] = ()
     platform: str = "unknown"
     reason: str = ""
@@ -133,6 +138,7 @@ class AgentRunSpec:
     permission_prompt_tool: str = ""
     environment: Mapping[str, str] = field(default_factory=dict)
     bridge_keys: tuple[str, ...] = ()
+    effective_context_window: int = 0
 
 
 @dataclass
@@ -236,6 +242,30 @@ def _permission_modes_from_help(help_text: str) -> tuple[str, ...]:
     return tuple(mode for _position, mode in sorted(located))
 
 
+def resolve_autocompact_window(
+    help_text: str,
+    environment: Mapping[str, str] | None = None,
+    *,
+    default: int = DEFAULT_AUTO_COMPACT_WINDOW,
+) -> int:
+    """Resolve the native Claude compact window without inventing env names.
+
+    Current Claude Code exposes ``--autocompact``.  Older supported clients
+    use the official ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` environment variable;
+    callers decide whether to pass the value as an argv flag or that fallback.
+    """
+    source = environment or {}
+    if "--autocompact" in str(help_text or ""):
+        try:
+            return max(0, int(source.get(AUTO_COMPACT_WINDOW_ENV) or default))
+        except (TypeError, ValueError):
+            return max(0, int(default))
+    try:
+        return max(0, int(source.get(AUTO_COMPACT_WINDOW_ENV) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _cli_permission_mode(semantic_mode: str, choices: Sequence[str] | None) -> str:
     semantic = "default" if str(semantic_mode or "") in {"", "ask", "manual"} else str(semantic_mode)
     available = tuple(str(item) for item in (choices or ()))
@@ -255,6 +285,7 @@ def _claude_arguments(
     path_mapper: Callable[[str], str],
     *,
     permission_choices: Sequence[str] | None = None,
+    auto_compact_supported: bool | None = None,
 ) -> list[str]:
     args = [
         "-p",
@@ -270,6 +301,9 @@ def _claude_arguments(
         "--resume" if spec.resume else "--session-id",
         spec.claude_session_id,
     ]
+    compact_window = max(0, int(getattr(spec, "effective_context_window", 0) or getattr(spec, "autocompact_window", 0) or 0))
+    if compact_window and auto_compact_supported is not False:
+        args.extend(["--autocompact", str(compact_window)])
     cli_permission_mode = _cli_permission_mode(spec.permission_mode, permission_choices)
     if cli_permission_mode == "bypassPermissions":
         args.append("--allow-dangerously-skip-permissions")
@@ -521,6 +555,8 @@ class WslAgentRuntime(AgentRuntime):
             agent_registry=False,
             native_send_message=False,
             auto_permission="auto" in permission_modes,
+            auto_compact="--autocompact" in help_text,
+            effective_context_window=DEFAULT_AUTO_COMPACT_WINDOW,
             permission_modes=permission_modes,
             platform="wsl2",
             reason="" if status == "ready" else detail,
@@ -642,6 +678,7 @@ class WslAgentRuntime(AgentRuntime):
             spec,
             lambda value: self.map_path(value),
             permission_choices=self.capabilities().permission_modes,
+            auto_compact_supported=self.capabilities().auto_compact,
         )
         return [
             "wsl.exe",

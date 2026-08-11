@@ -216,11 +216,11 @@ asyncio.run(run())
         finally:
             shutil.rmtree(probe_root, ignore_errors=True)
 
-    def test_source_and_desktop_versions_are_5_0_1(self) -> None:
+    def test_source_and_desktop_versions_are_5_0_2(self) -> None:
         version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
         package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
         lockfile = json.loads((ROOT / "desktop" / "package-lock.json").read_text(encoding="utf-8"))
-        self.assertEqual(version, "5.0.1")
+        self.assertEqual(version, "5.0.2")
         self.assertEqual(package["version"], version)
         self.assertEqual(lockfile["version"], version)
         self.assertEqual(lockfile["packages"][""].get("version"), version)

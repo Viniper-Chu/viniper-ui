@@ -63,6 +63,7 @@ class ContextUsageSnapshot:
     source: str
     updated_at: float
     model: str
+    effective_context_window: int = 0
     input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
@@ -96,6 +97,7 @@ class ContextUsageLedger:
                     session_id=str(session_id),
                     used_tokens=max(0, int(value.get("used_tokens") or 0)),
                     context_limit=max(0, int(value.get("context_limit") or 0)),
+                    effective_context_window=max(0, int(value.get("effective_context_window") or value.get("context_limit") or 0)),
                     ratio=max(0.0, min(1.0, float(value.get("ratio") or 0))),
                     source=str(value.get("source") or "unavailable"),
                     updated_at=float(value.get("updated_at") or 0),
@@ -126,6 +128,7 @@ class ContextUsageLedger:
             session_id=str(session_id),
             used_tokens=0,
             context_limit=max(0, int(context_limit or 0)),
+            effective_context_window=max(0, int(context_limit or 0)),
             ratio=0.0,
             source="unavailable",
             updated_at=0.0,
@@ -159,6 +162,7 @@ class ContextUsageLedger:
             session_id=str(session_id),
             used_tokens=used_tokens,
             context_limit=context_limit,
+            effective_context_window=context_limit,
             ratio=ratio,
             source="real",
             updated_at=time.time(),
@@ -186,6 +190,7 @@ class ContextUsageLedger:
                 session_id=str(session_id),
                 used_tokens=current.used_tokens if current is not None else 0,
                 context_limit=limit,
+                effective_context_window=(current.effective_context_window if current is not None else limit) or limit,
                 ratio=current.ratio if current is not None else 0.0,
                 source=current.source if current is not None else "unavailable",
                 updated_at=time.time(),
@@ -218,6 +223,7 @@ class ContextUsageLedger:
                 session_id=str(session_id),
                 used_tokens=used,
                 context_limit=limit,
+                effective_context_window=limit,
                 ratio=min(used / limit, 1.0) if limit else 0.0,
                 source="estimated",
                 updated_at=time.time(),

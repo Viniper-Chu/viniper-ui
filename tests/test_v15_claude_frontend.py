@@ -90,9 +90,9 @@ class V15StaticContracts(unittest.TestCase):
     def test_permission_fallback_copy_and_real_ids_match_latest_reference(self) -> None:
         app = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         expected = [
-            ("default", "手动", "Claude 在需要权限时暂停并询问"),
+            ("default", "询问权限", "Claude 在需要权限时暂停并询问"),
             ("acceptEdits", "自动接受编辑", "自动允许文件编辑，其他高风险操作仍会询问"),
-            ("plan", "计划", "先规划，减少直接执行动作"),
+            ("plan", "计划模式", "先规划，减少直接执行动作"),
         ]
         positions = []
         for mode_id, label, description in expected:
@@ -102,7 +102,7 @@ class V15StaticContracts(unittest.TestCase):
             self.assertIn(f'description: "{description}"', app)
             positions.append(app.index(marker))
         self.assertEqual(positions, sorted(positions))
-        self.assertIn('const visible = new Set(["default", "acceptEdits", "plan"])', app)
+        self.assertIn('const visible = new Set(["default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"])', app)
         self.assertIn("permission_mode: permissionMode", app)
 
 
@@ -227,9 +227,9 @@ class V15RendererHarness(unittest.TestCase):
             [
                 {
                     "id": "default",
-                    "label": "手动",
+                    "label": "询问权限",
                     "description": "Claude 在需要权限时暂停并询问",
-                    "title": "手动：Claude 在需要权限时暂停并询问",
+                    "title": "询问权限：Claude 在需要权限时暂停并询问",
                 },
                 {
                     "id": "acceptEdits",
@@ -239,9 +239,27 @@ class V15RendererHarness(unittest.TestCase):
                 },
                 {
                     "id": "plan",
-                    "label": "计划",
+                    "label": "计划模式",
                     "description": "先规划，减少直接执行动作",
-                    "title": "计划：先规划，减少直接执行动作",
+                    "title": "计划模式：先规划，减少直接执行动作",
+                },
+                {
+                    "id": "auto",
+                    "label": "自动模式",
+                    "description": "请先满足 Claude Code 自动模式的设置与运行时能力",
+                    "title": "自动模式：请先满足 Claude Code 自动模式的设置与运行时能力",
+                },
+                {
+                    "id": "bypassPermissions",
+                    "label": "跳过权限",
+                    "description": "请先在设置中明确启用跳过权限",
+                    "title": "跳过权限：请先在设置中明确启用跳过权限",
+                },
+                {
+                    "id": "dontAsk",
+                    "label": "不询问",
+                    "description": "CLI 模式：未预批准的工具会被自动拒绝",
+                    "title": "不询问：CLI 模式：未预批准的工具会被自动拒绝",
                 },
             ],
         )

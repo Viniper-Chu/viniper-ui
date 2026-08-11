@@ -91,10 +91,10 @@ $item = $folder.ParseName((Split-Path -Leaf $path))
         self.assertEqual(installer.count('-AppUserModelId "${APP_ID}"'), 2)
         self.assertEqual(installer.count("Abort \"Viniper"), 2)
 
-    def test_visible_release_and_internal_revision_match_5_0_1(self) -> None:
+    def test_visible_release_and_internal_revision_match_5_0_2(self) -> None:
         package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "5.0.1")
-        self.assertEqual(package["version"], "5.0.1")
+        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "5.0.2")
+        self.assertEqual(package["version"], "5.0.2")
         self.assertEqual((ROOT / "RELEASE_REVISION").read_text(encoding="utf-8").strip(), "1")
 
     def test_release_source_scan_excludes_local_evidence_and_build_outputs(self) -> None:

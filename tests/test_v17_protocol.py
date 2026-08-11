@@ -10,6 +10,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server
 from agent_runtime import AgentRunSpec, RuntimeCapabilities, RuntimeProbe, _claude_arguments
 from context_usage import ContextUsageLedger
@@ -127,11 +130,14 @@ class SessionPermissionModeRedTests(unittest.TestCase):
         self.assertEqual(legacy["permission_mode"], "plan")
         self.assertEqual(explicit["permission_mode"], "default")
 
-    def test_auto_is_fail_closed_for_third_party_provider_and_dontask_is_desktop_hidden(self) -> None:
+    def test_auto_is_fail_closed_for_third_party_provider_and_dontask_is_discoverable_cli_extension(self) -> None:
         settings = server.normalize_settings({
             "runtime": {"permission_mode": "default", "enable_auto_mode": True, "allow_bypass_permissions": True},
         })
-        capabilities = RuntimeCapabilities(auto_permission=True)
+        capabilities = RuntimeCapabilities(
+            auto_permission=True,
+            permission_modes=("manual", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"),
+        )
         runtime = unittest.mock.Mock()
         runtime.capabilities.return_value = capabilities
         with (
@@ -144,7 +150,10 @@ class SessionPermissionModeRedTests(unittest.TestCase):
             modes = server.available_permission_mode_ids()
         self.assertNotIn("auto", modes)
         self.assertIn("bypassPermissions", modes)
-        self.assertNotIn("dontAsk", {item["id"] for item in server.PERMISSION_MODE_OPTIONS})
+        self.assertIn("dontAsk", {item["id"] for item in server.PERMISSION_MODE_OPTIONS})
+        descriptors = {item["id"]: item for item in server.permission_mode_descriptors()}
+        self.assertFalse(descriptors["auto"]["enabled"])
+        self.assertTrue(descriptors["dontAsk"]["cli_only"])
 
     def test_bypass_is_both_session_state_and_real_cli_argument(self) -> None:
         spec = AgentRunSpec(

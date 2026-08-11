@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 RESIDUE = ROOT / "codex" / "运行残留"
 RESIDUE.mkdir(parents=True, exist_ok=True)
 _MODULE_DATA = tempfile.TemporaryDirectory(prefix="update-revision-module-", dir=RESIDUE)
-os.environ.setdefault("VINIPER_UI_DATA_DIR", _MODULE_DATA.name)
-os.environ.setdefault("VINIPER_UI_OPEN_BROWSER", "0")
+os.environ["VINIPER_UI_DATA_DIR"] = _MODULE_DATA.name
+os.environ["VINIPER_UI_OPEN_BROWSER"] = "0"
 
 import server  # noqa: E402
 

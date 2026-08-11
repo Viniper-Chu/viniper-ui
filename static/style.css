@@ -3414,6 +3414,19 @@ body[data-view-mode="agent"] .input-footer-row .composer-status { visibility: hi
 }
 .anchored-menu-option:hover,
 .anchored-menu-option:focus-visible { outline: 0; background: var(--color-hover); color: var(--text); }
+.anchored-menu-option:disabled { cursor: not-allowed; opacity: .64; }
+.anchored-menu-option:disabled:hover { background: transparent; }
+.permission-menu-divider {
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 5px 9px 3px 39px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
 .anchored-menu-option.selected { color: var(--text); }
 .anchored-menu-check { color: var(--text); text-align: center; }
 .anchored-menu-copy { display: grid; min-width: 0; gap: 2px; }
@@ -3829,6 +3842,10 @@ body[data-view-mode="agent"] #workdir-display.session-workdir { display: block !
 .permission-menu {
   width: 344px;
   min-width: 344px;
+  max-height: min(520px, calc(100dvh - var(--titlebar-height) - var(--workspace-mode-bar-height) - 24px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   gap: 1px;
   padding: 7px;
   border-radius: 13px;

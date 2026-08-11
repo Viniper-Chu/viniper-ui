@@ -14,6 +14,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server  # noqa: E402
 
 

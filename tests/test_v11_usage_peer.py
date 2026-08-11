@@ -11,6 +11,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server
 from agent_runtime import RuntimeCapabilities
 from context_usage import ContextUsageLedger

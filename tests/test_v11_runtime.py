@@ -11,6 +11,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server
 from agent_runtime import (
     AgentRunSpec,
@@ -381,7 +384,10 @@ class RuntimeProductContractTests(unittest.TestCase):
                 self.auto = auto
 
             def capabilities(self) -> RuntimeCapabilities:
-                return RuntimeCapabilities(auto_permission=self.auto)
+                return RuntimeCapabilities(
+                    auto_permission=self.auto,
+                    permission_modes=("manual", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"),
+                )
 
         with patch.object(server, "agent_runtime", return_value=Runtime(False)), patch.object(
             server,
@@ -391,9 +397,13 @@ class RuntimeProductContractTests(unittest.TestCase):
             self.assertEqual(server.allowed_permission_mode("default"), "default")
             self.assertEqual(server.allowed_permission_mode("acceptEdits"), "acceptEdits")
             self.assertEqual(server.allowed_permission_mode("plan"), "plan")
-            self.assertEqual(server.allowed_permission_mode("auto"), "default")
-            self.assertEqual(server.allowed_permission_mode("bypassPermissions"), "default")
-            self.assertEqual(server.allowed_permission_mode("dontAsk"), "default")
+            self.assertEqual(server.allowed_permission_mode("auto"), "auto")
+            self.assertEqual(server.allowed_permission_mode("bypassPermissions"), "bypassPermissions")
+            self.assertEqual(server.allowed_permission_mode("dontAsk"), "dontAsk")
+            for mode in ("auto", "bypassPermissions"):
+                with self.assertRaises(server.HTTPException):
+                    server.require_permission_mode(mode)
+            self.assertEqual(server.require_permission_mode("dontAsk"), "dontAsk")
 
         enabled = {
             "account": {"signed_in": True},

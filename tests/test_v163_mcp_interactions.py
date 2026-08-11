@@ -19,6 +19,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import agent_host_bridge
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server
 from agent_runtime import AgentRunSpec, WslAgentRuntime
 

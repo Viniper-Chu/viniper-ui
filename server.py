@@ -36,12 +36,15 @@ from context_lifecycle import (
 from context_usage import ContextUsageLedger, ContextUsageSnapshot
 from daily_usage import DailyUsageLedger
 from agent_runtime import (
+    AUTO_COMPACT_WINDOW_ENV,
     AgentRunSpec,
+    DEFAULT_AUTO_COMPACT_WINDOW,
     MANAGED_DISTRO_NAME,
     MANAGED_DISTRO_USER,
     RuntimeProbe,
     WindowsNativeRuntime,
     WslAgentRuntime,
+    resolve_autocompact_window,
     stable_session_name,
 )
 from agent_instructions import AgentInstructionsStore
@@ -125,7 +128,7 @@ def normalize_session_mode(value: Any) -> str:
 PERMISSION_MODE_OPTIONS = [
     {
         "id": "default",
-        "label": "手动",
+        "label": "询问权限",
         "description": "Claude 在需要权限时暂停并询问",
     },
     {
@@ -135,8 +138,13 @@ PERMISSION_MODE_OPTIONS = [
     },
     {
         "id": "plan",
-        "label": "计划",
+        "label": "计划模式",
         "description": "先规划，减少直接执行动作",
+    },
+    {
+        "id": "auto",
+        "label": "自动模式",
+        "description": "由 Claude Code 的可用自动模式判断动作",
     },
     {
         "id": "bypassPermissions",
@@ -144,9 +152,11 @@ PERMISSION_MODE_OPTIONS = [
         "description": "跳过 Claude Code 权限确认，仅在设置中明确启用后提供",
     },
     {
-        "id": "auto",
-        "label": "自动",
-        "description": "由 Claude Code 的可用自动模式判断动作",
+        "id": "dontAsk",
+        "label": "不询问",
+        "description": "CLI 模式：未预批准的工具会被自动拒绝",
+        "cli_only": True,
+        "separator_before": True,
     },
 ]
 PERMISSION_MODE_IDS = {item["id"] for item in PERMISSION_MODE_OPTIONS}
@@ -175,10 +185,10 @@ CLAUDE_REQUIRED_OPTIONS = [
 CLAUDE_REQUIRED_PERMISSION_MODES = [
     "default",
     "acceptEdits",
+    "plan",
     "auto",
     "bypassPermissions",
     "dontAsk",
-    "plan",
 ]
 RUN_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_RUN_TIMEOUT", "0"))
 HEARTBEAT_INTERVAL_SECONDS = int(env_value("VINIPER_UI_HEARTBEAT_INTERVAL", "15"))
@@ -511,6 +521,12 @@ def runtime_update_coordinator() -> RuntimeUpdateCoordinator:
 
 def runtime_payload_from_probe(probe: RuntimeProbe) -> dict[str, Any]:
     payload = probe.as_dict()
+    # Runtime status and the selected model's context ring share one effective
+    # window source; the per-run AgentRunSpec carries the same value.
+    selected_model = allowed_model("")
+    effective_window = context_limit_for_model(selected_model)
+    payload["effective_context_window"] = effective_window
+    payload.setdefault("capabilities", {})["effective_context_window"] = effective_window
     payload["install_location"] = str(managed_runtime_location())
     payload["configured"] = probe.ready
     payload["update"] = runtime_update_coordinator().status()
@@ -549,11 +565,13 @@ def context_usage_ledger() -> ContextUsageLedger:
 
 def context_usage_payload(session_id: str, model: str = "") -> dict[str, Any]:
     selected_model = allowed_model(model) if model else allowed_model("")
-    return context_usage_ledger().get(
+    payload = context_usage_ledger().get(
         session_id,
         model=selected_model,
         context_limit=context_limit_for_model(selected_model),
     ).as_dict()
+    payload["effective_auto_compact_threshold"] = effective_auto_compact_threshold()
+    return payload
 
 
 def daily_usage_ledger() -> DailyUsageLedger:
@@ -761,12 +779,12 @@ def normalize_session(session_id: str, raw: dict[str, Any]) -> dict[str, Any]:
     configured_default = str(load_app_settings().get("runtime", {}).get("permission_mode") or DEFAULT_PERMISSION_MODE)
     if configured_default in {"ask", "manual"}:
         configured_default = "default"
-    if configured_default not in PERMISSION_MODE_IDS or configured_default == "dontAsk":
+    if configured_default not in PERMISSION_MODE_IDS:
         configured_default = "default"
     stored_permission_mode = str(raw.get("permission_mode") or configured_default)
     if stored_permission_mode in {"ask", "manual"}:
         stored_permission_mode = "default"
-    if stored_permission_mode not in PERMISSION_MODE_IDS or stored_permission_mode == "dontAsk":
+    if stored_permission_mode not in PERMISSION_MODE_IDS:
         stored_permission_mode = configured_default
     mode = normalize_session_mode(raw.get("mode"))
     normalized = {
@@ -1926,10 +1944,21 @@ def allowed_model(model: str | None) -> str:
     return env_model if env_model in ids else models[0]["id"]
 
 
-def available_permission_mode_ids() -> set[str]:
+def permission_mode_descriptors() -> list[dict[str, Any]]:
+    """Return the complete session menu, including gated choices.
+
+    Visibility is deliberately separate from enablement: users can discover
+    all six CLI choices, while provider/settings/runtime gates fail closed and
+    explain why a choice cannot currently be selected.
+    """
     app_settings = load_app_settings()
     settings = app_settings.get("runtime", {})
-    available = {"default", "acceptEdits", "plan"}
+    try:
+        capabilities = agent_runtime().capabilities()
+    except Exception:
+        capabilities = None
+    declared = {str(item) for item in (getattr(capabilities, "permission_modes", ()) or ())}
+    supports = lambda mode: mode in {"default", "acceptEdits", "plan"} or mode in declared or (mode == "default" and "manual" in declared)
     provider = deepseek_config()
     provider_id = str(provider.get("provider") or "").strip().lower()
     provider_label = str(provider.get("label") or "").strip().lower()
@@ -1943,11 +1972,44 @@ def available_permission_mode_ids() -> set[str]:
         and (not provider_url or "api.anthropic.com" in provider_url)
         and (not provider_model or provider_model.startswith("claude"))
     )
-    if bool(settings.get("enable_auto_mode")) and native_anthropic and agent_runtime().capabilities().auto_permission:
-        available.add("auto")
-    if bool(settings.get("allow_bypass_permissions")):
-        available.add("bypassPermissions")
-    return available
+    auto_capable = bool(getattr(capabilities, "auto_permission", False)) and supports("auto")
+    bypass_capable = supports("bypassPermissions")
+    dont_ask_capable = supports("dontAsk")
+    result: list[dict[str, Any]] = []
+    for option in PERMISSION_MODE_OPTIONS:
+        item = dict(option)
+        mode = str(item["id"])
+        enabled = supports(mode)
+        reason = ""
+        if mode == "auto":
+            enabled = bool(settings.get("enable_auto_mode")) and native_anthropic and auto_capable
+            if not native_anthropic:
+                reason = "当前 DeepSeek/第三方 Provider 不支持 Claude 原生自动模式"
+            elif not bool(settings.get("enable_auto_mode")):
+                reason = "请先在设置中启用自动模式"
+            elif not auto_capable:
+                reason = "当前 Claude Code 未声明 auto 能力"
+        elif mode == "bypassPermissions":
+            enabled = bool(settings.get("allow_bypass_permissions")) and bypass_capable
+            if not bool(settings.get("allow_bypass_permissions")):
+                reason = "请先在设置中明确启用跳过权限"
+            elif not bypass_capable:
+                reason = "当前 Claude Code 未声明 bypassPermissions 能力"
+        elif mode == "dontAsk":
+            enabled = dont_ask_capable
+            if not enabled:
+                reason = "当前 Claude Code 未声明 CLI 不询问能力"
+        elif not enabled:
+            reason = "当前 Claude Code 未声明此权限模式"
+        item["enabled"] = bool(enabled)
+        if reason:
+            item["reason"] = reason
+        result.append(item)
+    return result
+
+
+def available_permission_mode_ids() -> set[str]:
+    return {str(item["id"]) for item in permission_mode_descriptors() if item.get("enabled")}
 
 
 def permission_workdir_key(workdir: Any) -> str:
@@ -1983,25 +2045,32 @@ def allowed_permission_mode(permission_mode: str | None) -> str:
     if value in {"ask", "manual"}:
         value = "default"
     settings = load_app_settings().get("runtime", {})
-    available = available_permission_mode_ids()
     configured_default = str(settings.get("permission_mode") or DEFAULT_PERMISSION_MODE)
     if configured_default in {"ask", "manual"}:
         configured_default = "default"
-    fallback = configured_default if configured_default in available else "default"
-    return value if value in available else fallback
+    fallback = configured_default if configured_default in PERMISSION_MODE_IDS else "default"
+    # Preserve a known but currently gated mode in durable/session state.  The
+    # request boundary (require_permission_mode) reports the explicit reason;
+    # it must not silently rewrite a user's choice to default.
+    return value if value in PERMISSION_MODE_IDS else fallback
 
 
 def require_permission_mode(permission_mode: str | None) -> str:
     value = str(permission_mode or "").strip()
-    if value not in available_permission_mode_ids():
+    if value in {"ask", "manual"}:
+        value = "default"
+    if value not in PERMISSION_MODE_IDS:
         raise HTTPException(status_code=400, detail="unknown permission_mode")
+    descriptor = next((item for item in permission_mode_descriptors() if item.get("id") == value), None)
+    if not descriptor or not descriptor.get("enabled"):
+        raise HTTPException(status_code=400, detail=str((descriptor or {}).get("reason") or "permission mode unavailable"))
     return value
 
 
 def session_permission_mode(session: dict[str, Any]) -> str:
     """Return the durable per-session Desktop permission mode, fail closed."""
     value = str(session.get("permission_mode") or "default")
-    if value in available_permission_mode_ids():
+    if value in PERMISSION_MODE_IDS:
         return value
     session["permission_mode"] = "default"
     return "default"
@@ -2205,7 +2274,13 @@ if (Test-Path -LiteralPath $taskbar) {{
         pass
 
 
-def build_agent_env(cfg: dict[str, str] | None = None, session: dict[str, Any] | None = None) -> dict[str, str]:
+def build_agent_env(
+    cfg: dict[str, str] | None = None,
+    session: dict[str, Any] | None = None,
+    *,
+    effective_context_window: int = 0,
+    auto_compact_supported: bool | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     env.update(merged_env())
     cfg = cfg or provider_config()
@@ -2225,14 +2300,30 @@ def build_agent_env(cfg: dict[str, str] | None = None, session: dict[str, Any] |
     if session:
         env["VINIPER_SESSION_ID"] = str(session.get("id") or "")
         env["VINIPER_WORKDIR"] = str(session.get("workdir") or "")
+    window = max(0, int(effective_context_window or 0))
+    if window and auto_compact_supported is False:
+        # Official fallback for Claude Code versions that do not expose the
+        # current --autocompact flag.  Do not invent a Viniper-specific limit.
+        env[AUTO_COMPACT_WINDOW_ENV] = str(window)
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
-def build_claude_env(cfg: dict[str, str] | None = None, session: dict[str, Any] | None = None) -> dict[str, str]:
+def build_claude_env(
+    cfg: dict[str, str] | None = None,
+    session: dict[str, Any] | None = None,
+    *,
+    effective_context_window: int = 0,
+    auto_compact_supported: bool | None = None,
+) -> dict[str, str]:
     cfg = cfg or provider_config()
-    env = build_agent_env(cfg, session)
+    env = build_agent_env(
+        cfg,
+        session,
+        effective_context_window=effective_context_window,
+        auto_compact_supported=auto_compact_supported,
+    )
     env["ANTHROPIC_BASE_URL"] = cfg.get("base_url", "")
     env["ANTHROPIC_MODEL"] = cfg.get("model", "")
     if cfg.get("api_key"):
@@ -2260,6 +2351,7 @@ def runtime_bridge_keys() -> tuple[str, ...]:
         "VINIPER_API_KEY",
         "VINIPER_SESSION_ID",
         "VINIPER_WORKDIR",
+        AUTO_COMPACT_WINDOW_ENV,
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",
@@ -5131,6 +5223,8 @@ async def stream_chat_impl(
 
     session = safe_session(session_id)
     selected_model = cfg["model"]
+    runtime_caps = runtime.capabilities()
+    effective_context_window = context_limit_for_model(selected_model)
     selected_permission_mode = allowed_permission_mode(permission_mode)
     attachments = attachments or []
     prompt = user_msg.strip()
@@ -5192,8 +5286,14 @@ async def stream_chat_impl(
         permission_prompt_tool=(
             PERMISSION_PROMPT_MCP_QUALIFIED_TOOL if host_mcp_config_path is not None else ""
         ),
-        environment=build_claude_env(cfg, session),
+        environment=build_claude_env(
+            cfg,
+            session,
+            effective_context_window=effective_context_window,
+            auto_compact_supported=runtime_caps.auto_compact,
+        ),
         bridge_keys=runtime_bridge_keys(),
+        effective_context_window=effective_context_window,
     )
     watched_file_roots = file_change_watch_roots(cwd)
     before_file_state = snapshot_watch_files(watched_file_roots)
@@ -6606,7 +6706,7 @@ async def status():
         "claude_available": bool(runtime_status.get("ready")),
         "runtime": runtime_status,
         "permission_mode": allowed_permission_mode(str(settings.get("runtime", {}).get("permission_mode") or DEFAULT_PERMISSION_MODE)),
-        "permission_modes": [item for item in PERMISSION_MODE_OPTIONS if item["id"] in available_permission_mode_ids()],
+        "permission_modes": permission_mode_descriptors(),
         "data_dir": str(DATA_DIR),
         "update": {
             "configured": bool(update_source.get("manifest_url")),
@@ -6704,7 +6804,7 @@ async def update_settings(request: Request):
         "ok": True,
         "settings": public_settings(load_app_settings()),
         "models": effective_model_options(),
-        "permission_modes": [item for item in PERMISSION_MODE_OPTIONS if item["id"] in available_permission_mode_ids()],
+        "permission_modes": permission_mode_descriptors(),
     }
 
 
@@ -7058,7 +7158,11 @@ async def chat(session_id: str, request: Request):
     model = allowed_model(str(body.get("model") or ""))
     permission_mode = None
     if mode == "agent":
-        permission_mode = session_permission_mode(session)
+        # A persisted mode may become unavailable after a provider/runtime or
+        # settings change.  Re-check the server-authoritative descriptor before
+        # accepting the turn so no message, coordinator run, or provider call
+        # can escape through a stale auto/bypass/dontAsk selection.
+        permission_mode = require_permission_mode(session_permission_mode(session))
         requested_permission_mode = str(body.get("permission_mode") or "").strip()
         if requested_permission_mode:
             validated_permission_mode = require_permission_mode(requested_permission_mode)
@@ -7532,7 +7636,8 @@ async def read_skill(filename: str):
     }
 
 
-CONTEXT_COMPRESS_THRESHOLD = 0.65
+DEFAULT_AUTO_COMPACT_THRESHOLD = 0.95
+CONTEXT_COMPRESS_THRESHOLD = DEFAULT_AUTO_COMPACT_THRESHOLD
 CONTEXT_LIMITS = {
     "deepseek-v4-pro[1m]": 1000000,
     "deepseek-v4-flash": 128000,
@@ -7541,6 +7646,20 @@ CONTEXT_LIMITS = {
 
 def context_limit_for_model(model: str) -> int:
     return CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+
+
+def effective_auto_compact_threshold() -> float:
+    """Return the native Claude Code auto-compact threshold as a ratio."""
+    raw = env_value("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "").strip()
+    if not raw:
+        return DEFAULT_AUTO_COMPACT_THRESHOLD
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_AUTO_COMPACT_THRESHOLD
+    if value > 1:
+        value /= 100.0
+    return min(max(value, 0.5), 0.99)
 
 
 def context_revision(session: dict[str, Any]) -> str:
@@ -7598,7 +7717,7 @@ async def summarize_with_deepseek(
     if not api_key:
         raise ContextAdapterUnavailable("no external summary API key")
 
-    threshold = int(context_limit_for_model(model) * CONTEXT_COMPRESS_THRESHOLD)
+    threshold = int(context_limit_for_model(model) * effective_auto_compact_threshold())
     summary_prompt = compression_prompt(messages, existing_summary, threshold)
 
     try:

@@ -8,6 +8,9 @@ from unittest.mock import patch
 
 from agent_run_coordinator import ActiveRunExists, AgentRunCoordinator
 from agent_queue import AgentQueueStore
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server
 
 

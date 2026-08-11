@@ -8,6 +8,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import agent_run_coordinator as coordinator_module
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server
 from agent_run_coordinator import AgentRunCoordinator
 

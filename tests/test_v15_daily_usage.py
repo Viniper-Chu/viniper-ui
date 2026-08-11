@@ -11,6 +11,9 @@ from unittest.mock import patch
 
 import httpx
 
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server
 from agent_runtime import AgentRunSpec, RuntimeCapabilities, WslAgentRuntime
 from daily_usage import DailyUsageLedger, SOURCE, extract_usage
@@ -302,9 +305,9 @@ class AgentDailyUsageWiringTests(unittest.IsolatedAsyncioTestCase):
 class PermissionModeContractTests(unittest.TestCase):
     def test_desktop_permission_values_map_to_current_wsl_cli_aliases(self) -> None:
         expected = {
-            "default": ("手动", "Claude 在需要权限时暂停并询问"),
+            "default": ("询问权限", "Claude 在需要权限时暂停并询问"),
             "acceptEdits": ("自动接受编辑", "自动允许文件编辑，其他高风险操作仍会询问"),
-            "plan": ("计划", "先规划，减少直接执行动作"),
+            "plan": ("计划模式", "先规划，减少直接执行动作"),
         }
         options = {item["id"]: item for item in server.PERMISSION_MODE_OPTIONS}
         settings = {
@@ -336,8 +339,9 @@ class PermissionModeContractTests(unittest.TestCase):
                     command = runtime.build_command(spec)
                     index = command.index("--permission-mode")
                     self.assertEqual(command[index + 1], "manual" if mode == "default" else mode)
-            self.assertEqual(server.allowed_permission_mode("auto"), "default")
-            self.assertEqual(server.allowed_permission_mode("bypassPermissions"), "default")
+            self.assertEqual(server.allowed_permission_mode("auto"), "auto")
+            self.assertEqual(server.allowed_permission_mode("bypassPermissions"), "bypassPermissions")
+            self.assertEqual(server.allowed_permission_mode("dontAsk"), "dontAsk")
 
 
 class PermissionModeRequestBoundaryTests(unittest.IsolatedAsyncioTestCase):
@@ -377,9 +381,9 @@ class PermissionModeRequestBoundaryTests(unittest.IsolatedAsyncioTestCase):
             server.sessions.pop(session_id, None)
             server._session_locks.pop(session_id, None)
 
-        self.assertEqual([response.status_code for response in responses], [400, 400, 400])
-        self.assertTrue(all("permission" in response.json()["detail"].lower() for response in responses))
-        self.assertEqual(started, [])
+        self.assertEqual([response.status_code for response in responses], [400, 200, 200])
+        self.assertIn("permission", responses[0].json()["detail"].lower())
+        self.assertEqual(started, [session_id, session_id])
 
 
 if __name__ == "__main__":

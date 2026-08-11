@@ -8,6 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server
 
 

@@ -1,4 +1,4 @@
-# Viniper 5.0.1 Claude Desktop 风格设计真源
+# Viniper 5.0.2 Claude Desktop 风格设计真源
 
 状态：`APPROVED_REFERENCE / V17_PROTOCOL_REPAIR / RELEASE_AUTHORIZED_AFTER_ACCEPTANCE`
 
@@ -264,7 +264,7 @@ Viniper 是本地 agent shell 的安静桌面工作区。界面应让会话、�
 - 服务端为每个活动运行维护唯一 pending interaction，以 `session_id + request_id` 关联请求与回答。前端提交只能命中当前会话、当前请求且尚未回答的交互；重复、过期、串会话或停止后的回答必须明确拒绝，不能落到另一个 CLI 进程。
 - `AskUserQuestion` 卡片显示问题、简短 header、`当前题 / 总题数`、编号选项和说明；支持单选、多选、其他文本、上一步/下一步/提交/跳过（仅当上游允许）。方向键、数字键、Enter、Esc 与鼠标执行同一状态机。
 - 权限卡片显示真实工具名、操作摘要、目标路径/命令与工作目录；至少提供 `拒绝` 与 `仅本次允许`。只有 CLI 请求明确携带可持久化的权限建议且后端能原样回传时，才显示 `以后允许`；前端不得自行写 Claude 配置或把一次允许升级成整轮 `bypassPermissions`。
-- 权限模式由 session 真源保存，Desktop 顺序固定为 `Manual / Accept edits / Plan / Bypass permissions / Auto`，简体中文分别为“手动 / 自动接受编辑 / 计划 / 跳过权限 / 自动”。稳定持久值仍为 `default`，当前 CLI 暴露 `manual` 时仅在启动参数边界做 alias 映射。`bypassPermissions` 只有设置显式允许并且 CLI 的 allow/permission 参数真实生效时出现；`auto` 只有当前账号、模型、Provider 和 CLI 均真实支持且设置启用时出现，DeepSeek/第三方 Provider 默认 fail-closed；CLI-only `dontAsk` 永不进入 Desktop 选择器。现有 session 的选择彼此独立；非 Plan 选择按 workdir 记忆为后续新 session 初值，Plan 只作用于当前 session，均不覆盖已存在会话。
+- 权限模式由 session 真源保存，Viniper 菜单顺序固定为 `default (Manual) → acceptEdits (Accept edits) → plan (Plan) → auto (Auto) → bypassPermissions (Bypass permissions) → 分隔线 → dontAsk`，简体中文分别为“手动 / 自动接受编辑 / 计划 / 自动 / 跳过权限 / CLI 模式 · 不询问”。稳定持久值仍为 `default`，当前 CLI 暴露 `manual` 时仅在启动参数边界做 alias 映射。`auto` 即使在 DeepSeek/第三方 Provider 下也保持可发现但 disabled，并显示真实不支持原因；只有账号、模型、Provider、CLI 与设置 gate 全部满足时才可选。`bypassPermissions` 只有设置显式允许且 CLI 的 allow/permission 参数真实生效时才可选；`dontAsk` 是同一菜单中的 CLI-only 扩展，语义是未预批准工具自动拒绝，只有 CLI 能力存在时才可选并传真实 `--permission-mode dontAsk`，不伪装为 Desktop 官方模式。现有 session 的选择彼此独立；非 Plan 选择按 workdir 记忆为后续新 session 初值，Plan 只作用于当前 session，均不覆盖已存在会话。
 - 是否弹窗由 CLI 决定；自动允许或绕过模式没有真实请求时不得显示假卡。等待期间保持同一条流式连接与停止能力，composer 的新发送被禁用；用户提交成功后活跃卡立即退出可交互 Dock，内部保留 awaiting-ACK 状态；matching CLI ACK 成功后只留下紧凑历史结果，ACK 失败时才恢复不可操作的失败记录。
 - 点击停止必须终止对应 CLI、使 pending interaction 失效并把卡片标为已取消。应用刷新或后端重启导致进程不可恢复时，卡片显示已失效并允许重新发送任务，不能伪装继续执行。
 
@@ -447,7 +447,7 @@ Viniper 是本地 agent shell 的安静桌面工作区。界面应让会话、�
 - 双会话串卡红测：A 等待 Bash 权限→新建或切到 B→注入延迟 A interaction/ACK；B Dock 始终为空，A 权限/上下文/运行状态不变，切回 A 才恢复其真源。
 - 交互终态红测：提交成功即从活跃 Dock 收起；matching ACK 成功保持消失并生成一条紧凑记录，ACK 失败恢复不可操作失败记录；重复 ACK 幂等。
 - 权限模式回归：默认/接受编辑/计划仅在 fixture 真正发出控制请求时显示卡片；自动/绕过且没有控制请求时不显示任何假权限窗口。
-- 权限持久化回归：A=`plan`、B=`default`，切换、reload、resume 后仍各自保持；Auto 对 DeepSeek/第三方 Provider fail-closed；bypass 同时验证设置门、会话状态与实际 CLI 参数；`dontAsk` 不在 Desktop DOM。
+- 权限持久化回归：A=`plan`、B=`default`，切换、reload、resume 后仍各自保持；菜单 DOM 保留五档官方区、分隔线与 CLI-only `dontAsk`；Auto 对 DeepSeek/第三方 Provider 可见但 disabled 并给出真实原因；bypass 同时验证设置门、会话状态与实际 CLI 参数；dontAsk 验证真实 CLI 参数与能力 gate。
 - 原生压缩红测：真实 `current_usage`→`system/compact_boundary`→下一次 usage，逐 session 验证圆环和“正在压缩”；全链不得调用旧自动 `/api/compress`、不得更换 Claude session ID、不得触发摘要 Provider。
 - 图片块红测：assistant image、MCP tool_result image 与本地图片 artifact 可预览；无效 MIME/base64、超限数据和普通文本路径不能生成图片 DOM。
 - Claude 式顶部五项导航：菜单打开并执行动作、搜索检索并跳转会话/技能/命令、后退/前进跨会话和技能详情正确回放。

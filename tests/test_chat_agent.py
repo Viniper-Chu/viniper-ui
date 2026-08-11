@@ -18,6 +18,9 @@ RUNTIME_ROOT = ROOT / "codex" / "运行残留"
 RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(ROOT))
 
+from tests._isolation import configure_server_data_root
+
+configure_server_data_root()
 import server  # noqa: E402
 
 

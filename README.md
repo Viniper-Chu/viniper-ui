@@ -41,7 +41,7 @@ Provider 采用 Anthropic-compatible 配置：
 
 ## 用户数据与升级兼容
 
-正式 5.0.1 的可见品牌为 Viniper，但继续使用 4.x 的桌面 App ID 和兼容数据标识，避免升级后丢失历史：
+正式 5.0.2 的可见品牌为 Viniper，但继续使用 4.x 的桌面 App ID 和兼容数据标识，避免升级后丢失历史：
 
 - Windows 正式版：`%APPDATA%\Viniper UI`
 - Windows Preview：`%APPDATA%\Viniper Preview`（与正式版隔离）
@@ -75,7 +75,7 @@ python scripts/verify_release.py
 
 ```powershell
 python scripts/build_desktop.py --target win --skip-install
-python scripts/build_release.py --version 5.0.1 --repo Viniper-Chu/viniper-ui
+python scripts/build_release.py --version 5.0.2 --repo Viniper-Chu/viniper-ui
 python scripts/verify_release.py --require-windows-installer
 ```
 

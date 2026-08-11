@@ -297,11 +297,11 @@ async function runContractSurface() {
       const tick = (ms = 35) => new Promise((resolve) => setTimeout(resolve, ms));
       api.state.status = {
         permission_modes: [
-          { id: "default", label: "手动" },
+          { id: "default", label: "询问权限" },
           { id: "acceptEdits", label: "自动接受编辑" },
-          { id: "plan", label: "计划" },
+          { id: "plan", label: "计划模式" },
           { id: "bypassPermissions", label: "跳过权限" },
-          { id: "auto", label: "自动" },
+          { id: "auto", label: "自动模式" },
           { id: "dontAsk", label: "不询问" },
         ],
         runtime: { capabilities: { auto_permission: true } },
