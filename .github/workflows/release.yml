@@ -235,4 +235,6 @@ jobs:
           name: Viniper ${{ env.RELEASE_TAG }}
           body_path: release-artifacts/release-notes.md
           make_latest: true
-          overwrite_files: false
+          # Replace only same-name assets in this release so latest.json
+          # describes the bytes produced by this run; older releases remain.
+          overwrite_files: true

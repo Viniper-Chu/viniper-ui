@@ -272,6 +272,7 @@ class ReleaseEntryPointContractTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", source)
         self.assertIn("target_release_tag:", source)
         self.assertIn("build_ref:", source)
+        self.assertIn("overwrite_files: true", source)
         self.assertIn('required_asset(root / f"Viniper.Setup.{version}.exe")', source)
         self.assertIn('required_asset(root / f"Viniper.Setup.{version}.exe.blockmap")', source)
         self.assertIn('required_asset(root / f"Viniper.{version}-arm64-mac.zip")', source)
