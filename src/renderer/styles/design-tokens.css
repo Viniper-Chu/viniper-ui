@@ -1,0 +1,88 @@
+:root {
+  --titlebar-height: 48px;
+  --rail-width: 260px;
+  --context-width: 304px;
+  --canvas: #F4FAF9;
+  --surface: #FFFFFF;
+  --surface-soft: #F8FCFB;
+  --ice: #E6F5F7;
+  --mint: #DDF5EF;
+  --accent-main: #168A91;
+  --accent-bright: #22B8B5;
+  --accent-deep: #116B73;
+  --ink: #15343B;
+  --ink-secondary: #5E7478;
+  --ink-tertiary: #6F8588;
+  --line: #D7E7E5;
+  --line-strong: #B8D4D1;
+  --running: #168A91;
+  --waiting: #9A711A;
+  --failed: #B84655;
+  --cancelled: #849799;
+  --radius-sm: 7px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-menu: 0 16px 36px rgba(21, 52, 59, .16);
+  --shadow-dialog: 0 24px 72px rgba(21, 52, 59, .2);
+  --body-size: 16px;
+  --control-size: 14px;
+  --meta-size: 12px;
+
+  /* Phase 7 aliases retained for module and test compatibility. */
+  --workspace-canvas: var(--canvas);
+  --workspace-surface: var(--surface);
+  --workspace-surface-soft: var(--surface-soft);
+  --workspace-ice: var(--ice);
+  --workspace-mint: var(--mint);
+  --workspace-accent: var(--accent-main);
+  --workspace-accent-deep: var(--accent-deep);
+  --workspace-ink: var(--ink);
+  --workspace-ink-secondary: var(--ink-secondary);
+  --workspace-ink-tertiary: var(--ink-tertiary);
+  --workspace-line: var(--line);
+  --workspace-line-strong: var(--line-strong);
+  --workspace-danger: var(--failed);
+}
+
+* { box-sizing: border-box; }
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--canvas);
+}
+
+body {
+  color: var(--ink);
+  font-family: "Segoe UI Variable", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+select,
+input,
+textarea { font: inherit; }
+
+button,
+select,
+input,
+textarea { color: inherit; }
+
+button { cursor: pointer; }
+
+button:disabled,
+select:disabled,
+input:disabled,
+textarea:disabled { cursor: not-allowed; }
+
+small,
+.section-kicker,
+.eyebrow,
+.session-meta,
+.context-item small,
+.inspector-note { font-size: 12px; }

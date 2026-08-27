@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title>Viniper workstation Harness V</title>
+  <rect width="64" height="64" rx="24" fill="#DDF5EF"/>
+  <path d="M15 16h10l7 22 7-22h10L37 49h-10L15 16Z" fill="#116B73"/>
+  <path d="M19 16h6l7 22-3 8-10-30Z" fill="#22B8B5" opacity=".85"/>
+</svg>

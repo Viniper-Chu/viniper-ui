@@ -1,0 +1,134 @@
+@import url("./v016-viniper-shell.css");
+
+/* v0.17: a denser Viniper workbench. The three-pane shell stays canonical;
+   typography, empty-state hierarchy and context usage are brought forward. */
+:root {
+  --rail-width: 300px;
+  --titlebar-height: 52px;
+  --viniper-canvas: #fbfdfd;
+  --viniper-rail: #f3f8f7;
+  --viniper-hover: #e9f5f3;
+  --viniper-border: #d3e4e2;
+  --viniper-text: #102f35;
+  --viniper-muted: #60777b;
+}
+
+body { font-size: 16px; }
+.app-titlebar { background: rgba(251, 253, 253, .98); }
+.titlebar-leading { padding-left: 12px; }
+.titlebar-brand { gap: 9px; }
+.titlebar-brand .brand-mark { width: 34px; height: 34px; flex-basis: 34px; border-radius: 13px; }
+.titlebar-brand strong { max-width: 170px; font-size: 16px; letter-spacing: -.015em; }
+.menu-trigger, .titlebar-action, .titlebar-icon { width: 36px; min-width: 36px; height: 36px; border-radius: 10px; }
+.menu-trigger .ui-icon, .titlebar-action .ui-icon { width: 18px; height: 18px; }
+.window-controls button { width: 44px; height: var(--titlebar-height); }
+
+/* The rail is readable at desktop distance without turning into a dashboard. */
+.sidebar { padding: 14px 12px 10px; }
+.sidebar-quick-grid { gap: 4px; padding-bottom: 12px; }
+.sidebar-quick-action { height: 54px; border-radius: 11px; }
+.sidebar-quick-action .ui-icon { width: 19px; height: 19px; }
+.sidebar-quick-action span { font-size: 13px; font-weight: 620; }
+.session-rail-heading { min-height: 42px; font-size: 16px; }
+.session-rail-heading > span { font-size: 13px; }
+.session-rail-heading button { width: 30px; height: 30px; }
+.session-search { height: 42px; padding-inline: 12px; border-radius: 12px; }
+.session-search input { font-size: 14px; }
+.session-filter-drawer summary, .session-group-label { font-size: 13px; }
+.session-group-label { padding: 14px 10px 5px; }
+.session-item { min-height: 62px; border-radius: 12px; }
+.session-main { padding-block: 9px; }
+.session-title { font-size: 15px; font-weight: 670; }
+.session-meta { font-size: 12px; }
+.session-action, .session-action-remove { width: 29px; height: 29px; border-radius: 8px; }
+.sidebar-footer-row { min-height: 44px; padding-top: 7px; }
+.sidebar-notification { font-size: 13px; }
+.sidebar-settings-button { width: 36px; height: 36px; flex-basis: 36px; border-radius: 10px; }
+
+/* One focused conversation surface. */
+.session-header { min-height: 74px; padding: 0 24px 0 30px; }
+.current-session-identity { gap: 2px; }
+.session-title-button h1 { font-size: 22px; letter-spacing: -.025em; }
+.session-path { max-width: min(640px, 54vw); font-size: 13px; }
+.session-header-tools { gap: 7px; }
+.header-icon { width: 38px; height: 38px; border-radius: 11px; }
+.header-icon .ui-icon { width: 18px; height: 18px; }
+.conversation { padding: 30px clamp(24px, 6vw, 96px) 30px; }
+.message-list { width: min(900px, 100%); }
+.message { margin-bottom: 30px; }
+.message.user { max-width: min(760px, 88%); padding: 12px 15px; border-radius: 15px 15px 5px 15px; }
+.message-heading { font-size: 13px; }
+.message-heading strong { font-size: 14px; }
+.message-text { font-size: 16px; line-height: 1.75; }
+
+/* Calm cold-start surface: identity, one promise, one real session metric. */
+.empty-state { width: 100%; min-height: 100%; color: var(--viniper-muted); }
+.empty-stage {
+  width: min(540px, calc(100% - 36px));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  margin: clamp(42px, 10vh, 104px) auto 0;
+  text-align: center;
+}
+.empty-stage-mark { position: relative; width: 90px; height: 58px; display: flex; align-items: center; justify-content: flex-start; }
+.empty-stage-mark img { width: 46px; height: 46px; border-radius: 16px; }
+.empty-stage-flow { position: absolute; left: 46px; top: 27px; width: 44px; height: 1px; background: #b7d8d5; }
+.empty-stage-flow i { position: absolute; top: -3px; width: 7px; height: 7px; border: 2px solid var(--viniper-canvas); border-radius: 50%; background: #2aa6a5; }
+.empty-stage-flow i:nth-child(1) { left: 3px; }
+.empty-stage-flow i:nth-child(2) { left: 19px; background: #78c9c4; }
+.empty-stage-flow i:nth-child(3) { right: 0; background: #b7d8d5; }
+.empty-stage h2 { margin: 20px 0 0; color: #0b343b; font-size: 28px; line-height: 1.25; letter-spacing: -.035em; }
+.empty-stage p { margin: 9px 0 0; color: var(--viniper-muted); font-size: 15px; }
+.empty-token-status {
+  width: min(430px, 100%);
+  min-height: 54px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 30px;
+  padding: 9px 12px 9px 15px;
+  border: 1px solid var(--viniper-border);
+  border-radius: 14px;
+  color: var(--viniper-muted);
+  background: #f6faf9;
+  text-align: left;
+}
+.empty-token-status:hover, .empty-token-status:focus-visible { border-color: #8fc7c4; color: #174c52; background: #eef8f6; }
+.empty-token-status > span { color: #4e696d; font-size: 13px; font-weight: 650; }
+.empty-token-status strong { min-width: 0; color: #123b41; font-size: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.empty-token-status small { max-width: 150px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.empty-token-status .ui-icon { width: 17px; height: 17px; }
+
+/* The composer is the primary control, with Viniper's compact context ring. */
+.composer-region { padding: 10px clamp(20px, 5vw, 76px) 20px; }
+.composer { max-width: 960px; padding: 13px 14px 12px; border-radius: 16px; box-shadow: 0 12px 36px rgba(18, 73, 78, .08); }
+.composer textarea { min-height: 58px; font-size: 16px; line-height: 1.62; }
+.composer-context { font-size: 12px; }
+.composer-controls { gap: 7px; }
+.composer-controls select { height: 38px; max-width: 190px; border-radius: 10px; font-size: 14px; }
+#permissionSelect { min-width: 116px; }
+.usage-trigger { width: 38px; min-width: 38px; height: 38px; min-height: 38px; justify-content: center; padding: 0; border: 0; border-radius: 50%; background: transparent; }
+.usage-trigger:hover, .usage-trigger[aria-expanded="true"] { background: #eaf6f5; }
+.usage-ring { width: 29px; height: 29px; flex-basis: 29px; font-size: 12px; }
+.usage-trigger-copy { display: none; }
+.send-button { width: 40px; min-width: 40px; min-height: 40px; border-radius: 11px; }
+.cancel-button { min-height: 38px; border-radius: 10px; }
+.token-usage-popover { right: clamp(72px, 7vw, 118px); bottom: 88px; }
+
+@media (max-width: 900px) {
+  :root { --rail-width: 276px; }
+  .session-header { padding-inline: 18px; }
+  .session-path { max-width: 40vw; }
+  .composer-region { padding-inline: 16px; }
+}
+
+@media (max-width: 760px) {
+  .empty-stage { margin-top: 42px; }
+  .empty-stage h2 { font-size: 24px; }
+  .empty-token-status { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .empty-token-status small { display: none; }
+  .session-path { max-width: 52vw; }
+  .composer-controls select { max-width: 150px; }
+}

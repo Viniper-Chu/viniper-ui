@@ -1,0 +1,74 @@
+/* Compatibility layer: the v0.12 shell owns the visual system in app.css. */
+.phase7-legacy-surface { display: contents; }
+
+/* v0.13 command workbench: a real AppShell view, not a permanent empty card. */
+.app-view { min-width: 0; min-height: 0; display: flex; flex: 1; flex-direction: column; overflow: hidden; }
+.app-view.hidden { display: none !important; }
+.view-tabs { min-width: 0; display: inline-flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-soft); }
+.view-tab { min-height: 32px; padding: 0 9px; border: 0; border-radius: 6px; color: var(--ink-secondary); background: transparent; font-size: 14px; white-space: nowrap; }
+.view-tab:hover, .view-tab:focus-visible { color: var(--ink); background: var(--ice); }
+.view-tab.active { color: var(--ink); background: var(--surface); box-shadow: 0 1px 3px rgba(21, 52, 59, .1); }
+.terminal-view { background: var(--canvas); }
+.terminal-view-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding: 24px 26px 16px; border-bottom: 1px solid var(--line); background: var(--canvas); }
+.terminal-view-heading h2 { margin-top: 4px; color: var(--ink); font-size: 24px; line-height: 1.25; }
+.terminal-view-heading p { max-width: 620px; margin-top: 6px; color: var(--ink-secondary); font-size: 14px; line-height: 1.5; }
+.terminal-view-heading > .command-workbench-status { flex: 0 0 auto; margin-top: 28px; color: var(--accent-deep); font-size: 12px; white-space: nowrap; }
+.terminal-status-bar { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, 1fr) auto; gap: 0; padding: 0 26px; border-bottom: 1px solid var(--line); background: var(--canvas); }
+.terminal-status-bar > div, .terminal-token-button { min-width: 0; min-height: 58px; display: flex; flex-direction: column; justify-content: center; gap: 3px; padding: 8px 11px; border: 0; border-right: 1px solid var(--line); color: var(--ink-secondary); background: var(--canvas); text-align: left; }
+.terminal-status-bar small { color: var(--ink-tertiary); font-size: 12px; }
+.terminal-status-bar strong { overflow: hidden; color: var(--ink); font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-capability-line { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 8px 26px; border-bottom: 1px solid var(--line); color: var(--ink-secondary); background: var(--surface); font-size: 12px; }
+.terminal-capability-line span { min-width: 0; }
+.terminal-token-button { min-width: 86px; border-left: 1px solid var(--line); cursor: pointer; }
+.terminal-token-button:hover, .terminal-token-button:focus-visible { color: var(--accent-deep); background: var(--ice); }
+.terminal-token-button strong { color: var(--accent-deep); }
+.command-workbench { min-width: 0; min-height: 0; display: flex; flex: 1; flex-direction: column; padding: 18px 26px 22px; background: var(--canvas); }
+.command-workbench-head { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.command-workbench-head h3 { margin-top: 3px; color: var(--ink); font-size: 18px; }
+.terminal-stream-status { color: var(--ink-tertiary); font-size: 12px; }
+.terminal-stream { min-height: 0; display: flex; flex: 1; flex-direction: column; gap: 8px; padding: 14px 0 4px; overflow: auto; }
+.command-workbench-empty { max-width: 620px; margin: auto; color: var(--ink-tertiary); font-size: 15px; line-height: 1.6; text-align: center; }
+.terminal-stream-row { min-width: 0; display: grid; grid-template-columns: 15px minmax(0, 1fr); gap: 9px; padding: 11px 0; border-bottom: 1px solid var(--line); }
+.terminal-stream-row:last-child { border-bottom: 0; }
+.terminal-stream-marker { padding-top: 5px; color: var(--accent-main); font: 700 16px/1 ui-monospace, "Cascadia Mono", monospace; }
+.terminal-stream-row.failed .terminal-stream-marker { color: var(--failed); }
+.terminal-stream-row.waiting .terminal-stream-marker { color: var(--waiting); }
+.terminal-stream-body { min-width: 0; }
+.terminal-stream-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.terminal-stream-heading strong { min-width: 0; overflow: hidden; color: var(--ink); font-size: 15px; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-stream-heading span { flex: 0 0 auto; color: var(--ink-tertiary); font-size: 12px; }
+.terminal-stream-body > p { margin-top: 4px; color: var(--ink-secondary); font-size: 14px; line-height: 1.45; }
+.terminal-output { min-width: 0; margin-top: 9px; padding: 8px 10px; border-left: 2px solid var(--accent-main); background: var(--surface); }
+.terminal-output.stderr { border-left-color: var(--failed); }
+.terminal-output.continued { background: var(--ice); }
+.terminal-output-label, .terminal-output-more { display: inline-block; color: var(--ink-tertiary); font-size: 12px; }
+.terminal-output-more { margin-left: 8px; color: var(--accent-deep); }
+.terminal-output code { display: block; max-height: 150px; margin-top: 6px; overflow: auto; color: var(--ink); font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.terminal-output-continue { min-height: 32px; margin-top: 8px; font-size: 14px; }
+
+@media (max-width: 1179px) {
+  .terminal-view-heading, .command-workbench { padding-inline: 20px; }
+  .terminal-status-bar { padding-inline: 20px; }
+  .terminal-capability-line { padding-inline: 20px; }
+}
+
+@media (max-width: 860px) {
+  .command-status { flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+  .view-tabs { order: 3; width: 100%; justify-content: stretch; }
+  .view-tab { flex: 1; }
+  .terminal-view-heading { padding-top: 18px; }
+  .terminal-view-heading > .command-workbench-status { margin-top: 4px; text-align: right; white-space: normal; }
+  .terminal-status-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); padding-inline: 16px; }
+  .terminal-token-button { border-left: 0; border-top: 1px solid var(--line); }
+  .terminal-status-bar > div:nth-child(3), .terminal-token-button { border-top: 1px solid var(--line); }
+  .terminal-view-heading, .command-workbench { padding-inline: 16px; }
+  .terminal-capability-line { padding-inline: 16px; }
+}
+
+@media (max-width: 560px) {
+  .terminal-view-heading { display: block; }
+  .terminal-view-heading > .command-workbench-status { display: block; margin-top: 10px; text-align: left; }
+  .terminal-status-bar { grid-template-columns: 1fr; }
+  .terminal-status-bar > div:nth-child(2), .terminal-status-bar > div:nth-child(3), .terminal-token-button { border-top: 1px solid var(--line); }
+  .terminal-stream-heading { align-items: flex-start; flex-direction: column; gap: 3px; }
+}

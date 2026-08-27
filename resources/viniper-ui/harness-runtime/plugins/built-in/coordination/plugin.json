@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 1,
+  "id": "built-in.coordination",
+  "name": "内置会话协作",
+  "version": "1.0.0",
+  "capabilities": ["session-message", "task-delegation"],
+  "skills": [],
+  "tools": ["coordination.send-message", "coordination.delegate-task", "coordination.wait-for-result", "coordination.read-result"],
+  "providers": []
+}

@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 1,
+  "id": "example.declarative",
+  "name": "声明式示例插件",
+  "version": "1.0.0",
+  "capabilities": ["metadata-only"],
+  "skills": [],
+  "tools": ["example.untrusted-tool"],
+  "providers": []
+}

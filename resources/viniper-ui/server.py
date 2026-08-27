@@ -1,0 +1,9961 @@
+import asyncio
+import base64
+import copy
+import difflib
+import http.client
+import httpx
+import inspect
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import uuid
+import zipfile
+from pathlib import Path
+from typing import Any
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+from context_lifecycle import (
+    ContextAdapterUnavailable,
+    ContextLifecycle,
+    ExternalSummaryAdapter,
+    NativeContextAdapter,
+)
+from context_usage import ContextUsageLedger, ContextUsageSnapshot
+from daily_usage import DailyUsageLedger, merge_turn_usage
+from agent_runtime import (
+    AUTO_COMPACT_WINDOW_ENV,
+    AgentRunSpec,
+    DEFAULT_AUTO_COMPACT_WINDOW,
+    MANAGED_DISTRO_NAME,
+    MANAGED_DISTRO_USER,
+    RuntimeProbe,
+    WindowsNativeRuntime,
+    WslAgentRuntime,
+    resolve_autocompact_window,
+    stable_session_name,
+)
+from agent_instructions import AgentInstructionsStore
+from agent_host_bridge import (
+    MCP_RESPONSE_ACK_STAGE,
+    PERMISSION_PROMPT_MCP_QUALIFIED_TOOL,
+    HostInteractionChannel,
+    build_hook_response,
+    build_hook_settings,
+    build_passive_hook_settings,
+    build_permission_prompt_mcp_config,
+    build_permission_prompt_response,
+)
+from agent_queue import AgentQueueStore
+from agent_run_coordinator import (
+    ActiveRunExists,
+    AgentRunCoordinator,
+    AgentRunJournal,
+    DurableInteractionStore,
+)
+from native_peer import ClaudeCrossSessionAdapter, NativePeerMessaging, build_native_send_instruction
+from skill_sync import localized_skill_fields
+from wsl_runtime import RuntimeUpdateCoordinator, WslRuntimeProvisioner
+from harness_application_port import HarnessApplicationPort
+
+
+PROFILE_NAME = "agent-shell"
+VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+RELEASE_REVISION_FILE = VERSION_FILE.with_name("RELEASE_REVISION")
+PROFILE_FILE = Path(__file__).resolve().parent / "profiles.json"
+
+
+def read_profile_config() -> dict[str, Any]:
+    try:
+        data = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def env_value(name: str, default: str = "") -> str:
+    return os.environ.get(name, default)
+
+
+def read_app_version() -> str:
+    env_version = env_value("VINIPER_UI_VERSION", "").strip()
+    if env_version:
+        return env_version
+    try:
+        return VERSION_FILE.read_text(encoding="utf-8").strip() or "1.6.0"
+    except Exception:
+        return "1.6.0"
+
+
+def read_release_revision() -> int:
+    raw = env_value("VINIPER_UI_RELEASE_REVISION", "").strip()
+    if not raw:
+        try:
+            raw = RELEASE_REVISION_FILE.read_text(encoding="utf-8").strip()
+        except OSError:
+            return 0
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 0
+
+
+APP_VERSION = read_app_version()
+APP_RELEASE_REVISION = read_release_revision()
+PROFILE_CONFIG = read_profile_config()
+REQUESTED_PROFILE = env_value("VINIPER_UI_PROFILE", "").strip().lower()
+PREVIEW_MODE = REQUESTED_PROFILE == "preview" or (
+    REQUESTED_PROFILE != "stable"
+    and (env_value("VINIPER_UI_PREVIEW", "").strip() == "1" or VERSION_FILE.with_name("PREVIEW").exists())
+)
+STABLE_MODE = REQUESTED_PROFILE == "stable"
+WORKSTATION_MODE = PREVIEW_MODE or STABLE_MODE
+PREVIEW_PROFILE = PROFILE_CONFIG.get("preview", {})
+if not isinstance(PREVIEW_PROFILE, dict):
+    PREVIEW_PROFILE = {}
+STABLE_PROFILE = PROFILE_CONFIG.get("stable", {})
+if not isinstance(STABLE_PROFILE, dict):
+    STABLE_PROFILE = {}
+ACTIVE_PROFILE_CONFIG = STABLE_PROFILE if STABLE_MODE else PREVIEW_PROFILE if PREVIEW_MODE else {}
+APP_TITLE = str(ACTIVE_PROFILE_CONFIG.get("product_name") or ("Viniper Preview" if PREVIEW_MODE else "Viniper"))
+ACTIVE_PROFILE = "stable" if STABLE_MODE else "preview" if PREVIEW_MODE else "formal-runtime"
+RELEASE_STAGE = "Stable" if STABLE_MODE else "Preview" if PREVIEW_MODE else "Legacy"
+ASSET_VERSION = env_value("VINIPER_UI_ASSET_VERSION", "").strip() or APP_VERSION
+MODE_VINIPER = "viniper"
+MODE_CLAUDE = "claude"
+SESSION_MODES = {MODE_VINIPER, MODE_CLAUDE}
+LEGACY_SESSION_MODE_MAP = {"chat": MODE_VINIPER, "agent": MODE_CLAUDE}
+CLAUDE_NATIVE_COMMAND_VERSION = "2.1.234"
+CLAUDE_NATIVE_COMMAND_NAMES = (
+    "add-dir", "agents", "background", "branch", "btw", "clear", "color", "compact",
+    "config", "context", "copy", "diff", "doctor", "effort", "exit", "export", "fast",
+    "feedback", "focus", "fork", "goal", "help", "hooks", "ide", "init", "insights",
+    "keybindings", "login", "logout", "mcp", "memory", "mobile", "model", "permissions",
+    "plugin", "powerup", "recap", "release-notes", "reload-plugins", "reload-skills", "rename",
+    "resume", "review", "rewind", "security-review", "skills", "status", "statusline", "tasks",
+    "theme", "ui", "usage", "workflows",
+)
+
+
+def normalize_session_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in SESSION_MODES:
+        return raw
+    return MODE_VINIPER
+
+
+def normalize_loaded_session_mode(value: Any) -> str:
+    """One-time disk migration seam for retired session mode names."""
+    raw = str(value or "").strip().lower()
+    return raw if raw in SESSION_MODES else LEGACY_SESSION_MODE_MAP.get(raw, MODE_VINIPER)
+
+
+def require_canonical_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw not in SESSION_MODES:
+        raise HTTPException(status_code=400, detail="mode must be viniper or claude")
+    return raw
+VINIPER_PERMISSION_MODE_OPTIONS = [
+    {
+        "id": "ask",
+        "label": "每次询问",
+        "description": "每个有副作用工具都人工批准",
+    },
+    {
+        "id": "review",
+        "label": "规划自动审核",
+        "description": "先生成结构化计划；项目内受控动作审核通过后自动执行，越界/高风险直接拒绝",
+    },
+    {
+        "id": "fullAccess",
+        "label": "完全访问",
+        "description": "已注册通用工具在产品边界内自动执行，不弹人工批准",
+    },
+]
+CLAUDE_PERMISSION_MODE_OPTIONS = [
+    {
+        "id": "default",
+        "label": "询问权限",
+        "description": "Claude Code CLI 在需要权限时暂停并询问",
+    },
+    {
+        "id": "acceptEdits",
+        "label": "自动接受编辑",
+        "description": "Claude Code CLI 自动允许文件编辑，其他高风险操作仍会询问",
+    },
+    {
+        "id": "plan",
+        "label": "计划模式",
+        "description": "Claude Code CLI 先规划，减少直接执行动作",
+    },
+]
+VINIPER_PERMISSION_MODE_IDS = {item["id"] for item in VINIPER_PERMISSION_MODE_OPTIONS}
+CLAUDE_PERMISSION_MODE_IDS = {item["id"] for item in CLAUDE_PERMISSION_MODE_OPTIONS}
+# Compatibility union for older persisted settings. New consumers must use
+# permission_ids_for_mode() so engine-owned choices never share a state model.
+PERMISSION_MODE_IDS = VINIPER_PERMISSION_MODE_IDS | CLAUDE_PERMISSION_MODE_IDS | {
+    "manual", "auto", "full", "dontAsk", "bypassPermissions",
+}
+DEFAULT_PERMISSION_MODE = env_value("VINIPER_UI_PERMISSION_MODE", "ask")
+
+
+def permission_options_for_mode(mode: str = MODE_CLAUDE) -> list[dict[str, Any]]:
+    return VINIPER_PERMISSION_MODE_OPTIONS if normalize_session_mode(mode) == MODE_VINIPER else CLAUDE_PERMISSION_MODE_OPTIONS
+
+
+def permission_ids_for_mode(mode: str = MODE_CLAUDE) -> set[str]:
+    return VINIPER_PERMISSION_MODE_IDS if normalize_session_mode(mode) == MODE_VINIPER else CLAUDE_PERMISSION_MODE_IDS
+
+
+def migrate_permission_mode(value: Any, mode: str = MODE_CLAUDE) -> str | None:
+    """Canonicalize a persisted choice without sharing engine semantics."""
+    raw = str(value or "").strip()
+    if normalize_session_mode(mode) == MODE_VINIPER:
+        return {
+            "ask": "ask",
+            "manual": "ask",
+            "default": "ask",
+            "review": "review",
+            "auto": "review",
+            "acceptEdits": "review",
+            "plan": "review",
+            "full": "fullAccess",
+            "fullAccess": "fullAccess",
+            "bypassPermissions": "fullAccess",
+        }.get(raw)
+    return {
+        "default": "default",
+        "ask": "default",
+        "manual": "default",
+        "acceptEdits": "acceptEdits",
+        "auto": "acceptEdits",
+        "plan": "plan",
+    }.get(raw)
+CLAUDE_REQUIRED_OPTIONS = [
+    "-p",
+    "--output-format",
+    "--include-partial-messages",
+    "--include-hook-events",
+    "--model",
+    "--session-id",
+    "--resume",
+    "--permission-mode",
+    "--allow-dangerously-skip-permissions",
+    "--fallback-model",
+    "--name",
+    "--append-system-prompt",
+    "--add-dir",
+    "--settings",
+    "--mcp-config",
+    "--permission-prompt-tool",
+    "--verbose",
+]
+CLAUDE_REQUIRED_PERMISSION_MODES = [
+    "default",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "bypassPermissions",
+    "dontAsk",
+]
+RUN_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_RUN_TIMEOUT", "0"))
+HEARTBEAT_INTERVAL_SECONDS = int(env_value("VINIPER_UI_HEARTBEAT_INTERVAL", "15"))
+NO_OUTPUT_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_NO_OUTPUT_TIMEOUT", str(40 * 60)))
+CLI_INTERACTION_ACK_TIMEOUT_SECONDS = float(env_value("VINIPER_UI_CLI_ACK_TIMEOUT", "30"))
+CLI_ACK_TIMEOUT_FAILURE_MESSAGE = "用户已允许，但 CLI 未确认；请求未执行或状态未知。"
+HOST_HOOK_COMPATIBILITY_GRACE_SECONDS = float(env_value("VINIPER_UI_HOOK_COMPAT_GRACE", "0.35"))
+MODEL_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_MODEL_IDLE_TIMEOUT", str(25 * 60)))
+MODEL_STALL_RECOVERY_ATTEMPTS = int(env_value("VINIPER_UI_MODEL_STALL_RECOVERY_ATTEMPTS", "2"))
+GUI_COMMAND_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_GUI_COMMAND_TIMEOUT", "0"))
+ACTION_TASK_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_ACTION_IDLE_TIMEOUT", "0"))
+SAFETY_GUARDS_ENABLED = env_value("VINIPER_UI_SAFETY_GUARDS", "0") == "1"
+TOOL_RESULT_DISPLAY_LIMIT = int(env_value("VINIPER_UI_TOOL_RESULT_LIMIT", "8000"))
+STREAM_READ_CHUNK_SIZE = max(
+    4096,
+    int(env_value("VINIPER_UI_STREAM_READ_CHUNK_SIZE", str(64 * 1024))),
+)
+MAX_ATTACHMENT_BYTES = int(env_value("VINIPER_UI_MAX_ATTACHMENT_BYTES", str(50 * 1024 * 1024)))
+MAX_ATTACHMENT_TOTAL_BYTES = int(env_value("VINIPER_UI_MAX_ATTACHMENT_TOTAL_BYTES", str(100 * 1024 * 1024)))
+MAX_RENDER_IMAGE_BYTES = int(env_value("VINIPER_UI_MAX_RENDER_IMAGE_BYTES", str(10 * 1024 * 1024)))
+SUPPORTED_RENDER_IMAGE_MIME_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+}
+IMAGE_SUFFIX_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+UPDATE_SOURCE_FILE = VERSION_FILE.with_name("update_source.json")
+UPDATE_MANIFEST_URL_ENV = env_value("VINIPER_UI_UPDATE_MANIFEST_URL", "").strip()
+UPDATE_REPOSITORY_ENV = env_value("VINIPER_UI_UPDATE_REPO", "").strip()
+UPDATE_HTTP_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_UPDATE_TIMEOUT", "45"))
+UPDATE_DOWNLOAD_RETRIES = int(env_value("VINIPER_UI_UPDATE_RETRIES", "5"))
+UPDATE_DOWNLOAD_CHUNK_SIZE = max(64 * 1024, int(env_value("VINIPER_UI_UPDATE_CHUNK_SIZE", str(1024 * 1024))))
+DEFAULT_CONTEXT_LIMIT = 128000
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
+LEGACY_DEEPSEEK_BASE_URLS = {
+    "http://127.0.0.1:57322",
+    "http://localhost:57322",
+}
+MODEL_OPTIONS = [
+    {
+        "id": "deepseek-v4-pro[1m]",
+        "label": "DeepSeek V4 Pro",
+        "description": "复杂编码与长上下文工作",
+        "context": 1000000,
+    },
+    {
+        "id": "deepseek-v4-flash",
+        "label": "DeepSeek V4 Flash",
+        "description": "更快完成日常工作",
+        "context": 128000,
+    },
+]
+PROVIDER_MODE_IDS = (MODE_VINIPER, MODE_CLAUDE)
+MODE_SECRET_REFS = {
+    MODE_VINIPER: "provider.deepseek",
+    MODE_CLAUDE: "provider.anthropic.api-key",
+}
+DEFAULT_AGENT_BASE_URL = DEFAULT_DEEPSEEK_BASE_URL
+SHELL_OPTIONS = [
+    {
+        "id": "claude-code",
+        "label": "Claude Code",
+        "description": "使用 Claude Code CLI 作为 Agent 执行壳。",
+        "available": True,
+    },
+    {
+        "id": "custom-cli",
+        "label": "自定义 CLI",
+        "description": "通过标准输入输出运行本地 Agent CLI，并从标准输入发送任务。",
+        "available": True,
+    },
+]
+LANGUAGE_OPTIONS = [
+    {"id": "zh-CN", "label": "简体中文"},
+    {"id": "en-US", "label": "English"},
+]
+THEME_OPTIONS = [
+    {"id": "system", "label": "跟随系统"},
+    {"id": "light", "label": "浅色"},
+    {"id": "dark", "label": "深色"},
+]
+FONT_SIZE_OPTIONS = [
+    {"id": "xs", "label": "更小"},
+    {"id": "sm", "label": "小"},
+    {"id": "normal", "label": "标准"},
+    {"id": "lg", "label": "大"},
+    {"id": "xl", "label": "更大"},
+]
+
+MOJIBAKE_MARKERS = (
+    "\ufffd",
+    "\u00c2",
+    "\u00c3",
+    "\u00c5",
+    "\u00c6",
+    "\u00c7",
+    "\u00c8",
+    "\u00c9",
+    "\u00e2",
+    "\u00e4",
+    "\u00e5",
+    "\u00e6",
+    "\u00e7",
+    "\u00e8",
+    "\u00e9",
+    "\u00ef",
+    "\u2018",
+    "\u2019",
+    "\u201c",
+    "\u201d",
+    "\u2026",
+    "\u2030",
+)
+GBK_MOJIBAKE_MARKERS = (
+    "\u59dd",
+    "\u6d93",
+    "\u95c7",
+    "\u7039",
+    "\u7487",
+    "\u9359",
+    "\u934f",
+    "\u95c8",
+    "\u7e43",
+    "\u7eeb",
+    "\u9365",
+    "\u9436",
+    "\u93b4",
+    "\u951b",
+    "\u951f",
+    "\u69b4",
+    "\u6fb6",
+    "\u6fa7",
+    "\u93c2",
+)
+
+APP_DIR = Path(__file__).resolve().parent
+BASE_DIR = APP_DIR.parent
+STATIC_DIR = APP_DIR / "static"
+PROJECT_SKILLS_DIR = BASE_DIR / ".claude" / "skills"
+VINIPER_SKILL_SOURCE_ROOTS = [
+    APP_DIR / ".agents" / "skills",
+    BASE_DIR / ".agents" / "skills",
+    Path.home() / ".codex" / "skills",
+    Path.home() / ".agents" / "skills",
+]
+CLAUDE_SKILL_SOURCE_ROOTS = [
+    Path.home() / ".claude" / "skills",
+    PROJECT_SKILLS_DIR,
+    APP_DIR / ".claude" / "skills",
+]
+PROJECT_SKILLS_DIRS = VINIPER_SKILL_SOURCE_ROOTS
+SKILL_SOURCE_ROOTS = [
+    ("project-app-agents", APP_DIR / ".agents" / "skills"),
+    ("project-agents", BASE_DIR / ".agents" / "skills"),
+    ("global-codex", Path.home() / ".codex" / "skills"),
+    ("global-agents", Path.home() / ".agents" / "skills"),
+]
+CLAUDE_SKILL_ROOTS = [
+    ("global-claude", Path.home() / ".claude" / "skills"),
+    ("project-claude", PROJECT_SKILLS_DIR),
+    ("project-app-claude", APP_DIR / ".claude" / "skills"),
+]
+GOAL_SKILL_COMMAND = "dbs-goal"
+USER_CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+LEGACY_DATA_DIR = APP_DIR / "data"
+
+
+def platform_default_workspace_root() -> Path:
+    configured = env_value("VINIPER_UI_DEFAULT_WORKSPACE_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if os.name == "nt":
+        for letter in ("D", "C"):
+            root = Path(f"{letter}:/")
+            if root.exists() and root.is_dir():
+                return root
+    return Path.home()
+
+
+def normalize_existing_dir(value: Any, fallback: Path | None = None) -> str:
+    fallback_path = fallback or platform_default_workspace_root()
+    text = str(value or "").strip()
+    if not text:
+        return str(fallback_path)
+    path = Path(text).expanduser()
+    try:
+        if path.exists() and path.is_dir():
+            return str(path.resolve())
+    except Exception:
+        pass
+    return str(fallback_path)
+
+
+def default_data_dir() -> Path:
+    configured = env_value("VINIPER_UI_DATA_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if WORKSTATION_MODE:
+        data_dir_name = str(ACTIVE_PROFILE_CONFIG.get("data_dir_name") or "Viniper workstation Preview")
+        if os.name == "nt":
+            base = os.environ.get("APPDATA")
+            if base:
+                return Path(base) / data_dir_name
+        if sys.platform == "darwin":
+            return Path.home() / "Library" / "Application Support" / data_dir_name
+        return Path.home() / ".local" / "share" / data_dir_name.lower().replace(" ", "-")
+    if os.name == "nt":
+        base = os.environ.get("APPDATA")
+        if base:
+            return Path(base) / "Viniper UI"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Viniper UI"
+    return Path.home() / ".local" / "share" / "viniper-ui"
+
+
+DATA_DIR = default_data_dir()
+ATTACHMENTS_DIR = DATA_DIR / "attachments"
+SESSIONS_FILE = DATA_DIR / "sessions.json"
+AGENT_QUEUE_FILE = DATA_DIR / "runtime" / "agent-queue.json"
+AGENT_RUN_JOURNAL_FILE = DATA_DIR / "runtime" / "agent-runs.json"
+INTERACTION_STATE_FILE = DATA_DIR / "runtime" / "interaction-state.json"
+GOALS_FILE = DATA_DIR / "goals.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+KNOWN_WORK_DIRS = [
+    BASE_DIR,
+]
+
+# These are the two retired Harness work roots whose sessions were migrated
+# into the current Harness SQLite domain.  They are deliberately matched as
+# exact normalized paths so current Workstation sessions (including a
+# Workstation install path) are never projected as legacy records.
+LEGACY_HARNESS_WORKDIRS = {
+    os.path.normcase(os.path.normpath(r"D:\Agent")),
+    os.path.normcase(os.path.normpath(r"C:\Users\13968\AppData\Local\Programs\Viniper Harness Preview")),
+}
+SESSION_PROJECTION_VERSION = "legacy-final-cleanup-r3"
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if not WORKSTATION_MODE:
+        await asyncio.to_thread(refresh_windows_shortcuts)
+    try:
+        await asyncio.wait_for(project_harness_sessions(), timeout=20.0)
+    except Exception:
+        # Session projection is a best-effort startup migration.  The shell
+        # remains usable with its existing sessions if the host bridge is
+        # unavailable; no exception text or session content is emitted.
+        pass
+    update_task = asyncio.create_task(runtime_update_coordinator().ensure_current(APP_VERSION))
+    schedule_runtime_probe_refresh()
+    yield
+    if _agent_run_coordinator is not None:
+        await _agent_run_coordinator.shutdown()
+    if not update_task.done():
+        update_task.cancel()
+    if _runtime_probe_task is not None and not _runtime_probe_task.done():
+        _runtime_probe_task.cancel()
+
+
+app = FastAPI(title=APP_TITLE, lifespan=lifespan)
+sessions: dict[str, dict[str, Any]] = {}
+goals: dict[str, dict[str, Any]] = {}
+_skills_cache: dict[str, dict[str, Any]] = {
+    MODE_VINIPER: {"time": 0.0, "items": []},
+    MODE_CLAUDE: {"time": 0.0, "items": []},
+}
+_session_locks: dict[str, asyncio.Lock] = {}
+_active_runs: dict[str, dict[str, Any]] = {}
+_viniper_tasks: dict[str, asyncio.Task] = {}
+_goal_tasks: dict[str, asyncio.Task] = {}
+_context_lifecycle: ContextLifecycle | None = None
+_agent_runtime: WslAgentRuntime | WindowsNativeRuntime | None = None
+_runtime_probe_task: asyncio.Task[RuntimeProbe] | None = None
+_runtime_probe_updated_at = 0.0
+_runtime_probe_payload: dict[str, Any] | None = None
+_runtime_probe_owner_id: int | None = None
+RUNTIME_PROBE_STALE_SECONDS = 60.0
+STATUS_BASE_CACHE_SECONDS = 2.0
+_status_base_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_runtime_provisioner: WslRuntimeProvisioner | None = None
+_runtime_update_coordinator: RuntimeUpdateCoordinator | None = None
+_agent_instructions_stores: dict[str, AgentInstructionsStore] = {}
+_context_usage_ledger: ContextUsageLedger | None = None
+_daily_usage_ledger: DailyUsageLedger | None = None
+_agent_queue_store: AgentQueueStore | None = None
+_agent_run_coordinator: AgentRunCoordinator | None = None
+_agent_run_journal: AgentRunJournal | None = None
+_durable_interaction_store: DurableInteractionStore | None = None
+_native_peer_messaging: NativePeerMessaging = ClaudeCrossSessionAdapter()
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def managed_runtime_location() -> Path:
+    configured = env_value("VINIPER_UI_RUNTIME_LOCATION", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    local_app_data = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+    profile_name = str(ACTIVE_PROFILE_CONFIG.get("data_dir_name") or "Viniper workstation Preview") if WORKSTATION_MODE else "Viniper"
+    return local_app_data / profile_name / "Runtime" / "ViniperRuntime"
+
+
+def agent_runtime() -> WslAgentRuntime | WindowsNativeRuntime:
+    global _agent_runtime
+    if _agent_runtime is None:
+        _agent_runtime = WslAgentRuntime()
+    return _agent_runtime
+
+
+def agent_run_coordinator() -> AgentRunCoordinator:
+    global _agent_run_coordinator
+    if _agent_run_coordinator is None:
+        _agent_run_coordinator = AgentRunCoordinator(decode=sse_payloads)
+    return _agent_run_coordinator
+
+
+def agent_run_journal() -> AgentRunJournal:
+    global _agent_run_journal
+    expected = DATA_DIR / "runtime" / "agent-runs.json"
+    if _agent_run_journal is None or _agent_run_journal.path != expected:
+        _agent_run_journal = AgentRunJournal(expected)
+    return _agent_run_journal
+
+
+def durable_interaction_store() -> DurableInteractionStore:
+    global _durable_interaction_store
+    expected = DATA_DIR / "runtime" / "interaction-state.json"
+    if _durable_interaction_store is None or _durable_interaction_store.path != expected:
+        _durable_interaction_store = DurableInteractionStore(expected)
+    return _durable_interaction_store
+
+
+def runtime_provisioner() -> WslRuntimeProvisioner:
+    global _runtime_provisioner
+    if _runtime_provisioner is None:
+        _runtime_provisioner = WslRuntimeProvisioner(
+            runtime=agent_runtime(),
+            state_path=DATA_DIR / "runtime" / "provision-state.json",
+            install_location=managed_runtime_location(),
+        )
+    return _runtime_provisioner
+
+
+def runtime_update_coordinator() -> RuntimeUpdateCoordinator:
+    global _runtime_update_coordinator
+    if _runtime_update_coordinator is None:
+        _runtime_update_coordinator = RuntimeUpdateCoordinator(
+            agent_runtime(),
+            DATA_DIR / "runtime" / "update-state.json",
+            lambda: {sid for sid, run in _active_runs.items() if run.get("kind") == MODE_CLAUDE},
+        )
+    return _runtime_update_coordinator
+
+
+def runtime_payload_from_probe(probe: RuntimeProbe) -> dict[str, Any]:
+    payload = probe.as_dict()
+    # Runtime status and the selected model's context ring share one effective
+    # window source; the per-run AgentRunSpec carries the same value.
+    selected_model = allowed_model("", MODE_CLAUDE)
+    effective_window = context_limit_for_model(selected_model)
+    payload["effective_context_window"] = effective_window
+    payload.setdefault("capabilities", {})["effective_context_window"] = effective_window
+    payload["install_location"] = str(managed_runtime_location())
+    payload["configured"] = probe.ready
+    payload["update"] = runtime_update_coordinator().status()
+    return payload
+
+
+def runtime_public_status(*, refresh: bool = False) -> dict[str, Any]:
+    runtime = agent_runtime()
+    if _runtime_probe_payload is not None and _runtime_probe_owner_id == id(runtime):
+        payload = dict(_runtime_probe_payload)
+        if isinstance(payload.get("capabilities"), dict):
+            payload["capabilities"] = dict(payload["capabilities"])
+        if isinstance(payload.get("update"), dict):
+            payload["update"] = dict(payload["update"])
+    else:
+        payload = RuntimeProbe(
+            status="checking",
+            detail="managed WSL runtime compatibility check is in progress",
+        ).as_dict()
+        payload["install_location"] = str(managed_runtime_location())
+        payload["configured"] = False
+    age = time.monotonic() - _runtime_probe_updated_at if _runtime_probe_updated_at else None
+    payload["stale"] = age is None or age > RUNTIME_PROBE_STALE_SECONDS
+    payload["refreshing"] = bool(_runtime_probe_task is not None and not _runtime_probe_task.done())
+    return payload
+
+
+async def _refresh_runtime_probe() -> RuntimeProbe:
+    global _runtime_probe_owner_id, _runtime_probe_payload, _runtime_probe_updated_at
+    probe = await asyncio.to_thread(agent_runtime().probe)
+    _runtime_probe_payload = runtime_payload_from_probe(probe)
+    _runtime_probe_owner_id = id(agent_runtime())
+    _runtime_probe_updated_at = time.monotonic()
+    return probe
+
+
+def schedule_runtime_probe_refresh() -> asyncio.Task[RuntimeProbe]:
+    """Start at most one host runtime probe without blocking API callers."""
+    global _runtime_probe_task
+    if _runtime_probe_task is None or _runtime_probe_task.done():
+        _runtime_probe_task = asyncio.create_task(_refresh_runtime_probe())
+    return _runtime_probe_task
+
+
+async def runtime_probe_snapshot(*, refresh: bool = True) -> dict[str, Any]:
+    snapshot = runtime_public_status()
+    if refresh and snapshot["stale"]:
+        schedule_runtime_probe_refresh()
+        # Let the single-flight task claim its worker before concurrent callers
+        # inspect the cached state; callers still never await the slow probe.
+        await asyncio.sleep(0)
+        snapshot = runtime_public_status()
+    return snapshot
+
+
+def status_base_snapshot(mode: str) -> dict[str, Any]:
+    """Cache mode-owned settings/provider metadata outside the runtime probe."""
+    selected_mode = normalize_provider_mode(mode)
+    now = time.monotonic()
+    cached = _status_base_cache.get(selected_mode)
+    if cached is not None and now - cached[0] <= STATUS_BASE_CACHE_SECONDS:
+        return cached[1]
+    cfg = deepseek_config(mode=selected_mode)
+    settings = public_settings(mode=selected_mode)
+    snapshot = {
+        "cfg": cfg,
+        "settings": settings,
+        "models": effective_model_options(selected_mode),
+        "update_source": read_update_source(),
+        "permission_mode": allowed_permission_mode(
+            str(settings.get("runtime", {}).get("permission_mode_by_mode", {}).get(selected_mode) or ""),
+            selected_mode,
+        ),
+        "permission_modes": permission_mode_descriptors(selected_mode),
+    }
+    _status_base_cache[selected_mode] = (now, snapshot)
+    return snapshot
+
+
+def agent_instructions_store(mode: str = MODE_VINIPER) -> AgentInstructionsStore:
+    selected_mode = normalize_session_mode(mode)
+    target = DATA_DIR / ("AGENT.md" if selected_mode == MODE_VINIPER else "CLAUDE.md")
+    current = _agent_instructions_stores.get(selected_mode)
+    if current is None or current.path != target:
+        current = AgentInstructionsStore(target)
+        _agent_instructions_stores[selected_mode] = current
+    return current
+
+
+def read_agent_instructions(mode: str = MODE_VINIPER) -> str:
+    return agent_instructions_store(mode).read().content
+
+
+def context_usage_ledger() -> ContextUsageLedger:
+    global _context_usage_ledger
+    if _context_usage_ledger is None:
+        _context_usage_ledger = ContextUsageLedger(DATA_DIR / "runtime" / "context-usage.json")
+    return _context_usage_ledger
+
+
+def context_usage_payload(session_id: str, model: str = "") -> dict[str, Any]:
+    mode = normalize_session_mode(sessions.get(str(session_id), {}).get("mode")) if str(session_id) in sessions else MODE_CLAUDE
+    selected_model = allowed_model(model, mode) if model else allowed_model("", mode)
+    payload = context_usage_ledger().get(
+        session_id,
+        model=selected_model,
+        context_limit=context_limit_for_model(selected_model),
+    ).as_dict()
+    payload["effective_auto_compact_threshold"] = effective_auto_compact_threshold()
+    return payload
+
+
+def daily_usage_ledger() -> DailyUsageLedger:
+    global _daily_usage_ledger
+    if _daily_usage_ledger is None:
+        _daily_usage_ledger = DailyUsageLedger(DATA_DIR / "runtime" / "daily-usage.json")
+    return _daily_usage_ledger
+
+
+def agent_queue_store() -> AgentQueueStore:
+    global _agent_queue_store
+    if _agent_queue_store is None:
+        _agent_queue_store = AgentQueueStore(AGENT_QUEUE_FILE)
+    return _agent_queue_store
+
+
+def prepare_agent_host_channel(
+    runtime: WslAgentRuntime | WindowsNativeRuntime,
+    session_id: str,
+    run_id: str,
+) -> tuple[HostInteractionChannel, Path, Path | None]:
+    safe_session_id = re.sub(r"[^A-Za-z0-9_-]", "-", str(session_id or "session"))[:80] or "session"
+    root = DATA_DIR / "runtime" / "agent-host" / safe_session_id / str(run_id)
+    channel = HostInteractionChannel(root, session_id=session_id, run_id=run_id)
+    script_path = Path(__file__).resolve().with_name("agent_host_bridge.py")
+    if isinstance(runtime, WslAgentRuntime):
+        hook_script = runtime.map_path(script_path)
+        hook_channel = runtime.map_path(root)
+        settings_payload = build_passive_hook_settings()
+        mcp_config_path: Path | None = root / "mcp-config.json"
+        mcp_config_path.write_text(
+            json.dumps(
+                build_permission_prompt_mcp_config(
+                    script_path=hook_script,
+                    channel_path=hook_channel,
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+    else:
+        hook_script = str(script_path)
+        hook_channel = str(root)
+        settings_payload = build_hook_settings(script_path=hook_script, channel_path=hook_channel)
+        mcp_config_path = None
+    settings_path = root / "hook-settings.json"
+    settings_path.write_text(
+        json.dumps(settings_payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return channel, settings_path, mcp_config_path
+
+
+def _viniper_peer_runs() -> dict[str, dict[str, Any]]:
+    return {
+        str(session_id): {
+            "claude_session_id": str(run.get("claude_session_id") or ""),
+            "peer_name": str(run.get("peer_name") or ""),
+            "display_name": str(run.get("display_name") or session_id),
+        }
+        for session_id, run in _active_runs.items()
+        if run.get("kind") == MODE_CLAUDE
+        and str(run.get("claude_session_id") or "")
+        and str(run.get("peer_name") or "")
+    }
+
+
+async def native_peer_status_payload(session_id: str) -> dict[str, Any]:
+    """Project native peer availability without creating a parallel mailbox."""
+
+    sid = str(session_id)
+    session = safe_session(sid)
+    if normalize_session_mode(session.get("mode")) != MODE_CLAUDE:
+        return {
+            "available": False,
+            "verified": False,
+            "reason": "Viniper Harness 不使用 Claude 原生跨会话通道",
+            "discovery": "unavailable",
+            "targets": [],
+        }
+    if is_custom_shell(load_app_settings().get("shell", {})):
+        return {
+            "available": False,
+            "verified": False,
+            "reason": "原生跨会话消息仅由受管 Claude Code WSL2 运行时提供",
+            "discovery": "unavailable",
+            "targets": [],
+        }
+    runtime_capabilities = await asyncio.to_thread(agent_runtime().capabilities)
+    if runtime_capabilities.platform != "wsl2" or not runtime_capabilities.native_cli:
+        return {
+            "available": False,
+            "verified": False,
+            "reason": runtime_capabilities.reason or "原生跨会话消息需要受管 WSL2 Linux Claude Code 运行时",
+            "discovery": "unavailable",
+            "targets": [],
+        }
+    observed = _native_peer_messaging.capability_for(sid)
+    if not observed.send_message:
+        observed = _native_peer_messaging.best_capability()
+    targets = _native_peer_messaging.reachable_targets(
+        sid,
+        _viniper_peer_runs(),
+        current_session_id=sid,
+    )
+    roster_verified = bool(observed.available and _native_peer_messaging.roster_observed(sid))
+    available = bool(roster_verified and targets)
+    reason = observed.reason
+    if observed.available and not roster_verified:
+        reason = "当前会话尚未取得原生 ListAgents 可达会话列表"
+    elif roster_verified and not targets:
+        reason = "当前没有另一个真实运行且可达的 Viniper Agent 会话"
+    return {
+        **observed.as_dict(),
+        "available": available,
+        "verified": roster_verified,
+        "reason": reason,
+        "targets": targets,
+    }
+
+
+async def prepare_native_peer_request(
+    sender_session_id: str,
+    target_session_id: str,
+    message: str,
+) -> dict[str, str]:
+    """Validate a native target against the live CLI registry."""
+
+    status = await native_peer_status_payload(sender_session_id)
+    target = next(
+        (item for item in status.get("targets", []) if str(item.get("session_id")) == str(target_session_id)),
+        None,
+    )
+    if not status.get("verified"):
+        raise HTTPException(status_code=409, detail=status.get("reason") or "尚未验证原生 SendMessage 能力")
+    if target is None:
+        raise HTTPException(status_code=409, detail="目标 Viniper Agent 会话当前未运行或原生能力尚未验证")
+    content = str(message or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="message is required")
+    return {
+        "target_session_id": str(target["session_id"]),
+        "target_peer_name": str(target["peer_name"]),
+        "target_display_name": str(target["display_name"]),
+        "message": content,
+    }
+
+
+def decorate_peer_event(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach safe Viniper identity to an incoming native peer event."""
+
+    result = dict(payload)
+    if result.get("type") != "peer_incoming":
+        return result
+    sender = str(result.get("sender") or "")
+    for session_id, run in _viniper_peer_runs().items():
+        if str(run.get("peer_name") or "") == sender:
+            result["sender_session_id"] = session_id
+            result["sender_display_name"] = str(run.get("display_name") or sender)
+            break
+    return result
+
+
+def session_lock(session_id: str) -> asyncio.Lock:
+    lock = _session_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_locks[session_id] = lock
+    return lock
+
+
+def force_release_session_lock(session_id: str) -> None:
+    """Replace a held session lock so stuck waiters can proceed."""
+    old = _session_locks.pop(session_id, None)
+    if old is not None and old.locked():
+        _session_locks[session_id] = asyncio.Lock()
+
+
+def new_claude_session_id(value: Any = None) -> str:
+    try:
+        return str(uuid.UUID(str(value)))
+    except Exception:
+        return str(uuid.uuid4())
+
+
+def is_missing_claude_session_error(detail: str) -> bool:
+    value = str(detail or "").lower()
+    return (
+        "no conversation found with session id" in value
+        or "conversation not found" in value
+        or "session not found" in value
+    )
+
+
+def is_claude_session_in_use_error(detail: str) -> bool:
+    value = str(detail or "").lower()
+    return "session id" in value and "already in use" in value
+
+
+def normalize_session(session_id: str, raw: dict[str, Any]) -> dict[str, Any]:
+    last_run_status = str(raw.get("last_run_status") or "")
+    if last_run_status not in {"running", "completed", "failed", "cancelled"}:
+        last_run_status = ""
+    mode = normalize_loaded_session_mode(raw.get("mode"))
+    runtime_settings = load_app_settings().get("runtime", {})
+    mode_defaults = runtime_settings.get("permission_mode_by_mode") if isinstance(runtime_settings.get("permission_mode_by_mode"), dict) else {}
+    stored_permission_mode = migrate_permission_mode(raw.get("permission_mode"), mode)
+    if stored_permission_mode not in permission_ids_for_mode(mode):
+        stored_permission_mode = migrate_permission_mode(mode_defaults.get(mode), mode) or allowed_permission_mode(None, mode)
+    normalized = {
+        "id": str(raw.get("id") or session_id),
+        "mode": mode,
+        "messages": raw.get("messages") if isinstance(raw.get("messages"), list) else [],
+        "created": float(raw.get("created") or now_ts()),
+        "updated": float(raw.get("updated") or raw.get("created") or now_ts()),
+        "name": str(raw.get("name") or ""),
+        "workdir": str(raw.get("workdir") or BASE_DIR),
+        "pinned": bool(raw.get("pinned")),
+        "unread": bool(raw.get("unread")),
+        "last_run_status": last_run_status,
+        # Viniper never resumes a Claude Code run. Preserve its stored value
+        # exactly during startup migration instead of manufacturing a Claude
+        # session identifier for an empty legacy field.
+        "claude_session_id": (
+            new_claude_session_id(raw.get("claude_session_id"))
+            if mode == MODE_CLAUDE
+            else str(raw.get("claude_session_id") or "")
+        ),
+        "claude_initialized": bool(raw.get("claude_initialized")),
+        "summary": str(raw.get("summary") or ""),
+    }
+    # Canonical sessions always retain an explicit permission mode. Legacy
+    # records are normalized at load and persisted by the startup migration.
+    if mode in SESSION_MODES or "permission_mode" in raw:
+        normalized["permission_mode"] = stored_permission_mode
+    # These user-owned collections may be present in older/newer compatible
+    # session records. Normalization must not discard them during startup.
+    for key in ("queue", "attachments", "plan", "claude_agents"):
+        if key in raw:
+            normalized[key] = raw[key]
+    for key in (
+        "source",
+        "source_session_id",
+        "source_updated_at",
+        "imported_at",
+        "migration_version",
+    ):
+        if key in raw and raw[key] is not None:
+            normalized[key] = raw[key]
+    return normalized
+
+
+def session_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, float, float, str]:
+    """Return the deterministic order for the session list."""
+    session_id, session = item
+    return (
+        0 if bool(session.get("pinned")) else 1,
+        -float(session.get("updated", session.get("created", 0)) or 0),
+        float(session.get("created", 0) or 0),
+        str(session_id),
+    )
+
+
+def load_sessions_from_disk() -> dict[str, dict[str, Any]]:
+    if not SESSIONS_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    loaded: dict[str, dict[str, Any]] = {}
+    for session_id, session in raw.items():
+        if isinstance(session, dict):
+            loaded[str(session_id)] = normalize_session(str(session_id), session)
+    return loaded
+
+
+def save_sessions_to_disk() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = SESSIONS_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(sessions, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(SESSIONS_FILE)
+
+
+def _source_epoch_seconds(value: Any, fallback: float | None = None) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(fallback if fallback is not None else now_ts())
+    # Harness Runtime stores epoch milliseconds; the shell stores seconds.
+    if number > 100_000_000_000:
+        number /= 1000.0
+    return number if number > 0 else float(fallback if fallback is not None else now_ts())
+
+
+def _legacy_workdir(value: Any) -> bool:
+    normalized = os.path.normcase(os.path.normpath(str(value or "").strip()))
+    return normalized in LEGACY_HARNESS_WORKDIRS
+
+
+def _projected_permission_mode(value: Any) -> str:
+    mode = str(value or "").strip()
+    if mode in {"auto", "acceptEdits"}:
+        return "acceptEdits"
+    if mode == "plan":
+        return "plan"
+    return "default"
+
+
+def _projected_message(source_session_id: str, index: int, raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    role = str(raw.get("role") or "").strip().lower()
+    if role not in {"user", "assistant", "system"}:
+        return None
+    content = raw.get("content") if isinstance(raw.get("content"), str) else raw.get("text")
+    if not isinstance(content, str):
+        return None
+    source_message_id = str(raw.get("id") or f"message-{index}")
+    message: dict[str, Any] = {
+        "id": f"legacy-{source_session_id}-{source_message_id}",
+        "role": role,
+        "content": content,
+        "created": _source_epoch_seconds(raw.get("createdAt")),
+        "status": str(raw.get("status") or "completed"),
+        "source": "harness-runtime",
+        "source_message_id": source_message_id,
+    }
+    for key in ("attachments", "fileReferences"):
+        values = raw.get(key)
+        if not isinstance(values, list):
+            continue
+        safe_values: list[dict[str, Any]] = []
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            safe_item = {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or item.get("fileName") or ""),
+                "path": str(item.get("path") or item.get("relativePath") or ""),
+                "mime": str(item.get("mime") or item.get("mimeType") or ""),
+                "size": int(item.get("size") or 0),
+            }
+            if any(safe_item[key] for key in ("id", "name", "path")):
+                safe_values.append(safe_item)
+        if safe_values:
+            message[key] = safe_values
+    return message
+
+
+def _projected_shell_session(source: dict[str, Any]) -> dict[str, Any] | None:
+    source_id = str(source.get("id") or "").strip()
+    workdir = str(source.get("workingDirectory") or "").strip()
+    if not source_id or not _legacy_workdir(workdir):
+        return None
+    if str(source.get("engineId") or "").strip().lower() != "viniper":
+        return None
+    source_messages = source.get("messages") if isinstance(source.get("messages"), list) else []
+    messages = [
+        projected
+        for index, raw in enumerate(source_messages)
+        if (projected := _projected_message(source_id, index, raw)) is not None
+    ]
+    created = _source_epoch_seconds(source.get("createdAt"))
+    updated = _source_epoch_seconds(source.get("updatedAt"), created)
+    source_status = str(source.get("status") or "idle")
+    last_run_status = source_status if source_status in {"running", "completed", "failed", "cancelled"} else ""
+    return {
+        "id": f"legacy-harness-{source_id}",
+        "mode": MODE_VINIPER,
+        "messages": messages,
+        "created": created,
+        "updated": updated,
+        "name": str(source.get("title") or "Viniper Harness 会话"),
+        "workdir": workdir,
+        "pinned": bool(source.get("pinned")),
+        "unread": bool(source.get("unread")),
+        "last_run_status": last_run_status,
+        "claude_session_id": "",
+        "claude_initialized": False,
+        "summary": "",
+        "permission_mode": _projected_permission_mode(source.get("permissionMode")),
+        "source": "harness-runtime",
+        "source_session_id": source_id,
+        "source_updated_at": updated,
+        "imported_at": now_ts(),
+        "migration_version": SESSION_PROJECTION_VERSION,
+    }
+
+
+async def project_harness_sessions() -> dict[str, Any]:
+    """Project retired Harness sessions into the shell session source.
+
+    The Application Port owns the read.  This function only writes the shell
+    JSON projection and never opens or mutates Harness SQLite directly.
+    """
+    port = VINIPER_TRANSPORT.application_port
+    if hasattr(port, "session_snapshot"):
+        payload = await port.session_snapshot()
+    else:
+        payload = await port.control("sessions.snapshot")
+    source_sessions = payload.get("sessions") if isinstance(payload, dict) else []
+    if not isinstance(source_sessions, list):
+        return {"source_count": 0, "imported_count": 0, "updated_count": 0, "message_count": 0, "changed": False}
+
+    imported = 0
+    updated = 0
+    message_count = 0
+    for source in source_sessions:
+        projected = _projected_shell_session(source)
+        if projected is None:
+            continue
+        source_id = str(projected["source_session_id"])
+        existing_id = next(
+            (sid for sid, item in sessions.items() if str(item.get("source_session_id") or "") == source_id),
+            projected["id"],
+        )
+        existing = sessions.get(existing_id)
+        if existing is None:
+            sessions[existing_id] = projected
+            imported += 1
+            message_count += len(projected["messages"])
+            continue
+        old_updated = _source_epoch_seconds(existing.get("source_updated_at"), 0)
+        if old_updated >= float(projected["source_updated_at"]):
+            continue
+        projected["id"] = existing_id
+        sessions[existing_id] = projected
+        updated += 1
+        message_count += len(projected["messages"])
+    changed = bool(imported or updated)
+    if changed:
+        save_sessions_to_disk()
+    return {
+        "source_count": len(source_sessions),
+        "imported_count": imported,
+        "updated_count": updated,
+        "message_count": message_count,
+        "changed": changed,
+    }
+
+
+GOAL_STATUSES = {"running", "paused", "waiting", "completed", "failed"}
+GOAL_DEFAULT_MAX_TURNS = 12
+GOAL_MAX_TURNS_LIMIT = 100
+GOAL_DONE_MARKER = "[VINIPER_GOAL_DONE]"
+GOAL_CONTINUE_MARKER = "[VINIPER_GOAL_CONTINUE]"
+GOAL_BETWEEN_TURN_DELAY_SECONDS = 2.5
+
+
+def normalize_goal(goal_id: str, raw: dict[str, Any]) -> dict[str, Any]:
+    status = str(raw.get("status") or "paused")
+    if status not in GOAL_STATUSES:
+        status = "paused"
+    max_turns = int(raw.get("max_turns") or GOAL_DEFAULT_MAX_TURNS)
+    max_turns = min(GOAL_MAX_TURNS_LIMIT, max(1, max_turns))
+    return {
+        "id": str(raw.get("id") or goal_id),
+        "session_id": str(raw.get("session_id") or ""),
+        "title": str(raw.get("title") or "目标任务"),
+        "prompt": str(raw.get("prompt") or ""),
+        "status": status,
+        "model": allowed_model(str(raw.get("model") or ""), MODE_VINIPER),
+        "permission_mode": allowed_permission_mode(str(raw.get("permission_mode") or ""), MODE_VINIPER),
+        "turn_count": max(0, int(raw.get("turn_count") or 0)),
+        "max_turns": max_turns,
+        "created": float(raw.get("created") or now_ts()),
+        "updated": float(raw.get("updated") or raw.get("created") or now_ts()),
+        "last_run": float(raw.get("last_run") or 0),
+        "last_output": str(raw.get("last_output") or ""),
+        "last_error": str(raw.get("last_error") or ""),
+        "current_step": str(raw.get("current_step") or ""),
+    }
+
+
+def session_runtime_state(session_id: str, session: dict[str, Any] | None = None) -> str:
+    coordinated = _agent_run_coordinator.snapshot(str(session_id)) if _agent_run_coordinator is not None else None
+    if coordinated and coordinated.get("active"):
+        if coordinated.get("status") == "awaiting_cli_ack":
+            return "awaiting_cli_ack"
+        if coordinated.get("pending_interaction") or coordinated.get("status") == "waiting_input":
+            return "waiting_input"
+        if coordinated.get("status") == "failed":
+            return "failed"
+        return "running"
+    run = _active_runs.get(str(session_id))
+    if run:
+        if run.get("awaiting_interaction_ack"):
+            return "awaiting_cli_ack"
+        if run.get("pending_interaction"):
+            return "waiting_input"
+        if run.get("status") == "failed":
+            return "failed"
+        return "running"
+    durable_interaction = agent_interaction_broker.pending_for(str(session_id))
+    if durable_interaction:
+        interaction_state = str(durable_interaction.get("interaction_state") or "pending")
+        if interaction_state in {"response_committed", "awaiting_cli_ack"}:
+            return "awaiting_cli_ack"
+        if interaction_state == "failed":
+            return "failed"
+        if interaction_state in {"created", "pending", "answering", "waiting_input"}:
+            return "waiting_input"
+    if session and str(session.get("last_run_status") or "") == "failed":
+        return "failed"
+    if session and session.get("unread"):
+        return "completed_unread"
+    return "idle"
+
+
+def coordinated_run_snapshot(session_id: str) -> dict[str, Any] | None:
+    if _agent_run_coordinator is None:
+        return None
+    return _agent_run_coordinator.snapshot(str(session_id))
+
+
+def pending_interaction_for_session(session_id: str) -> dict[str, Any] | None:
+    snapshot = coordinated_run_snapshot(session_id)
+    if snapshot and snapshot.get("active") and snapshot.get("pending_interaction"):
+        return copy.deepcopy(snapshot["pending_interaction"])
+    return agent_interaction_broker.pending_for(str(session_id))
+
+
+def project_permission_denied_event(
+    data: dict[str, Any],
+    *,
+    session_id: str,
+    run_id: str,
+    store: DurableInteractionStore | None = None,
+) -> dict[str, Any]:
+    """Persist and project one official permission_denied terminal event.
+
+    The durable record and renderer event intentionally share the same
+    tool-use identity and error content, so a rejected tool can never become a
+    vanished card or an unmatched transcript row.
+    """
+    tool_use_id = str(data.get("tool_use_id") or "")
+    message = clean_stream_text(str(
+        data.get("message") or data.get("decision_reason") or "权限请求已被拒绝"
+    ))
+    projected = {
+        "type": "tool_result",
+        "tool_id": tool_use_id,
+        "tool_use_id": tool_use_id,
+        "status": "失败",
+        "content": message,
+        "permission_denied": True,
+        "is_error": True,
+    }
+    denied_event = {
+        **copy.deepcopy(data),
+        "session_id": str(data.get("session_id") or session_id),
+        "run_id": str(data.get("run_id") or run_id),
+        "tool_result": {
+            "tool_use_id": tool_use_id,
+            "is_error": True,
+            "content": message,
+        },
+    }
+    if tool_use_id:
+        (store or durable_interaction_store()).record_permission_denied(denied_event)
+    return projected
+
+
+def load_goals_from_disk() -> dict[str, dict[str, Any]]:
+    if not GOALS_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(GOALS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    loaded: dict[str, dict[str, Any]] = {}
+    for goal_id, goal in raw.items():
+        if not isinstance(goal, dict):
+            continue
+        normalized = normalize_goal(str(goal_id), goal)
+        if normalized["status"] == "running":
+            normalized["status"] = "paused"
+            normalized["last_error"] = f"{APP_TITLE} restarted while this goal was running."
+        loaded[str(goal_id)] = normalized
+    return loaded
+
+
+def save_goals_to_disk() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = GOALS_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(goals, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(GOALS_FILE)
+
+
+def default_settings() -> dict[str, Any]:
+    viniper_provider = {
+        "id": "deepseek",
+        "label": "DeepSeek",
+        "base_url": DEFAULT_DEEPSEEK_BASE_URL,
+        "api_key": "",
+        "api_key_env": "ANTHROPIC_AUTH_TOKEN",
+        "base_url_env": "ANTHROPIC_BASE_URL",
+        "model_env": "ANTHROPIC_MODEL",
+        "model": "deepseek-v4-pro[1m]",
+        "models": copy.deepcopy(MODEL_OPTIONS),
+        "secret_ref": MODE_SECRET_REFS[MODE_VINIPER],
+    }
+    claude_provider = {
+        "id": "anthropic",
+        "label": "Claude code",
+        "base_url": DEFAULT_AGENT_BASE_URL,
+        "api_key": "",
+        "api_key_env": "ANTHROPIC_AUTH_TOKEN",
+        "base_url_env": "ANTHROPIC_BASE_URL",
+        "model_env": "ANTHROPIC_MODEL",
+        "model": "deepseek-v4-pro[1m]",
+        "models": copy.deepcopy(MODEL_OPTIONS),
+        "secret_ref": MODE_SECRET_REFS[MODE_CLAUDE],
+    }
+    return {
+        "account": {
+            "display_name": "Viniper 用户",
+            "signed_in": False,
+        },
+        "appearance": {
+            "language": "zh-CN",
+            "theme": "system",
+            "accent": "viniper",
+            "font_size": "normal",
+        },
+        "shell": {
+            "id": "claude-code",
+            "custom_command": "",
+            "custom_env": "",
+        },
+        "providers": {
+            MODE_VINIPER: viniper_provider,
+            MODE_CLAUDE: claude_provider,
+        },
+        # Kept as a load/save compatibility alias for older settings files;
+        # runtime reads use providers[canonical mode].
+        "provider": copy.deepcopy(viniper_provider),
+        "desktop": {
+            "open_at_login": False,
+            "minimize_to_tray": True,
+        },
+        "workspace": {
+            "default_root": str(platform_default_workspace_root()),
+        },
+        "runtime": {
+            "kind": "wsl2",
+            "cross_session_inbound": "permissions",
+            "permission_mode": "default",
+            "permission_mode_by_workdir": {},
+            "enable_auto_mode": False,
+            "allow_bypass_permissions": False,
+            "memory_enabled": True,
+        },
+    }
+
+
+def merge_dict(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merge_dict(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def normalize_model_options(value: Any) -> list[dict[str, Any]]:
+    raw_items = value if isinstance(value, list) else MODEL_OPTIONS
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        label = str(item.get("label") or model_id).strip()
+        description = str(item.get("description") or "").strip()
+        try:
+            context = int(item.get("context") or DEFAULT_CONTEXT_LIMIT)
+        except Exception:
+            context = DEFAULT_CONTEXT_LIMIT
+        normalized.append(
+            {
+                "id": model_id,
+                "label": label,
+                "description": description,
+                "context": max(context, 8192),
+            }
+        )
+    return normalized or [dict(item) for item in MODEL_OPTIONS]
+
+
+def normalize_provider_base_url(provider_id: Any, value: Any, mode: str = MODE_VINIPER) -> str:
+    base_url = str(value or "").strip().rstrip("/")
+    if str(provider_id or "").strip().lower() == "deepseek":
+        if not base_url or base_url.lower() in LEGACY_DEEPSEEK_BASE_URLS:
+            return DEFAULT_DEEPSEEK_BASE_URL
+    return base_url or (DEFAULT_AGENT_BASE_URL if mode == MODE_CLAUDE else DEFAULT_DEEPSEEK_BASE_URL)
+
+
+def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw_settings = raw if isinstance(raw, dict) else {}
+    settings = merge_dict(default_settings(), raw_settings)
+    raw_providers = raw_settings.get("providers") if isinstance(raw_settings.get("providers"), dict) else {}
+    legacy_provider = raw_settings.get("provider") if isinstance(raw_settings.get("provider"), dict) else {}
+    # One-time compatibility migration: old provider keys are consumed here,
+    # then discarded from the normalized/persisted representation.
+    migrated_providers = dict(raw_providers)
+    if MODE_VINIPER not in migrated_providers and isinstance(raw_providers.get("chat"), dict):
+        migrated_providers[MODE_VINIPER] = raw_providers["chat"]
+    if MODE_CLAUDE not in migrated_providers and isinstance(raw_providers.get("agent"), dict):
+        migrated_providers[MODE_CLAUDE] = raw_providers["agent"]
+    if MODE_VINIPER not in migrated_providers and legacy_provider:
+        migrated_providers[MODE_VINIPER] = legacy_provider
+    settings["providers"].update(migrated_providers)
+    settings["providers"] = {
+        mode: normalize_provider_record(settings.get("providers", {}).get(mode), mode)
+        for mode in PROVIDER_MODE_IDS
+    }
+    settings["provider"] = copy.deepcopy(settings["providers"][MODE_VINIPER])
+    appearance = settings["appearance"]
+    if appearance.get("language") not in {item["id"] for item in LANGUAGE_OPTIONS}:
+        appearance["language"] = "zh-CN"
+    if appearance.get("theme") not in {item["id"] for item in THEME_OPTIONS}:
+        appearance["theme"] = "system"
+    appearance["accent"] = "viniper"
+    if appearance.get("font_size") not in {item["id"] for item in FONT_SIZE_OPTIONS}:
+        appearance["font_size"] = "normal"
+
+    shell = settings["shell"]
+    if shell.get("id") not in {item["id"] for item in SHELL_OPTIONS}:
+        shell["id"] = "claude-code"
+    shell["custom_command"] = str(shell.get("custom_command") or "").strip()
+    shell["custom_env"] = str(shell.get("custom_env") or "").strip()
+
+    workspace = settings.setdefault("workspace", {})
+    workspace["default_root"] = normalize_existing_dir(workspace.get("default_root"), platform_default_workspace_root())
+    runtime = settings.setdefault("runtime", {})
+    runtime["kind"] = "wsl2"
+    inbound = str(runtime.get("cross_session_inbound") or "permissions")
+    runtime["cross_session_inbound"] = inbound if inbound in {"permissions", "accept", "hold", "reject"} else "permissions"
+    legacy_permission_mode = str(runtime.get("permission_mode") or DEFAULT_PERMISSION_MODE)
+    raw_mode_defaults = runtime.get("permission_mode_by_mode")
+    raw_mode_defaults = raw_mode_defaults if isinstance(raw_mode_defaults, dict) else {}
+    mode_defaults = {
+        MODE_VINIPER: migrate_permission_mode(raw_mode_defaults.get(MODE_VINIPER) or legacy_permission_mode, MODE_VINIPER) or "ask",
+        MODE_CLAUDE: migrate_permission_mode(raw_mode_defaults.get(MODE_CLAUDE) or legacy_permission_mode, MODE_CLAUDE) or "default",
+    }
+    runtime["permission_mode_by_mode"] = mode_defaults
+    # Compatibility field remains Claude-owned; Viniper sessions carry their
+    # own canonical mode and never read this shared alias.
+    runtime["permission_mode"] = mode_defaults[MODE_CLAUDE]
+    raw_preferences = runtime.get("permission_mode_by_workdir")
+    preferences: dict[str, str] = {}
+    if isinstance(raw_preferences, dict):
+        for raw_workdir, raw_mode in raw_preferences.items():
+            workdir_key = str(raw_workdir or "").strip()
+            stored_mode = str(raw_mode or "").strip()
+            stored_mode = migrate_permission_mode(stored_mode, MODE_CLAUDE)
+            if workdir_key and stored_mode in CLAUDE_PERMISSION_MODE_IDS and stored_mode != "plan":
+                preferences[workdir_key] = stored_mode
+    runtime["permission_mode_by_workdir"] = preferences
+    runtime["enable_auto_mode"] = bool(runtime.get("enable_auto_mode"))
+    runtime["allow_bypass_permissions"] = bool(runtime.get("allow_bypass_permissions"))
+    runtime["memory_enabled"] = bool(runtime.get("memory_enabled", True))
+    return settings
+
+
+def load_app_settings() -> dict[str, Any]:
+    if not SETTINGS_FILE.exists():
+        return normalize_settings()
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    return normalize_settings(raw if isinstance(raw, dict) else {})
+
+
+def save_app_settings(settings: dict[str, Any]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    normalized = normalize_settings(settings)
+    tmp_path = SETTINGS_FILE.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(SETTINGS_FILE)
+    cache = globals().get("_status_base_cache")
+    if isinstance(cache, dict):
+        cache.clear()
+
+
+def provider_env_names(provider: dict[str, Any] | None = None) -> dict[str, str]:
+    provider = provider if isinstance(provider, dict) else load_app_settings().get("provider", {})
+    return {
+        "api_key": str(provider.get("api_key_env") or "ANTHROPIC_AUTH_TOKEN").strip() or "ANTHROPIC_AUTH_TOKEN",
+        "base_url": str(provider.get("base_url_env") or "ANTHROPIC_BASE_URL").strip() or "ANTHROPIC_BASE_URL",
+        "model": str(provider.get("model_env") or "ANTHROPIC_MODEL").strip() or "ANTHROPIC_MODEL",
+    }
+
+
+def normalize_provider_record(raw: Any, mode: str) -> dict[str, Any]:
+    mode_key = normalize_provider_mode(mode)
+    defaults = default_settings()["providers"][mode_key]
+    provider = merge_dict(defaults, raw if isinstance(raw, dict) else {})
+    provider["id"] = str(provider.get("id") or ("anthropic" if mode_key == MODE_CLAUDE else "deepseek")).strip()
+    provider["label"] = str(provider.get("label") or ("Claude code" if mode_key == MODE_CLAUDE else "DeepSeek")).strip()
+    provider["base_url"] = normalize_provider_base_url(provider["id"], provider.get("base_url"), mode_key)
+    # Secrets are host-owned.  Never retain an incoming plaintext value in
+    # settings.json, including files written by earlier previews.
+    provider["api_key"] = ""
+    provider["secret_ref"] = MODE_SECRET_REFS[mode_key]
+    provider["api_key_env"] = str(provider.get("api_key_env") or "ANTHROPIC_AUTH_TOKEN").strip() or "ANTHROPIC_AUTH_TOKEN"
+    provider["base_url_env"] = str(provider.get("base_url_env") or "ANTHROPIC_BASE_URL").strip() or "ANTHROPIC_BASE_URL"
+    provider["model_env"] = str(provider.get("model_env") or "ANTHROPIC_MODEL").strip() or "ANTHROPIC_MODEL"
+    provider["models"] = normalize_model_options(provider.get("models"))
+    ids = {item["id"] for item in provider["models"]}
+    if provider.get("model") not in ids:
+        provider["model"] = provider["models"][0]["id"]
+    return provider
+
+
+def normalize_provider_mode(mode: Any) -> str:
+    return normalize_session_mode(mode)
+
+
+def provider_for_mode(settings: dict[str, Any] | None, mode: Any) -> dict[str, Any]:
+    normalized = normalize_settings(settings or {})
+    return normalized.get("providers", {}).get(normalize_provider_mode(mode), {})
+
+
+def _host_secret_request(mode: Any, endpoint: str) -> dict[str, Any]:
+    port = str(os.environ.get("VINIPER_HOST_SECRET_BROKER_PORT") or "").strip()
+    token = str(os.environ.get("VINIPER_HOST_SECRET_BROKER_TOKEN") or "").strip()
+    if not port or not token:
+        return {}
+    selected_mode = normalize_provider_mode(mode)
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/secret/{endpoint}?mode={selected_mode}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1.2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def host_secret_configured(mode: Any) -> bool:
+    return bool(_host_secret_request(mode, "status").get("configured"))
+
+
+def read_host_secret(mode: Any) -> str:
+    payload = _host_secret_request(mode, "read")
+    return str(payload.get("secret") or "") if payload.get("configured") else ""
+
+
+def provider_env_fallback(provider: dict[str, Any], mode: str) -> str:
+    names = provider_env_names(provider)
+    env = merged_env(include_app_settings=False, mode=mode)
+    candidates = [names["api_key"]]
+    # Keep API-key and auth-token modes mutually exclusive. A provider record
+    # selects exactly one bridge variable; never copy one secret into both.
+    if names["api_key"] == "ANTHROPIC_API_KEY":
+        candidates.append("ANTHROPIC_API_KEY")
+    elif names["api_key"] == "ANTHROPIC_AUTH_TOKEN":
+        candidates.append("ANTHROPIC_AUTH_TOKEN")
+    for key in dict.fromkeys(candidates):
+        value = str(env.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def public_provider(provider: dict[str, Any], mode: str) -> dict[str, Any]:
+    safe = json.loads(json.dumps(provider or {}, ensure_ascii=False))
+    safe["api_key"] = ""
+    safe["api_key_configured"] = bool(host_secret_configured(mode) or provider_env_fallback(provider, mode))
+    return safe
+
+
+def public_settings(settings: dict[str, Any] | None = None, mode: str = MODE_VINIPER) -> dict[str, Any]:
+    safe = json.loads(json.dumps(normalize_settings(settings or load_app_settings()), ensure_ascii=False))
+    providers = safe.get("providers", {})
+    safe["providers"] = {
+        selected: public_provider(providers.get(selected, {}), selected)
+        for selected in PROVIDER_MODE_IDS
+    }
+    selected_mode = normalize_provider_mode(mode)
+    safe["provider"] = safe["providers"][selected_mode]
+    runtime = safe.setdefault("runtime", {})
+    # The public settings projection is mode-scoped too.  Keep the legacy
+    # runtime.permission_mode field for compatibility, but never expose the
+    # Claude-owned value while the Viniper settings page is active.
+    runtime["permission_mode"] = allowed_permission_mode(None, selected_mode)
+    return safe
+
+
+def read_sessions_file(path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def merge_session_files(source: Path, target: Path) -> None:
+    source_data = read_sessions_file(source)
+    if not source_data:
+        return
+
+    target_data = read_sessions_file(target) if target.exists() else {}
+    changed = False
+    for session_id, source_session in source_data.items():
+        if not isinstance(source_session, dict):
+            continue
+        existing = target_data.get(session_id)
+        if not isinstance(existing, dict):
+            target_data[session_id] = source_session
+            changed = True
+            continue
+        source_updated = float(source_session.get("updated") or source_session.get("created") or 0)
+        existing_updated = float(existing.get("updated") or existing.get("created") or 0)
+        if source_updated > existing_updated:
+            target_data[session_id] = source_session
+            changed = True
+
+    if changed:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(target_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def migrate_legacy_data_dir() -> None:
+    try:
+        if LEGACY_DATA_DIR.resolve() == DATA_DIR.resolve():
+            return
+    except Exception:
+        pass
+
+    legacy_sessions = LEGACY_DATA_DIR / "sessions.json"
+    if legacy_sessions.exists():
+        merge_session_files(legacy_sessions, SESSIONS_FILE)
+
+    legacy_attachments = LEGACY_DATA_DIR / "attachments"
+    if legacy_attachments.exists() and legacy_attachments.is_dir():
+        ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+        for item in legacy_attachments.iterdir():
+            target = ATTACHMENTS_DIR / item.name
+            if target.exists():
+                continue
+            if item.is_dir():
+                shutil.copytree(item, target)
+            elif item.is_file():
+                shutil.copy2(item, target)
+
+
+def format_bytes(size: int) -> str:
+    value = float(max(size, 0))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{int(size)} B"
+
+
+def safe_attachment_filename(name: Any) -> str:
+    original = Path(str(name or "attachment.bin")).name
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", original).strip(" ._")
+    if not cleaned:
+        cleaned = "attachment.bin"
+    return cleaned[:120]
+
+
+def normalize_image_block(block: Any, *, alt: str = "") -> dict[str, Any] | None:
+    """Normalize only explicit supported image blocks; never infer images from text."""
+    if not isinstance(block, dict) or str(block.get("type") or "") != "image":
+        return None
+    source = block.get("source") if isinstance(block.get("source"), dict) else None
+    if source is not None and str(source.get("type") or "") not in {"", "base64"}:
+        return None
+    payload = source or block
+    mime_type = str(
+        payload.get("mimeType")
+        or payload.get("mime_type")
+        or payload.get("media_type")
+        or block.get("mimeType")
+        or block.get("mime_type")
+        or ""
+    ).strip().lower()
+    if mime_type not in SUPPORTED_RENDER_IMAGE_MIME_TYPES:
+        return None
+    encoded = str(payload.get("data") or "").strip()
+    if encoded.startswith("data:") and "," in encoded:
+        header, encoded = encoded.split(",", 1)
+        if mime_type not in header.lower() or ";base64" not in header.lower():
+            return None
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except Exception:
+        return None
+    if not decoded or len(decoded) > MAX_RENDER_IMAGE_BYTES:
+        return None
+    return {
+        "type": "image",
+        "mime_type": mime_type,
+        "data": base64.b64encode(decoded).decode("ascii"),
+        "alt": str(alt or block.get("alt") or "图片")[:160],
+    }
+
+
+def local_artifact_image(path: Any, allowed_roots: list[Path]) -> dict[str, Any] | None:
+    try:
+        target = Path(str(path or "")).resolve()
+        roots = [Path(root).resolve() for root in allowed_roots]
+        if not target.is_file() or not any(target == root or target.is_relative_to(root) for root in roots):
+            return None
+        mime_type = IMAGE_SUFFIX_MIME_TYPES.get(target.suffix.lower())
+        if not mime_type or target.stat().st_size > MAX_RENDER_IMAGE_BYTES:
+            return None
+        encoded = base64.b64encode(target.read_bytes()).decode("ascii")
+        return normalize_image_block(
+            {"type": "image", "mimeType": mime_type, "data": encoded},
+            alt=target.name,
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def save_run_attachments(session_id: str, raw_items: Any) -> list[dict[str, Any]]:
+    if not raw_items:
+        return []
+    if not isinstance(raw_items, list):
+        raise HTTPException(status_code=400, detail="attachments must be a list")
+
+    target_dir = ATTACHMENTS_DIR / safe_attachment_filename(session_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[dict[str, Any]] = []
+    total_size = 0
+
+    for index, item in enumerate(raw_items, start=1):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"attachment {index} is invalid")
+
+        original_name = str(item.get("name") or f"attachment-{index}.bin")
+        mime_type = str(item.get("type") or "application/octet-stream")
+        encoded = str(item.get("data") or "")
+        if encoded.startswith("data:") and "," in encoded:
+            encoded = encoded.split(",", 1)[1]
+
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"attachment {original_name} is not valid base64")
+
+        if len(content) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(status_code=413, detail=f"attachment {original_name} is larger than {format_bytes(MAX_ATTACHMENT_BYTES)}")
+        total_size += len(content)
+        if total_size > MAX_ATTACHMENT_TOTAL_BYTES:
+            raise HTTPException(status_code=413, detail=f"attachments exceed {format_bytes(MAX_ATTACHMENT_TOTAL_BYTES)}")
+
+        filename = f"{uuid.uuid4().hex[:10]}_{safe_attachment_filename(original_name)}"
+        path = target_dir / filename
+        path.write_bytes(content)
+        saved.append({
+            "name": original_name,
+            "type": mime_type,
+            "size": len(content),
+            "filename": filename,
+            "path": str(path.resolve()),
+        })
+
+    return saved
+
+
+def attachment_display_lines(attachments: list[dict[str, Any]]) -> list[str]:
+    return [
+        f"[附件: {item.get('name')} · {format_bytes(int(item.get('size') or 0))} · {item.get('type') or 'application/octet-stream'}]"
+        for item in attachments
+    ]
+
+
+def attachment_message_items(attachments: list[dict[str, Any]], session_id: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    safe_id = safe_attachment_filename(session_id)
+    for item in attachments:
+        message_item = {
+            "name": item.get("name") or "attachment",
+            "type": item.get("type") or "application/octet-stream",
+            "size": int(item.get("size") or 0),
+        }
+        filename = str(item.get("filename") or "")
+        if filename:
+            message_item["url"] = f"/api/attachments/{safe_id}/{safe_attachment_filename(filename)}"
+        items.append(message_item)
+    return items
+
+
+def append_attachment_prompt(prompt: str, attachments: list[dict[str, Any]]) -> str:
+    if not attachments:
+        return prompt
+
+    lines = [
+        "",
+        "[本轮附件已由网页端保存为本机文件。不要把附件内容当作聊天文本；请按用户请求用 Claude Code 的 Read/Bash/相关工具解析这些文件。]",
+        "附件列表：",
+    ]
+    has_image = False
+    has_archive = False
+    for item in attachments:
+        name = str(item.get("name") or "attachment")
+        mime_type = str(item.get("type") or "application/octet-stream")
+        path = str(item.get("path") or "")
+        size = format_bytes(int(item.get("size") or 0))
+        suffix = Path(name).suffix.lower()
+        has_image = has_image or mime_type.startswith("image/") or suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+        has_archive = has_archive or suffix in {".zip", ".tar", ".gz", ".tgz", ".tar.gz", ".7z", ".rar"}
+        lines.append(f"- 原名: {name}; 类型: {mime_type}; 大小: {size}; 路径: {path}")
+
+    if has_image:
+        lines.append("图片附件请优先用 Read 工具查看图像内容，再根据用户问题回答。")
+    if has_archive:
+        lines.append("压缩包附件请先用合适命令列出内容，再按需解压到附件目录或工作目录中处理。")
+    return f"{prompt.rstrip()}\n\n" + "\n".join(lines)
+
+
+def read_update_source() -> dict[str, str]:
+    source: dict[str, str] = {}
+    if UPDATE_SOURCE_FILE.exists():
+        try:
+            raw = json.loads(UPDATE_SOURCE_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                source.update({str(k): str(v) for k, v in raw.items() if v})
+        except Exception:
+            pass
+    if UPDATE_REPOSITORY_ENV:
+        source["repository"] = UPDATE_REPOSITORY_ENV
+    if UPDATE_MANIFEST_URL_ENV:
+        source["manifest_url"] = UPDATE_MANIFEST_URL_ENV
+    repository = source.get("repository", "").strip().strip("/")
+    if repository and not source.get("manifest_url"):
+        source["manifest_url"] = f"https://github.com/{repository}/releases/latest/download/latest.json"
+    return source
+
+
+def version_key(value: str) -> tuple[int, ...]:
+    numbers = re.findall(r"\d+", str(value or ""))
+    if not numbers:
+        return (0,)
+    return tuple(int(item) for item in numbers[:4])
+
+
+def is_newer_version(candidate: str, current: str = APP_VERSION) -> bool:
+    left = version_key(candidate)
+    right = version_key(current)
+    width = max(len(left), len(right))
+    return left + (0,) * (width - len(left)) > right + (0,) * (width - len(right))
+
+
+def update_decision(
+    manifest: dict[str, Any],
+    *,
+    current_version: str = APP_VERSION,
+    current_release_revision: int = APP_RELEASE_REVISION,
+) -> dict[str, Any]:
+    candidate_version = str(manifest.get("version") or "").strip()
+    try:
+        candidate_revision = max(0, int(manifest.get("release_revision") or 0))
+    except (TypeError, ValueError):
+        candidate_revision = 0
+    current_revision = max(0, int(current_release_revision or 0))
+    candidate_key = version_key(candidate_version)
+    current_key = version_key(current_version)
+    width = max(len(candidate_key), len(current_key))
+    candidate_key += (0,) * (width - len(candidate_key))
+    current_key += (0,) * (width - len(current_key))
+
+    if candidate_key > current_key:
+        automatic = True
+        manual_install_required = False
+        reason = "newer_version"
+    elif candidate_key == current_key and candidate_revision > current_revision:
+        automatic = True
+        manual_install_required = False
+        reason = "newer_release_revision"
+    elif candidate_key < current_key:
+        automatic = False
+        manual_install_required = True
+        reason = "manual_downgrade_only"
+    else:
+        automatic = False
+        manual_install_required = False
+        reason = "current"
+    return {
+        "automatic": automatic,
+        "manual_install_required": manual_install_required,
+        "reason": reason,
+        "current_release_revision": current_revision,
+        "latest_release_revision": candidate_revision,
+    }
+
+
+def fetch_json_url(url: str) -> dict[str, Any]:
+    request = urllib.request.Request(url, headers={"User-Agent": f"ViniperUI/{APP_VERSION}"})
+    with urllib.request.urlopen(request, timeout=UPDATE_HTTP_TIMEOUT_SECONDS) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError("update manifest is not a JSON object")
+    return data
+
+
+def update_requires_installer(manifest: dict[str, Any]) -> bool:
+    migration = manifest.get("migration") if isinstance(manifest.get("migration"), dict) else {}
+    return bool(manifest.get("requires_installer") is True or migration.get("requires_installer") is True)
+
+
+def _installer_asset(assets: Any) -> dict[str, Any] | None:
+    if isinstance(assets, dict):
+        for key in ("installer", "windows-installer", "nsis", "setup"):
+            item = assets.get(key)
+            if isinstance(item, dict) and item.get("url"):
+                result = dict(item)
+                result["key"] = key
+                return result
+        for key, item in assets.items():
+            if not isinstance(item, dict) or not item.get("url"):
+                continue
+            name = str(item.get("name") or item.get("url") or "")
+            if name.casefold().endswith(".exe"):
+                result = dict(item)
+                result["key"] = str(key)
+                return result
+    if isinstance(assets, list):
+        for item in assets:
+            if isinstance(item, dict) and str(item.get("name") or item.get("url") or "").casefold().endswith(".exe"):
+                return dict(item)
+    return None
+
+
+def choose_update_asset(manifest: dict[str, Any], requested_asset: str | None = None) -> dict[str, Any]:
+    assets = manifest.get("assets")
+    if update_requires_installer(manifest):
+        installer = _installer_asset(assets)
+        if installer is None:
+            raise ValueError("this update requires a full Windows installer, but the manifest has no installer asset")
+        if requested_asset and str(installer.get("key") or "") != str(requested_asset):
+            raise ValueError("this runtime migration cannot use a portable update asset")
+        return installer
+    if isinstance(assets, dict):
+        if requested_asset and isinstance(assets.get(requested_asset), dict):
+            return dict(assets[requested_asset])
+        # In-app updates should prefer the small portable package. Full platform
+        # installers are still published for manual downloads, but they are large
+        # enough to fail more often on flaky GitHub/proxy connections.
+        for key in ("app", "portable", "source", "zip"):
+            item = assets.get(key)
+            if isinstance(item, dict) and item.get("url"):
+                item = dict(item)
+                item["key"] = key
+                return item
+        system_name = platform.system().lower()
+        preferred: list[str] = []
+        if "darwin" in system_name:
+            preferred.extend(["macos", "darwin"])
+        elif "windows" in system_name:
+            preferred.extend(["windows", "win"])
+        elif "linux" in system_name:
+            preferred.append("linux")
+        for key in preferred:
+            item = assets.get(key)
+            if isinstance(item, dict) and item.get("url"):
+                item = dict(item)
+                item["key"] = key
+                return item
+        for key, item in assets.items():
+            if isinstance(item, dict) and item.get("url"):
+                item = dict(item)
+                item["key"] = str(key)
+                return item
+    if isinstance(assets, list):
+        for item in assets:
+            if isinstance(item, dict) and item.get("url"):
+                return dict(item)
+    raise ValueError("update manifest has no downloadable asset")
+
+
+def download_update_asset(asset: dict[str, Any], target_path: Path) -> None:
+    url = str(asset.get("url") or "")
+    if not url:
+        raise ValueError("selected update asset has no url")
+
+    expected_size = int(asset.get("size") or 0)
+    if expected_size <= 0:
+        raise ValueError("selected update asset has no positive size")
+    part_path = target_path.with_name(f"{target_path.name}.part")
+    last_error: Exception | None = None
+
+    for attempt in range(max(1, UPDATE_DOWNLOAD_RETRIES)):
+        downloaded = part_path.stat().st_size if part_path.exists() else 0
+        headers = {"User-Agent": f"ViniperUI/{APP_VERSION}"}
+        if downloaded > 0:
+            headers["Range"] = f"bytes={downloaded}-"
+        request = urllib.request.Request(url, headers=headers)
+
+        try:
+            with urllib.request.urlopen(request, timeout=UPDATE_HTTP_TIMEOUT_SECONDS) as response:
+                status = int(getattr(response, "status", response.getcode() or 200))
+                if downloaded > 0 and status != 206:
+                    downloaded = 0
+                mode = "ab" if downloaded > 0 else "wb"
+                with part_path.open(mode) as handle:
+                    while True:
+                        try:
+                            chunk = response.read(UPDATE_DOWNLOAD_CHUNK_SIZE)
+                        except http.client.IncompleteRead as exc:
+                            if exc.partial:
+                                handle.write(exc.partial)
+                            raise
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+
+            actual_size = part_path.stat().st_size
+            if expected_size and actual_size != expected_size:
+                raise ValueError(f"incomplete update download: {actual_size} of {expected_size} bytes")
+            part_path.replace(target_path)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < UPDATE_DOWNLOAD_RETRIES - 1:
+                time.sleep(min(2 ** attempt, 8))
+
+    raise ValueError(f"download update failed after {UPDATE_DOWNLOAD_RETRIES} attempts: {last_error}")
+
+
+def safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
+    with zipfile.ZipFile(zip_path) as archive:
+        for member in archive.infolist():
+            destination = (target_dir / member.filename).resolve()
+            if not str(destination).startswith(str(target_dir.resolve())):
+                raise ValueError(f"unsafe zip entry: {member.filename}")
+        archive.extractall(target_dir)
+
+
+def find_update_app_root(extract_dir: Path) -> Path:
+    candidates = [
+        extract_dir / "viniper-ui",
+        extract_dir / f"ViniperUI-{APP_VERSION}" / "viniper-ui",
+    ]
+    candidates.extend(path for path in extract_dir.rglob("viniper-ui") if path.is_dir())
+    candidates.extend(path for path in [extract_dir] if (path / "server.py").exists())
+    for candidate in candidates:
+        if (candidate / "server.py").exists() and (candidate / "static").exists():
+            return candidate
+    raise ValueError("downloaded package does not contain Viniper app files")
+
+
+def copy_update_tree(src: Path, dst: Path) -> None:
+    batch = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    backup_dir = DATA_DIR / "update-backups" / batch
+    staging_dir = DATA_DIR / "update-staging" / batch
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    allowed_files = [
+        "server.py", "context_lifecycle.py", "context_usage.py", "daily_usage.py", "skill_sync.py",
+        "agent_instructions.py", "agent_runtime.py", "agent_host_bridge.py",
+        "agent_queue.py", "agent_run_coordinator.py", "native_peer.py", "wsl_runtime.py",
+        "profiles.json", "requirements.txt", "VERSION", "update_source.json", "start.bat",
+    ]
+    allowed_dirs = ["static", "scripts", ".agents"]
+    required_runtime = [name for name in allowed_files if name.endswith(".py")]
+    missing = [name for name in required_runtime if not (src / name).is_file()]
+    if missing:
+        raise ValueError(f"update package missing runtime modules: {', '.join(missing)}")
+
+    for name in allowed_files:
+        source = src / name
+        if source.is_file():
+            shutil.copy2(source, staging_dir / name)
+    for name in allowed_dirs:
+        source = src / name
+        if source.is_dir():
+            shutil.copytree(source, staging_dir / name)
+
+    applied: list[str] = []
+    try:
+        for name in [*allowed_files, *allowed_dirs]:
+            staged = staging_dir / name
+            if not staged.exists():
+                continue
+            target = dst / name
+            previous = backup_dir / name
+            if target.exists():
+                os.replace(target, previous)
+            applied.append(name)
+            os.replace(staged, target)
+    except Exception:
+        for name in reversed(applied):
+            target = dst / name
+            previous = backup_dir / name
+            if target.exists():
+                failed = backup_dir / f"failed-new-{name.replace('/', '_')}"
+                os.replace(target, failed)
+            if previous.exists():
+                os.replace(previous, target)
+        raise
+
+
+def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str | None = None) -> dict[str, Any]:
+    asset = choose_update_asset(manifest, requested_asset)
+    url = str(asset.get("url") or "")
+    if not url:
+        raise ValueError("selected update asset has no url")
+
+    with tempfile.TemporaryDirectory(prefix="viniper-ui-update-") as tmp:
+        tmp_dir = Path(tmp)
+        package_path = tmp_dir / "update.zip"
+        download_update_asset(asset, package_path)
+
+        asset_name = str(asset.get("name") or package_path.name)
+        if update_requires_installer(manifest) and not asset_name.lower().endswith(".exe"):
+            raise ValueError("runtime migration requires the full Windows installer")
+        if os.name == "nt" and asset_name.lower().endswith(".exe"):
+            updates_dir = DATA_DIR / "updates"
+            updates_dir.mkdir(parents=True, exist_ok=True)
+            installer_path = updates_dir / safe_attachment_filename(asset_name)
+            shutil.copy2(package_path, installer_path)
+            subprocess.Popen([str(installer_path)], cwd=str(updates_dir), close_fds=True)
+            return {
+                "asset": asset,
+                "installer": str(installer_path),
+                "installer_opened": True,
+                "requires_installer": update_requires_installer(manifest),
+                "dependencies": "",
+            }
+
+        extract_dir = tmp_dir / "extract"
+        extract_dir.mkdir()
+        safe_extract_zip(package_path, extract_dir)
+        update_root = find_update_app_root(extract_dir)
+        copy_update_tree(update_root, APP_DIR)
+
+    deps_output = ""
+    requirements = APP_DIR / "requirements.txt"
+    if requirements.exists():
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "-r", str(requirements)],
+                cwd=str(APP_DIR),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=180,
+                check=False,
+            )
+            deps_output = completed.stdout[-1200:] if completed.stdout else ""
+        except Exception as exc:
+            deps_output = f"dependency install skipped: {exc}"
+
+    if os.name == "nt":
+        refresh_windows_shortcuts()
+
+    return {
+        "asset": asset,
+        "dependencies": deps_output,
+        "restarting": True,
+    }
+
+
+def _schedule_restart() -> None:
+    """Schedule a delayed restart of the server after the HTTP response is sent."""
+    if os.name != "nt":
+        return
+
+    async def _restart():
+        await asyncio.sleep(0.5)
+        try:
+            if env_value("VINIPER_UI_DESKTOP", "") == "1":
+                pass
+            else:
+                start_script = APP_DIR / "start.bat"
+                if start_script.exists():
+                    subprocess.Popen(
+                        ["cmd.exe", "/c", "start", "", "cmd", "/c", str(start_script)],
+                        cwd=str(APP_DIR),
+                        close_fds=True,
+                    )
+        except Exception:
+            pass
+        os._exit(0)
+
+    try:
+        asyncio.create_task(_restart())
+    except Exception:
+        pass
+
+
+migrate_legacy_data_dir()
+sessions.update(load_sessions_from_disk())
+if sessions:
+    save_sessions_to_disk()
+
+
+def next_session_name(mode: str = MODE_VINIPER) -> str:
+    prefix = "新建会话"
+    existing_numbers: set[int] = set()
+    for session in sessions.values():
+        existing_name = str(session.get("name") or "")
+        match = re.fullmatch(rf"{re.escape(prefix)}（(\d+)）", existing_name)
+        if match:
+            existing_numbers.add(int(match.group(1)))
+
+    number = 1
+    while number in existing_numbers:
+        number += 1
+    return f"{prefix}（{number}）"
+
+
+def remove_dir_inside(path: Path, base: Path) -> None:
+    try:
+        resolved = path.resolve()
+        base_resolved = base.resolve()
+        if resolved == base_resolved or not resolved.is_relative_to(base_resolved):
+            return
+        if resolved.exists() and resolved.is_dir():
+            shutil.rmtree(resolved)
+    except Exception:
+        pass
+
+
+def remove_session_runtime_data(session_id: str) -> None:
+    safe_id = safe_attachment_filename(session_id)
+    remove_dir_inside(ATTACHMENTS_DIR / safe_id, ATTACHMENTS_DIR)
+    remove_dir_inside(DATA_DIR / "session-memory" / safe_id, DATA_DIR / "session-memory")
+
+
+def safe_session(session_id: str) -> dict[str, Any]:
+    if session_id not in sessions:
+        sessions[session_id] = {
+            "id": session_id,
+            "mode": MODE_VINIPER,
+            "messages": [],
+            "created": now_ts(),
+            "updated": now_ts(),
+            "name": next_session_name(MODE_VINIPER),
+            "workdir": str(BASE_DIR),
+            "pinned": False,
+            "unread": False,
+            "last_run_status": "",
+            "claude_session_id": str(uuid.uuid4()),
+            "claude_initialized": False,
+            "summary": "",
+            "permission_mode": allowed_permission_mode(None, MODE_VINIPER),
+        }
+        save_sessions_to_disk()
+    session = normalize_session(session_id, sessions[session_id])
+    sessions[session_id] = session
+    return session
+
+
+def load_claude_settings() -> dict[str, Any]:
+    if not USER_CLAUDE_SETTINGS.exists():
+        return {}
+    try:
+        return json.loads(USER_CLAUDE_SETTINGS.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def parse_env_lines(value: Any) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for raw_line in str(value or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, item = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        env[key] = item.strip().strip("\"'")
+    return env
+
+
+def merged_env(include_app_settings: bool = True, mode: str = MODE_CLAUDE) -> dict[str, str]:
+    settings_env = load_claude_settings().get("env", {})
+    secret_env_keys = {
+        "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+        "VINIPER_API_KEY", "API_KEY", "TOKEN", "SECRET",
+    }
+    selected_provider = provider_for_mode(load_app_settings(), mode)
+    selected_secret_key = provider_env_names(selected_provider)["api_key"]
+    result = {
+        k: str(v) for k, v in settings_env.items()
+        if v is not None and str(k).upper() not in secret_env_keys
+    }
+    if include_app_settings:
+        settings = load_app_settings()
+        provider = provider_for_mode(settings, mode)
+        names = provider_env_names(provider)
+        base_url = str(provider.get("base_url") or "").strip()
+        model = str(provider.get("model") or "").strip()
+        if base_url:
+            result[names["base_url"]] = base_url
+        if model:
+            result[names["model"]] = model
+        result["VINIPER_PROVIDER"] = str(provider.get("id") or "")
+        result["VINIPER_PROVIDER_LABEL"] = str(provider.get("label") or "")
+        result["VINIPER_BASE_URL"] = base_url
+        result["VINIPER_MODEL"] = model
+        result.update({
+            key: value
+            for key, value in parse_env_lines(settings.get("shell", {}).get("custom_env", "")).items()
+            if key.upper() not in secret_env_keys
+        })
+    extra_keys = []
+    if include_app_settings:
+        names = provider_env_names(provider_for_mode(load_app_settings(), mode))
+        extra_keys.extend([names["api_key"], names["base_url"], names["model"]])
+    for key in tuple(dict.fromkeys((
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        *extra_keys,
+    ))):
+        if key in secret_env_keys and key != selected_secret_key:
+            continue
+        if os.environ.get(key):
+            result[key] = os.environ[key]
+    return result
+
+
+def effective_model_options(mode: str = MODE_VINIPER) -> list[dict[str, Any]]:
+    selected_mode = normalize_provider_mode(mode)
+    return normalize_model_options(provider_for_mode(load_app_settings(), selected_mode).get("models"))
+
+
+def allowed_model(model: str | None, mode: str = MODE_VINIPER) -> str:
+    selected_mode = normalize_provider_mode(mode)
+    models = effective_model_options(selected_mode)
+    ids = {item["id"] for item in models}
+    if model in ids:
+        return str(model)
+    app_model = str(provider_for_mode(load_app_settings(), selected_mode).get("model") or "").strip()
+    if app_model in ids:
+        return app_model
+    env_model = str(merged_env(include_app_settings=False, mode=selected_mode).get("ANTHROPIC_MODEL") or "").strip()
+    return env_model if env_model in ids else models[0]["id"]
+
+
+DEEPSEEK_PROVIDER_MODEL_ALIASES = {
+    "deepseek-v4-pro[1m]": "deepseek-v4-pro",
+}
+
+
+def provider_model_id(model: str | None) -> str:
+    """Normalize only the Provider-facing DeepSeek model identifier.
+
+    The bracketed 1m suffix remains the UI/context-window identifier. Raw
+    Anthropic requests and Claude Code CLI argv/env receive the official model
+    id so neither boundary silently falls back to another model.
+    """
+    normalized = str(model or "").strip()
+    return DEEPSEEK_PROVIDER_MODEL_ALIASES.get(normalized, normalized)
+
+
+def permission_mode_descriptors(mode: str = MODE_CLAUDE) -> list[dict[str, Any]]:
+    """Expose exactly three choices owned by the selected engine."""
+    selected_mode = normalize_session_mode(mode)
+    try:
+        runtime = agent_runtime()
+        cached_probe = getattr(runtime, "cached_probe", None)
+        probe = cached_probe() if callable(cached_probe) else None
+        capabilities = getattr(probe, "capabilities", None)
+    except Exception:
+        capabilities = None
+    declared = {str(item) for item in (getattr(capabilities, "permission_modes", ()) or ())}
+    supports = lambda value: value in CLAUDE_PERMISSION_MODE_IDS or value in declared or (value == "default" and "manual" in declared)
+    result: list[dict[str, Any]] = []
+    for option in permission_options_for_mode(selected_mode):
+        item = dict(option)
+        value = str(item["id"])
+        enabled = True if selected_mode == MODE_VINIPER else supports(value)
+        item["enabled"] = bool(enabled)
+        if not enabled:
+            item["reason"] = "当前 Claude Code CLI 未声明此权限模式"
+        result.append(item)
+    return result
+
+
+def available_permission_mode_ids(mode: str = MODE_CLAUDE) -> set[str]:
+    return {str(item["id"]) for item in permission_mode_descriptors(mode) if item.get("enabled")}
+
+
+def permission_workdir_key(workdir: Any) -> str:
+    return str(workdir or "").strip().replace("\\", "/").rstrip("/").casefold()
+
+
+def remembered_workdir_permission_mode(workdir: Any, mode: str = MODE_CLAUDE) -> str:
+    selected_mode = normalize_session_mode(mode)
+    settings = load_app_settings().get("runtime", {})
+    if selected_mode == MODE_VINIPER:
+        return allowed_permission_mode(None, MODE_VINIPER)
+    preferences = settings.get("permission_mode_by_workdir")
+    stored = preferences.get(permission_workdir_key(workdir)) if isinstance(preferences, dict) else None
+    return allowed_permission_mode(str(stored or settings.get("permission_mode_by_mode", {}).get(MODE_CLAUDE) or DEFAULT_PERMISSION_MODE), MODE_CLAUDE)
+
+
+def remember_workdir_permission_mode(workdir: Any, permission_mode: str, mode: str = MODE_CLAUDE) -> None:
+    selected_mode = normalize_session_mode(mode)
+    if selected_mode == MODE_VINIPER:
+        return
+    value = migrate_permission_mode(permission_mode, MODE_CLAUDE)
+    key = permission_workdir_key(workdir)
+    if not key or value in {None, "plan"}:
+        return
+    settings = load_app_settings()
+    runtime = settings.setdefault("runtime", {})
+    preferences = runtime.setdefault("permission_mode_by_workdir", {})
+    if not isinstance(preferences, dict):
+        preferences = {}
+        runtime["permission_mode_by_workdir"] = preferences
+    if preferences.get(key) == value:
+        return
+    preferences[key] = value
+    save_app_settings(settings)
+
+
+def allowed_permission_mode(permission_mode: str | None, mode: str = MODE_CLAUDE) -> str:
+    selected_mode = normalize_session_mode(mode)
+    settings = load_app_settings().get("runtime", {})
+    by_mode = settings.get("permission_mode_by_mode") if isinstance(settings.get("permission_mode_by_mode"), dict) else {}
+    configured = migrate_permission_mode(by_mode.get(selected_mode), selected_mode)
+    if configured is None:
+        configured = migrate_permission_mode(settings.get("permission_mode"), selected_mode)
+    fallback = configured or ("ask" if selected_mode == MODE_VINIPER else "default")
+    explicit = migrate_permission_mode(permission_mode, selected_mode)
+    return explicit or fallback
+
+
+# Goal normalization consumes both the mode-owned model registry and the
+# permission mapping. Load persisted goals only after both are available.
+goals.update(load_goals_from_disk())
+
+
+def require_permission_mode(permission_mode: str | None, mode: str = MODE_CLAUDE) -> str:
+    selected_mode = normalize_session_mode(mode)
+    raw = str(permission_mode or "").strip()
+    value = migrate_permission_mode(raw, selected_mode) if raw else allowed_permission_mode(None, selected_mode)
+    if value not in permission_ids_for_mode(selected_mode):
+        raise HTTPException(status_code=400, detail="unknown permission_mode")
+    descriptor = next((item for item in permission_mode_descriptors(selected_mode) if item.get("id") == value), None)
+    if not descriptor or not descriptor.get("enabled"):
+        raise HTTPException(status_code=400, detail=str((descriptor or {}).get("reason") or "permission mode unavailable"))
+    return value
+
+
+def session_permission_mode(session: dict[str, Any]) -> str:
+    """Return the durable per-session Desktop permission mode, fail closed."""
+    mode = normalize_session_mode(session.get("mode"))
+    value = migrate_permission_mode(session.get("permission_mode"), mode)
+    if value in permission_ids_for_mode(mode):
+        if session.get("permission_mode") != value:
+            session["permission_mode"] = value
+        return value
+    fallback = "ask" if mode == MODE_VINIPER else "default"
+    session["permission_mode"] = fallback
+    return fallback
+
+
+def harness_permission_mode(mode: str | None) -> str:
+    """Map Viniper-owned choices to Harness policy semantics."""
+    value = allowed_permission_mode(mode, MODE_VINIPER)
+    return {"ask": "ask", "review": "review", "fullAccess": "full"}[value]
+
+
+def claude_permission_mode(mode: str | None) -> str:
+    """Map the shared presentation choice to native Claude Code semantics."""
+    value = allowed_permission_mode(mode, MODE_CLAUDE)
+    return {"default": "default", "acceptEdits": "acceptEdits", "plan": "plan"}[value]
+
+
+def provider_config(model_override: str | None = None, mode: str = MODE_VINIPER) -> dict[str, str]:
+    selected_mode = normalize_provider_mode(mode)
+    settings = load_app_settings()
+    provider = provider_for_mode(settings, selected_mode)
+    names = provider_env_names(provider)
+    env = merged_env(include_app_settings=False, mode=selected_mode)
+    api_key = read_host_secret(selected_mode) or provider_env_fallback(provider, selected_mode)
+    base_url = (
+        str(provider.get("base_url") or "").strip()
+        or env.get(names["base_url"])
+        or env.get("ANTHROPIC_BASE_URL")
+        or env.get("OPENAI_BASE_URL")
+        or (DEFAULT_AGENT_BASE_URL if selected_mode == MODE_CLAUDE else DEFAULT_DEEPSEEK_BASE_URL)
+    )
+    return {
+        "provider": str(provider.get("id") or ("anthropic" if selected_mode == MODE_CLAUDE else "custom")),
+        "label": str(provider.get("label") or ("Claude code" if selected_mode == MODE_CLAUDE else "Model Provider")),
+        "api_key": api_key,
+        "api_key_env": names["api_key"],
+        "base_url_env": names["base_url"],
+        "model_env": names["model"],
+        "secret_ref": str(provider.get("secret_ref") or MODE_SECRET_REFS[selected_mode]),
+        "base_url": base_url.rstrip("/"),
+        "model": allowed_model(model_override, selected_mode),
+    }
+
+
+def deepseek_config(model_override: str | None = None, mode: str = MODE_CLAUDE) -> dict[str, str]:
+    return provider_config(model_override, mode)
+
+
+def messages_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/v1/messages"):
+        return base
+    if base.endswith("/anthropic"):
+        return f"{base}/v1/messages"
+    if base.endswith("/anthropic/v1") or base.endswith("/v1"):
+        return f"{base}/messages"
+    return f"{base}/v1/messages"
+
+
+def claude_launcher() -> list[str]:
+    found = shutil.which("claude")
+    candidates = [
+        Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe",
+        Path(found) if found else None,
+        Path.home() / "AppData" / "Roaming" / "npm" / "claude",
+        Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd",
+        Path.home() / "AppData" / "Roaming" / "npm" / "claude.ps1",
+    ]
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            path = str(candidate)
+            if path.lower().endswith((".cmd", ".bat")):
+                return ["cmd.exe", "/d", "/c", path]
+            if path.lower().endswith(".ps1"):
+                return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path]
+            return [path]
+    return ["claude"]
+
+
+def native_claude_available() -> bool:
+    try:
+        if shutil.which("claude"):
+            return True
+        candidates = [
+            Path.home() / "AppData" / "Roaming" / "npm" / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe",
+            Path.home() / "AppData" / "Roaming" / "npm" / "claude",
+            Path.home() / "AppData" / "Roaming" / "npm" / "claude.cmd",
+            Path.home() / "AppData" / "Roaming" / "npm" / "claude.ps1",
+        ]
+        return any(path.exists() for path in candidates)
+    except Exception:
+        return False
+
+
+def claude_available() -> bool:
+    return agent_runtime().probe().ready
+
+
+def claude_cli_compatibility() -> dict[str, Any]:
+    probe = agent_runtime().probe()
+    return {
+        "ok": probe.ready,
+        "detail": probe.detail,
+        "version": probe.version,
+        "runtime": "wsl2",
+        "capabilities": probe.capabilities.as_dict(),
+        "native_migration_available": native_claude_available(),
+    }
+
+
+def current_windows_desktop_exe() -> Path | None:
+    if os.name != "nt":
+        return None
+    configured = env_value("VINIPER_UI_DESKTOP_EXE", "").strip().strip('"')
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.exists() and candidate.is_file() and candidate.name.lower() in {"viniper.exe", "viniper ui.exe"}:
+            return candidate.resolve()
+
+    for root in (APP_DIR, *APP_DIR.parents):
+        for executable_name in ("Viniper.exe", "Viniper UI.exe"):
+            candidate = root / executable_name
+            if candidate.exists() and candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
+def refresh_windows_shortcuts() -> None:
+    if os.name != "nt" or WORKSTATION_MODE:
+        return
+    icon = STATIC_DIR / "assets" / "viniper-harness-circuit-node.ico"
+    installed_candidates = [
+        current_windows_desktop_exe(),
+        BASE_DIR / "Viniper.exe",
+        BASE_DIR.parent / "Viniper.exe",
+        Path("C:/Program Files/Viniper/Viniper.exe"),
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Viniper" / "Viniper.exe",
+        BASE_DIR / "Viniper UI.exe",
+        BASE_DIR.parent / "Viniper UI.exe",
+        Path("C:/Program Files/Viniper UI/Viniper UI.exe"),
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Viniper UI" / "Viniper UI.exe",
+    ]
+    installed_candidates = [path for path in installed_candidates if path is not None]
+    installed_exe = next((path for path in installed_candidates if path.exists()), installed_candidates[-1])
+    start_script = APP_DIR / "start.bat"
+    target_path = installed_exe if installed_exe.exists() else start_script
+    if not target_path.exists():
+        return
+
+    icon_location = f"{target_path},0" if installed_exe.exists() else (f"{icon},0" if icon.exists() else "")
+    desktop = Path.home() / "Desktop"
+    start_menu = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    taskbar = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Internet Explorer" / "Quick Launch" / "User Pinned" / "TaskBar"
+    app_user_model_id = "com.viniper.ui.desktop"
+    app_id_setter = APP_DIR / "scripts" / "set_shortcut_app_id.ps1"
+    ps = rf"""
+$shell = New-Object -ComObject WScript.Shell
+$target = '{str(target_path).replace("'", "''")}'
+$workdir = '{str(target_path.parent).replace("'", "''")}'
+$icon = '{icon_location.replace("'", "''")}'
+$appId = '{app_user_model_id}'
+$appIdSetter = '{str(app_id_setter).replace("'", "''")}'
+$desktop = '{str(desktop).replace("'", "''")}'
+$startMenu = '{str(start_menu).replace("'", "''")}'
+$taskbar = '{str(taskbar).replace("'", "''")}'
+function Update-ViniperShortcut($path) {{
+  try {{
+    $exists = Test-Path -LiteralPath $path
+    $shortcut = $shell.CreateShortcut($path)
+    $changed = -not $exists
+    if ($shortcut.TargetPath -ne $target) {{
+      $shortcut.TargetPath = $target
+      $changed = $true
+    }}
+    if ($shortcut.WorkingDirectory -ne $workdir) {{
+      $shortcut.WorkingDirectory = $workdir
+      $changed = $true
+    }}
+    if ($icon -and $shortcut.IconLocation -ne $icon) {{
+      $shortcut.IconLocation = $icon
+      $changed = $true
+    }}
+    if ($changed) {{ $shortcut.Save() }}
+    if (-not (Test-Path -LiteralPath $appIdSetter -PathType Leaf)) {{
+      throw "Shortcut AppUserModelID setter is missing: $appIdSetter"
+    }}
+    & $appIdSetter -ShortcutPath $path -AppUserModelId $appId
+  }} catch {{}}
+}}
+if (Test-Path -LiteralPath $desktop) {{
+  Update-ViniperShortcut (Join-Path $desktop 'Viniper.lnk')
+  Get-ChildItem -LiteralPath $desktop -Filter 'Viniper UI*.lnk' -ErrorAction SilentlyContinue |
+    ForEach-Object {{ Update-ViniperShortcut $_.FullName }}
+}}
+if (Test-Path -LiteralPath $startMenu) {{
+  Update-ViniperShortcut (Join-Path $startMenu 'Viniper.lnk')
+}}
+if (Test-Path -LiteralPath $taskbar) {{
+  Get-ChildItem -LiteralPath $taskbar -Filter '*.lnk' -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.Name -like 'Viniper*.lnk' }} |
+    ForEach-Object {{ Update-ViniperShortcut $_.FullName }}
+}}
+"""
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def build_agent_env(
+    cfg: dict[str, str] | None = None,
+    session: dict[str, Any] | None = None,
+    *,
+    mode: str = MODE_CLAUDE,
+    effective_context_window: int = 0,
+    auto_compact_supported: bool | None = None,
+) -> dict[str, str]:
+    selected_mode = normalize_provider_mode(mode)
+    secret_keys = {
+        "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "VINIPER_API_KEY",
+    }
+    env = {key: value for key, value in os.environ.items() if key not in secret_keys}
+    env.update(merged_env(mode=selected_mode))
+    for key in secret_keys:
+        env.pop(key, None)
+    cfg = cfg or provider_config(mode=selected_mode)
+    provider = provider_for_mode(load_app_settings(), selected_mode)
+    names = provider_env_names(provider)
+    env["VINIPER_PROVIDER"] = cfg.get("provider", "")
+    env["VINIPER_PROVIDER_LABEL"] = cfg.get("label", "")
+    env["VINIPER_BASE_URL"] = cfg.get("base_url", "")
+    env["VINIPER_MODEL"] = cfg.get("model", "")
+    if cfg.get("base_url"):
+        env[names["base_url"]] = cfg["base_url"]
+    if cfg.get("model"):
+        env[names["model"]] = cfg["model"]
+    if cfg.get("api_key"):
+        env[names["api_key"]] = cfg["api_key"]
+    if session:
+        env["VINIPER_SESSION_ID"] = str(session.get("id") or "")
+        env["VINIPER_WORKDIR"] = str(session.get("workdir") or "")
+    window = max(0, int(effective_context_window or 0))
+    if window and auto_compact_supported is False:
+        # Official fallback for Claude Code versions that do not expose the
+        # current --autocompact flag.  Do not invent a Viniper-specific limit.
+        env[AUTO_COMPACT_WINDOW_ENV] = str(window)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def build_claude_env(
+    cfg: dict[str, str] | None = None,
+    session: dict[str, Any] | None = None,
+    *,
+    mode: str = MODE_CLAUDE,
+    effective_context_window: int = 0,
+    auto_compact_supported: bool | None = None,
+) -> dict[str, str]:
+    selected_mode = normalize_provider_mode(mode)
+    cfg = cfg or provider_config(mode=selected_mode)
+    env = build_agent_env(
+        cfg,
+        session,
+        mode=selected_mode,
+        effective_context_window=effective_context_window,
+        auto_compact_supported=auto_compact_supported,
+    )
+    env["ANTHROPIC_BASE_URL"] = cfg.get("base_url", "")
+    transport_model = provider_model_id(cfg.get("model", ""))
+    env["ANTHROPIC_MODEL"] = transport_model
+    provider = provider_for_mode(load_app_settings(), selected_mode)
+    names = provider_env_names(provider)
+    if names.get("model"):
+        env[names["model"]] = transport_model
+    if cfg.get("api_key"):
+        env[cfg.get("api_key_env") or "ANTHROPIC_AUTH_TOKEN"] = cfg["api_key"]
+        other = "ANTHROPIC_API_KEY" if (cfg.get("api_key_env") or "").upper() == "ANTHROPIC_AUTH_TOKEN" else "ANTHROPIC_AUTH_TOKEN"
+        env.pop(other, None)
+    env["NO_COLOR"] = "1"
+    return env
+
+
+def runtime_bridge_keys(mode: str = MODE_CLAUDE) -> tuple[str, ...]:
+    names = provider_env_names(provider_for_mode(load_app_settings(), mode))
+    return tuple(dict.fromkeys((
+        names["api_key"],
+        names["base_url"],
+        names["model"],
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "VINIPER_PROVIDER",
+        "VINIPER_PROVIDER_LABEL",
+        "VINIPER_BASE_URL",
+        "VINIPER_MODEL",
+        "VINIPER_SESSION_ID",
+        "VINIPER_WORKDIR",
+        AUTO_COMPACT_WINDOW_ENV,
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    )))
+
+
+def active_shell_settings() -> dict[str, Any]:
+    return load_app_settings().get("shell", {})
+
+
+def active_shell_label(shell_id: str | None = None) -> str:
+    value = shell_id or str(active_shell_settings().get("id") or "claude-code")
+    for option in SHELL_OPTIONS:
+        if option["id"] == value:
+            return str(option.get("label") or value)
+    return value
+
+
+def is_custom_shell(settings: dict[str, Any] | None = None) -> bool:
+    shell = settings if isinstance(settings, dict) else active_shell_settings()
+    return str(shell.get("id") or "claude-code") == "custom-cli"
+
+
+def shell_quote(value: Any) -> str:
+    text = str(value)
+    if os.name == "nt":
+        return subprocess.list2cmdline([text])
+    return shlex.quote(text)
+
+
+def format_custom_command(template: str, cfg: dict[str, str], session: dict[str, Any], permission_mode: str) -> str:
+    replacements = {
+        "model": cfg.get("model", ""),
+        "base_url": cfg.get("base_url", ""),
+        "provider": cfg.get("provider", ""),
+        "provider_label": cfg.get("label", ""),
+        "workdir": str(session.get("workdir") or ""),
+        "session_id": str(session.get("id") or ""),
+        "permission_mode": permission_mode,
+    }
+    command = template
+    for key, value in replacements.items():
+        command = command.replace("{" + key + "}", shell_quote(value))
+    return command
+
+
+def build_generic_cli_prompt(
+    session: dict[str, Any],
+    prompt: str,
+    attachments: list[dict[str, Any]],
+    agent_instructions: str = "",
+) -> str:
+    history = []
+    for message in list(session.get("messages", []))[-12:]:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "message")
+        content = str(message.get("content") or "").strip()
+        if content:
+            history.append(f"{role}: {content}")
+    parts = [
+        f"You are running inside {APP_TITLE} as a thin wrapper around a user-selected agent shell.",
+        "Use the current working directory and return concise progress plus final results.",
+        "After a tool completes, finish with a concise result; do not repeat completed tools or the user message, and do not keep thinking without new output beyond the finalization budget.",
+    ]
+    system_append = build_system_append(session, agent_instructions)
+    if system_append:
+        parts.append(system_append)
+    if history:
+        parts.append("Recent conversation:\n" + "\n\n".join(history))
+    parts.append("Current user message:\n" + append_attachment_prompt(prompt, attachments))
+    return "\n\n".join(parts)
+
+
+def build_system_append(session: dict[str, Any], agent_instructions: str = "") -> str:
+    summary = str(session.get("summary") or "").strip()
+    isolation_note = (
+        f"当前 {APP_TITLE} 会话与其他会话隔离。只把本会话传入的历史摘要、当前工作目录和用户消息"
+        "作为连续上下文；不要主动引用其他 UI 会话的记忆。"
+    )
+    stability_note = (
+        "稳定性要求：遇到 docx、pdf、图片很多或输出很长的任务时，不要把完整文件内容、完整图片清单、"
+        "大段日志或二进制内容直接打印到聊天里；优先用脚本在工作目录生成中间文件或最终文件，"
+        "聊天里只返回简短摘要、关键路径和下一步。这样可以避免第三方模型网关在工具结果后卡住。"
+    )
+    parts = [isolation_note, stability_note]
+    if summary:
+        parts.append(f"以下是网页端压缩后的历史摘要，请在回答时保持连续性：{summary}")
+    instructions = str(agent_instructions or "")
+    if instructions.strip():
+        parts.append(
+            "以下是用户在 Viniper 全局 AGENT.md 中保存的自定义指令。"
+            "它与工作目录中的 CLAUDE.md、AGENTS.md 可以同时生效；请在本次 Agent 工作中遵循：\n"
+            f"{instructions}"
+        )
+    return "\n\n".join(parts)
+
+
+def prepare_agent_system_prompt(session: dict[str, Any]) -> Path:
+    """Read AGENT.md for this turn and materialize one private prompt file."""
+    content = build_system_append(session, read_agent_instructions(MODE_CLAUDE))
+    prompt_dir = DATA_DIR / "runtime" / "prompts"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    session_token = safe_attachment_filename(str(session.get("id") or "session"))
+    target = prompt_dir / f"{session_token}-{uuid.uuid4().hex}.md"
+    temporary = target.with_suffix(".md.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(target)
+    return target
+
+
+def cleanup_agent_system_prompt(path: Path | str | None) -> None:
+    if not path:
+        return
+    target = Path(path)
+    prompt_dir = (DATA_DIR / "runtime" / "prompts").resolve()
+    try:
+        resolved = target.resolve()
+        if resolved.parent == prompt_dir:
+            resolved.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def existing_workdir(value: str | None) -> Path:
+    if value:
+        path = Path(value)
+        if path.exists() and path.is_dir():
+            return path
+    return BASE_DIR
+
+
+FILE_CHANGE_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".cache",
+    "update-backups",
+    "codex",
+    "cache_data",
+}
+FILE_CHANGE_SKIP_SUFFIXES = {".pyc", ".pyo", ".tmp", ".temp", ".log"}
+FILE_CHANGE_SCAN_LIMIT = 8000
+FILE_CHANGE_RESULT_LIMIT = 12
+
+
+def safe_resolve_path(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve()
+    except Exception:
+        return path.expanduser()
+
+
+def should_watch_file_root(path: Path) -> bool:
+    root = safe_resolve_path(path)
+    try:
+        if not root.exists() or not root.is_dir():
+            return False
+        # Avoid scanning an entire drive such as D:\.
+        if root.parent == root:
+            return False
+        if os.name == "nt" and re.fullmatch(r"[A-Za-z]:\\?", str(root)):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def file_change_watch_roots(workdir: Path) -> list[Path]:
+    roots: list[Path] = []
+
+    def add(path: Path) -> None:
+        root = safe_resolve_path(path)
+        if should_watch_file_root(root) and root not in roots:
+            roots.append(root)
+
+    add(workdir)
+    return roots
+
+
+def iter_watch_files(root: Path, limit: int = FILE_CHANGE_SCAN_LIMIT):
+    count = 0
+    stack = [root]
+    while stack and count < limit:
+        current = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except Exception:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir():
+                    if entry.name.casefold() not in FILE_CHANGE_SKIP_DIRS:
+                        stack.append(entry)
+                    continue
+                if not entry.is_file() or entry.suffix.lower() in FILE_CHANGE_SKIP_SUFFIXES:
+                    continue
+                stat = entry.stat()
+            except Exception:
+                continue
+            count += 1
+            yield safe_resolve_path(entry), stat
+            if count >= limit:
+                break
+
+
+def snapshot_watch_files(roots: list[Path]) -> dict[str, tuple[int, int]]:
+    snapshot: dict[str, tuple[int, int]] = {}
+    for root in roots:
+        for path, stat in iter_watch_files(root):
+            snapshot[str(path).lower()] = (int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))), int(stat.st_size))
+    return snapshot
+
+
+def changed_watch_files(before: dict[str, tuple[int, int]], roots: list[Path]) -> list[str]:
+    changed: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for root in roots:
+        for path, stat in iter_watch_files(root):
+            key = str(path).lower()
+            current = (int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))), int(stat.st_size))
+            if key in seen or before.get(key) == current:
+                continue
+            seen.add(key)
+            changed.append((current[0], str(path)))
+    changed.sort(key=lambda item: item[0], reverse=True)
+    return [path for _, path in changed[:FILE_CHANGE_RESULT_LIMIT]]
+
+
+def snapshot_watch_text(roots: list[Path], max_bytes: int = 256 * 1024) -> dict[str, tuple[str, str]]:
+    """Capture bounded text before a run so a later diff is evidence-backed."""
+    snapshot: dict[str, tuple[str, str]] = {}
+    for root in roots:
+        for path, stat in iter_watch_files(root):
+            if int(stat.st_size) > max_bytes:
+                continue
+            try:
+                raw = path.read_bytes()
+                if b"\x00" in raw:
+                    continue
+                snapshot[str(path).lower()] = (str(path), raw.decode("utf-8", errors="replace"))
+            except OSError:
+                continue
+    return snapshot
+
+
+def file_change_records(
+    before_meta: dict[str, tuple[int, int]],
+    before_text: dict[str, tuple[str, str]],
+    roots: list[Path],
+) -> list[dict[str, Any]]:
+    current_text = snapshot_watch_text(roots)
+    changed_paths = changed_watch_files(before_meta, roots)
+    current_by_key = {str(path).lower(): str(path) for path in changed_paths}
+    records: list[dict[str, Any]] = []
+    keys = list(current_by_key)
+    for key in before_text:
+        if key not in current_text and key not in current_by_key:
+            keys.append(key)
+    for key in keys[:FILE_CHANGE_RESULT_LIMIT]:
+        before_entry = before_text.get(key)
+        after_entry = current_text.get(key)
+        path = (after_entry or before_entry or (current_by_key.get(key, key), ""))[0]
+        before_value = before_entry[1] if before_entry else ""
+        after_value = after_entry[1] if after_entry else ""
+        operation = "created" if before_entry is None else ("deleted" if after_entry is None else "modified")
+        diff_lines = list(difflib.unified_diff(
+            before_value.splitlines(),
+            after_value.splitlines(),
+            fromfile=f"a/{Path(path).name}",
+            tofile=f"b/{Path(path).name}",
+            lineterm="",
+        ))
+        additions = sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++"))
+        deletions = sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---"))
+        records.append({
+            "path": path,
+            "operation": operation,
+            "additions": additions,
+            "deletions": deletions,
+            "diff": "\n".join(diff_lines),
+            "available": bool(diff_lines),
+        })
+    return records
+
+
+PLAN_STEP_STATUSES = {"pending", "in_progress", "completed", "skipped", "failed"}
+
+
+def _normalize_plan_steps(session: dict[str, Any], raw_steps: list[Any]) -> list[dict[str, str]]:
+    previous = session.get("plan") if isinstance(session.get("plan"), dict) else {}
+    prior_ids = {
+        str(item.get("title") or ""): str(item.get("id") or "")
+        for item in previous.get("steps") or []
+        if isinstance(item, dict)
+    }
+    steps: list[dict[str, str]] = []
+    for index, item in enumerate(raw_steps[:40]):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("content") or item.get("title") or item.get("step") or "").strip()
+        status = str(item.get("status") or ("in_progress" if index == 0 else "pending")).casefold()
+        status = {
+            "done": "completed",
+            "complete": "completed",
+            "running": "in_progress",
+            "active": "in_progress",
+        }.get(status, status)
+        if not title or status not in PLAN_STEP_STATUSES:
+            continue
+        steps.append({
+            "id": prior_ids.get(title) or str(uuid.uuid4())[:8],
+            "title": title[:240],
+            "status": status,
+        })
+    return steps
+
+
+def _plan_projection(session_id: str, session: dict[str, Any], source: str = "", run_id: str = "") -> dict[str, Any]:
+    plan = session.get("plan") if isinstance(session.get("plan"), dict) else {}
+    steps = [copy.deepcopy(step) for step in plan.get("steps") or [] if isinstance(step, dict)]
+    current = next((index + 1 for index, step in enumerate(steps) if step.get("status") == "in_progress"), 0)
+    if not current and steps and all(step.get("status") in {"completed", "skipped", "failed"} for step in steps):
+        current = len(steps)
+    result = {
+        "session_id": str(session_id),
+        "mode": normalize_session_mode(session.get("mode")),
+        "steps": steps,
+        "current": current,
+        "total": len(steps),
+        "source": str(source or plan.get("source") or ""),
+    }
+    if run_id or plan.get("run_id"):
+        result["run_id"] = str(run_id or plan.get("run_id") or "")
+    if plan.get("terminal_status"):
+        result["terminal_status"] = str(plan.get("terminal_status"))
+    return result
+
+
+def persist_runtime_plan_event(
+    session_id: str,
+    raw_steps: list[Any],
+    *,
+    source: str = "runtime.plan",
+    run_id: str = "",
+    explanation: str = "",
+) -> dict[str, Any] | None:
+    """Persist the latest canonical plan projection for renderer recovery."""
+    session = safe_session(str(session_id))
+    steps = _normalize_plan_steps(session, raw_steps)
+    if not steps:
+        return None
+    plan: dict[str, Any] = {
+        "steps": steps,
+        "updated": now_ts(),
+        "source": str(source or "runtime.plan"),
+    }
+    if run_id:
+        plan["run_id"] = str(run_id)
+    if explanation:
+        plan["explanation"] = str(explanation)[:500]
+    session["plan"] = plan
+    session["updated"] = now_ts()
+    sessions[str(session_id)] = session
+    save_sessions_to_disk()
+    return _plan_projection(str(session_id), session, source, run_id)
+
+
+def update_plan_from_tool_event(
+    session_id: str,
+    tool_name: str,
+    tool_input: Any,
+    run_id: str = "",
+) -> dict[str, Any] | None:
+    """Project a real engine plan tool payload into the canonical session plan."""
+    normalized_name = re.sub(r"[^a-z]", "", str(tool_name or "").casefold())
+    if normalized_name not in {"todowrite", "updateplan", "planupdate"} or not isinstance(tool_input, dict):
+        return None
+    raw_steps = tool_input.get("todos") if isinstance(tool_input.get("todos"), list) else tool_input.get("steps")
+    if not isinstance(raw_steps, list):
+        return None
+    return persist_runtime_plan_event(
+        session_id,
+        raw_steps,
+        source=str(tool_name),
+        run_id=str(run_id or ""),
+        explanation=str(tool_input.get("explanation") or ""),
+    )
+
+
+def finalize_plan_for_terminal(session_id: str, terminal_status: str, run_id: str = "") -> dict[str, Any] | None:
+    """Close unresolved steps so a terminal run never leaves pending state."""
+    session = safe_session(str(session_id))
+    plan = session.get("plan") if isinstance(session.get("plan"), dict) else None
+    if not plan or not isinstance(plan.get("steps"), list) or not plan.get("steps"):
+        return None
+    plan_run_id = str(plan.get("run_id") or "")
+    if run_id and plan_run_id and plan_run_id != str(run_id):
+        return None
+    terminal = str(terminal_status or "failed").casefold()
+    unresolved_status = "failed" if terminal in {"failed", "error"} else "skipped"
+    changed = False
+    for step in plan["steps"]:
+        if not isinstance(step, dict):
+            continue
+        status = str(step.get("status") or "pending")
+        if status in {"pending", "in_progress"}:
+            step["status"] = unresolved_status
+            changed = True
+    if plan.get("terminal_status") != terminal:
+        plan["terminal_status"] = terminal
+        changed = True
+    if not changed:
+        return _plan_projection(str(session_id), session, str(plan.get("source") or ""), plan_run_id)
+    plan["updated"] = now_ts()
+    session["plan"] = plan
+    session["updated"] = now_ts()
+    sessions[str(session_id)] = session
+    save_sessions_to_disk()
+    return _plan_projection(str(session_id), session, str(plan.get("source") or ""), plan_run_id)
+
+
+def directory_payload(path: Path) -> dict[str, str]:
+    return {"path": str(path), "name": path.name or str(path)}
+
+
+def filesystem_roots() -> list[dict[str, str]]:
+    roots: list[Path] = []
+
+    def add(path: Path) -> None:
+        try:
+            resolved = path.expanduser().resolve()
+            if resolved.exists() and resolved.is_dir() and resolved not in roots:
+                roots.append(resolved)
+        except Exception:
+            pass
+
+    add(Path(load_app_settings().get("workspace", {}).get("default_root") or platform_default_workspace_root()))
+    add(platform_default_workspace_root())
+    add(BASE_DIR)
+    add(Path.home())
+    if os.name == "nt":
+        for code in range(ord("A"), ord("Z") + 1):
+            add(Path(f"{chr(code)}:/"))
+    return [directory_payload(path) for path in roots]
+
+
+def resolve_existing_directory(value: Any | None, fallback: Path | None = None) -> Path:
+    path = Path(str(value or fallback or platform_default_workspace_root())).expanduser()
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    if not resolved.exists() or not resolved.is_dir():
+        raise HTTPException(status_code=400, detail="directory does not exist")
+    return resolved
+
+
+def validate_folder_name(name: Any) -> str:
+    value = str(name or "").strip().strip(". ")
+    if not value:
+        raise HTTPException(status_code=400, detail="folder name is required")
+    if re.search(r'[<>:"/\\|?*\x00-\x1f]', value):
+        raise HTTPException(status_code=400, detail="folder name contains invalid characters")
+    return value[:120]
+
+
+def agent_add_dirs(session: dict[str, Any], prompt: str, attachments: list[dict[str, Any]] | None = None) -> list[str]:
+    paths: list[Path] = [existing_workdir(str(session.get("workdir") or ""))]
+    paths.extend(path for path in KNOWN_WORK_DIRS if path.exists())
+    for item in attachments or []:
+        path = Path(str(item.get("path") or ""))
+        if path.exists():
+            paths.append(path.parent)
+
+    # Let Claude Code touch obvious Windows paths named in the prompt.
+    for drive in ("C", "D", "E"):
+        token = f"{drive}:/"
+        if token.lower() in prompt.lower():
+            root = Path(f"{drive}:/")
+            if root.exists():
+                paths.append(root)
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        try:
+            resolved = str(path.resolve())
+        except Exception:
+            resolved = str(path)
+        key = resolved.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(resolved)
+    skill_bridge = claude_skill_bridge_root()
+    if skill_bridge and skill_bridge.lower() not in seen:
+        result.append(skill_bridge)
+    return result
+
+
+def add_dir_args(session: dict[str, Any], prompt: str, attachments: list[dict[str, Any]] | None = None) -> list[str]:
+    """Compatibility helper; AgentRuntime owns final CLI argument construction."""
+    result: list[str] = []
+    for directory in agent_add_dirs(session, prompt, attachments):
+        result.extend(["--add-dir", directory])
+    return result
+
+
+def mojibake_score(text: str) -> int:
+    if not text:
+        return 0
+    score = text.count("\ufffd") * 30
+    score += sum(8 for ch in text if 0x80 <= ord(ch) <= 0x9F)
+    for marker in MOJIBAKE_MARKERS:
+        score += text.count(marker) * 2
+    for marker in GBK_MOJIBAKE_MARKERS:
+        score += text.count(marker) * 4
+    return score
+
+
+def repair_with_encoding(text: str, encoding: str) -> str | None:
+    try:
+        repaired = text.encode(encoding).decode("utf-8")
+    except UnicodeError:
+        return None
+    return repaired if repaired != text else None
+
+
+def clean_stream_text(value: str) -> str:
+    text = str(value)
+    score = mojibake_score(text)
+    if score < 6:
+        return text
+
+    candidates = [text]
+    for encoding in ("latin1", "cp1252", "gb18030", "gbk"):
+        repaired = repair_with_encoding(text, encoding)
+        if repaired:
+            candidates.append(repaired)
+
+    # Some terminal paths double-wrap mojibake. One extra pass is enough and
+    # keeps normal multilingual text from being touched.
+    for candidate in list(candidates[1:]):
+        for encoding in ("latin1", "cp1252", "gb18030", "gbk"):
+            repaired = repair_with_encoding(candidate, encoding)
+            if repaired:
+                candidates.append(repaired)
+
+    best = min(candidates, key=lambda item: (mojibake_score(item), -len(item)))
+    return best if mojibake_score(best) < score else text
+
+
+def clean_payload_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return clean_stream_text(value)
+    if isinstance(value, list):
+        return [clean_payload_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: clean_payload_value(item) for key, item in value.items()}
+    return value
+
+
+def sse(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(clean_payload_value(payload), ensure_ascii=False)}\n\n"
+
+
+class InteractionRequestError(RuntimeError):
+    """A structured CLI interaction could not be safely matched or answered."""
+
+
+def _control_display_text(value: Any, limit: int = 320) -> str:
+    text = clean_stream_text(str(value or "")).strip()
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def _permission_display_payload(tool_input: dict[str, Any], summary: str = "") -> dict[str, str]:
+    """Expose only short, user-action-relevant permission details to the renderer."""
+    display: dict[str, str] = {}
+    for key in ("command", "file_path", "path", "url"):
+        value = _control_display_text(tool_input.get(key))
+        if value:
+            display[key] = value
+    description = _control_display_text(tool_input.get("description") or summary)
+    if description:
+        display["description"] = description
+    return display
+
+
+def _question_answer_map(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key, answer in value.items():
+        result[str(key)] = ", ".join(str(item) for item in answer) if isinstance(answer, list) else answer
+    return result
+
+
+def _control_request_body(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    body = payload.get("request")
+    if isinstance(body, dict) and isinstance(body.get("request"), dict):
+        body = body["request"]
+    if not isinstance(body, dict):
+        body = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if isinstance(body, dict) and isinstance(body.get("request"), dict):
+        body = body["request"]
+    return body if isinstance(body, dict) else {}
+
+
+def normalize_control_request(payload: Any) -> dict[str, Any] | None:
+    """Normalize only Claude's explicit structured control request envelopes.
+
+    Plain assistant text is deliberately ignored. This function is the single
+    server-side gate for inline questions and permission cards.
+    """
+    if not isinstance(payload, dict):
+        return None
+    event_type = str(payload.get("type") or "").strip().lower()
+    nested = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    tool_name = str(payload.get("name") or payload.get("tool_name") or "")
+    tool_input = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+    structured_question_tool = (
+        event_type in {"tool_start", "tool_use"}
+        and tool_name.casefold() == "askuserquestion"
+        and isinstance(tool_input.get("questions"), list)
+    )
+    if (
+        event_type != "control_request"
+        and str(nested.get("type") or "").strip().lower() != "control_request"
+        and not structured_question_tool
+    ):
+        return None
+    body = payload if structured_question_tool else _control_request_body(payload)
+    subtype = "askuserquestion" if structured_question_tool else str(
+        body.get("subtype")
+        or body.get("request_type")
+        or body.get("kind")
+        or body.get("type")
+        or payload.get("subtype")
+        or ""
+    ).strip().lower()
+    request_id = str(
+        payload.get("request_id")
+        or payload.get("tool_id")
+        or payload.get("id")
+        or body.get("request_id")
+        or nested.get("request_id")
+        or ""
+    ).strip()
+    if not request_id:
+        return None
+
+    tool_name = str(body.get("tool_name") or body.get("name") or tool_name)
+    question_input = body.get("input") if isinstance(body.get("input"), dict) else {}
+    question_payload = body if isinstance(body.get("questions"), list) else question_input
+
+    if subtype in {"askuserquestion", "ask_user_question", "question", "questions"} or (
+        subtype == "can_use_tool"
+        and tool_name.casefold() == "askuserquestion"
+        and isinstance(question_payload.get("questions"), list)
+    ):
+        questions = question_payload.get("questions") if isinstance(question_payload.get("questions"), list) else []
+        normalized_questions: list[dict[str, Any]] = []
+        for question in questions:
+            if not isinstance(question, dict):
+                continue
+            options = question.get("options") if isinstance(question.get("options"), list) else []
+            normalized_questions.append({
+                "question": clean_stream_text(str(question.get("question") or question.get("prompt") or "")),
+                "header": clean_stream_text(str(question.get("header") or "")),
+                "multiSelect": bool(question.get("multiSelect")),
+                "options": [
+                    {
+                        "label": clean_stream_text(str(option.get("label") or "")),
+                        "description": clean_stream_text(str(option.get("description") or "")),
+                    }
+                    for option in options if isinstance(option, dict) and str(option.get("label") or "").strip()
+                ],
+            })
+        return {
+            "type": "interaction_request",
+            "kind": "question",
+            "request_id": request_id,
+            "questions": normalized_questions,
+            "_original_questions": copy.deepcopy(questions),
+            "_response_mode": "continuation" if structured_question_tool else "control_response",
+            "allowed_actions": ["answer", "skip"] if structured_question_tool else ["answer"],
+        }
+
+    if subtype in {"can_use_tool", "permission", "permission_request", "tool_permission"}:
+        raw_suggestions = body.get("permission_suggestions") or body.get("suggestions") or []
+        permission_updates: list[dict[str, Any]] = []
+        if isinstance(raw_suggestions, list):
+            for item in raw_suggestions:
+                if not isinstance(item, dict):
+                    continue
+                candidate = item.get("permission_update") if isinstance(item.get("permission_update"), dict) else item
+                if not isinstance(candidate, dict) or not any(candidate.get(field) for field in ("destination", "type", "behavior", "rules")):
+                    continue
+                permission_updates.append(copy.deepcopy(candidate))
+        tool_input = copy.deepcopy(body.get("input") if isinstance(body.get("input"), dict) else {})
+        summary = clean_stream_text(str(body.get("description") or body.get("summary") or ""))
+        allowed_actions = ["deny", "allow_once"]
+        if permission_updates:
+            allowed_actions.append("allow_always")
+        return {
+            "type": "interaction_request",
+            "kind": "permission",
+            "request_id": request_id,
+            "tool_name": tool_name or "工具",
+            "input": tool_input,
+            "summary": summary,
+            "display": _permission_display_payload(tool_input, summary),
+            "_permission_updates": permission_updates,
+            "allowed_actions": allowed_actions,
+        }
+
+    return None
+
+
+def build_stream_json_user_envelope(prompt: str, session_id: str | None = None) -> dict[str, Any]:
+    """Build the first NDJSON user event for a bidirectional CLI run."""
+    envelope: dict[str, Any] = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": str(prompt or "")}],
+        },
+    }
+    if session_id:
+        envelope["session_id"] = str(session_id)
+    return envelope
+
+
+def build_control_response_envelope(record: dict[str, Any], action: str, answers: Any = None, value: Any = None) -> dict[str, Any]:
+    kind = str(record.get("kind") or "")
+    request_id = str(record.get("request_id") or "")
+    if kind == "permission":
+        if action == "deny":
+            response = {"behavior": "deny", "message": "用户拒绝了本次操作"}
+        elif action in {"allow_later", "allow_always"}:
+            permission_updates = copy.deepcopy(record.get("_permission_updates") or [])
+            if not permission_updates:
+                response = {"behavior": "deny", "message": "当前请求没有可验证的后续权限规则"}
+            else:
+                response = {
+                    "behavior": "allow",
+                    "updatedInput": copy.deepcopy(record.get("input") or {}),
+                    "updatedPermissions": permission_updates,
+                }
+        else:
+            response = {"behavior": "allow", "updatedInput": copy.deepcopy(record.get("input") or {})}
+        return {"type": "control_response", "request_id": request_id, "response": response}
+    answer_value = _question_answer_map(copy.deepcopy(answers if answers is not None else value))
+    original_questions = copy.deepcopy(record.get("_original_questions"))
+    if not isinstance(original_questions, list):
+        original_questions = copy.deepcopy(record.get("questions") or [])
+    return {
+        "type": "control_response",
+        "request_id": request_id,
+        "response": {
+            "behavior": "allow",
+            "updatedInput": {"questions": original_questions, "answers": answer_value},
+        },
+    }
+
+
+def build_question_continuation_envelope(record: dict[str, Any], action: str, answers: Any = None) -> dict[str, Any]:
+    """Resume a CLI stream that surfaced AskUserQuestion only as tool events."""
+    answer_map = _question_answer_map(copy.deepcopy(answers))
+    if action == "skip":
+        guidance = (
+            "[Viniper 问答续写] 用户选择跳过刚才的 AskUserQuestion。"
+            "请在不再次输出该失败工具结果的情况下继续当前任务。"
+        )
+    else:
+        guidance = (
+            "[Viniper 问答续写] 用户已回答刚才的 AskUserQuestion。"
+            f"精确答案：{json.dumps(answer_map, ensure_ascii=False, separators=(',', ':'))}。"
+            "请沿用这些答案继续当前任务，不要重复提问，也不要解释问答桥接。"
+        )
+    return build_stream_json_user_envelope(guidance)
+
+
+class ActiveAgentInputError(RuntimeError):
+    """A same-run Agent input could not be written safely."""
+
+
+class ActiveAgentInputChannel:
+    """Serialize every NDJSON input written to one active Agent run."""
+
+    def __init__(self, active_runs: Any) -> None:
+        self._active_runs = active_runs
+
+    def _runs(self) -> dict[str, dict[str, Any]]:
+        runs = self._active_runs() if callable(self._active_runs) else self._active_runs
+        return runs if isinstance(runs, dict) else {}
+
+    @staticmethod
+    def _lock_for(run: dict[str, Any]) -> asyncio.Lock:
+        lock = run.get("input_lock")
+        if lock is None:
+            lock = asyncio.Lock()
+            run["input_lock"] = lock
+        return lock
+
+    @staticmethod
+    def _writer_is_closing(writer: Any) -> bool:
+        probe = getattr(writer, "is_closing", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            return True
+
+    async def write(
+        self,
+        session_id: str,
+        run: dict[str, Any],
+        envelope: dict[str, Any],
+        *,
+        process_identity: str = "",
+    ) -> None:
+        sid = str(session_id or "")
+        if not sid or not isinstance(run, dict):
+            raise ActiveAgentInputError("Agent 运行标识无效")
+        lock = self._lock_for(run)
+        async with lock:
+            if self._runs().get(sid) is not run:
+                raise ActiveAgentInputError("当前 Agent 任务已经结束，请重新发送")
+            if run.get("kind") != MODE_CLAUDE:
+                raise ActiveAgentInputError("当前会话不是可引导的 Agent 任务")
+            if process_identity and str(run.get("process_identity") or "") != str(process_identity):
+                raise ActiveAgentInputError("Agent 输入不属于当前运行进程")
+            writer = run.get("stdin")
+            if writer is None or self._writer_is_closing(writer):
+                raise ActiveAgentInputError("当前 Agent 输入通道已关闭，请重新发送")
+            writer.write((json.dumps(envelope, ensure_ascii=False) + "\n").encode("utf-8"))
+            drain = getattr(writer, "drain", None)
+            if drain is not None:
+                result = drain()
+                if inspect.isawaitable(result):
+                    await result
+
+    async def send_guidance(self, session_id: str, message: str) -> dict[str, Any]:
+        sid = str(session_id or "")
+        text = str(message or "").strip()
+        if not text:
+            raise ActiveAgentInputError("运行中引导不能为空")
+        run = self._runs().get(sid)
+        if not isinstance(run, dict) or run.get("kind") != MODE_CLAUDE:
+            raise ActiveAgentInputError("当前会话没有正在运行的 Agent 任务")
+        claude_session_id = str(run.get("claude_session_id") or "")
+        if not claude_session_id:
+            raise ActiveAgentInputError("当前 Agent 会话标识不可用")
+        await self.write(
+            sid,
+            run,
+            build_stream_json_user_envelope(text, claude_session_id),
+            process_identity=str(run.get("process_identity") or ""),
+        )
+        return {"ok": True, "accepted": True, "queued": True, "session_id": sid}
+
+
+active_agent_input_channel = ActiveAgentInputChannel(lambda: _active_runs)
+
+
+def finalize_transcript_segments(segments: Any) -> list[dict[str, Any]]:
+    """Persist completed activity/text and a stable, non-running thinking trace."""
+    if not isinstance(segments, list):
+        return []
+    finalized: list[dict[str, Any]] = []
+    for source in segments:
+        if not isinstance(source, dict):
+            continue
+        segment = copy.deepcopy(source)
+        if str(segment.get("type") or "") == "thinking":
+            content = str(segment.get("content") or "").strip()
+            if not content and not segment.get("images"):
+                continue
+            # A completed transcript may be expanded by the user, but it must
+            # never reappear as an active/running thought after reload.
+            segment["activeThinking"] = False
+            segment.pop("startedAt", None)
+        finalized.append(segment)
+    return finalized
+
+
+def persist_accepted_agent_turn(
+    session_id: str,
+    display_prompt: str,
+    model: str,
+    attachments: list[dict[str, Any]] | None = None,
+) -> str:
+    """Persist the accepted Agent turn before its SSE producer can fail."""
+    session = safe_session(session_id)
+    turn_id = str(uuid.uuid4())
+    user_message: dict[str, Any] = {
+        "role": "user",
+        "content": str(display_prompt or ""),
+        "turn_id": turn_id,
+    }
+    if attachments:
+        user_message["attachments"] = attachment_message_items(attachments, session_id)
+    assistant_message = {
+        "role": "assistant",
+        "content": "",
+        "model": str(model or ""),
+        "segments": [],
+        "pending": True,
+        "turn_id": turn_id,
+    }
+    session["messages"] = [
+        *list(session.get("messages", [])),
+        user_message,
+        assistant_message,
+    ]
+    session["last_run_status"] = "running"
+    session["updated"] = now_ts()
+    sessions[session_id] = session
+    save_sessions_to_disk()
+    return turn_id
+
+
+def finalize_accepted_agent_turn_failure(
+    session_id: str,
+    turn_id: str,
+    detail: str,
+    model: str = "",
+) -> None:
+    """Keep the user turn and replace its pending assistant with a retryable error."""
+    session = safe_session(session_id)
+    message: dict[str, Any] | None = None
+    for candidate in reversed(session.get("messages", [])):
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("role") == "assistant"
+            and str(candidate.get("turn_id") or "") == str(turn_id)
+        ):
+            message = candidate
+            break
+    if message is None:
+        message = {"role": "assistant", "turn_id": str(turn_id)}
+        session.setdefault("messages", []).append(message)
+    content = str(detail or "Agent 请求失败")
+    if not content.startswith("错误："):
+        content = f"错误：{content}"
+    message.update({
+        "content": content,
+        "model": str(model or message.get("model") or ""),
+        "segments": [{"type": "text", "content": content}],
+        "error": str(detail or "Agent 请求失败"),
+        "retryable": True,
+    })
+    message.pop("pending", None)
+    message.pop("thinking", None)
+    session["last_run_status"] = "failed"
+    session["unread"] = True
+    session["updated"] = now_ts()
+    sessions[session_id] = session
+    save_sessions_to_disk()
+
+
+def process_is_alive(pid: int) -> bool:
+    value = int(pid or 0)
+    if value <= 1:
+        return False
+    try:
+        os.kill(value, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def reconcile_orphaned_agent_runs(
+    session_records: dict[str, dict[str, Any]],
+    *,
+    journal: AgentRunJournal,
+    runtime: Any,
+    owner_alive: Any = process_is_alive,
+    interaction_store: DurableInteractionStore | None = None,
+    at: float | None = None,
+) -> list[dict[str, Any]]:
+    """Fail closed only journaled runs whose exact backend owner is gone."""
+    results: list[dict[str, Any]] = []
+    timestamp = float(at if at is not None else now_ts())
+    failure_text = "运行 owner 已失效；任务中断，请求未执行。"
+    for entry in journal.active():
+        session_id = str(entry.get("session_id") or "")
+        run_id = str(entry.get("coordinator_run_id") or "")
+        owner_pid = int(entry.get("owner_pid") or 0)
+        if owner_alive(owner_pid):
+            results.append({"session_id": session_id, "run_id": run_id, "status": "owned"})
+            continue
+        try:
+            cleaned = bool(runtime.cleanup_orphaned(
+                str(entry.get("session_key") or ""),
+                int(entry.get("runtime_pgid") or 0),
+                int(entry.get("runtime_pid") or 0),
+            ))
+        except (OSError, ValueError):
+            cleaned = False
+        session = session_records.get(session_id)
+        if isinstance(session, dict):
+            message: dict[str, Any] | None = None
+            for candidate in reversed(session.get("messages", [])):
+                if isinstance(candidate, dict) and candidate.get("role") == "assistant" and candidate.get("pending"):
+                    message = candidate
+                    break
+            if message is None:
+                message = {"role": "assistant"}
+                session.setdefault("messages", []).append(message)
+            message.update({
+                "content": failure_text,
+                "segments": [{"type": "text", "content": failure_text}],
+                "error": "owner_lost",
+                "retryable": True,
+            })
+            message.pop("pending", None)
+            message.pop("thinking", None)
+            session["last_run_status"] = "failed"
+            session["unread"] = True
+            session["updated"] = timestamp
+        if interaction_store is not None:
+            try:
+                interaction_store.fail_owner(session_id, run_id, reason=failure_text)
+            except ValueError:
+                pass
+        journal.finish(session_id, run_id, status="failed")
+        results.append({
+            "session_id": session_id,
+            "run_id": run_id,
+            "status": "cleaned" if cleaned else "not_found",
+        })
+    return results
+
+
+class AgentInteractionBroker:
+    """Match one explicit CLI interaction to its same-run response channel."""
+
+    def __init__(
+        self,
+        input_channel: ActiveAgentInputChannel | None = None,
+        store_factory: Any = None,
+        managed_channels_only: bool = False,
+    ) -> None:
+        self._pending: dict[str, dict[str, Any]] = {}
+        self._input_channel = input_channel
+        self._store_factory = store_factory
+        self._managed_channels_only = bool(managed_channels_only)
+
+    def _store(self) -> DurableInteractionStore | None:
+        if self._store_factory is None:
+            return None
+        candidate = self._store_factory() if callable(self._store_factory) else self._store_factory
+        return candidate if isinstance(candidate, DurableInteractionStore) else None
+
+    @staticmethod
+    def _public_record(record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not record:
+            return None
+        safe_keys = {
+            "type", "kind", "request_id", "tool_use_id", "session_id", "run_id",
+            "tool_name", "summary", "workdir", "allowed_actions", "questions", "display",
+            "agent_id", "response", "interaction_state", "terminal", "failure_message",
+            "failure_code", "response_action", "decision",
+            "blocked_path", "decision_reason", "decision_reason_type", "title",
+            "display_name", "description", "risk",
+        }
+        public = {key: copy.deepcopy(value) for key, value in record.items() if key in safe_keys}
+        state = str(record.get("interaction_state") or record.get("state") or "")
+        if state == "waiting_input":
+            state = "pending"
+        if state:
+            public["interaction_state"] = state
+        if state not in {"created", "pending"}:
+            public["allowed_actions"] = []
+        return public
+
+    def pending_for(self, session_id: str) -> dict[str, Any] | None:
+        store = self._store()
+        if store is not None:
+            durable = store.public_for_session(str(session_id))
+            if durable is not None:
+                return durable
+        record = self._pending.get(str(session_id))
+        if not record or str(record.get("state") or "waiting_input") not in {
+            "waiting_input", "answering", "response_committed", "awaiting_cli_ack", "failed",
+        }:
+            return None
+        return self._public_record(record)
+
+    def unsettled_for(self, session_id: str) -> bool:
+        sid = str(session_id)
+        store = self._store()
+        if store is not None and any(str(item.get("session_id") or "") == sid for item in store.active()):
+            return True
+        return sid in self._pending
+
+    def _record_from_durable(self, session_id: str, request_id: str) -> dict[str, Any] | None:
+        store = self._store()
+        if store is None:
+            return None
+        durable = store.record_for(str(session_id), str(request_id))
+        if not durable:
+            return None
+        private = durable.get("private") if isinstance(durable.get("private"), dict) else {}
+        channel_path = str(durable.get("host_channel") or "")
+        channel = HostInteractionChannel(channel_path) if channel_path else None
+        return {
+            "type": "interaction_request",
+            "kind": str(durable.get("kind") or ""),
+            "request_id": str(durable.get("request_id") or ""),
+            "tool_use_id": str(durable.get("tool_use_id") or durable.get("request_id") or ""),
+            "bridge_request_id": str(durable.get("bridge_request_id") or ""),
+            "session_id": str(durable.get("session_id") or ""),
+            "run_id": str(durable.get("run_id") or ""),
+            "process_identity": str(durable.get("process_identity") or ""),
+            "tool_name": str(durable.get("tool_name") or ""),
+            "questions": copy.deepcopy(durable.get("questions") or []),
+            "_original_questions": copy.deepcopy(private.get("original_questions") or []),
+            "_tool_input": copy.deepcopy(private.get("tool_input") or {}),
+            "_permission_suggestions": copy.deepcopy(private.get("permission_suggestions") or []),
+            "display": copy.deepcopy(durable.get("display") or {}),
+            "summary": str(durable.get("summary") or ""),
+            "workdir": str(durable.get("workdir") or ""),
+            "allowed_actions": copy.deepcopy(durable.get("allowed_actions") or []),
+            "_response_mode": str(durable.get("response_mode") or "host_hook"),
+            "_committed_response": copy.deepcopy(durable.get("response") or {}),
+            "_committed_action": str(durable.get("action") or ""),
+            "_host_channel": channel,
+            "state": str(durable.get("state") or ""),
+        }
+
+    def _persist_host_request(self, record: dict[str, Any], channel: HostInteractionChannel) -> None:
+        store = self._store()
+        if store is None:
+            return
+        if self._managed_channels_only:
+            try:
+                channel.root.resolve().relative_to((DATA_DIR / "runtime" / "agent-host").resolve())
+            except ValueError:
+                return
+        run_id = str(record.get("run_id") or channel.run_id or "").strip()
+        if not run_id:
+            raise ValueError("host interaction is missing its run identity")
+        # ``record`` also owns live runtime objects (the active run, stdin,
+        # locks and the channel instance).  Persist the immutable protocol
+        # envelope only; attempting to deepcopy the whole record reaches
+        # asyncio Futures on real WSL runs and aborts before the card appears.
+        durable_entry = {
+            key: value
+            for key, value in record.items()
+            if key not in {
+                "_run", "_host_channel", "_channel", "stdin", "_input_lock",
+            }
+        }
+        created = store.create({
+            **durable_entry,
+            "run_id": run_id,
+            "host_channel": str(channel.root),
+            "response_mode": str(record.get("_response_mode") or "host_hook"),
+        })
+        if str(created.get("state") or "") == "created":
+            store.mark_pending(str(record.get("session_id") or ""), str(record.get("request_id") or ""))
+
+    def ack_status_for(self, session_id: str) -> dict[str, Any] | None:
+        record = self._pending.get(str(session_id))
+        if record is None:
+            store = self._store()
+            durable = store.latest_for_session(str(session_id)) if store is not None else None
+            if durable and str(durable.get("state") or "") in {"response_committed", "awaiting_cli_ack"}:
+                record = self._record_from_durable(session_id, str(durable.get("request_id") or ""))
+        if not record or str(record.get("_response_mode") or "") not in {
+            "host_hook", "permission_prompt_mcp",
+        }:
+            return None
+        channel = record.get("_host_channel")
+        if not isinstance(channel, HostInteractionChannel):
+            return None
+        status = channel.acknowledgement(str(record.get("bridge_request_id") or ""))
+        status["session_id"] = str(record.get("session_id") or "")
+        status["request_id"] = str(record.get("request_id") or "")
+        status["state"] = str(record.get("state") or "waiting_input")
+        self._sync_durable_ack(record, status)
+        return status
+
+    def _sync_durable_ack(self, record: dict[str, Any], acknowledgement: dict[str, Any]) -> None:
+        store = self._store()
+        if store is None:
+            return
+        session_id = str(record.get("session_id") or "")
+        request_id = str(record.get("request_id") or "")
+        if not session_id or not request_id:
+            return
+        for stage in (
+            "response_committed", "response_read", "stdout_written_and_flushed",
+            MCP_RESPONSE_ACK_STAGE, "hook_exit",
+        ):
+            if not acknowledgement.get(stage):
+                continue
+            try:
+                store.record_ack(
+                    session_id,
+                    request_id,
+                    stage,
+                    exit_code=(acknowledgement.get("hook_exit_code") if stage == "hook_exit" else None),
+                )
+            except ValueError:
+                continue
+
+    def expire_unacknowledged(self, *, now: float | None = None, timeout_seconds: float) -> list[dict[str, str]]:
+        current = float(now if now is not None else time.time())
+        expired: list[dict[str, str]] = []
+        for sid, record in list(self._pending.items()):
+            if str(record.get("state") or "") != "awaiting_cli_ack":
+                continue
+            if current - float(record.get("response_committed_at") or current) < max(0.01, float(timeout_seconds)):
+                continue
+            request_id = str(record.get("request_id") or "")
+            bound_run = record.get("_run")
+            if isinstance(bound_run, dict):
+                bound_run["pending_interaction"] = None
+                bound_run["awaiting_interaction_ack"] = None
+                bound_run["interaction_failure"] = "cli_ack_timeout"
+            channel = record.get("_host_channel")
+            if isinstance(channel, HostInteractionChannel):
+                channel.finalize("timeout", reason="cli_ack_timeout")
+            store = self._store()
+            if store is not None:
+                try:
+                    store.fail_owner(
+                        sid,
+                        str(record.get("run_id") or ""),
+                        reason=CLI_ACK_TIMEOUT_FAILURE_MESSAGE,
+                        failure_code="cli_ack_timeout",
+                    )
+                except ValueError:
+                    pass
+            self._pending.pop(sid, None)
+            expired.append({"session_id": sid, "request_id": request_id, "reason": "cli_ack_timeout"})
+        return expired
+
+    def confirm_cli_tool_result(self, session_id: str, request_id: str, *, success: bool) -> dict[str, Any] | None:
+        sid = str(session_id)
+        record = self._pending.get(sid)
+        if not record or str(record.get("state") or "") != "awaiting_cli_ack":
+            return None
+        if str(record.get("request_id") or "") != str(request_id):
+            return None
+        channel = record.get("_host_channel")
+        if not isinstance(channel, HostInteractionChannel):
+            return None
+        bridge_id = str(record.get("bridge_request_id") or "")
+        channel.record_cli_tool_result(bridge_id, str(request_id), success=bool(success))
+        response_mode = str(record.get("_response_mode") or "")
+        store = self._store()
+        durable = store.record_for(sid, str(request_id)) if store is not None else None
+        committed_response = record.get("_committed_response")
+        if not isinstance(committed_response, dict) and isinstance(durable, dict):
+            committed_response = durable.get("response")
+        response_behavior = DurableInteractionStore.response_behavior(committed_response)
+        expected_tool_result_success = response_behavior != "deny"
+        deadline = time.monotonic() + 0.25
+        while True:
+            acknowledgement = channel.acknowledgement(bridge_id)
+            if response_mode == "permission_prompt_mcp":
+                protocol_ready = all(bool(acknowledgement.get(stage)) for stage in (
+                    "response_committed", "response_read", MCP_RESPONSE_ACK_STAGE,
+                ))
+            else:
+                protocol_ready = all(bool(acknowledgement.get(stage)) for stage in (
+                    "response_committed", "response_read", "stdout_written_and_flushed", "hook_exit",
+                )) and int(acknowledgement.get("hook_exit_code") or 0) == 0
+            if protocol_ready or time.monotonic() >= deadline:
+                break
+            time.sleep(0.005)
+        tool_result_matches = bool(success) == expected_tool_result_success
+        accepted = bool(protocol_ready and tool_result_matches)
+        self._sync_durable_ack(record, acknowledgement)
+        if store is not None:
+            try:
+                store.record_ack(
+                    sid,
+                    str(request_id),
+                    "cli_tool_result",
+                    success=bool(success),
+                )
+            except ValueError:
+                pass
+        bound_run = record.get("_run")
+        if isinstance(bound_run, dict):
+            bound_run["pending_interaction"] = None
+            bound_run["awaiting_interaction_ack"] = None
+            if not accepted:
+                bound_run["interaction_failure"] = "cli_tool_result_mismatch" if not tool_result_matches else "cli_ack_incomplete"
+        self._pending.pop(sid, None)
+        terminal_state = "denied" if response_behavior == "deny" and accepted else ("accepted" if accepted else "failed")
+        return {
+            "session_id": sid,
+            "request_id": str(request_id),
+            "accepted": accepted,
+            "success": bool(success),
+            "terminal_state": terminal_state,
+            "acknowledgement": acknowledgement,
+            "reason": "" if accepted else ("cli_tool_result_mismatch" if not tool_result_matches else "cli_ack_incomplete"),
+        }
+
+    def create_request(
+        self,
+        session_id: str,
+        process_identity: str,
+        payload: Any,
+        stdin: Any = None,
+        workdir: str = "",
+        run: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        normalized = normalize_control_request(payload)
+        if normalized is None:
+            return None
+        sid = str(session_id)
+        request_id = str(normalized["request_id"])
+        existing = self._pending.get(sid)
+        if existing and existing.get("request_id") == request_id:
+            if str(existing.get("process_identity")) != str(process_identity):
+                return None
+            if stdin is not None:
+                existing["stdin"] = stdin
+            if run is not None:
+                existing["_run"] = run
+            return self._public_record(existing) or {}
+        if existing:
+            return None
+        record = {
+            **normalized,
+            "session_id": sid,
+            "process_identity": str(process_identity),
+            "workdir": str(workdir or ""),
+            "stdin": stdin,
+            "_run": run,
+            "_input_lock": asyncio.Lock(),
+            "payload": copy.deepcopy(payload),
+            "state": "waiting_input",
+            "created": now_ts(),
+        }
+        self._pending[sid] = record
+        return self.pending_for(sid) or {}
+
+    def create_host_request(
+        self,
+        session_id: str,
+        process_identity: str,
+        normalized: dict[str, Any],
+        channel: HostInteractionChannel,
+        *,
+        workdir: str = "",
+        run: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(normalized, dict) or normalized.get("type") != "interaction_request":
+            return None
+        request_id = str(normalized.get("request_id") or "").strip()
+        bridge_request_id = str(normalized.get("bridge_request_id") or "").strip()
+        if not request_id or not bridge_request_id:
+            return None
+        sid = str(session_id)
+        owner_mode = (
+            "permission_prompt_mcp"
+            if str(normalized.get("_transport") or "") == "permission_prompt_mcp"
+            else "host_hook"
+        )
+        existing = self._pending.get(sid)
+        if existing and str(existing.get("request_id")) == request_id:
+            if str(existing.get("process_identity")) != str(process_identity):
+                return None
+            if str(existing.get("_response_mode") or "") in {"host_hook", "permission_prompt_mcp"}:
+                return self._public_record(existing) or {}
+            if str(existing.get("state") or "waiting_input") != "waiting_input":
+                return None
+            # The official owner wins if it arrives during the bounded stdout
+            # compatibility grace window without creating a second card.
+            display = copy.deepcopy(normalized.get("display_payload") or {})
+            channel.bind_process_identity(str(process_identity))
+            try:
+                channel.record_interaction(
+                    bridge_request_id,
+                    request_id,
+                    str(normalized.get("kind") or ""),
+                    str(normalized.get("tool_name") or ""),
+                )
+            except FileExistsError:
+                pass
+            normalized_copy = {
+                key: copy.deepcopy(value)
+                for key, value in normalized.items()
+                if key != "_channel"
+            }
+            replacement = {
+                **normalized_copy,
+                "display": display,
+                "session_id": sid,
+                "process_identity": str(process_identity),
+                "workdir": str(workdir or normalized.get("workdir") or ""),
+                "_run": run or existing.get("_run"),
+                "_response_mode": owner_mode,
+                "_host_channel": channel,
+                "state": "waiting_input",
+                "created": existing.get("created") or now_ts(),
+            }
+            replacement["run_id"] = str(normalized.get("run_id") or channel.run_id or "")
+            self._pending[sid] = replacement
+            try:
+                self._persist_host_request(replacement, channel)
+            except ValueError:
+                self._pending.pop(sid, None)
+                return None
+            return self.pending_for(sid) or {}
+        if existing:
+            return None
+        display = copy.deepcopy(normalized.get("display_payload") or {})
+        channel.bind_process_identity(str(process_identity))
+        try:
+            channel.record_interaction(
+                bridge_request_id,
+                request_id,
+                str(normalized.get("kind") or ""),
+                str(normalized.get("tool_name") or ""),
+            )
+        except FileExistsError:
+            pass
+        normalized_copy = {
+            key: copy.deepcopy(value)
+            for key, value in normalized.items()
+            if key != "_channel"
+        }
+        record = {
+            **normalized_copy,
+            "display": display,
+            "session_id": sid,
+            "process_identity": str(process_identity),
+            "workdir": str(workdir or normalized.get("workdir") or ""),
+            "_run": run,
+            "_response_mode": owner_mode,
+            "_host_channel": channel,
+            "state": "waiting_input",
+            "created": now_ts(),
+        }
+        record["run_id"] = str(normalized.get("run_id") or channel.run_id or "")
+        self._pending[sid] = record
+        try:
+            self._persist_host_request(record, channel)
+        except ValueError:
+            self._pending.pop(sid, None)
+            return None
+        return self.pending_for(sid) or {}
+
+    async def resolve(
+        self,
+        session_id: str,
+        request_id: str,
+        kind: str,
+        action: str,
+        *,
+        stdin: Any = None,
+        run: dict[str, Any] | None = None,
+        process_identity: str = "",
+        answers: Any = None,
+        value: Any = None,
+    ) -> dict[str, Any]:
+        sid = str(session_id)
+        record = self._pending.get(sid)
+        if record is None:
+            record = self._record_from_durable(sid, str(request_id))
+        if not record:
+            raise InteractionRequestError("interaction request is stale or already answered")
+        if str(record.get("request_id")) != str(request_id) or str(record.get("kind")) != str(kind):
+            raise InteractionRequestError("interaction request does not match the active request")
+        if process_identity and str(record.get("process_identity")) != str(process_identity):
+            raise InteractionRequestError("interaction request belongs to another process")
+        allowed = {str(item) for item in record.get("allowed_actions") or []}
+        if action not in allowed and not (kind == "question" and action in {"answer", "submit"}):
+            raise InteractionRequestError("interaction action is not allowed")
+        owner_mode = str(record.get("_response_mode") or "")
+        if owner_mode in {"host_hook", "permission_prompt_mcp"}:
+            try:
+                normalized_action = "answer" if kind == "question" and action in {"answer", "submit"} else action
+                if owner_mode == "permission_prompt_mcp":
+                    response = build_permission_prompt_response(
+                        record, normalized_action, answers=answers, value=value,
+                    )
+                else:
+                    response = build_hook_response(
+                        record, normalized_action, answers=answers, value=value,
+                    )
+                channel = record.get("_host_channel")
+                if not isinstance(channel, HostInteractionChannel):
+                    raise InteractionRequestError("interaction host channel is unavailable")
+                store = self._store()
+                durable_before = store.record_for(sid, str(request_id)) if store is not None else None
+                if durable_before and str(durable_before.get("state") or "") in {"accepted", "denied", "cancelled", "failed", "terminal"}:
+                    raise InteractionRequestError("interaction request is no longer answerable")
+                if store is not None and str((durable_before or {}).get("state") or "") in {"created", "pending"}:
+                    store.begin_answer(sid, str(request_id))
+                channel.respond(str(record.get("bridge_request_id") or ""), response, action=action)
+                if store is not None and durable_before is not None:
+                    store.commit_response(sid, str(request_id), action=normalized_action, response=response)
+                    store.mark_awaiting_cli_ack(sid, str(request_id))
+                record["_committed_response"] = copy.deepcopy(response)
+                record["_committed_action"] = normalized_action
+                record["state"] = "awaiting_cli_ack"
+                record["response_committed_at"] = time.time()
+            except (FileExistsError, OSError, ValueError) as exc:
+                raise InteractionRequestError(str(exc)) from exc
+        elif kind == "question" and record.get("_response_mode") == "continuation":
+            envelope = build_question_continuation_envelope(record, action, answers)
+        else:
+            envelope = build_control_response_envelope(record, "answer" if kind == "question" else action, answers, value)
+        if owner_mode not in {"host_hook", "permission_prompt_mcp"}:
+            active_run = run or record.get("_run")
+            if self._input_channel is not None and isinstance(active_run, dict):
+                try:
+                    await self._input_channel.write(
+                        sid,
+                        active_run,
+                        envelope,
+                        process_identity=process_identity or str(record.get("process_identity") or ""),
+                    )
+                except ActiveAgentInputError as exc:
+                    raise InteractionRequestError(str(exc)) from exc
+            else:
+                writer = stdin or record.get("stdin")
+                if writer is None:
+                    raise InteractionRequestError("interaction process stdin is unavailable")
+                async with record["_input_lock"]:
+                    writer.write((json.dumps(envelope, ensure_ascii=False) + "\n").encode("utf-8"))
+                    drain = getattr(writer, "drain", None)
+                    if drain is not None:
+                        result = drain()
+                        if inspect.isawaitable(result):
+                            await result
+        bound_run = run or record.get("_run")
+        if isinstance(bound_run, dict) and str(bound_run.get("pending_interaction") or "") == str(request_id):
+            bound_run["pending_interaction"] = None
+        if owner_mode in {"host_hook", "permission_prompt_mcp"}:
+            if isinstance(bound_run, dict):
+                bound_run["awaiting_interaction_ack"] = str(request_id)
+            return {
+                "ok": True,
+                "request_id": str(request_id),
+                "kind": kind,
+                "action": action,
+                "status": "awaiting_cli_ack",
+                "acknowledgement": self.ack_status_for(sid),
+            }
+        self._pending.pop(sid, None)
+        return {"ok": True, "request_id": str(request_id), "kind": kind, "action": action, "status": "accepted"}
+
+    def invalidate(self, session_id: str, reason: str = "") -> dict[str, Any] | None:
+        sid = str(session_id)
+        record = self._pending.pop(sid, None)
+        if record is None:
+            store = self._store()
+            durable = store.latest_for_session(sid) if store is not None else None
+            if durable and str(durable.get("state") or "") in DurableInteractionStore._OPEN_STATES:
+                record = self._record_from_durable(sid, str(durable.get("request_id") or ""))
+        if record is not None:
+            record["invalidated_reason"] = str(reason or "cancelled")
+            owner_mode = str(record.get("_response_mode") or "")
+            explicit_cancel = str(reason or "") == "cancelled"
+            if explicit_cancel and owner_mode in {"host_hook", "permission_prompt_mcp"}:
+                channel = record.get("_host_channel")
+                if isinstance(channel, HostInteractionChannel):
+                    try:
+                        action = "skip" if record.get("kind") == "question" else "deny"
+                        if owner_mode == "permission_prompt_mcp":
+                            response = build_permission_prompt_response(record, action)
+                        else:
+                            response = build_hook_response(record, action)
+                        channel.respond(
+                            str(record.get("bridge_request_id") or ""),
+                            response,
+                        )
+                    except (FileExistsError, OSError, ValueError):
+                        pass
+            store = self._store()
+            if store is not None:
+                try:
+                    if explicit_cancel:
+                        store.mark_cancelled(sid, str(record.get("request_id") or ""), reason="用户已停止任务")
+                    else:
+                        store.fail_owner(
+                            sid,
+                            str(record.get("run_id") or ""),
+                            reason="任务中断；请求未执行。",
+                        )
+                except ValueError:
+                    pass
+            bound_run = record.get("_run")
+            if isinstance(bound_run, dict):
+                bound_run["pending_interaction"] = None
+                bound_run["awaiting_interaction_ack"] = None
+        return record
+
+
+agent_interaction_broker = AgentInteractionBroker(
+    input_channel=active_agent_input_channel,
+    store_factory=durable_interaction_store,
+    managed_channels_only=True,
+)
+
+
+def tool_use_text(block: dict[str, Any]) -> str:
+    name = str(block.get("name") or "tool")
+    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+    command = tool_input.get("command") or tool_input.get("file_path") or tool_input.get("path") or ""
+    description = tool_input.get("description") or ""
+    details = clean_stream_text(" ".join(str(part) for part in (description, command) if part))
+    return f"\n\n[Claude Code 工具] {name}{': ' + details if details else ''}\n"
+
+
+def tool_result_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return ""
+
+    chunks: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        raw = block.get("content") or ""
+        if isinstance(raw, list):
+            raw = "\n".join(str(item.get("text", item)) for item in raw if isinstance(item, dict))
+        text = clean_stream_text(str(raw).strip())
+        if len(text) > TOOL_RESULT_DISPLAY_LIMIT:
+            text = text[:TOOL_RESULT_DISPLAY_LIMIT] + "\n...[工具输出过长，显示已截断]"
+        status = "失败" if block.get("is_error") else "完成"
+        chunks.append(f"\n[工具结果/{status}]\n{text}\n")
+    return "".join(chunks)
+
+
+def project_tool_result_stream_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Preserve a stable policy reason without changing the tool_result wire type."""
+    content = clean_stream_text(str(event.get("content") or "工具完成"))
+    reason = str(event.get("reason") or "")
+    detail = clean_stream_text(str(event.get("detail") or (content if reason else "")))
+    return {
+        "type": "tool_result",
+        "tool_name": str(event.get("tool_name") or event.get("name") or "工具"),
+        "call_id": str(event.get("call_id") or event.get("tool_id") or ""),
+        "run_id": str(event.get("run_id") or ""),
+        "content": content,
+        "status": str(event.get("status") or "success"),
+        **({"reason": reason, "detail": detail} if reason else {}),
+    }
+
+
+async def read_stderr(proc: asyncio.subprocess.Process) -> str:
+    if proc.stderr is None:
+        return ""
+    chunks: list[bytes] = []
+    while True:
+        chunk = await proc.stderr.read(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return clean_stream_text(b"".join(chunks).decode("utf-8", errors="replace").strip())
+
+
+class ChunkedLineReader:
+    """Read newline-delimited subprocess output without StreamReader.readline limits."""
+
+    def __init__(self, stream: asyncio.StreamReader, chunk_size: int = STREAM_READ_CHUNK_SIZE):
+        self.stream = stream
+        self.chunk_size = chunk_size
+        self.buffer = bytearray()
+        self.eof = False
+
+    async def readline(self, timeout: float | None) -> bytes:
+        while True:
+            newline_index = self.buffer.find(b"\n")
+            if newline_index >= 0:
+                line = bytes(self.buffer[: newline_index + 1])
+                del self.buffer[: newline_index + 1]
+                return line
+
+            if self.eof:
+                if not self.buffer:
+                    return b""
+                line = bytes(self.buffer)
+                self.buffer.clear()
+                return line
+
+            chunk = await asyncio.wait_for(self.stream.read(self.chunk_size), timeout=timeout)
+            if chunk:
+                self.buffer.extend(chunk)
+            else:
+                self.eof = True
+
+
+async def kill_process_tree(pid: int | None) -> None:
+    if not pid:
+        return
+    try:
+        killer = await asyncio.create_subprocess_exec(
+            "taskkill.exe",
+            "/PID",
+            str(pid),
+            "/T",
+            "/F",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await killer.communicate()
+    except Exception:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"Stop-Process -Id {int(pid)} -Force -ErrorAction SilentlyContinue",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+        except Exception:
+            pass
+
+
+async def kill_orphaned_claude_session(claude_session_id: str) -> None:
+    session_token = str(claude_session_id or "").strip()
+    if not session_token:
+        return
+    if os.name == "nt":
+        ps = rf"""
+$sid = '{session_token.replace("'", "''")}'
+$selfPid = $PID
+Get-CimInstance Win32_Process |
+  Where-Object {{
+    $_.ProcessId -ne $selfPid -and
+    $_.CommandLine -and
+    (
+      $_.Name -like 'claude*' -or
+      $_.Name -like 'node*'
+    ) -and
+    $_.CommandLine -match ('(--session-id|--resume)\s+' + [regex]::Escape($sid))
+  }} |
+  ForEach-Object {{
+    try {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }} catch {{}}
+  }}
+"""
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+        except Exception:
+            pass
+        return
+
+    if shutil.which("pkill"):
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ["pkill", "-f", session_token],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+                check=False,
+            )
+        except Exception:
+            pass
+
+
+def remove_last_attempt_messages(session: dict[str, Any], display_prompt: str) -> None:
+    current_messages = list(session.get("messages", []))
+    if (
+        current_messages
+        and current_messages[-1].get("role") == "assistant"
+        and current_messages[-1].get("pending")
+    ):
+        current_messages.pop()
+    if (
+        current_messages
+        and current_messages[-1].get("role") == "user"
+        and current_messages[-1].get("content") == display_prompt
+    ):
+        current_messages.pop()
+    session["messages"] = current_messages
+
+
+def tool_command(block: dict[str, Any]) -> str:
+    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+    return str(tool_input.get("command") or "")
+
+
+def is_foreground_server_command(command: str) -> bool:
+    lower = command.lower()
+    long_running = any(
+        token in lower
+        for token in (
+            "npm run dev",
+            "npm start",
+            "vite --",
+            "vite ",
+            "node --watch",
+            "python -m uvicorn",
+            "uvicorn ",
+        )
+    )
+    if not long_running:
+        return False
+    backgrounded = any(
+        token in lower
+        for token in (
+            "start-process",
+            "cmd.exe /c start",
+            "start /b",
+            "nohup ",
+            "setsid ",
+        )
+    )
+    return not backgrounded
+
+
+def is_browser_open_command(command: str) -> bool:
+    lower = command.lower()
+    if not any(prefix in lower for prefix in ("http://", "https://", "file://")):
+        return False
+    openers = (
+        "cmd.exe /c start",
+        "cmd /c start",
+        "start-process",
+        "explorer.exe",
+        "msedge.exe",
+        "microsoft\\edge\\application\\msedge",
+        "chrome.exe",
+        "google\\chrome\\application\\chrome",
+        "rundll32 url.dll,fileprotocolhandler",
+    )
+    return any(token in lower for token in openers)
+
+
+def is_external_gui_command(command: str) -> bool:
+    lower = command.lower()
+    gui_tokens = (
+        "winword",
+        "word.application",
+        "documents.open",
+        "documents.add",
+        ".docx",
+        ".docm",
+        ".doc\"",
+        ".doc'",
+        "invoke-item",
+        "os.startfile",
+        "start-process",
+        "explorer.exe",
+        "cmd.exe /c start",
+        "cmd /c start",
+        "rundll32 url.dll,fileprotocolhandler",
+        "msedge.exe",
+        "chrome.exe",
+    )
+    return any(token in lower for token in gui_tokens)
+
+
+def is_action_task_prompt(prompt: str) -> bool:
+    lower = prompt.lower()
+    action_tokens = (
+        "打开",
+        "启动",
+        "运行",
+        "安装",
+        "部署",
+        "转换",
+        "转成",
+        "导出",
+        "保存",
+        "新建",
+        "创建",
+        "编辑",
+        "修改文件",
+        "写入",
+        "网页",
+        "网站",
+        "程序",
+        "浏览器",
+        "文件",
+        "资料",
+        "文档",
+        "word",
+        "excel",
+        "powerpoint",
+        "ppt",
+        "pdf",
+        "docx",
+        "xlsx",
+        "pptx",
+        "skill",
+        "npm",
+        "vite",
+        "python ",
+        "powershell",
+        "cmd.exe",
+    )
+    return any(token in lower for token in action_tokens)
+
+
+def skill_aliases(skill: dict[str, str]) -> set[str]:
+    filename_stem = str(skill.get("slug") or Path(skill.get("filename", "")).stem)
+    command = str(skill.get("command") or "")
+    display_name = str(skill.get("name") or "")
+    aliases = {command, filename_stem, display_name}
+    if "_" in filename_stem:
+        aliases.add(filename_stem.split("_", 1)[1])
+    normalized: set[str] = set()
+    for alias in aliases:
+        value = alias.strip().lower()
+        if value:
+            normalized.add(value)
+            normalized.add(value.replace(" ", "-"))
+    return normalized
+
+
+def parse_skill_directive(prompt: str) -> tuple[dict[str, str], str] | None:
+    stripped = prompt.lstrip()
+    if not stripped.startswith("/"):
+        return None
+
+    parts = stripped.split(maxsplit=2)
+    if not parts:
+        return None
+
+    if parts[0].lower() == "/skill" and len(parts) >= 2:
+        token = parts[1].lstrip("/").lower()
+        rest = parts[2] if len(parts) >= 3 else ""
+    else:
+        token = parts[0].lstrip("/").lower()
+        rest = stripped[len(parts[0]):].lstrip()
+
+    for skill in get_skills():
+        if token in skill_aliases(skill):
+            return skill, rest
+    return None
+
+
+def expand_skill_prompt(prompt: str) -> str:
+    parsed = parse_skill_directive(prompt)
+    if not parsed:
+        return prompt
+
+    skill, rest = parsed
+    path = skill_file_from_record(skill)
+    if not path:
+        return prompt
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return prompt
+
+    request = rest.strip() or "请按这个 skill 继续执行。"
+    return (
+        f"[网页端已展开本地技能说明文件: {skill.get('command') or skill.get('name')}]\n"
+        "不要再调用 slash command，也不要检查当前可用 skill 列表；"
+        "该技能说明已经完整粘贴在下方，请直接把它当作本次任务的专用操作规范，并严格按它处理用户请求。\n\n"
+        "<skill>\n"
+        f"{content}\n"
+        "</skill>\n\n"
+        "用户请求：\n"
+        f"{request}"
+    )
+
+
+def public_goal(goal: dict[str, Any]) -> dict[str, Any]:
+    status = str(goal.get("status") or "paused")
+    canonical_status = {
+        "running": "active",
+        "paused": "blocked",
+        "waiting": "blocked",
+        "failed": "blocked",
+        "completed": "complete",
+    }.get(status, "blocked")
+    elapsed_seconds = max(0, int(float(goal.get("updated") or 0) - float(goal.get("last_run") or goal.get("created") or 0)))
+    return {
+        "id": goal.get("id", ""),
+        "session_id": goal.get("session_id", ""),
+        "title": goal.get("title", ""),
+        "prompt": goal.get("prompt", ""),
+        "status": canonical_status,
+        "runtime_status": status,
+        "owner": "harness-goal-service",
+        "model": goal.get("model", ""),
+        "permission_mode": goal.get("permission_mode", DEFAULT_PERMISSION_MODE),
+        "turn_count": int(goal.get("turn_count") or 0),
+        "max_turns": int(goal.get("max_turns") or GOAL_DEFAULT_MAX_TURNS),
+        "created": float(goal.get("created") or 0),
+        "updated": float(goal.get("updated") or 0),
+        "last_run": float(goal.get("last_run") or 0),
+        "last_output": str(goal.get("last_output") or "")[-1200:],
+        "last_error": str(goal.get("last_error") or ""),
+        "current_step": str(goal.get("current_step") or ""),
+        "progress": {"current": int(goal.get("turn_count") or 0), "total": int(goal.get("max_turns") or GOAL_DEFAULT_MAX_TURNS)},
+        "elapsed_seconds": elapsed_seconds,
+        "token_usage": context_usage_payload(str(goal.get("session_id") or "")) if str(goal.get("session_id") or "") in sessions else {},
+    }
+
+
+def get_goal_or_404(goal_id: str) -> dict[str, Any]:
+    goal = goals.get(goal_id)
+    if not goal:
+        raise HTTPException(status_code=404, detail="goal not found")
+    normalized = normalize_goal(goal_id, goal)
+    goals[goal_id] = normalized
+    return normalized
+
+
+def sse_payloads(chunk: str) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for part in str(chunk or "").split("\n\n"):
+        for line in part.splitlines():
+            if not line.startswith("data: "):
+                continue
+            try:
+                payload = json.loads(line[6:])
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+    return payloads
+
+
+def skill_roots_for_mode(mode: str = MODE_VINIPER) -> list[tuple[str, Path]]:
+    return CLAUDE_SKILL_ROOTS if normalize_provider_mode(mode) == MODE_CLAUDE else SKILL_SOURCE_ROOTS
+
+
+def unique_skill_dirs(mode: str = MODE_VINIPER) -> list[Path]:
+    seen: set[str] = set()
+    dirs: list[Path] = []
+    for _source, path in skill_roots_for_mode(mode):
+        try:
+            key = str(path.resolve())
+        except Exception:
+            key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(path)
+    return dirs
+
+
+def unique_skill_source_roots(mode: str = MODE_VINIPER) -> list[tuple[str, Path]]:
+    seen: set[str] = set()
+    roots: list[tuple[str, Path]] = []
+    for source, path in skill_roots_for_mode(mode):
+        try:
+            key = str(path.resolve()).lower()
+        except Exception:
+            key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append((source, path))
+    return roots
+
+
+def skill_source_for_path(path: Path, mode: str = MODE_VINIPER) -> tuple[str, Path]:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    for source, root in unique_skill_source_roots(mode):
+        try:
+            if resolved == root.resolve() or root.resolve() in resolved.parents:
+                return source, root
+        except Exception:
+            continue
+    return "local", path.parent
+
+
+def skill_name_from_path(path: Path) -> str:
+    return path.parent.name if path.name.lower() == "skill.md" else path.stem
+
+
+def claude_skill_bridge_root() -> str:
+    configured = env_value("VINIPER_UI_CLAUDE_SKILL_BRIDGE_ROOT", "").strip()
+    return configured or f"/home/{MANAGED_DISTRO_USER}/.local/share/viniper/skill-library"
+
+
+def run_wsl_skill_bridge(script: str) -> subprocess.CompletedProcess:
+    try:
+        completed = subprocess.run(
+            [
+                "wsl.exe", "--distribution", MANAGED_DISTRO_NAME,
+                "--user", MANAGED_DISTRO_USER, "--exec", "bash", "-s",
+            ],
+            # Passing text through a Windows TextIO wrapper translates LF to
+            # CRLF; bash -s then reads tokens such as `set -eu\r`.  Send the
+            # generated POSIX script as UTF-8 bytes so WSL receives exact LF.
+            input=str(script).replace("\r\n", "\n").encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+        return subprocess.CompletedProcess(
+            completed.args,
+            completed.returncode,
+            stdout=bytes(completed.stdout or b"").decode("utf-8", errors="replace"),
+            stderr=bytes(completed.stderr or b"").decode("utf-8", errors="replace"),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(["wsl.exe"], 1, stdout="", stderr=str(exc))
+
+
+def skill_id_from_path(path: Path, mode: str = MODE_VINIPER) -> str:
+    source, root = skill_source_for_path(path, mode)
+    try:
+        relative = path.resolve().relative_to(root.resolve()).as_posix()
+    except Exception:
+        relative = path.name
+    return f"{source}:{relative}"
+
+
+def skill_display_path(path: Path, mode: str = MODE_VINIPER) -> str:
+    source, root = skill_source_for_path(path, mode)
+    try:
+        return f"{source}/{path.resolve().relative_to(root.resolve()).as_posix()}"
+    except Exception:
+        pass
+    for root in (APP_DIR, BASE_DIR):
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            continue
+    return str(path)
+
+
+def skill_file_from_record(skill: dict[str, str], mode: str = MODE_VINIPER) -> Path | None:
+    record_id = str(skill.get("id") or "").strip()
+    if ":" in record_id:
+        source, relative = record_id.split(":", 1)
+        for candidate_source, root in unique_skill_source_roots(mode):
+            if candidate_source != source:
+                continue
+            try:
+                candidate = (root / relative).resolve()
+                if root.resolve() in candidate.parents and candidate.is_file() and candidate.suffix.lower() == ".md":
+                    return candidate
+            except Exception:
+                return None
+        return None
+    absolute = str(skill.get("absolute_path") or "").strip()
+    if absolute:
+        path = Path(absolute)
+        if path.exists() and path.is_file():
+            return path
+    filename = str(skill.get("filename") or "").strip()
+    if filename:
+        for directory in unique_skill_dirs(mode):
+            candidates = [
+                directory / filename,
+                directory / skill.get("id", "") / filename,
+                directory / skill.get("id", "") / "SKILL.md",
+            ]
+            for candidate in candidates:
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+    return None
+
+
+def find_skill(command: str, mode: str = MODE_VINIPER) -> dict[str, str] | None:
+    token = command.strip().lstrip("/").lower()
+    if not token:
+        return None
+    for skill in get_skills(mode):
+        if token in skill_aliases(skill):
+            return skill
+    return None
+
+
+def read_skill_content(command: str, limit: int | None = None, mode: str = MODE_VINIPER) -> str:
+    skill = find_skill(command, mode)
+    if not skill:
+        return ""
+    path = skill_file_from_record(skill, mode)
+    if not path:
+        return ""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+    if limit and len(content) > limit:
+        return content[:limit].rstrip() + "\n\n[skill truncated for goal-mode context]"
+    return content
+
+
+def goal_skill_section() -> str:
+    content = read_skill_content(GOAL_SKILL_COMMAND, limit=18000)
+    if not content:
+        return (
+            "Goal refinement protocol:\n"
+            "- Audit the goal for vague words, missing deliverables, missing failure conditions, and missing next actions.\n"
+            "- Each turn must deepen or verify the previous turn instead of repeating it.\n"
+        )
+    return (
+        f"Embedded goal skill: {GOAL_SKILL_COMMAND}\n"
+        "Use this skill as the goal-refinement protocol, but adapt it to autonomous goal mode: "
+        "when the skill asks to pause for user input, first infer from files, command output, and previous turns; "
+        "ask the user only if the missing information blocks further work.\n"
+        "<goal-skill>\n"
+        f"{content}\n"
+        "</goal-skill>\n"
+    )
+
+
+def build_goal_turn_prompt(goal: dict[str, Any], turn_number: int) -> str:
+    original = str(goal.get("prompt") or "").strip()
+    last_output = str(goal.get("last_output") or "").strip()
+    last_section = f"\nPrevious goal-mode output to improve, not repeat:\n{last_output[-3500:]}\n" if last_output else ""
+    max_turns = int(goal.get("max_turns") or GOAL_DEFAULT_MAX_TURNS)
+    phase = "初始审计" if turn_number <= 1 else ("递进深化" if turn_number < max_turns else "最终收束")
+    return (
+        "Viniper Goal Mode is a hidden outer controller for the current conversation. "
+        "Continue the user's long-running goal through the configured agent shell. "
+        "The visible reply should be useful and concise. Use tools when needed. Do not invent completed work.\n\n"
+        f"{goal_skill_section()}\n"
+        f"Original goal:\n{original}\n"
+        f"{last_section}\n"
+        f"Turn: {turn_number} / {max_turns}. Phase: {phase}.\n\n"
+        "Required behavior for this turn:\n"
+        "1. Start from the original goal and the previous output. Identify the single most important ambiguity, risk, or incomplete deliverable that remains.\n"
+        "2. Apply the dbs-goal idea of making every vague word do work: define the checkable artifact, failure condition, next action, and verification evidence for this turn.\n"
+        "3. Execute the next concrete improvement or verification step. Do not merely restate the goal and do not repeat earlier work unless verification shows it was wrong.\n"
+        "4. At the end of the visible answer, briefly report: this turn's finding, this turn's concrete improvement, what remains next.\n"
+        "5. Only mark the goal done when the deliverable is actually complete and verified. If the goal is complete, end the final hidden line with "
+        f"{GOAL_DONE_MARKER}. If further refinement or execution remains, end the final hidden line with {GOAL_CONTINUE_MARKER}."
+    )
+
+
+def goal_output_is_done(output: str) -> bool:
+    value = str(output or "")
+    if GOAL_DONE_MARKER in value:
+        return True
+    if GOAL_CONTINUE_MARKER in value:
+        return False
+    return False
+
+
+def strip_goal_control_markers(value: str) -> str:
+    return (
+        str(value or "")
+        .replace(GOAL_DONE_MARKER, "")
+        .replace(GOAL_CONTINUE_MARKER, "")
+        .strip()
+    )
+
+
+def is_leaked_goal_control_message(message: dict[str, Any]) -> bool:
+    if message.get("role") != "user":
+        return False
+    content = str(message.get("content") or "")
+    legacy_or_current_brand = "Viniper Goal Mode" in content or "Viniper UI Goal Mode" in content
+    return "[GUIDANCE]" in content and legacy_or_current_brand and "Original goal:" in content
+
+
+def sanitize_goal_session_messages(session_id: str) -> None:
+    session = safe_session(session_id)
+    changed = False
+    messages = []
+    for message in list(session.get("messages", [])):
+        if isinstance(message, dict) and is_leaked_goal_control_message(message):
+            changed = True
+            continue
+        messages.append(message)
+    session["messages"] = messages
+
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for key in ("content", "thinking"):
+            if key in message:
+                cleaned = strip_goal_control_markers(str(message.get(key) or ""))
+                if cleaned != message.get(key):
+                    message[key] = cleaned
+                    changed = True
+        for segment in message.get("segments") or []:
+            if not isinstance(segment, dict) or "content" not in segment:
+                continue
+            cleaned = strip_goal_control_markers(str(segment.get("content") or ""))
+            if cleaned != segment.get("content"):
+                segment["content"] = cleaned
+                changed = True
+        break
+
+    if changed:
+        session["updated"] = now_ts()
+        sessions[session_id] = session
+        save_sessions_to_disk()
+
+
+def start_goal_task(goal_id: str) -> None:
+    task = _goal_tasks.get(goal_id)
+    if task and not task.done():
+        return
+    _goal_tasks[goal_id] = asyncio.create_task(run_goal_loop(goal_id))
+
+
+async def stop_goal_task(goal_id: str, goal: dict[str, Any] | None = None) -> None:
+    task = _goal_tasks.pop(goal_id, None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    target_goal = goal or goals.get(goal_id)
+    if target_goal:
+        run = _active_runs.get(str(target_goal.get("session_id") or ""))
+        if run:
+            try:
+                await kill_process_tree(int(run.get("pid") or 0))
+            except Exception:
+                pass
+            force_release_session_lock(str(target_goal.get("session_id") or ""))
+
+
+async def run_goal_loop(goal_id: str) -> None:
+    await asyncio.sleep(0.1)
+    try:
+        while True:
+            goal = goals.get(goal_id)
+            if not goal or goal.get("status") != "running":
+                return
+
+            goal = normalize_goal(goal_id, goal)
+            if goal["turn_count"] >= goal["max_turns"]:
+                goal["status"] = "waiting"
+                goal["current_step"] = "Reached the configured turn limit. Resume to continue."
+                goal["updated"] = now_ts()
+                goals[goal_id] = goal
+                save_goals_to_disk()
+                return
+
+            turn_number = int(goal["turn_count"]) + 1
+            goal["current_step"] = f"Running turn {turn_number}"
+            goal["last_run"] = now_ts()
+            goal["last_error"] = ""
+            goal["updated"] = now_ts()
+            goals[goal_id] = goal
+            save_goals_to_disk()
+
+            output_parts: list[str] = []
+            error_text = ""
+            prompt = build_goal_turn_prompt(goal, turn_number)
+            async for chunk in stream_conversation(
+                str(goal.get("session_id") or ""),
+                prompt,
+                True,
+                str(goal.get("model") or ""),
+                str(goal.get("permission_mode") or DEFAULT_PERMISSION_MODE),
+                [],
+                suppress_user_message=True,
+            ):
+                for payload in sse_payloads(chunk):
+                    content = str(payload.get("content") or "")
+                    if payload.get("type") in {"text", "thinking"} and content:
+                        output_parts.append(content)
+                    elif payload.get("type") == "error":
+                        error_text = content or "Goal turn failed."
+                        output_parts.append(error_text)
+                current = goals.get(goal_id)
+                if not current or current.get("status") != "running":
+                    return
+
+            goal = goals.get(goal_id)
+            if not goal:
+                return
+            sanitize_goal_session_messages(str(goal.get("session_id") or ""))
+            goal = normalize_goal(goal_id, goal)
+            goal["turn_count"] = int(goal.get("turn_count") or 0) + 1
+            output = strip_goal_control_markers(clean_stream_text("".join(output_parts))).strip()
+            goal["last_output"] = output[-4000:]
+            goal["updated"] = now_ts()
+
+            if error_text:
+                goal["status"] = "failed"
+                goal["last_error"] = error_text[:1200]
+                goal["current_step"] = "Stopped after an error."
+                goals[goal_id] = goal
+                save_goals_to_disk()
+                return
+
+            if goal_output_is_done(output):
+                goal["status"] = "completed"
+                goal["current_step"] = "Completed."
+                goals[goal_id] = goal
+                save_goals_to_disk()
+                return
+
+            if int(goal["turn_count"]) >= int(goal["max_turns"]):
+                goal["status"] = "waiting"
+                goal["current_step"] = "Reached the configured turn limit. Resume to continue."
+                goals[goal_id] = goal
+                save_goals_to_disk()
+                return
+
+            goal["current_step"] = f"Turn {turn_number} finished; starting the next turn shortly."
+            goals[goal_id] = goal
+            save_goals_to_disk()
+            await asyncio.sleep(GOAL_BETWEEN_TURN_DELAY_SECONDS)
+    except asyncio.CancelledError:
+        goal = goals.get(goal_id)
+        if goal and goal.get("status") == "running":
+            goal["status"] = "paused"
+            goal["current_step"] = "Paused."
+            goal["updated"] = now_ts()
+            goals[goal_id] = goal
+            save_goals_to_disk()
+        raise
+    except Exception as exc:
+        goal = goals.get(goal_id)
+        if goal:
+            goal["status"] = "failed"
+            goal["last_error"] = str(exc)[:1200]
+            goal["current_step"] = "Goal runner failed."
+            goal["updated"] = now_ts()
+            goals[goal_id] = goal
+            save_goals_to_disk()
+    finally:
+        task = _goal_tasks.get(goal_id)
+        if task is asyncio.current_task():
+            _goal_tasks.pop(goal_id, None)
+
+
+PROVIDER_USAGE_ALIASES: dict[str, tuple[str, ...]] = {
+    "input_tokens": ("input_tokens", "prompt_tokens"),
+    "output_tokens": ("output_tokens", "completion_tokens"),
+    "total_tokens": ("total_tokens", "total"),
+    "cache_read_tokens": (
+        "cache_read_input_tokens",
+        "cache_read_tokens",
+        "prompt_cache_hit_tokens",
+        "cache_hit_tokens",
+    ),
+    "cache_creation_tokens": (
+        "cache_creation_input_tokens",
+        "cache_creation_tokens",
+        "prompt_cache_miss_tokens",
+        "cache_miss_tokens",
+    ),
+}
+HARNESS_RUNTIME_SYSTEM_PREFIX = (
+    "Viniper Harness Runtime v1. Keep the ordered conversation context intact "
+    "and return only the requested assistant response."
+)
+TOOL_FINALIZATION_BUDGET_SECONDS = float(env_value("VINIPER_UI_TOOL_FINALIZATION_BUDGET", "90"))
+AGENT_COMPLETION_INSTRUCTIONS = (
+    "工具完成后，如果目标已经达成，请立即给出简洁的最终结果并结束本轮；"
+    "如果工具完成后没有新的工具调用或文本输出，不要重复用户消息或已完成工具，"
+    "必须在收尾预算内结束并明确说明当前结果。"
+ )
+
+
+def provider_usage_snapshot(event: dict[str, Any]) -> dict[str, int | float | str]:
+    """Project provider usage without retaining headers, keys, or raw events."""
+    if not isinstance(event, dict):
+        return {}
+    candidates: list[dict[str, Any]] = []
+    for value in (event.get("usage"), event.get("message"), event.get("delta")):
+        if isinstance(value, dict):
+            usage = value.get("usage") if isinstance(value.get("usage"), dict) else value
+            if isinstance(usage, dict):
+                candidates.append(usage)
+    snapshot: dict[str, int | float | str] = {}
+    source = str(event.get("source") or "")
+    if not source and candidates:
+        source = "provider"
+    for canonical, aliases in PROVIDER_USAGE_ALIASES.items():
+        for usage in candidates:
+            for alias in aliases:
+                raw = usage.get(alias)
+                try:
+                    number = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if number >= 0:
+                    snapshot[canonical] = number
+                    break
+            if canonical in snapshot:
+                break
+    total_cache = int(snapshot.get("cache_read_tokens", 0)) + int(snapshot.get("cache_creation_tokens", 0))
+    if source in {"provider", "estimated"}:
+        snapshot["source"] = source
+    if "total_tokens" not in snapshot:
+        total = int(snapshot.get("input_tokens", 0)) + int(snapshot.get("output_tokens", 0))
+        if total:
+            snapshot["total_tokens"] = total
+    if total_cache:
+        snapshot["cache_hit_ratio"] = round(int(snapshot.get("cache_read_tokens", 0)) / total_cache, 4)
+        snapshot["cache_source"] = "provider"
+    return snapshot
+
+
+class HarnessRuntimeTransport:
+    """Viniper owner seam: every run crosses the Harness Application Port."""
+
+    runtime_id = "harness-runtime"
+    cache_contract = {
+        "runtime_owner": "copied-harness-agent-runtime",
+        "execution_boundary": "HarnessApplicationPort",
+        "stable_prefix": HARNESS_RUNTIME_SYSTEM_PREFIX,
+        "history_order": "stable",
+        "tool_order": "runtime-tool-registry",
+        "usage_source": "provider-events",
+        "secret_boundary": "host-config-only",
+    }
+
+    def __init__(self, application_port: HarnessApplicationPort):
+        if application_port is None:
+            raise ValueError("Harness Application Port is required")
+        self.application_port = application_port
+
+    async def stream(
+        self,
+        session_id: str,
+        user_msg: str,
+        model: str | None = None,
+        permission_mode: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ):
+        session = safe_session(session_id)
+        if normalize_session_mode(session.get("mode")) != MODE_VINIPER:
+            raise RuntimeError("HarnessRuntimeTransport 只能服务 Viniper 会话。")
+        prompt = str(user_msg or "").strip()
+        if not prompt:
+            return
+        attachments = attachments or []
+        runtime_prompt = append_attachment_prompt(prompt, attachments)
+        harness_instructions = read_agent_instructions(MODE_VINIPER).strip()
+        if harness_instructions:
+            runtime_prompt = f"[Viniper Harness 独立指令]\n{harness_instructions}\n\n[当前请求]\n{runtime_prompt}"
+        runtime_prompt = f"[通用 Agent 收尾指令]\n{AGENT_COMPLETION_INSTRUCTIONS}\n\n{runtime_prompt}"
+        selected_permission_mode = allowed_permission_mode(permission_mode or session.get("permission_mode"), MODE_VINIPER)
+        if selected_permission_mode == "review":
+            runtime_prompt = "[Viniper 规划自动审核：先维护结构化计划与检查点；仅项目内受控动作可在审核通过后自动执行，越界或高风险动作直接拒绝。]\n\n" + runtime_prompt
+        elif selected_permission_mode == "fullAccess":
+            runtime_prompt = "[Viniper 完全访问：仅在已注册工具与产品硬边界内自动执行。]\n\n" + runtime_prompt
+        elif selected_permission_mode == "plan":
+            runtime_prompt = "[Viniper 计划模式：只分析并维护计划，不执行文件修改或有副作用的工具。]\n\n" + runtime_prompt
+        cfg = provider_config(model, MODE_VINIPER)
+        workdir = existing_workdir(str(session.get("workdir") or ""))
+        watched_file_roots = file_change_watch_roots(workdir)
+        before_file_state = snapshot_watch_files(watched_file_roots)
+        before_file_text = snapshot_watch_text(watched_file_roots)
+        # Preview without a host-owned secret stays explicitly offline on the
+        # real Harness Demo provider.  Configured secrets select the requested
+        # ProviderSettings profile; no secret is ever sent to the renderer.
+        offline_demo = (
+            env_value("VINIPER_UI_DEMO_ONLY", "").strip() == "1"
+            or not bool(cfg.get("api_key"))
+        )
+        selected_model = "demo-default" if offline_demo else cfg["model"]
+        provider_model = provider_model_id(selected_model)
+        message_created_at = now_ts()
+        user_message: dict[str, Any] = {
+            "role": "user",
+            "content": prompt,
+            "created_at": message_created_at,
+            "updated_at": message_created_at,
+        }
+        if attachments:
+            user_message["attachments"] = attachment_message_items(attachments, session_id)
+        session["messages"] = list(session.get("messages", [])) + [user_message]
+        session["last_run_status"] = "running"
+        session["updated"] = now_ts()
+        sessions[session_id] = session
+        save_sessions_to_disk()
+
+        assistant_text = ""
+        thinking_text = ""
+        segments: list[dict[str, Any]] = []
+        thinking_started = False
+        completed_thinking_activity_ids: set[str] = set()
+        current_thinking_activity_id = ""
+        thinking_interval_started_at: float | None = None
+        thinking_elapsed_total = 0.0
+        turn_usage: dict[str, int | float | str] = {}
+        usage_run_id = str(uuid.uuid4())
+        started = time.monotonic()
+        last_save = 0.0
+        active_plan_run_id = ""
+        plan_touched = False
+
+        def thinking_elapsed_seconds() -> int:
+            active = 0.0
+            if thinking_interval_started_at is not None:
+                active = max(0.0, time.monotonic() - thinking_interval_started_at)
+            return max(0, int(round(thinking_elapsed_total + active)))
+
+        def begin_thinking() -> None:
+            nonlocal thinking_started, thinking_interval_started_at
+            if thinking_started:
+                return
+            thinking_started = True
+            thinking_interval_started_at = time.monotonic()
+
+        def finish_thinking() -> int:
+            nonlocal thinking_started, thinking_interval_started_at, thinking_elapsed_total
+            if thinking_interval_started_at is not None:
+                thinking_elapsed_total += max(0.0, time.monotonic() - thinking_interval_started_at)
+            thinking_started = False
+            thinking_interval_started_at = None
+            return thinking_elapsed_seconds()
+
+        def append_segment(segment_type: str, content: str) -> None:
+            if not content:
+                return
+            if segments and segments[-1].get("type") == segment_type:
+                segments[-1]["content"] = str(segments[-1].get("content") or "") + content
+            else:
+                segments.append({"type": segment_type, "content": content})
+
+        def save_progress(force: bool = False) -> None:
+            nonlocal last_save
+            now = time.monotonic()
+            if not force and now - last_save < 1.0:
+                return
+            last_save = now
+            timestamp = now_ts()
+            message = {
+                "role": "assistant",
+                "content": assistant_text,
+                "thinking": thinking_text,
+                "model": selected_model,
+                "segments": copy.deepcopy(segments),
+                "elapsed_seconds": max(0, round(now - started)),
+                "pending": True,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+            }
+            thinking_elapsed = thinking_elapsed_seconds()
+            if thinking_elapsed > 0:
+                message["thinking_elapsed_seconds"] = thinking_elapsed
+            if turn_usage:
+                message["turn_usage"] = copy.deepcopy(turn_usage)
+            session.setdefault("messages", []).append(message)
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+
+        def update_pending() -> None:
+            for message in reversed(session.get("messages", [])):
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
+                    message.update({
+                        "content": assistant_text,
+                        "thinking": thinking_text,
+                        "model": selected_model,
+                        "segments": copy.deepcopy(segments),
+                        "elapsed_seconds": max(0, round(time.monotonic() - started)),
+                        "updated_at": now_ts(),
+                    })
+                    if turn_usage:
+                        message["turn_usage"] = copy.deepcopy(turn_usage)
+                    thinking_elapsed = thinking_elapsed_seconds()
+                    if thinking_elapsed > 0:
+                        message["thinking_elapsed_seconds"] = thinking_elapsed
+                    else:
+                        message.pop("thinking_elapsed_seconds", None)
+                    return
+
+        save_progress(force=True)
+        yield {
+            "type": "assistant_start",
+            "mode": MODE_VINIPER,
+            "engine": "harness-runtime",
+            "model": selected_model,
+        }
+        try:
+            event_stream = self.application_port.stream(
+                session_id=session_id,
+                prompt=runtime_prompt,
+                model=provider_model,
+                workdir=str(workdir),
+                permission_mode=harness_permission_mode(selected_permission_mode),
+                provider_id="demo" if offline_demo else cfg.get("provider"),
+                base_url="" if offline_demo else cfg.get("base_url", ""),
+                host_secret_value="" if offline_demo else cfg.get("api_key", ""),
+                memory_enabled=bool(load_app_settings().get("runtime", {}).get("memory_enabled", True)),
+            )
+            async for envelope in event_stream:
+                if envelope.get("type") == "runtime.finalization_timeout":
+                    raise RuntimeError("Provider 工具续轮未产生可见终答；本轮可安全重试。")
+                if envelope.get("type") != "provider.event":
+                    continue
+                event = envelope.get("event")
+                if not isinstance(event, dict):
+                    continue
+                event_type = str(event.get("type") or "")
+                usage_event = event
+                if event_type == "turn_usage" and isinstance(event.get("turn_usage"), dict):
+                    usage_event = {"usage": event["turn_usage"], "source": event.get("source")}
+                usage = provider_usage_snapshot(usage_event)
+                if usage:
+                    turn_usage.update(usage)
+                    daily_usage_ledger().record_event(usage_run_id, session_id, usage_event, mode=MODE_VINIPER)
+                    update_pending()
+                    yield {"type": "turn_usage", "turn_usage": copy.deepcopy(turn_usage)}
+                if event_type == "turn_usage":
+                    continue
+                if event_type == "plan":
+                    raw_steps = event.get("steps") if isinstance(event.get("steps"), list) else []
+                    event_run_id = str(event.get("run_id") or "")
+                    plan_event = {
+                        "type": "plan",
+                        "session_id": session_id,
+                        "run_id": event_run_id,
+                        "explanation": clean_stream_text(str(event.get("explanation") or "")),
+                        "steps": copy.deepcopy(raw_steps),
+                        "current": max(0, int(event.get("current") or 0)),
+                        "total": len(raw_steps),
+                    }
+                    persisted_plan = persist_runtime_plan_event(
+                        session_id,
+                        raw_steps,
+                        source="runtime.plan",
+                        run_id=event_run_id,
+                        explanation=plan_event["explanation"],
+                    )
+                    if persisted_plan is not None:
+                        plan_touched = True
+                        active_plan_run_id = event_run_id or active_plan_run_id
+                        plan_event.update({
+                            "steps": copy.deepcopy(persisted_plan["steps"]),
+                            "current": persisted_plan["current"],
+                            "total": persisted_plan["total"],
+                        })
+                    plan_segment = {**plan_event, "type": "plan_timeline"}
+                    existing_index = next(
+                        (
+                            index for index in range(len(segments) - 1, -1, -1)
+                            if segments[index].get("type") == "plan_timeline"
+                            and str(segments[index].get("run_id") or "") == plan_event["run_id"]
+                        ),
+                        -1,
+                    )
+                    if existing_index >= 0:
+                        segments[existing_index] = plan_segment
+                    else:
+                        segments.append(plan_segment)
+                    update_pending()
+                    yield plan_event
+                    continue
+                if event_type == "turn_diff":
+                    turn_diff = event.get("turn_diff") if isinstance(event.get("turn_diff"), dict) else {}
+                    diff_event = {
+                        "type": "turn_diff",
+                        "run_id": str(event.get("run_id") or ""),
+                        "turn_id": str(event.get("turn_id") or event.get("run_id") or ""),
+                        "turn_diff": copy.deepcopy(turn_diff),
+                    }
+                    diff_segment = copy.deepcopy(diff_event)
+                    existing_index = next(
+                        (
+                            index for index in range(len(segments) - 1, -1, -1)
+                            if segments[index].get("type") == "turn_diff"
+                            and str(segments[index].get("run_id") or "") == diff_event["run_id"]
+                        ),
+                        -1,
+                    )
+                    if existing_index >= 0:
+                        segments[existing_index] = diff_segment
+                    else:
+                        segments.append(diff_segment)
+                    update_pending()
+                    yield diff_event
+                    continue
+                if event_type == "content_block_start":
+                    block = event.get("content_block") if isinstance(event.get("content_block"), dict) else {}
+                    if block.get("type") == "thinking" and not thinking_started:
+                        current_thinking_activity_id = str(event.get("activity_id") or "")
+                        if current_thinking_activity_id in completed_thinking_activity_ids:
+                            continue
+                        begin_thinking()
+                        yield {"type": "thinking_start", "elapsed": 0}
+                    continue
+                if event_type == "content_block_delta":
+                    delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                    delta_type = str(delta.get("type") or "")
+                    if delta_type == "thinking_delta":
+                        activity_id = str(event.get("activity_id") or current_thinking_activity_id or "")
+                        if activity_id and activity_id in completed_thinking_activity_ids:
+                            # Some Harness providers replay the final
+                            # reasoning delta after a tool result. The same
+                            # activity was already rendered before the tool;
+                            # dropping the replay prevents a duplicate panel.
+                            continue
+                        text = clean_stream_text(str(delta.get("thinking") or ""))
+                        if text:
+                            if not thinking_started:
+                                begin_thinking()
+                                yield {"type": "thinking_start", "elapsed": 0}
+                            thinking_text += text
+                            append_segment("thinking", text)
+                            update_pending()
+                            yield {"type": "thinking_delta", "content": text, "elapsed": max(0, round(time.monotonic() - started))}
+                    elif delta_type == "text_delta":
+                        text = clean_stream_text(str(delta.get("text") or ""))
+                        if text:
+                            if thinking_started:
+                                yield {"type": "thinking_complete", "elapsed": finish_thinking()}
+                            assistant_text += text
+                            append_segment("text", text)
+                            update_pending()
+                            yield {"type": "text", "content": text}
+                    continue
+                if event_type == "thinking_complete":
+                    activity_id = str(event.get("activity_id") or current_thinking_activity_id or "")
+                    if activity_id:
+                        completed_thinking_activity_ids.add(activity_id)
+                    if thinking_started:
+                        yield {"type": "thinking_complete", "elapsed": finish_thinking()}
+                    continue
+                if event_type == "tool_start":
+                    tool_name = str(event.get("tool_name") or event.get("name") or "工具")
+                    call_id = str(event.get("call_id") or event.get("tool_id") or "")
+                    tool_content = clean_stream_text(str(event.get("content") or tool_name))
+                    tool_input = event.get("input") if isinstance(event.get("input"), dict) else {}
+                    plan_snapshot = update_plan_from_tool_event(
+                        session_id,
+                        tool_name,
+                        tool_input,
+                        str(event.get("run_id") or ""),
+                    )
+                    if plan_snapshot is not None:
+                        plan_touched = True
+                        active_plan_run_id = str(plan_snapshot.get("run_id") or active_plan_run_id)
+                        yield {"type": "plan", **plan_snapshot}
+                    segments.append({
+                        "type": "tool_start",
+                        "tool_name": tool_name,
+                        "name": tool_name,
+                        "call_id": call_id,
+                        "tool_id": call_id,
+                        "content": tool_content,
+                        "status": str(event.get("status") or "running"),
+                        "input": copy.deepcopy(tool_input),
+                    })
+                    yield {
+                        "type": "tool_start",
+                        "tool_name": tool_name,
+                        "call_id": call_id,
+                        "run_id": str(event.get("run_id") or ""),
+                        "content": tool_content,
+                        "status": str(event.get("status") or "running"),
+                        "input": copy.deepcopy(tool_input),
+                    }
+                    continue
+                if event_type == "tool_result":
+                    projected_tool_result = project_tool_result_stream_event(event)
+                    segments.append({
+                        **projected_tool_result,
+                        "name": projected_tool_result["tool_name"],
+                        "tool_id": projected_tool_result["call_id"],
+                    })
+                    yield projected_tool_result
+                    continue
+                if event_type == "permission_request":
+                    # Harness approvals are resolved through the Application
+                    # Port, keyed by the current session/call.  Do not route
+                    # this Viniper event through Claude's CLI interaction
+                    # broker.
+                    yield {
+                        "type": "permission_request",
+                        "request_id": str(event.get("call_id") or ""),
+                        "call_id": str(event.get("call_id") or ""),
+                        "run_id": str(event.get("run_id") or ""),
+                        "session_id": session_id,
+                        "owner": "viniper",
+                        "tool_name": str(event.get("tool_name") or "工具"),
+                        "content": clean_stream_text(str(event.get("content") or "需要权限")),
+                        "allowed_actions": ["deny", "allow_once"],
+                        "status": "waiting",
+                    }
+                    continue
+                if event_type == "permission_resolved":
+                    yield {
+                        "type": "permission_resolved",
+                        "request_id": str(event.get("call_id") or ""),
+                        "call_id": str(event.get("call_id") or ""),
+                        "run_id": str(event.get("run_id") or ""),
+                        "session_id": session_id,
+                        "owner": "viniper",
+                        "decision": str(event.get("decision") or "reject"),
+                        "content": clean_stream_text(str(event.get("content") or "权限已处理")),
+                    }
+                    continue
+                if event_type == "runtime_error":
+                    raise RuntimeError(str(event.get("content") or "Harness AgentRuntime failed"))
+                if event_type == "runtime_cancelled":
+                    raise asyncio.CancelledError()
+                if event_type == "interrupt_acknowledged":
+                    yield {
+                        "type": "interrupt_acknowledged",
+                        "run_id": str(event.get("run_id") or ""),
+                        "status": str(event.get("status") or "acknowledged"),
+                        "requested_at": event.get("requested_at"),
+                        "acknowledged_at": event.get("acknowledged_at"),
+                    }
+                    continue
+                if event_type in {"thinking", "thinking_delta"}:
+                    text = clean_stream_text(str(event.get("content") or event.get("thinking") or ""))
+                    if text:
+                        if not thinking_started:
+                            begin_thinking()
+                            yield {"type": "thinking_start", "elapsed": 0}
+                        thinking_text += text
+                        append_segment("thinking", text)
+                        update_pending()
+                        yield {"type": "thinking_delta", "content": text, "elapsed": max(0, round(time.monotonic() - started))}
+                    continue
+                if event_type in {"text", "text_delta"}:
+                    text = clean_stream_text(str(event.get("content") or event.get("text") or ""))
+                    if text:
+                        if thinking_started:
+                            yield {"type": "thinking_complete", "elapsed": finish_thinking()}
+                        assistant_text += text
+                        append_segment("text", text)
+                        update_pending()
+                        yield {"type": "text", "content": text}
+                    continue
+                if event_type == "message_stop" and thinking_started:
+                    yield {"type": "thinking_complete", "elapsed": finish_thinking()}
+
+            if thinking_started:
+                yield {"type": "thinking_complete", "elapsed": finish_thinking()}
+            for change in file_change_records(before_file_state, before_file_text, watched_file_roots):
+                artifact = {
+                    "type": "artifact",
+                    "path": change["path"],
+                    "name": Path(change["path"]).name,
+                    "status": "success",
+                    "file_change": change,
+                }
+                segments.append(artifact)
+                yield artifact
+            update_pending()
+            for message in reversed(session.get("messages", [])):
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
+                    message["segments"] = finalize_transcript_segments(message.get("segments"))
+                    message["updated_at"] = now_ts()
+                    if turn_usage:
+                        message["turn_usage"] = copy.deepcopy(turn_usage)
+                    message.pop("thinking", None)
+                    message.pop("pending", None)
+                    break
+            if plan_touched:
+                finalize_plan_for_terminal(session_id, "completed", active_plan_run_id)
+            session["last_run_status"] = "completed"
+            session["unread"] = True
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            done = {"type": "done"}
+            if turn_usage:
+                done["turn_usage"] = copy.deepcopy(turn_usage)
+            if thinking_elapsed_seconds() > 0:
+                done["thinking_elapsed_seconds"] = thinking_elapsed_seconds()
+            yield done
+        except asyncio.CancelledError:
+            if thinking_started:
+                finish_thinking()
+            update_pending()
+            for message in reversed(session.get("messages", [])):
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
+                    message["segments"] = finalize_transcript_segments(message.get("segments"))
+                    message.pop("thinking", None)
+                    message.pop("pending", None)
+                    message["cancelled"] = True
+                    break
+            if plan_touched:
+                finalize_plan_for_terminal(session_id, "cancelled", active_plan_run_id)
+            session["last_run_status"] = "cancelled"
+            session["unread"] = True
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            raise
+        except Exception as exc:
+            if thinking_started:
+                finish_thinking()
+            update_pending()
+            for message in reversed(session.get("messages", [])):
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("pending"):
+                    message["segments"] = finalize_transcript_segments(message.get("segments"))
+                    message.pop("thinking", None)
+                    message.pop("pending", None)
+                    message["error"] = str(exc)
+                    break
+            if plan_touched:
+                finalize_plan_for_terminal(session_id, "failed", active_plan_run_id)
+            session["last_run_status"] = "failed"
+            session["unread"] = True
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield {"type": "error", "content": f"Viniper 运行失败：{exc}"}
+            done = {"type": "done"}
+            if turn_usage:
+                done["turn_usage"] = copy.deepcopy(turn_usage)
+            if thinking_elapsed_seconds() > 0:
+                done["thinking_elapsed_seconds"] = thinking_elapsed_seconds()
+            yield done
+
+
+class ClaudeCodeTransport:
+    """Claude owner seam around the native Claude Code CLI process stream."""
+
+    async def stream(self, session_id: str, user_msg: str, is_guidance: bool = False,
+                     model: str | None = None, permission_mode: str | None = None,
+                     attachments: list[dict[str, Any]] | None = None,
+                     suppress_user_message: bool = False,
+                     process_factory: Any = None,
+                     peer_request: dict[str, str] | None = None,
+                     queued_item_id: str = "",
+                     accepted_turn_id: str = ""):
+        async for chunk in stream_claude_impl(
+            session_id,
+            user_msg,
+            is_guidance,
+            model,
+            permission_mode,
+            attachments or [],
+            suppress_user_message=suppress_user_message,
+            process_factory=process_factory,
+            peer_request=peer_request,
+            queued_item_id=queued_item_id,
+            accepted_turn_id=accepted_turn_id,
+        ):
+            yield chunk
+
+
+VINIPER_TRANSPORT = HarnessRuntimeTransport(application_port=HarnessApplicationPort())
+CLAUDE_TRANSPORT = ClaudeCodeTransport()
+
+
+def workstation_loopback_mcp_endpoint() -> str:
+    port = int(env_value("VINIPER_UI_PORT", "17373"))
+    return f"http://127.0.0.1:{port}/api/harness/mcp"
+
+
+def local_model_runner_status() -> dict[str, Any]:
+    runners = [
+        {"id": "ollama", "installed": bool(shutil.which("ollama")), "default_endpoint": "http://127.0.0.1:11434"},
+        {"id": "lm-studio", "installed": bool(shutil.which("lmstudio")), "default_endpoint": "http://127.0.0.1:1234"},
+    ]
+    available = any(item["installed"] for item in runners)
+    return {
+        "available": available,
+        "runners": runners,
+        "reason": "" if available else "未检测到 Ollama 或 LM Studio；请先由用户安装并启动一个 loopback runner。",
+    }
+
+
+async def sync_harness_host_configuration() -> dict[str, Any]:
+    """Hydrate the long-lived Harness host from shell-owned refs, never renderer state."""
+    port = VINIPER_TRANSPORT.application_port
+    if port is None:
+        raise RuntimeError("Harness Application Port unavailable")
+    cfg = provider_config(mode=MODE_VINIPER)
+    return await port.control(
+        "harness.operation",
+        target="host.configure",
+        args={
+            "provider_id": str(cfg.get("provider") or "deepseek"),
+            "base_url": str(cfg.get("base_url") or ""),
+            "model": str(cfg.get("model") or ""),
+            "host_secret_value": str(cfg.get("api_key") or ""),
+            "mcp_endpoint": workstation_loopback_mcp_endpoint(),
+        },
+    )
+
+
+async def stream_conversation(
+    session_id: str,
+    user_msg: str,
+    is_guidance: bool = False,
+    model: str | None = None,
+    permission_mode: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    suppress_user_message: bool = False,
+    peer_request: dict[str, str] | None = None,
+    accepted_turn_id: str = "",
+):
+    lock = session_lock(session_id)
+    agent_mode = False
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=6)
+    except asyncio.TimeoutError:
+        yield sse({
+            "type": "error",
+            "content": "上一个任务还在运行，已拦截这次重复提交。如果刚才点了停止按钮，等几秒钟再发即可。",
+        })
+        yield sse({"type": "done"})
+        return
+    try:
+        session = safe_session(session_id)
+        mode = normalize_session_mode(session.get("mode"))
+        if mode == MODE_VINIPER:
+            if is_guidance:
+                yield sse({
+                    "type": "error",
+                    "content": "Viniper Harness 的运行中引导请使用当前运行入口。",
+                })
+                yield sse({"type": "done"})
+                return
+            task = asyncio.current_task()
+            if task is not None:
+                _viniper_tasks[session_id] = task
+                _active_runs[session_id] = {
+                    "kind": MODE_VINIPER,
+                    "task": task,
+                    "started": now_ts(),
+                    "cancel_requested": False,
+                }
+            try:
+                async for event in VINIPER_TRANSPORT.stream(session_id, user_msg, model, permission_mode, attachments):
+                    if isinstance(event, dict) and event.get("type") == "provider.event":
+                        projected = event.get("event") if isinstance(event.get("event"), dict) else {}
+                        runtime_run_id = str(projected.get("run_id") or "")
+                        if runtime_run_id and isinstance(_active_runs.get(session_id), dict):
+                            _active_runs[session_id]["run_id"] = runtime_run_id
+                    yield sse(event)
+            finally:
+                _viniper_tasks.pop(session_id, None)
+                _active_runs.pop(session_id, None)
+        else:
+            agent_mode = True
+            current_message = user_msg
+            current_model = model
+            current_permission = permission_mode
+            current_attachments = attachments or []
+            current_suppress = suppress_user_message
+            current_peer_request = peer_request
+            current_accepted_turn_id = str(accepted_turn_id or "")
+            queued_item: dict[str, Any] | None = None
+            while True:
+                saw_done = False
+                saw_error = False
+                runtime_started = False
+                async for chunk in CLAUDE_TRANSPORT.stream(
+                    session_id,
+                    current_message,
+                    is_guidance if queued_item is None else False,
+                    current_model,
+                    current_permission,
+                    current_attachments,
+                    suppress_user_message=current_suppress,
+                    peer_request=current_peer_request,
+                    queued_item_id=str(queued_item.get("id") or "") if queued_item else "",
+                    accepted_turn_id=current_accepted_turn_id,
+                ):
+                    for payload in sse_payloads(chunk):
+                        event_type = str(payload.get("type") or "")
+                        if event_type == "runtime_started":
+                            runtime_started = True
+                            if queued_item is not None:
+                                agent_queue_store().mark_started(session_id, str(queued_item.get("id") or ""))
+                                yield sse({
+                                    "type": "queue_removed",
+                                    "session_id": session_id,
+                                    "item_id": str(queued_item.get("id") or ""),
+                                })
+                        elif event_type == "error":
+                            saw_error = True
+                        elif event_type == "done":
+                            saw_done = True
+                    yield chunk
+
+                current_accepted_turn_id = ""
+
+                if queued_item is not None and not runtime_started:
+                    agent_queue_store().pause_dispatch(session_id, str(queued_item.get("id") or ""))
+                run_status = str(safe_session(session_id).get("last_run_status") or "")
+                if not saw_done or saw_error or run_status != "completed":
+                    break
+                token = agent_queue_store().authorize_drain(session_id, str(uuid.uuid4()), "done")
+                if not token:
+                    break
+                queued_item = agent_queue_store().claim_authorized(session_id, token)
+                if queued_item is None:
+                    break
+                yield sse({
+                    "type": "queue_dispatch",
+                    "session_id": session_id,
+                    "item": {
+                        key: copy.deepcopy(queued_item.get(key))
+                        for key in ("id", "text", "attachments", "model", "permission_mode", "status", "created_at")
+                    },
+                })
+                current_message = str(queued_item.get("text") or "")
+                current_model = str(queued_item.get("model") or model or "")
+                current_permission = str(queued_item.get("permission_mode") or permission_mode or "")
+                current_attachments = copy.deepcopy(queued_item.get("attachments") or [])
+                current_suppress = False
+                current_peer_request = None
+    finally:
+        if agent_mode:
+            agent_queue_store().pause_pending(session_id)
+        try:
+            lock.release()
+        except RuntimeError:
+            pass
+
+
+async def stream_viniper_with_queue(
+    session_id: str,
+    user_msg: str,
+    is_guidance: bool = False,
+    model: str | None = None,
+    permission_mode: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    peer_request: dict[str, str] | None = None,
+    accepted_turn_id: str = "",
+):
+    """Drain the Viniper-owned FIFO without sharing Claude's transport/state."""
+    current_message = user_msg
+    current_model = model
+    current_permission = permission_mode
+    current_attachments = attachments or []
+    current_guidance = is_guidance
+    current_peer_request = peer_request
+    current_accepted_turn_id = str(accepted_turn_id or "")
+    queued_item: dict[str, Any] | None = None
+    try:
+        while True:
+            saw_done = False
+            saw_error = False
+            runtime_started = False
+            queue_removed = False
+            async for chunk in stream_conversation(
+                session_id,
+                current_message,
+                current_guidance,
+                current_model,
+                current_permission,
+                current_attachments,
+                peer_request=current_peer_request,
+                accepted_turn_id=current_accepted_turn_id,
+            ):
+                for payload in sse_payloads(chunk):
+                    event_type = str(payload.get("type") or "")
+                    if event_type in {"assistant_start", "runtime_started"}:
+                        runtime_started = True
+                        if queued_item is not None and not queue_removed:
+                            try:
+                                agent_queue_store().mark_started(session_id, str(queued_item.get("id") or ""))
+                            except KeyError:
+                                pass
+                            yield sse({
+                                "type": "queue_removed",
+                                "session_id": session_id,
+                                "item_id": str(queued_item.get("id") or ""),
+                            })
+                            queue_removed = True
+                    elif event_type == "error":
+                        saw_error = True
+                    elif event_type == "done":
+                        saw_done = True
+                yield chunk
+
+            current_accepted_turn_id = ""
+            if queued_item is not None and not runtime_started:
+                agent_queue_store().pause_dispatch(session_id, str(queued_item.get("id") or ""))
+            run_status = str(safe_session(session_id).get("last_run_status") or "")
+            if not saw_done or saw_error or run_status != "completed":
+                break
+            token = agent_queue_store().authorize_drain(session_id, str(uuid.uuid4()), "done")
+            if not token:
+                break
+            queued_item = agent_queue_store().claim_authorized(session_id, token)
+            if queued_item is None:
+                break
+            yield sse({
+                "type": "queue_dispatch",
+                "session_id": session_id,
+                "item": {
+                    key: copy.deepcopy(queued_item.get(key))
+                    for key in ("id", "text", "attachments", "model", "permission_mode", "mode", "status", "created_at")
+                },
+            })
+            current_message = str(queued_item.get("text") or "")
+            current_model = str(queued_item.get("model") or current_model or "")
+            current_permission = str(queued_item.get("permission_mode") or current_permission or "")
+            current_attachments = copy.deepcopy(queued_item.get("attachments") or [])
+            current_guidance = False
+            current_peer_request = None
+    finally:
+        agent_queue_store().pause_pending(session_id)
+
+
+async def stream_custom_cli_impl(
+    session_id: str,
+    user_msg: str,
+    is_guidance: bool = False,
+    model: str | None = None,
+    permission_mode: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    suppress_user_message: bool = False,
+):
+    settings = load_app_settings()
+    shell_settings = settings.get("shell", {})
+    command_template = str(shell_settings.get("custom_command") or "").strip()
+    if not command_template:
+        yield sse({"type": "error", "content": "Custom CLI is selected, but no command template is configured in Settings."})
+        yield sse({"type": "done"})
+        return
+
+    cfg = provider_config(model, MODE_CLAUDE)
+    session = safe_session(session_id)
+    selected_model = cfg["model"]
+    selected_permission_mode = claude_permission_mode(permission_mode)
+    attachments = attachments or []
+    prompt = user_msg.strip()
+    if is_guidance:
+        prompt = f"[GUIDANCE] {prompt}"
+    display_prompt = prompt
+    if not suppress_user_message:
+        user_message = {"role": "user", "content": display_prompt}
+        if attachments:
+            user_message["attachments"] = attachment_message_items(attachments, session_id)
+        session["messages"] = list(session.get("messages", [])) + [user_message]
+    session["last_run_status"] = "running"
+    session["updated"] = now_ts()
+    sessions[session_id] = session
+    save_sessions_to_disk()
+
+    cwd = existing_workdir(str(session.get("workdir") or ""))
+    watched_file_roots = file_change_watch_roots(cwd)
+    before_file_state = snapshot_watch_files(watched_file_roots)
+    before_file_text = snapshot_watch_text(watched_file_roots)
+    command = format_custom_command(command_template, cfg, session, selected_permission_mode)
+    stdin_prompt = build_generic_cli_prompt(session, prompt, attachments, read_agent_instructions(MODE_CLAUDE))
+    assistant_text = ""
+    thinking_text = ""
+    started = time.monotonic()
+
+    yield sse({
+        "type": "assistant_start",
+        "model": selected_model,
+        "mode": "custom-cli",
+        "permission_mode": selected_permission_mode,
+    })
+    proc = None
+    stderr_task = None
+    coordinator_run_id = ""
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(cwd),
+            env=build_agent_env(cfg, session, mode=MODE_CLAUDE),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _active_runs[session_id] = {"pid": proc.pid, "started": now_ts(), "prompt": prompt, "cancel_requested": False}
+        stderr_task = asyncio.create_task(read_stderr(proc))
+        if proc.stdin is not None:
+            proc.stdin.write(stdin_prompt.encode("utf-8", errors="replace"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+
+        assert proc.stdout is not None
+        stdout_reader = ChunkedLineReader(proc.stdout)
+        last_heartbeat = started
+        while True:
+            if RUN_TIMEOUT_SECONDS > 0 and time.monotonic() - started >= RUN_TIMEOUT_SECONDS:
+                await kill_process_tree(proc.pid)
+                detail = f"Custom CLI exceeded {RUN_TIMEOUT_SECONDS} seconds and was stopped."
+                yield sse({"type": "error", "content": detail})
+                assistant_text = assistant_text or detail
+                break
+            try:
+                raw_line = await stdout_reader.readline(10)
+            except asyncio.TimeoutError:
+                now = time.monotonic()
+                if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                    yield sse({"type": "heartbeat", "elapsed": round(now - started), "action_task": False, "waiting_for": "custom-cli"})
+                    last_heartbeat = now
+                continue
+            if not raw_line:
+                break
+            text = clean_stream_text(raw_line.decode("utf-8", errors="replace"))
+            if not text:
+                continue
+            assistant_text += text
+            yield sse({"type": "text", "content": text})
+
+        return_code = await proc.wait()
+        stderr_text = await stderr_task if stderr_task else ""
+        if _active_runs.get(session_id, {}).get("cancel_requested"):
+            session["last_run_status"] = "cancelled"
+            session["unread"] = True
+            assistant_text = assistant_text or "已停止当前任务，输入已恢复。"
+            yield sse({"type": "text", "content": assistant_text})
+        elif return_code != 0:
+            session["last_run_status"] = "failed"
+            session["unread"] = True
+            detail = stderr_text or f"Custom CLI exited with code {return_code}"
+            yield sse({"type": "error", "content": detail[:3000]})
+            assistant_text = assistant_text or f"错误：{detail}"
+        elif not assistant_text.strip():
+            assistant_text = "任务已完成，但自定义 CLI 没有返回文本输出。"
+            yield sse({"type": "text", "content": assistant_text})
+
+        if not session.get("last_run_status") or session.get("last_run_status") == "running":
+            session["last_run_status"] = "completed"
+        session["unread"] = True
+
+        changes = file_change_records(before_file_state, before_file_text, watched_file_roots)
+        artifact_segments = []
+        for change in changes:
+            path = change["path"]
+            artifact = {"type": "artifact", "path": path, "name": Path(path).name, "status": "success", "file_change": change}
+            image = local_artifact_image(path, watched_file_roots)
+            if image is not None:
+                artifact["image"] = image
+            artifact_segments.append(artifact)
+        for segment in artifact_segments:
+            yield sse(segment)
+
+        session = safe_session(session_id)
+        session.setdefault("messages", []).append({
+            "role": "assistant",
+            "content": assistant_text,
+            "model": selected_model,
+            "segments": ([{"type": "text", "content": assistant_text}] if assistant_text else []) + artifact_segments,
+            "elapsed_seconds": max(0, round(time.monotonic() - started)),
+        })
+        session["updated"] = now_ts()
+        sessions[session_id] = session
+        save_sessions_to_disk()
+        yield sse({"type": "done"})
+    except Exception as exc:
+        session["last_run_status"] = "failed"
+        session["unread"] = True
+        detail = f"Custom CLI failed: {exc}"
+        yield sse({"type": "error", "content": detail})
+        yield sse({"type": "done"})
+    finally:
+        if proc and proc.returncode is None:
+            await kill_process_tree(proc.pid)
+        if stderr_task and not stderr_task.done():
+            stderr_task.cancel()
+        _active_runs.pop(session_id, None)
+
+
+def _unresolved_parallel_tool_count(segments: list[dict[str, Any]]) -> int:
+    """Count tool starts in a turn that have no matching tool result."""
+    starts: list[str] = []
+    results: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        segment_type = str(segment.get("type") or "")
+        tool_id = str(segment.get("tool_id") or segment.get("tool_use_id") or "")
+        if segment_type in {"tool_start", "tool_use"}:
+            starts.append(tool_id)
+        elif segment_type in {"tool_result", "tool_result_summary"}:
+            results.append(tool_id)
+    if not starts:
+        return 0
+    matched = list(results)
+    unresolved = 0
+    for tool_id in starts:
+        if tool_id and tool_id in matched:
+            matched.remove(tool_id)
+        elif not tool_id and matched:
+            matched.pop(0)
+        else:
+            unresolved += 1
+    return unresolved
+
+
+async def stream_claude_impl(
+    session_id: str,
+    user_msg: str,
+    is_guidance: bool = False,
+    model: str | None = None,
+    permission_mode: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    retry_missing_session: bool = False,
+    retry_session_in_use: bool = False,
+    suppress_user_message: bool = False,
+    stall_recovery_count: int = 0,
+    process_factory: Any = None,
+    peer_request: dict[str, str] | None = None,
+    queued_item_id: str = "",
+    accepted_turn_id: str = "",
+):
+    settings = load_app_settings()
+    if is_custom_shell(settings.get("shell", {})):
+        async for chunk in stream_custom_cli_impl(
+            session_id,
+            user_msg,
+            is_guidance,
+            model,
+            permission_mode,
+            attachments or [],
+            suppress_user_message,
+        ):
+            yield chunk
+        return
+
+    cfg = deepseek_config(model, MODE_CLAUDE)
+    if not cfg["api_key"]:
+        detail = f"未找到 {cfg['label']} API key，请在设置里配置 API Key 或环境变量。"
+        if accepted_turn_id:
+            finalize_accepted_agent_turn_failure(session_id, accepted_turn_id, detail, cfg["model"])
+        yield sse({"type": "error", "content": detail})
+        yield sse({"type": "done"})
+        return
+
+    runtime = WindowsNativeRuntime(claude_launcher(), process_factory=process_factory) if process_factory else agent_runtime()
+    if isinstance(runtime, WslAgentRuntime):
+        runtime_probe = runtime.probe()
+        if not runtime_probe.ready:
+            yield sse({
+                "type": "runtime_status",
+                "runtime": runtime_probe.as_dict(),
+            })
+            yield sse({
+                "type": "error",
+                "content": "Claude code 需要先完成 ViniperRuntime（WSL2）运行时设置。Viniper 仍可正常使用。",
+            })
+            if accepted_turn_id:
+                finalize_accepted_agent_turn_failure(
+                    session_id,
+                    accepted_turn_id,
+                    "Claude code 需要先完成 ViniperRuntime（WSL2）运行时设置。Viniper 仍可正常使用。",
+                    cfg["model"],
+                )
+            yield sse({"type": "done"})
+            return
+
+    session = safe_session(session_id)
+    selected_model = cfg["model"]
+    runtime_caps = runtime.capabilities()
+    effective_context_window = context_limit_for_model(selected_model)
+    selected_permission_mode = claude_permission_mode(permission_mode)
+    attachments = attachments or []
+    prompt = user_msg.strip()
+    if is_guidance:
+        prompt = f"[GUIDANCE] {prompt}"
+    display_prompt = prompt
+    if peer_request:
+        prompt = build_native_send_instruction(
+            str(peer_request.get("target_peer_name") or ""),
+            str(peer_request.get("message") or user_msg),
+        )
+        display_prompt = (
+            f"发送给 {str(peer_request.get('target_display_name') or peer_request.get('target_peer_name') or '目标会话')}："
+            f"{str(peer_request.get('message') or user_msg)}"
+        )
+
+    resume_existing = bool(session.get("claude_initialized"))
+    if resume_existing:
+        claude_session_id = new_claude_session_id(session.get("claude_session_id"))
+    else:
+        claude_session_id = str(uuid.uuid4())
+    session["claude_session_id"] = claude_session_id
+    defer_queued_user = bool(queued_item_id and not suppress_user_message)
+    if not accepted_turn_id and not suppress_user_message and not defer_queued_user:
+        user_message = {"role": "user", "content": display_prompt}
+        if attachments:
+            user_message["attachments"] = attachment_message_items(attachments, session_id)
+        session["messages"] = list(session.get("messages", [])) + [user_message]
+    else:
+        session["messages"] = list(session.get("messages", []))
+    session["last_run_status"] = "running"
+    session["updated"] = now_ts()
+    sessions[session_id] = session
+    save_sessions_to_disk()
+
+    context_prompt = append_attachment_prompt(prompt, attachments)
+
+    transport_model = provider_model_id(selected_model)
+    fallback_model = "deepseek-v4-flash" if transport_model != "deepseek-v4-flash" else ""
+    system_prompt_path = prepare_agent_system_prompt(session)
+    usage_run_id = str(uuid.uuid4())
+    host_channel, host_settings_path, host_mcp_config_path = prepare_agent_host_channel(
+        runtime, session_id, usage_run_id,
+    )
+
+    cwd = existing_workdir(str(session.get("workdir") or ""))
+    run_spec = AgentRunSpec(
+        session_id=session_id,
+        claude_session_id=claude_session_id,
+        session_name=stable_session_name(str(session.get("name") or "session"), session_id),
+        workdir=str(cwd),
+        model=transport_model,
+        permission_mode=selected_permission_mode,
+        resume=resume_existing,
+        add_dirs=tuple(agent_add_dirs(session, prompt, attachments)),
+        fallback_model=fallback_model,
+        system_prompt_file=str(system_prompt_path),
+        settings_file=str(host_settings_path),
+        mcp_config_file=str(host_mcp_config_path) if host_mcp_config_path else "",
+        permission_prompt_tool=(
+            PERMISSION_PROMPT_MCP_QUALIFIED_TOOL if host_mcp_config_path is not None else ""
+        ),
+        environment=build_claude_env(
+            cfg,
+            session,
+            mode=MODE_CLAUDE,
+            effective_context_window=effective_context_window,
+            auto_compact_supported=runtime_caps.auto_compact,
+        ),
+        bridge_keys=runtime_bridge_keys(MODE_CLAUDE),
+        effective_context_window=effective_context_window,
+        agents={
+            str(item.get("name")): {
+                "description": str(item.get("description") or "")[:160],
+                "prompt": str(item.get("prompt") or "")[:8000],
+            }
+            for item in session.get("claude_agents") or []
+            if isinstance(item, dict) and item.get("name") and item.get("prompt")
+        },
+    )
+    watched_file_roots = file_change_watch_roots(cwd)
+    before_file_state = snapshot_watch_files(watched_file_roots)
+    before_file_text = snapshot_watch_text(watched_file_roots)
+    assistant_text = ""
+    thinking_text = ""
+    assistant_segments: list[dict[str, Any]] = []
+    message_started_at = time.monotonic()
+    final_result = ""
+    stderr_text = ""
+    timed_out = False
+    blocked_command = ""
+    duplicate_open_command = ""
+    browser_open_seen = False
+    external_gui_command = ""
+    external_gui_started = 0.0
+    external_gui_timeout = False
+    action_task = is_action_task_prompt(prompt)
+    action_idle_timeout = False
+    no_output_timeout = False
+    no_output_stage = ""
+    tool_finalization_timeout = False
+    tool_finalization_deadline: float | None = None
+    waiting_for = "model"
+    assistant_message_index: int | None = None
+    last_progress_save = 0.0
+    finalized = False
+    coordinator_run_id = usage_run_id
+    interaction_protocol_failure = ""
+    run_started_at: float | None = None
+    active_thinking_started_at: float | None = None
+    active_thinking_segment_index: int | None = None
+    thinking_elapsed_total = 0.0
+    turn_usage: dict[str, int] | None = None
+    plan_touched = False
+    active_plan_run_id = usage_run_id
+    fallback_question_tool_ids: set[str] = set()
+    published_interaction_ids: set[str] = set()
+    compatibility_interactions: dict[str, dict[str, Any]] = {}
+    fallback_input_closed = False
+
+    if accepted_turn_id:
+        for index in range(len(session.get("messages", [])) - 1, -1, -1):
+            message = session["messages"][index]
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and str(message.get("turn_id") or "") == str(accepted_turn_id)
+            ):
+                assistant_message_index = index
+                stored_turn_usage = message.get("turn_usage")
+                if isinstance(stored_turn_usage, dict):
+                    turn_usage = copy.deepcopy(stored_turn_usage)
+                break
+
+    def elapsed_seconds_since(started_at: float) -> int:
+        return max(0, int(round(time.monotonic() - started_at)))
+
+    def total_elapsed_seconds() -> int:
+        return elapsed_seconds_since(message_started_at)
+
+    def thinking_elapsed_seconds() -> int:
+        active = 0.0
+        if active_thinking_started_at is not None:
+            active = max(0.0, time.monotonic() - active_thinking_started_at)
+        return max(0, int(round(thinking_elapsed_total + active)))
+
+    def refresh_active_thinking_elapsed() -> None:
+        if active_thinking_started_at is None or active_thinking_segment_index is None:
+            return
+        if active_thinking_segment_index >= len(assistant_segments):
+            return
+        segment = assistant_segments[active_thinking_segment_index]
+        if segment.get("type") == "thinking":
+            segment["elapsed_seconds"] = elapsed_seconds_since(active_thinking_started_at)
+
+    def close_active_thinking() -> None:
+        nonlocal active_thinking_started_at, active_thinking_segment_index, thinking_elapsed_total
+        refresh_active_thinking_elapsed()
+        if active_thinking_started_at is not None:
+            thinking_elapsed_total += max(0.0, time.monotonic() - active_thinking_started_at)
+        active_thinking_started_at = None
+        active_thinking_segment_index = None
+
+    def append_assistant_segment(kind: str, text: str) -> None:
+        nonlocal active_thinking_started_at, active_thinking_segment_index
+        if not text:
+            return
+        segment_type = "thinking" if kind == "thinking" else "text"
+        if segment_type != "thinking":
+            close_active_thinking()
+        if assistant_segments and assistant_segments[-1].get("type") == segment_type:
+            assistant_segments[-1]["content"] = str(assistant_segments[-1].get("content") or "") + text
+        else:
+            assistant_segments.append({"type": segment_type, "content": text})
+        if segment_type == "thinking":
+            if active_thinking_segment_index != len(assistant_segments) - 1:
+                active_thinking_started_at = time.monotonic()
+                active_thinking_segment_index = len(assistant_segments) - 1
+                assistant_segments[active_thinking_segment_index]["elapsed_seconds"] = 0
+            refresh_active_thinking_elapsed()
+
+    def append_thinking_image(image: dict[str, Any]) -> None:
+        nonlocal active_thinking_started_at, active_thinking_segment_index
+        if active_thinking_segment_index is None or active_thinking_segment_index >= len(assistant_segments):
+            assistant_segments.append({"type": "thinking", "content": "", "images": [], "elapsed_seconds": 0})
+            active_thinking_segment_index = len(assistant_segments) - 1
+            active_thinking_started_at = time.monotonic()
+        segment = assistant_segments[active_thinking_segment_index]
+        if segment.get("type") != "thinking":
+            return
+        images = segment.setdefault("images", [])
+        if isinstance(images, list):
+            images.append(copy.deepcopy(image))
+        refresh_active_thinking_elapsed()
+
+    def append_activity_segment(activity_type: str, **payload: Any) -> None:
+        segment = {"type": activity_type}
+        segment.update({key: value for key, value in payload.items() if value is not None})
+        assistant_segments.append(segment)
+
+    def close_fallback_stream_input() -> None:
+        nonlocal fallback_input_closed
+        if fallback_input_closed or proc is None or proc.stdin is None:
+            return
+        fallback_input_closed = True
+        try:
+            if proc.stdin.can_write_eof():
+                proc.stdin.write_eof()
+            else:
+                proc.stdin.close()
+        except (AttributeError, NotImplementedError, RuntimeError):
+            proc.stdin.close()
+
+    def ensure_assistant_message() -> dict[str, Any]:
+        nonlocal assistant_message_index
+        if (
+            assistant_message_index is not None
+            and assistant_message_index < len(session.get("messages", []))
+            and isinstance(session["messages"][assistant_message_index], dict)
+            and session["messages"][assistant_message_index].get("role") == "assistant"
+        ):
+            return session["messages"][assistant_message_index]
+        session.setdefault("messages", []).append({"role": "assistant", "content": "", "model": selected_model, "pending": True})
+        assistant_message_index = len(session["messages"]) - 1
+        return session["messages"][assistant_message_index]
+
+    def save_assistant_progress(force: bool = False) -> None:
+        nonlocal last_progress_save
+        now = time.monotonic()
+        if not force and now - last_progress_save < 1.0:
+            return
+        last_progress_save = now
+        message = ensure_assistant_message()
+        message["content"] = assistant_text
+        message["model"] = selected_model
+        message["segments"] = copy.deepcopy(assistant_segments)
+        message["elapsed_seconds"] = total_elapsed_seconds()
+        if turn_usage:
+            message["turn_usage"] = copy.deepcopy(turn_usage)
+        else:
+            message.pop("turn_usage", None)
+        current_thinking_elapsed = thinking_elapsed_seconds()
+        if current_thinking_elapsed > 0:
+            message["thinking_elapsed_seconds"] = current_thinking_elapsed
+        else:
+            message.pop("thinking_elapsed_seconds", None)
+        if thinking_text:
+            message["thinking"] = thinking_text
+        message["pending"] = True
+        session["updated"] = now_ts()
+        sessions[session_id] = session
+        save_sessions_to_disk()
+
+    def finalize_assistant(content: str | None = None, thinking: str | None = None, status: str | None = None) -> None:
+        nonlocal finalized
+        close_active_thinking()
+        if content is not None and content != assistant_text and not assistant_segments:
+            append_assistant_segment("text", content)
+        message = ensure_assistant_message()
+        message["content"] = assistant_text if content is None else content
+        message["model"] = selected_model
+        message["segments"] = finalize_transcript_segments(assistant_segments)
+        message["elapsed_seconds"] = total_elapsed_seconds()
+        if turn_usage:
+            message["turn_usage"] = copy.deepcopy(turn_usage)
+        else:
+            message.pop("turn_usage", None)
+        completed_thinking_elapsed = thinking_elapsed_seconds()
+        if completed_thinking_elapsed > 0:
+            message["thinking_elapsed_seconds"] = completed_thinking_elapsed
+        else:
+            message.pop("thinking_elapsed_seconds", None)
+        message.pop("thinking", None)
+        message.pop("pending", None)
+        terminal_status = status or ("failed" if str(content or "").startswith("错误：") else "completed")
+        if plan_touched:
+            finalize_plan_for_terminal(session_id, terminal_status, active_plan_run_id)
+        session["last_run_status"] = terminal_status
+        session["unread"] = True
+        session["updated"] = now_ts()
+        sessions[session_id] = session
+        save_sessions_to_disk()
+        finalized = True
+
+    yield sse({
+        "type": "assistant_start",
+        "model": selected_model,
+        "mode": "claude-code-cli",
+        "permission_mode": selected_permission_mode,
+    })
+    if not defer_queued_user:
+        save_assistant_progress(force=True)
+
+    proc = None
+    stderr_task = None
+    try:
+        cleanup_stale = getattr(runtime, "cleanup_stale", None)
+        if cleanup_stale is not None:
+            await cleanup_stale(run_spec)
+        proc = await runtime.spawn_session(run_spec)
+        process_identity = proc.process_identity
+        coordinator_snapshot = coordinated_run_snapshot(session_id) or {}
+        coordinator_run_id = str(coordinator_snapshot.get("run_id") or usage_run_id)
+        if isinstance(runtime, WslAgentRuntime):
+            runtime_identity = None
+            for _attempt in range(20):
+                runtime_identity = await asyncio.to_thread(runtime.inspect_session_identity, proc.session_key)
+                if runtime_identity:
+                    break
+                await asyncio.sleep(0.025)
+            if runtime_identity:
+                agent_run_journal().begin({
+                    "session_id": session_id,
+                    "coordinator_run_id": coordinator_run_id,
+                    "owner_pid": os.getpid(),
+                    "runtime": "wsl2",
+                    "session_key": proc.session_key,
+                    "process_identity": process_identity,
+                    "runtime_pid": int(runtime_identity.get("runtime_pid") or 0),
+                    "runtime_pgid": int(runtime_identity.get("runtime_pgid") or 0),
+                    "host_channel": str(host_channel.root),
+                    "started_at": now_ts(),
+                })
+        run_info = {
+            "kind": MODE_CLAUDE,
+            "pid": proc.pid,
+            "started": now_ts(),
+            "prompt": prompt,
+            "cancel_requested": False,
+            "stdin": proc.stdin,
+            "process_identity": process_identity,
+            "pending_interaction": None,
+            "awaiting_interaction_ack": None,
+            "runtime": runtime,
+            "runtime_process": proc,
+            "claude_session_id": claude_session_id,
+            "peer_name": run_spec.session_name,
+            "display_name": str(session.get("name") or run_spec.session_name),
+            "peer_capability": None,
+            "usage_run_id": usage_run_id,
+            "model": selected_model,
+            "permission_mode": selected_permission_mode,
+            "host_channel": host_channel,
+            # Managed WSL uses one run-private MCP permission prompt owner.
+            # Native migration/test adapters retain legacy stdout fixtures.
+            "host_hooks_enabled": isinstance(runtime, WslAgentRuntime),
+            "published_interaction_ids": published_interaction_ids,
+            "session_record": session,
+        }
+        _active_runs[session_id] = run_info
+        if defer_queued_user:
+            user_message = {"role": "user", "content": display_prompt}
+            if attachments:
+                user_message["attachments"] = attachment_message_items(attachments, session_id)
+            session["messages"] = list(session.get("messages", [])) + [user_message]
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            save_assistant_progress(force=True)
+        yield sse({"type": "runtime_started", "session_id": session_id, "run_id": usage_run_id})
+        if proc.stdin is None:
+            raise RuntimeError("Claude Code stream-json stdin is unavailable")
+        await active_agent_input_channel.write(
+            session_id,
+            run_info,
+            build_stream_json_user_envelope(context_prompt, claude_session_id),
+            process_identity=process_identity,
+        )
+        stderr_task = asyncio.create_task(read_stderr(proc))
+
+        assert proc.stdout is not None
+        stdout_reader = ChunkedLineReader(proc.stdout)
+        run_started_at = time.monotonic()
+        started = run_started_at
+        last_heartbeat = started
+        last_process_output = started
+        published_ack_stage = ""
+        while True:
+            for host_request in host_channel.pending():
+                interaction = agent_interaction_broker.create_host_request(
+                    session_id,
+                    process_identity,
+                    host_request,
+                    host_channel,
+                    workdir=str(cwd),
+                    run=run_info,
+                )
+                if interaction is None:
+                    yield sse({
+                        "type": "error",
+                        "content": "底层 CLI 返回了无法安全匹配的宿主交互请求，未自动允许。",
+                    })
+                    continue
+                interaction_id = str(interaction.get("request_id") or "")
+                agent_run_journal().mark_interaction(
+                    session_id,
+                    kind=str(interaction.get("kind") or ""),
+                    request_id=interaction_id,
+                )
+                compatibility_interactions.pop(interaction_id, None)
+                if interaction_id in published_interaction_ids:
+                    continue
+                if active_thinking_started_at is not None:
+                    close_active_thinking()
+                    yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
+                published_interaction_ids.add(interaction_id)
+                if interaction.get("kind") == "question":
+                    fallback_question_tool_ids.add(interaction_id)
+                run_info["pending_interaction"] = interaction_id
+                run_info["awaiting_interaction_ack"] = None
+                waiting_for = "interaction"
+                yield sse(interaction)
+            compatibility_now = time.monotonic()
+            for compatibility_id, candidate in list(compatibility_interactions.items()):
+                if compatibility_id in published_interaction_ids:
+                    compatibility_interactions.pop(compatibility_id, None)
+                    continue
+                if compatibility_now - float(candidate.get("observed_at") or compatibility_now) < HOST_HOOK_COMPATIBILITY_GRACE_SECONDS:
+                    continue
+                compatibility_interactions.pop(compatibility_id, None)
+                if run_info.get("host_hooks_enabled"):
+                    interaction_protocol_failure = "interaction_owner_request_missing"
+                    await runtime.cancel(session_id)
+                    break
+                interaction = agent_interaction_broker.create_request(
+                    session_id,
+                    process_identity,
+                    candidate.get("payload"),
+                    stdin=proc.stdin,
+                    workdir=str(cwd),
+                    run=run_info,
+                )
+                if interaction is None:
+                    yield sse({
+                        "type": "error",
+                        "content": "底层 CLI 返回了无法安全匹配的兼容交互请求，未自动允许。",
+                    })
+                    continue
+                interaction_id = str(interaction.get("request_id") or "")
+                if active_thinking_started_at is not None:
+                    close_active_thinking()
+                    yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
+                published_interaction_ids.add(interaction_id)
+                if interaction.get("kind") == "question":
+                    fallback_question_tool_ids.add(interaction_id)
+                interaction["session_id"] = session_id
+                run_info["pending_interaction"] = interaction_id
+                run_info["awaiting_interaction_ack"] = None
+                waiting_for = "interaction"
+                yield sse(interaction)
+            if interaction_protocol_failure:
+                break
+            ack_status = agent_interaction_broker.ack_status_for(session_id)
+            if ack_status and str(ack_status.get("state") or "") == "awaiting_cli_ack":
+                run_info["pending_interaction"] = None
+                run_info["awaiting_interaction_ack"] = str(ack_status.get("request_id") or "")
+                waiting_for = "awaiting_cli_ack"
+                ack_stage = str(ack_status.get("stage") or "response_committed")
+                if ack_stage != published_ack_stage:
+                    published_ack_stage = ack_stage
+                    yield sse({
+                        "type": "interaction_ack",
+                        "request_id": str(ack_status.get("request_id") or ""),
+                        "status": "awaiting_cli_ack",
+                        "stage": ack_stage,
+                    })
+            elapsed = time.monotonic() - started
+            remaining = RUN_TIMEOUT_SECONDS - elapsed if RUN_TIMEOUT_SECONDS > 0 else None
+            if remaining is not None and remaining <= 0:
+                timed_out = True
+                await runtime.cancel(session_id)
+                break
+            if (
+                tool_finalization_deadline is not None
+                and time.monotonic() >= tool_finalization_deadline
+                and waiting_for == "model"
+                and not run_info.get("pending_interaction")
+            ):
+                tool_finalization_timeout = True
+                await runtime.cancel(session_id)
+                break
+            try:
+                read_timeout = 0.2 if remaining is None else min(0.2, remaining)
+                raw_line = await stdout_reader.readline(read_timeout)
+            except asyncio.TimeoutError:
+                now = time.monotonic()
+                expired_acks = agent_interaction_broker.expire_unacknowledged(
+                    now=time.time(),
+                    timeout_seconds=CLI_INTERACTION_ACK_TIMEOUT_SECONDS,
+                )
+                expired_ack = next((item for item in expired_acks if item.get("session_id") == session_id), None)
+                if expired_ack is not None:
+                    interaction_protocol_failure = str(expired_ack.get("reason") or "cli_ack_timeout")
+                    no_output_timeout = True
+                    no_output_stage = "awaiting_cli_ack"
+                    await agent_run_coordinator().acknowledge_interaction(
+                        session_id,
+                        str(expired_ack.get("request_id") or ""),
+                        success=False,
+                        reason=CLI_ACK_TIMEOUT_FAILURE_MESSAGE,
+                        failure_code="cli_ack_timeout",
+                    )
+                    await runtime.cancel(session_id)
+                    break
+                if (
+                    SAFETY_GUARDS_ENABLED
+                    and
+                    action_task
+                    and waiting_for != "interaction"
+                    and ACTION_TASK_IDLE_TIMEOUT_SECONDS > 0
+                    and now - last_process_output >= ACTION_TASK_IDLE_TIMEOUT_SECONDS
+                ):
+                    action_idle_timeout = True
+                    await runtime.cancel(session_id)
+                    break
+                if (
+                    waiting_for == "model"
+                    and MODEL_IDLE_TIMEOUT_SECONDS > 0
+                    and now - last_process_output >= MODEL_IDLE_TIMEOUT_SECONDS
+                ):
+                    no_output_timeout = True
+                    no_output_stage = "model"
+                    await runtime.cancel(session_id)
+                    break
+                if (
+                    waiting_for != "interaction"
+                    and NO_OUTPUT_TIMEOUT_SECONDS > 0
+                    and now - last_process_output >= NO_OUTPUT_TIMEOUT_SECONDS
+                ):
+                    no_output_timeout = True
+                    no_output_stage = waiting_for
+                    await runtime.cancel(session_id)
+                    break
+                if (
+                    SAFETY_GUARDS_ENABLED
+                    and
+                    external_gui_command
+                    and GUI_COMMAND_TIMEOUT_SECONDS > 0
+                    and now - external_gui_started >= GUI_COMMAND_TIMEOUT_SECONDS
+                ):
+                    external_gui_timeout = True
+                    await runtime.cancel(session_id)
+                    break
+                if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                    yield sse({
+                        "type": "heartbeat",
+                        "elapsed": round(now - started),
+                        "action_task": action_task,
+                        "waiting_for": waiting_for,
+                    })
+                    save_assistant_progress(force=True)
+                    last_heartbeat = now
+                continue
+            if not raw_line:
+                break
+            last_process_output = time.monotonic()
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                # Filter out Claude Code internal debug noise
+                if line.startswith("[Claude Code]") or line.startswith("[DEBUG]") or line.startswith("[WARN]") or line.startswith("[ERROR]") or line.startswith("[STARTUP]") or line.startswith("[API"):
+                    continue
+                if len(line) < 4:
+                    continue
+                text = f"{clean_stream_text(line)}\n"
+                assistant_text += text
+                append_assistant_segment("text", text)
+                save_assistant_progress()
+                yield sse({"type": "text", "content": text})
+                continue
+
+            daily_usage_ledger().record_event(usage_run_id, session_id, data, mode=MODE_CLAUDE)
+            merged_turn_usage = merge_turn_usage(turn_usage, data)
+            if merged_turn_usage != turn_usage:
+                turn_usage = merged_turn_usage
+                save_assistant_progress(force=True)
+                yield sse({
+                    "type": "turn_usage",
+                    "session_id": session_id,
+                    "run_id": usage_run_id,
+                    "turn_usage": copy.deepcopy(turn_usage),
+                })
+            usage_snapshot = context_usage_ledger().update_from_event(
+                session_id,
+                data,
+                model=selected_model,
+                fallback_limit=context_limit_for_model(selected_model),
+            )
+            if usage_snapshot is not None:
+                yield sse({"type": "usage", "usage": usage_snapshot.as_dict()})
+
+            event_type = data.get("type")
+            if event_type == "system" and str(data.get("subtype") or "") == "compact_boundary":
+                compacting_snapshot = context_usage_ledger().mark_compact_boundary(
+                    session_id,
+                    data,
+                    model=selected_model,
+                    fallback_limit=context_limit_for_model(selected_model),
+                )
+                yield sse({
+                    "type": "compact_boundary",
+                    "session_id": session_id,
+                    "run_id": usage_run_id,
+                    "trigger": str(data.get("trigger") or "auto"),
+                    "pre_tokens": int(data.get("pre_tokens") or 0),
+                    "usage": compacting_snapshot.as_dict(),
+                })
+                continue
+            if event_type == "system" and str(data.get("subtype") or "") == "init":
+                cli_version = str(data.get("claude_code_version") or runtime.runtime_version())
+                runtime_capabilities = runtime.capabilities()
+                peer_capability = _native_peer_messaging.observe_init(
+                    session_id,
+                    cli_version,
+                    data,
+                    registry_supported=False,
+                )
+                run_info["peer_capability"] = peer_capability.as_dict()
+                yield sse({"type": "peer_capability", "peer": peer_capability.as_dict()})
+                continue
+
+            if event_type == "system" and str(data.get("subtype") or "") == "permission_denied":
+                try:
+                    denied_projection = project_permission_denied_event(
+                        data,
+                        session_id=session_id,
+                        run_id=usage_run_id,
+                    )
+                except ValueError:
+                    denied_projection = {
+                        "type": "tool_result",
+                        "tool_id": str(data.get("tool_use_id") or ""),
+                        "tool_use_id": str(data.get("tool_use_id") or ""),
+                        "status": "失败",
+                        "content": clean_stream_text(str(
+                            data.get("message") or data.get("decision_reason") or "权限请求已被拒绝"
+                        )),
+                        "permission_denied": True,
+                        "is_error": True,
+                    }
+                append_activity_segment(
+                    "tool_result",
+                    tool_id=str(denied_projection.get("tool_id") or ""),
+                    status="失败",
+                    content=str(denied_projection.get("content") or ""),
+                )
+                save_assistant_progress()
+                yield sse(denied_projection)
+                continue
+
+            peer_events = [
+                decorate_peer_event(item)
+                for item in (_native_peer_messaging.observe_event(session_id, data) or [])
+            ]
+            peer_tool_ids = {
+                str(item.get("tool_id") or "")
+                for item in peer_events
+                if str(item.get("tool_id") or "")
+            }
+            if peer_events:
+                if active_thinking_started_at is not None:
+                    close_active_thinking()
+                    yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
+                for peer_event in peer_events:
+                    append_activity_segment(
+                        str(peer_event.get("type") or "peer_event"),
+                        **{key: value for key, value in peer_event.items() if key != "type"},
+                    )
+                    yield sse(peer_event)
+                save_assistant_progress()
+
+            if str(event_type or "").strip().lower() == "control_request":
+                if run_info.get("host_hooks_enabled"):
+                    normalized_compatibility = normalize_control_request(data)
+                    if normalized_compatibility is None:
+                        yield sse({
+                            "type": "error",
+                            "content": "底层 CLI 返回了无法识别的结构化交互请求，未自动允许。",
+                        })
+                        continue
+                    compatibility_id = str(normalized_compatibility.get("request_id") or "")
+                    compatibility_interactions.setdefault(compatibility_id, {
+                        "payload": copy.deepcopy(data),
+                        "observed_at": time.monotonic(),
+                    })
+                    continue
+                interaction = agent_interaction_broker.create_request(
+                    session_id,
+                    process_identity,
+                    data,
+                    stdin=proc.stdin,
+                    workdir=str(cwd),
+                    run=run_info,
+                )
+                if interaction is None:
+                    yield sse({
+                        "type": "error",
+                        "content": "底层 CLI 返回了无法识别的结构化交互请求，未自动允许。",
+                    })
+                    continue
+                interaction_id = str(interaction.get("request_id") or "")
+                if interaction_id in published_interaction_ids:
+                    continue
+                if active_thinking_started_at is not None:
+                    close_active_thinking()
+                    yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
+                published_interaction_ids.add(interaction_id)
+                if interaction.get("kind") == "question":
+                    fallback_question_tool_ids.add(interaction_id)
+                interaction["session_id"] = session_id
+                run_info["pending_interaction"] = interaction_id
+                run_info["awaiting_interaction_ack"] = None
+                waiting_for = "interaction"
+                yield sse(interaction)
+                continue
+
+            if event_type == "stream_event":
+                waiting_for = "model"
+                event = data.get("event") if isinstance(data.get("event"), dict) else {}
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+                    fallback_question_pending = bool(run_info.get("pending_interaction"))
+                    if delta.get("type") == "thinking_delta":
+                        text = clean_stream_text(str(delta.get("thinking") or ""))
+                        if text and not fallback_question_pending:
+                            if active_thinking_started_at is None:
+                                yield sse({"type": "thinking_start", "elapsed": 0})
+                            thinking_text += text
+                            append_assistant_segment("thinking", text)
+                            save_assistant_progress()
+                            yield sse({"type": "thinking", "content": text})
+                    elif delta.get("type") == "text_delta":
+                        text = clean_stream_text(str(delta.get("text") or ""))
+                        if fallback_question_pending:
+                            continue
+                        if text:
+                            tool_finalization_deadline = None
+                        assistant_text += text
+                        if active_thinking_started_at is not None:
+                            close_active_thinking()
+                            yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
+                        append_assistant_segment("text", text)
+                        save_assistant_progress()
+                        yield sse({"type": "text", "content": text})
+                continue
+
+            if event_type == "assistant":
+                message = data.get("message") if isinstance(data.get("message"), dict) else {}
+                content = message.get("content")
+                saw_tool_use = False
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "thinking":
+                            full_thinking = clean_stream_text(str(block.get("thinking") or ""))
+                            if full_thinking and full_thinking != thinking_text:
+                                if full_thinking.startswith(thinking_text):
+                                    delta = full_thinking[len(thinking_text):]
+                                elif full_thinking not in thinking_text:
+                                    delta = ("\n" if thinking_text else "") + full_thinking
+                                else:
+                                    delta = ""
+                                if delta:
+                                    if active_thinking_started_at is None:
+                                        yield sse({"type": "thinking_start", "elapsed": 0})
+                                    thinking_text += delta
+                                    append_assistant_segment("thinking", delta)
+                                    save_assistant_progress()
+                                    yield sse({"type": "thinking", "content": delta})
+                        elif block.get("type") == "text":
+                            full_text = clean_stream_text(str(block.get("text") or ""))
+                            if str(run_info.get("pending_interaction") or "") in fallback_question_tool_ids:
+                                continue
+                            if full_text and full_text not in assistant_text:
+                                tool_finalization_deadline = None
+                                if full_text.startswith(assistant_text):
+                                    delta = full_text[len(assistant_text):]
+                                else:
+                                    delta = ("\n" if assistant_text else "") + full_text
+                                if delta:
+                                    if active_thinking_started_at is not None:
+                                        close_active_thinking()
+                                        yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
+                                    assistant_text += delta
+                                    append_assistant_segment("text", delta)
+                                    save_assistant_progress()
+                                    yield sse({"type": "text", "content": delta})
+                        elif block.get("type") == "image":
+                            image = normalize_image_block(block, alt=str(block.get("alt") or "Claude 输出图片"))
+                            if image is not None:
+                                if active_thinking_started_at is not None:
+                                    append_thinking_image(image)
+                                    outbound_image = {**image, "scope": "thinking"}
+                                else:
+                                    append_activity_segment("image", **{key: value for key, value in image.items() if key != "type"})
+                                    outbound_image = image
+                                save_assistant_progress()
+                                yield sse(outbound_image)
+                        elif block.get("type") == "tool_use":
+                            saw_tool_use = True
+                            tool_finalization_deadline = None
+                            if active_thinking_started_at is not None:
+                                close_active_thinking()
+                                yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
+                            command_text = tool_command(block)
+                            tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                            tool_id = str(block.get("id") or uuid.uuid4())
+                            tool_name = str(block.get("name") or "tool")
+                            plan_snapshot = update_plan_from_tool_event(
+                                session_id,
+                                tool_name,
+                                tool_input,
+                                usage_run_id,
+                            )
+                            if plan_snapshot is not None:
+                                plan_touched = True
+                                yield sse({"type": "plan", **plan_snapshot})
+                            if tool_name == "SendMessage" and tool_id in peer_tool_ids:
+                                continue
+                            if tool_name.casefold() == "askuserquestion" and isinstance(tool_input.get("questions"), list):
+                                if tool_id in published_interaction_ids:
+                                    fallback_question_tool_ids.add(tool_id)
+                                    continue
+                                if run_info.get("host_hooks_enabled"):
+                                    fallback_question_tool_ids.add(tool_id)
+                                    compatibility_interactions.setdefault(tool_id, {
+                                        "payload": {
+                                            "type": "tool_start",
+                                            "tool_id": tool_id,
+                                            "name": tool_name,
+                                            "input": copy.deepcopy(tool_input),
+                                        },
+                                        "observed_at": time.monotonic(),
+                                    })
+                                    continue
+                                interaction = agent_interaction_broker.create_request(
+                                    session_id,
+                                    process_identity,
+                                    {
+                                        "type": "tool_start",
+                                        "tool_id": tool_id,
+                                        "name": tool_name,
+                                        "input": tool_input,
+                                    },
+                                    stdin=proc.stdin,
+                                    workdir=str(cwd),
+                                    run=run_info,
+                                )
+                                if interaction is None:
+                                    yield sse({
+                                        "type": "error",
+                                        "content": "底层 CLI 返回了无法识别的问题请求，未自动继续。",
+                                    })
+                                    continue
+                                if tool_id not in published_interaction_ids:
+                                    if active_thinking_started_at is not None:
+                                        close_active_thinking()
+                                        yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
+                                    fallback_question_tool_ids.add(tool_id)
+                                    published_interaction_ids.add(tool_id)
+                                    interaction["session_id"] = session_id
+                                    run_info["pending_interaction"] = tool_id
+                                    run_info["awaiting_interaction_ack"] = None
+                                    waiting_for = "interaction"
+                                    yield sse(interaction)
+                                continue
+                            summary = clean_stream_text(" ".join(
+                                str(part) for part in (
+                                    tool_input.get("description") or "",
+                                    command_text or tool_input.get("file_path") or tool_input.get("path") or "",
+                                ) if part
+                            ))
+                            append_activity_segment(
+                                "tool_start",
+                                tool_id=tool_id,
+                                name=tool_name,
+                                summary=summary,
+                                status="running",
+                                input=copy.deepcopy(tool_input),
+                            )
+                            save_assistant_progress()
+                            yield sse({
+                                "type": "tool_start",
+                                "tool_id": tool_id,
+                                "name": tool_name,
+                                "summary": summary,
+                                "status": "running",
+                                "input": copy.deepcopy(tool_input),
+                            })
+                            if SAFETY_GUARDS_ENABLED:
+                                if is_external_gui_command(command_text):
+                                    external_gui_command = command_text
+                                    external_gui_started = time.monotonic()
+                                if is_browser_open_command(command_text):
+                                    if browser_open_seen:
+                                        duplicate_open_command = command_text
+                                        await runtime.cancel(session_id)
+                                        break
+                                    browser_open_seen = True
+                                if is_foreground_server_command(command_text):
+                                    blocked_command = command_text
+                                    await runtime.cancel(session_id)
+                                    break
+                    waiting_for = "interaction" if run_info.get("pending_interaction") else ("tool" if saw_tool_use else "model")
+                continue
+
+            if event_type == "user":
+                waiting_for = "model"
+                message = data.get("message") if isinstance(data.get("message"), dict) else {}
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict) or block.get("type") != "tool_result":
+                            continue
+                        tool_result_id = str(block.get("tool_use_id") or "")
+                        interaction_ack = agent_interaction_broker.confirm_cli_tool_result(
+                            session_id,
+                            tool_result_id,
+                            success=not bool(block.get("is_error")),
+                        )
+                        if interaction_ack is not None:
+                            accepted = bool(interaction_ack.get("accepted"))
+                            await agent_run_coordinator().acknowledge_interaction(
+                                session_id,
+                                tool_result_id,
+                                success=accepted,
+                            )
+                            yield sse({
+                                "type": "interaction_ack",
+                                "request_id": tool_result_id,
+                                "status": "accepted" if accepted else "failed",
+                                "stage": "cli_tool_result",
+                            })
+                            waiting_for = "model" if accepted else "done"
+                            if not accepted:
+                                interaction_protocol_failure = str(interaction_ack.get("reason") or "cli_ack_failed")
+                                yield sse({
+                                    "type": "error",
+                                    "content": "底层 CLI 未确认本次交互结果，任务已安全停止。",
+                                })
+                                await runtime.cancel(session_id)
+                                break
+                        if tool_result_id in peer_tool_ids:
+                            continue
+                        if tool_result_id in fallback_question_tool_ids:
+                            continue
+                        raw = block.get("content") or ""
+                        result_images: list[dict[str, Any]] = []
+                        if isinstance(raw, list):
+                            text_items: list[str] = []
+                            for item in raw:
+                                if not isinstance(item, dict):
+                                    continue
+                                image = normalize_image_block(item, alt="工具输出图片")
+                                if image is not None:
+                                    result_images.append(image)
+                                elif item.get("type") == "text":
+                                    text_items.append(str(item.get("text") or ""))
+                            raw = "\n".join(text_items)
+                        elif isinstance(raw, dict):
+                            image = normalize_image_block(raw, alt="工具输出图片")
+                            result_images = [image] if image is not None else []
+                            raw = ""
+                        detail = clean_stream_text(str(raw).strip())
+                        if len(detail) > TOOL_RESULT_DISPLAY_LIMIT:
+                            detail = detail[:TOOL_RESULT_DISPLAY_LIMIT] + "\n...[工具输出过长，显示已截断]"
+                        status = "失败" if block.get("is_error") else "完成"
+                        append_activity_segment(
+                            "tool_result",
+                            tool_id=tool_result_id,
+                            status=status,
+                            content=detail,
+                            images=result_images,
+                        )
+                        save_assistant_progress()
+                        yield sse({
+                            "type": "tool_result",
+                            "tool_id": tool_result_id,
+                            "status": status,
+                            "content": detail,
+                            "images": result_images,
+                        })
+                if interaction_protocol_failure:
+                    break
+                if isinstance(content, list) and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content):
+                    waiting_for = "model"
+                    tool_finalization_deadline = time.monotonic() + TOOL_FINALIZATION_BUDGET_SECONDS
+                if external_gui_command:
+                    external_gui_command = ""
+                    external_gui_started = 0.0
+                continue
+
+            if event_type == "result":
+                waiting_for = "done"
+                tool_finalization_deadline = None
+                final_result = clean_stream_text(str(data.get("result") or ""))
+                if data.get("is_error"):
+                    error_text = final_result or clean_stream_text(str(data))
+                    if str(run_info.get("pending_interaction") or "") in fallback_question_tool_ids:
+                        final_result = ""
+                        continue
+                    final_result = error_text
+                    if not (
+                        (is_missing_claude_session_error(error_text) and not retry_missing_session)
+                        or (is_claude_session_in_use_error(error_text) and not retry_session_in_use)
+                    ):
+                        yield sse({"type": "error", "content": error_text})
+                if not run_info.get("pending_interaction"):
+                    close_fallback_stream_input()
+                continue
+
+        if active_thinking_started_at is not None:
+            close_active_thinking()
+            yield sse({"type": "thinking_complete", "elapsed": thinking_elapsed_seconds()})
+        return_code = await proc.wait()
+        mark_finished = getattr(runtime, "mark_finished", None)
+        if mark_finished is not None:
+            mark_finished(session_id, proc)
+        stderr_text = await stderr_task
+        unsettled_at_exit = agent_interaction_broker.unsettled_for(session_id)
+        if unsettled_at_exit and not interaction_protocol_failure:
+            ack = agent_interaction_broker.ack_status_for(session_id) or {}
+            interaction_protocol_failure = "process_exited_before_cli_ack"
+            await agent_run_coordinator().acknowledge_interaction(
+                session_id,
+                str(ack.get("request_id") or run_info.get("pending_interaction") or ""),
+                success=False,
+            )
+        agent_interaction_broker.invalidate(session_id, reason="process-exited")
+        if _active_runs.get(session_id) is not None:
+            _active_runs[session_id]["pending_interaction"] = None
+            _active_runs[session_id]["awaiting_interaction_ack"] = None
+
+        if interaction_protocol_failure and not no_output_timeout:
+            detail = (
+                "官方交互入口未接管底层结构化交互，任务已安全停止并恢复输入。"
+                if interaction_protocol_failure == "interaction_owner_request_missing"
+                else "底层 CLI 未完成本次交互确认，任务已安全停止并恢复输入。"
+            )
+            yield sse({"type": "error", "content": detail})
+            finalize_assistant(f"错误：{detail}")
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if external_gui_timeout:
+            detail = (
+                "外部程序或文档打开命令长时间没有返回，我已自动停止底层等待并恢复输入。"
+                "如果 Word 或浏览器窗口已经打开，可以直接继续操作；如果没打开，请再发一次，我会换用后台打开方式。"
+            )
+            if not assistant_text:
+                assistant_text = detail
+                append_assistant_segment("text", detail)
+                yield sse({"type": "text", "content": detail})
+            else:
+                assistant_text = f"{assistant_text}\n\n{detail}"
+                append_assistant_segment("text", f"\n\n{detail}")
+                yield sse({"type": "text", "content": f"\n\n{detail}"})
+            finalize_assistant()
+            session["updated"] = now_ts()
+            session["claude_initialized"] = True
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if tool_finalization_timeout:
+            detail = "工具已完成；Claude Code 在收尾预算内未返回新的文本，已安全结束本轮。"
+            if not assistant_text:
+                assistant_text = detail
+                append_assistant_segment("text", detail)
+                yield sse({"type": "working_status", "content": detail, "finalization_timeout": True})
+                yield sse({"type": "text", "content": detail})
+            finalize_assistant()
+            session["updated"] = now_ts()
+            session["claude_initialized"] = True
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if action_idle_timeout:
+            detail = (
+                f"这个动作型任务已经连续 {ACTION_TASK_IDLE_TIMEOUT_SECONDS} 秒没有任何 Claude Code 输出，"
+                "我已自动停止底层等待并恢复输入，避免界面一直卡住。"
+                "这通常是 Claude Code 在等待模型响应、文件转换工具或外部程序时没有返回。"
+                "你可以把任务拆小一点再发，例如先让我只定位第 21 讲资料，再让我单独转换 PDF。"
+            )
+            yield sse({"type": "error", "content": detail})
+            finalize_assistant(f"错误：{detail}")
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if no_output_timeout:
+            if no_output_stage == "model" and stall_recovery_count < MODEL_STALL_RECOVERY_ATTEMPTS and not peer_request:
+                detail = (
+                    f"底层 Claude Code 在等待模型/API 响应时连续 {MODEL_IDLE_TIMEOUT_SECONDS} 秒没有输出。"
+                    "这不是本地工具还在执行，而是模型请求无响应；我已停止该进程，并用同一个 Claude Code 会话自动恢复一次。"
+                )
+                yield sse({"type": "working_status", "content": "正在恢复底层 Claude Code 会话…", "detail": detail})
+                finalize_assistant()
+                session["updated"] = now_ts()
+                session["claude_initialized"] = True
+                sessions[session_id] = session
+                save_sessions_to_disk()
+                recovery_prompt = (
+                    "继续完成上一项任务。上一轮底层模型/API 在工具结果返回后长时间没有输出，"
+                    f"{APP_TITLE} 已经重启 Claude Code 进程并恢复同一个会话。"
+                    "请先检查当前工作目录里已经生成或已经读取过的内容，避免重复执行已完成步骤；"
+                    "如果需要继续处理大文件、图片很多的 docx/pdf 或长日志，请用脚本生成文件，"
+                    "聊天里只返回简短摘要、关键路径和最终结果。"
+                )
+                async for chunk in stream_claude_impl(
+                    session_id,
+                    recovery_prompt,
+                    True,
+                    model,
+                    permission_mode,
+                    [],
+                    retry_missing_session=True,
+                    suppress_user_message=True,
+                    stall_recovery_count=stall_recovery_count + 1,
+                ):
+                    yield chunk
+                return
+
+            if no_output_stage == "awaiting_cli_ack":
+                detail = (
+                    f"{CLI_ACK_TIMEOUT_FAILURE_MESSAGE}"
+                    "底层 CLI 在收到交互回答后没有返回匹配的工具结果，"
+                    "本次任务已安全停止并恢复输入。"
+                )
+                if _unresolved_parallel_tool_count(assistant_segments) > 0:
+                    detail += " 交互链路未完成，后续并行工具结果未返回。"
+            else:
+                detail = (
+                    f"Claude Code 已连续 {MODEL_IDLE_TIMEOUT_SECONDS if no_output_stage == 'model' else NO_OUTPUT_TIMEOUT_SECONDS} 秒没有任何输出，"
+                    "我已自动停止这次任务并恢复输入。"
+                    f"最后等待阶段：{no_output_stage or 'unknown'}。"
+                    "这通常表示底层模型请求、网络连接或外部工具进入了无响应状态；"
+                    "已完成的文件会保留，你可以缩小任务范围后继续。"
+                )
+            yield sse({"type": "error", "content": detail})
+            finalize_assistant(f"错误：{detail}")
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if duplicate_open_command:
+            detail = (
+                "我已经执行过一次打开网页命令，并拦截了本轮后续重复打开，避免继续弹出一堆浏览器窗口。"
+                "如果页面没有浮到最前面，请先切到已有浏览器窗口查看；确实没打开时，再单独让我重试一次。"
+            )
+            if not assistant_text:
+                assistant_text = detail
+                append_assistant_segment("text", detail)
+                yield sse({"type": "text", "content": detail})
+            else:
+                assistant_text = f"{assistant_text}\n\n{detail}"
+                append_assistant_segment("text", f"\n\n{detail}")
+                yield sse({"type": "text", "content": f"\n\n{detail}"})
+            finalize_assistant()
+            session["updated"] = now_ts()
+            session["claude_initialized"] = True
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if blocked_command:
+            detail = (
+                "我拦下了一个会常驻不退出的前台命令，避免网页一直卡住：\n"
+                f"`{blocked_command}`\n\n"
+                "打开本地网页时应该后台启动服务，或者服务已运行时直接打开 URL。"
+            )
+            yield sse({"type": "error", "content": detail})
+            finalize_assistant(f"错误：{detail}")
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if timed_out:
+            detail = f"Claude Code 执行超过 {RUN_TIMEOUT_SECONDS} 秒，我已停止这次任务，避免网页无限等待。"
+            yield sse({"type": "error", "content": detail})
+            finalize_assistant(f"错误：{detail}")
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if _active_runs.get(session_id, {}).get("cancel_requested"):
+            assistant_text = "已停止当前任务，输入已恢复。"
+            append_assistant_segment("text", assistant_text)
+            yield sse({"type": "text", "content": assistant_text})
+            finalize_assistant(assistant_text, status="cancelled")
+            session["updated"] = now_ts()
+            sessions[session_id] = session
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if return_code != 0:
+            detail = stderr_text or final_result or f"claude exited with code {return_code}"
+            if is_claude_session_in_use_error(detail) and not retry_session_in_use and not peer_request:
+                remove_last_attempt_messages(session, display_prompt)
+                was_initialized = bool(session.get("claude_initialized"))
+                if not was_initialized:
+                    session["claude_session_id"] = str(uuid.uuid4())
+                session["claude_initialized"] = was_initialized
+                session["updated"] = now_ts()
+                sessions[session_id] = session
+                save_sessions_to_disk()
+                cleanup_stale = getattr(runtime, "cleanup_stale", None)
+                if cleanup_stale is not None:
+                    await cleanup_stale(run_spec)
+                await asyncio.sleep(2 if not was_initialized else 5)
+                yield sse({
+                    "type": "working_status",
+                    "content": "底层 Claude Code 会话锁仍被占用，正在清理并重试…",
+                })
+                async for chunk in stream_claude_impl(
+                    session_id,
+                    user_msg,
+                    is_guidance,
+                    model,
+                    permission_mode,
+                    attachments,
+                    retry_missing_session,
+                    retry_session_in_use=True,
+                ):
+                    yield chunk
+                return
+
+            if is_missing_claude_session_error(detail) and not retry_missing_session and not peer_request:
+                remove_last_attempt_messages(session, display_prompt)
+                session["claude_session_id"] = str(uuid.uuid4())
+                session["claude_initialized"] = False
+                session["updated"] = now_ts()
+                sessions[session_id] = session
+                save_sessions_to_disk()
+                yield sse({
+                    "type": "working_status",
+                    "content": "底层 Claude Code 会话已失效，正在重建并重试…",
+                })
+                async for chunk in stream_claude_impl(
+                    session_id,
+                    user_msg,
+                    is_guidance,
+                    model,
+                    permission_mode,
+                    attachments,
+                    retry_missing_session=True,
+                ):
+                    yield chunk
+                return
+            yield sse({"type": "error", "content": detail[:3000]})
+            finalize_assistant(f"错误：{detail}")
+            save_sessions_to_disk()
+            yield sse({"type": "done"})
+            return
+
+        if not assistant_text and final_result:
+            assistant_text = final_result
+            append_assistant_segment("text", final_result)
+            yield sse({"type": "text", "content": final_result})
+
+        for change in file_change_records(before_file_state, before_file_text, watched_file_roots):
+            path = change["path"]
+            artifact = {"type": "artifact", "path": path, "name": Path(path).name, "status": "success", "file_change": change}
+            image = local_artifact_image(path, watched_file_roots)
+            if image is not None:
+                artifact["image"] = image
+            assistant_segments.append(artifact)
+            yield sse(artifact)
+
+        finalize_assistant()
+        session["updated"] = now_ts()
+        session["claude_initialized"] = True
+        sessions[session_id] = session
+        save_sessions_to_disk()
+        yield sse({"type": "done"})
+    except asyncio.CancelledError:
+        if proc and proc.returncode is None:
+            await runtime.cancel(session_id)
+        if stderr_task:
+            stderr_task.cancel()
+        force_release_session_lock(session_id)
+        raise
+    except FileNotFoundError:
+        detail = "找不到 claude 命令，请确认 Claude Code 已安装并在 PATH 中。"
+        finalize_assistant(f"错误：{detail}")
+        yield sse({"type": "error", "content": detail})
+        yield sse({"type": "done"})
+    except Exception as exc:
+        detail = f"Claude Code 启动失败：{exc}"
+        finalize_assistant(f"错误：{detail}")
+        yield sse({"type": "error", "content": detail})
+        yield sse({"type": "done"})
+    finally:
+        had_unsettled_interaction = agent_interaction_broker.unsettled_for(session_id)
+        agent_interaction_broker.invalidate(session_id, reason="stream-finished")
+        if had_unsettled_interaction:
+            host_channel.cancel_all("stream-finished")
+        if proc and proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+        if proc and proc.returncode is None:
+            await runtime.cancel(session_id)
+            if not finalized:
+                interruption_note = "连接中断，已停止底层 Claude Code 进程，避免任务在后台继续运行。"
+                final_content = f"{assistant_text}\n\n{interruption_note}".strip() if assistant_text else interruption_note
+                finalize_assistant(
+                    final_content,
+                    status="cancelled" if _active_runs.get(session_id, {}).get("cancel_requested") else "failed",
+                )
+        elif not finalized:
+            save_assistant_progress(force=True)
+        mark_finished = getattr(runtime, "mark_finished", None)
+        if mark_finished is not None:
+            mark_finished(session_id, proc)
+        cleanup_agent_system_prompt(system_prompt_path)
+        _active_runs.pop(session_id, None)
+        terminal = "completed" if finalized and str(session.get("last_run_status") or "") == "completed" else "failed"
+        if str(session.get("last_run_status") or "") == "cancelled":
+            terminal = "cancelled"
+        elif no_output_stage == "awaiting_cli_ack":
+            terminal = "timeout"
+        host_channel.finalize(terminal, reason=interaction_protocol_failure or terminal)
+        host_channel.cleanup()
+        agent_run_journal().finish(
+            session_id,
+            coordinator_run_id,
+            status=terminal,
+        )
+
+
+def list_skill_files(mode: str = MODE_VINIPER) -> list[Path]:
+    files: list[Path] = []
+    seen: set[str] = set()
+    for directory in unique_skill_dirs(mode):
+        if not directory.exists():
+            continue
+        candidates = sorted(
+            [
+                *(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() == ".md"),
+                *(p for p in directory.glob("*/SKILL.md") if p.is_file()),
+            ],
+            key=lambda item: str(item).lower(),
+        )
+        for path in candidates:
+            try:
+                key = str(path.resolve())
+            except Exception:
+                key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(path)
+    return files
+
+
+def skill_metadata(content: str) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    in_frontmatter = False
+    delimiter_count = 0
+    for raw in content.splitlines():
+        line = raw.strip()
+        if line == "---":
+            delimiter_count += 1
+            if delimiter_count == 1:
+                in_frontmatter = True
+                continue
+            break
+        if not in_frontmatter or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        if key in {"name", "description"}:
+            metadata[key] = value.strip().strip("\"'")
+    return metadata
+
+
+def get_skills(mode: str = MODE_VINIPER) -> list[dict[str, str]]:
+    selected_mode = normalize_provider_mode(mode)
+    cache = _skills_cache[selected_mode]
+    now = time.time()
+    if now - float(cache["time"]) < 30:
+        return cache["items"]
+
+    skills: list[dict[str, str]] = []
+    for path in list_skill_files(selected_mode):
+        record_id = skill_id_from_path(path, selected_mode)
+        source, _root = skill_source_for_path(path, selected_mode)
+        name = skill_name_from_path(path)
+        category = source
+        title = name
+        desc = ""
+        content = path.read_text(encoding="utf-8", errors="replace")
+        metadata = skill_metadata(content)
+        # Claude Code derives the slash command from the official skill
+        # directory name. Underscores are part of that stable identity.
+        command = name
+        if metadata.get("name"):
+            title = metadata["name"]
+        if metadata.get("description"):
+            desc = metadata["description"][:180]
+        # Frontmatter `name` is the display title for personal/project skills;
+        # the first H1 is only a fallback when that field is absent.
+        found_title = bool(metadata.get("name"))
+        for raw in content.splitlines():
+            line = raw.strip()
+            if line.startswith("# ") and not found_title:
+                title = line[2:].strip()
+                found_title = True
+            elif not desc and line and not line.startswith("#") and not line.startswith("---"):
+                desc = line[:120]
+                break
+        record = {
+                "id": record_id,
+                "filename": path.name,
+                "slug": name,
+                "name": title,
+                "command": command,
+                "category": category,
+                "description": desc,
+                "path": skill_display_path(path, selected_mode),
+                "source": source,
+                "mode": selected_mode,
+                "absolute_path": str(path),
+            }
+        record.update(localized_skill_fields(record))
+        record["availability"] = {
+            "state": "available",
+            "label": "Claude 原生" if selected_mode == MODE_CLAUDE else "Viniper Harness",
+            "detail": "独立来源；不会同步到另一引擎。",
+        }
+        skills.append(record)
+
+    cache["time"] = now
+    cache["items"] = skills
+    return skills
+
+
+@app.get("/")
+async def index():
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    asset_version = re.sub(r"[^A-Za-z0-9_.-]", "", ASSET_VERSION) or str(int(time.time()))
+    html = html.replace("__APP_VERSION__", asset_version)
+    html = html.replace("__APP_TITLE__", APP_TITLE)
+    return HTMLResponse(
+        html,
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+        },
+    )
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    icon = STATIC_DIR / "assets" / "viniper-harness-circuit-node.ico"
+    if icon.exists():
+        return FileResponse(icon)
+    raise HTTPException(status_code=404, detail="favicon not found")
+
+
+@app.get("/api/attachments/{session_id}/{filename}")
+async def attachment_file(session_id: str, filename: str):
+    safe_id = safe_attachment_filename(session_id)
+    safe_name = safe_attachment_filename(Path(filename).name)
+    target = (ATTACHMENTS_DIR / safe_id / safe_name).resolve()
+    root = (ATTACHMENTS_DIR / safe_id).resolve()
+    if root not in target.parents or not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="attachment not found")
+    return FileResponse(target)
+
+
+@app.get("/api/status")
+async def status(mode: str = Query(default=MODE_VINIPER)):
+    selected_mode = normalize_provider_mode(mode)
+    base = status_base_snapshot(selected_mode)
+    cfg = base["cfg"]
+    update_source = base["update_source"]
+    settings = base["settings"]
+    runtime_status = await runtime_probe_snapshot(refresh=True)
+    shell = settings.get("shell", {})
+    shell_id = str(shell.get("id") or "claude-code")
+    runtime_configured = bool(cfg["api_key"]) if shell_id == "claude-code" else bool(str(shell.get("custom_command") or "").strip())
+    return {
+        "ok": True,
+        "mode": "custom-cli" if shell_id == "custom-cli" else "claude-code-cli",
+        "profile": PROFILE_NAME,
+        "active_profile": ACTIVE_PROFILE,
+        "product_name": APP_TITLE,
+        "data_dir": str(DATA_DIR),
+        "version": APP_VERSION,
+        "release_revision": APP_RELEASE_REVISION,
+        "preview": PREVIEW_MODE,
+        "release_stage": RELEASE_STAGE,
+        "configured": runtime_configured,
+        "engines": {
+            "viniper": {
+                "id": "harness-runtime",
+                "transport": "harness-agent-runtime",
+                "cache_contract": HarnessRuntimeTransport.cache_contract,
+            },
+            "claude_code": {
+                "id": "claude-code-cli",
+                "transport": "agent-runtime",
+                "permission_modes": sorted(CLAUDE_PERMISSION_MODE_IDS),
+            },
+        },
+        "provider": cfg["provider"],
+        "provider_label": cfg["label"],
+        "base_url": cfg["base_url"],
+        "messages_url": messages_url(cfg["base_url"]),
+        "model": cfg["model"],
+        "models": base["models"],
+        "settings": settings,
+        "shells": SHELL_OPTIONS,
+        "languages": LANGUAGE_OPTIONS,
+        "themes": THEME_OPTIONS,
+        "font_sizes": FONT_SIZE_OPTIONS,
+        "claude_available": bool(runtime_status.get("ready")),
+        "runtime": runtime_status,
+        "native_commands": ({
+            "owner": "claude-code-cli",
+            "cli_version": CLAUDE_NATIVE_COMMAND_VERSION,
+            "commands": [f"/{name}" for name in CLAUDE_NATIVE_COMMAND_NAMES],
+        } if selected_mode == MODE_CLAUDE else None),
+        "permission_mode": base["permission_mode"],
+        "permission_modes": base["permission_modes"],
+        "data_dir": str(DATA_DIR),
+        "update": {
+            "configured": bool(update_source.get("manifest_url")),
+            "repository": update_source.get("repository", ""),
+            "manifest_url": update_source.get("manifest_url", ""),
+        },
+    }
+
+
+@app.get("/api/settings")
+async def get_settings(mode: str = Query(default=MODE_VINIPER)):
+    selected_mode = normalize_provider_mode(mode)
+    return {
+        "ok": True,
+        "settings": public_settings(mode=selected_mode),
+        "shells": SHELL_OPTIONS,
+        "languages": LANGUAGE_OPTIONS,
+        "themes": THEME_OPTIONS,
+        "font_sizes": FONT_SIZE_OPTIONS,
+        "models": effective_model_options(selected_mode),
+    }
+
+
+@app.get("/api/readiness")
+async def readiness():
+    """Return only the immutable local-server ownership identity."""
+    return {
+        "ok": True,
+        "profile": PROFILE_NAME,
+        "active_profile": ACTIVE_PROFILE,
+        "product_name": APP_TITLE,
+        "data_dir": str(DATA_DIR),
+        "version": APP_VERSION,
+        "release_revision": APP_RELEASE_REVISION,
+        "preview": PREVIEW_MODE,
+        "release_stage": RELEASE_STAGE,
+    }
+
+
+@app.get("/api/usage/daily")
+async def get_daily_usage(
+    days: int = Query(default=14, ge=7, le=90),
+    mode: str = Query(default=MODE_CLAUDE),
+):
+    selected_mode = normalize_session_mode(mode)
+    return {"ok": True, **daily_usage_ledger().daily(days, mode=selected_mode)}
+
+
+@app.get("/api/agent-instructions")
+async def get_agent_instructions(mode: str = Query(default=MODE_VINIPER)):
+    selected_mode = require_canonical_mode(mode)
+    return {"ok": True, "mode": selected_mode, "owner": "harness-instructions" if selected_mode == MODE_VINIPER else "claude-code-native-prompt", **agent_instructions_store(selected_mode).read().as_dict()}
+
+
+@app.put("/api/agent-instructions")
+async def update_agent_instructions(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("content"), str):
+        raise HTTPException(status_code=400, detail="content must be a string")
+    selected_mode = require_canonical_mode(body.get("mode"))
+    try:
+        snapshot = agent_instructions_store(selected_mode).write(body["content"])
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="保存 AGENT.md 失败；原内容已保留。") from exc
+    return {"ok": True, "mode": selected_mode, "owner": "harness-instructions" if selected_mode == MODE_VINIPER else "claude-code-native-prompt", **snapshot.as_dict()}
+
+
+@app.get("/api/runtime/status")
+async def get_runtime_status():
+    return {"ok": True, "runtime": await runtime_probe_snapshot(refresh=True)}
+
+
+@app.post("/api/runtime/provision")
+async def provision_runtime():
+    if any(run.get("kind") == MODE_CLAUDE for run in _active_runs.values()):
+        raise HTTPException(status_code=409, detail="请等待所有 Agent 会话停止后再设置运行时")
+    result = await runtime_provisioner().provision()
+    return {"ok": result.status == "ready", "runtime": result.as_dict()}
+
+
+@app.post("/api/runtime/platform-result")
+async def record_runtime_platform_result(request: Request):
+    body = await request.json()
+    result = runtime_provisioner().record_platform_result(bool(body.get("succeeded")))
+    return {"ok": result.status != "wsl_missing", "runtime": result.as_dict()}
+
+
+@app.post("/api/runtime/update")
+async def update_runtime():
+    result = await runtime_update_coordinator().ensure_current(APP_VERSION)
+    return {"ok": result.status in {"current", "compatible"}, "runtime_update": result.as_dict()}
+
+
+def enforce_bypass_permission_gate(settings: dict[str, Any]) -> list[str]:
+    """Fail closed when the user disables the global bypass gate.
+
+    The gate is user-scoped, while permission mode is session-scoped.  Turning
+    the gate off must therefore atomically normalize only sessions that still
+    claim bypassPermissions; all other session modes remain untouched.
+    """
+    runtime = settings.get("runtime") if isinstance(settings, dict) else {}
+    if not isinstance(runtime, dict) or bool(runtime.get("allow_bypass_permissions")):
+        return []
+    changed: list[str] = []
+    for session_id, session in sessions.items():
+        if not isinstance(session, dict) or session.get("permission_mode") != "bypassPermissions":
+            continue
+        session["permission_mode"] = "default"
+        changed.append(str(session_id))
+    if changed:
+        save_sessions_to_disk()
+    return changed
+
+
+@app.put("/api/settings")
+async def update_settings(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="settings body must be an object")
+
+    current = load_app_settings()
+    incoming = body.get("settings") if isinstance(body.get("settings"), dict) else body
+    selected_mode = normalize_provider_mode(body.get("mode") or incoming.get("_mode") or MODE_VINIPER)
+    merged = merge_dict(current, incoming)
+
+    # Provider credentials are never persisted by the Python API.  The
+    # selected mode owns only its structured non-secret fields; the Electron
+    # host IPC writes the encrypted value into the mode-specific vault ref.
+    incoming_provider = incoming.get("provider") if isinstance(incoming.get("provider"), dict) else {}
+    providers = merged.setdefault("providers", {})
+    existing_provider = current.get("providers", {}).get(selected_mode, {})
+    if incoming_provider:
+        provider_update = dict(incoming_provider)
+        provider_update.pop("api_key", None)
+        provider_update.pop("clear_api_key", None)
+        providers[selected_mode] = merge_dict(existing_provider, provider_update)
+    merged["provider"] = copy.deepcopy(providers.get(MODE_VINIPER, current.get("provider", {})))
+
+    save_app_settings(merged)
+    enforce_bypass_permission_gate(load_app_settings())
+    return {
+        "ok": True,
+        "settings": public_settings(load_app_settings(), selected_mode),
+        "models": effective_model_options(selected_mode),
+        "permission_modes": permission_mode_descriptors(selected_mode),
+    }
+
+
+@app.post("/api/provider/test")
+async def test_provider_connection(mode: str = Query(default=MODE_VINIPER)):
+    """Run one bounded Provider connectivity check without exposing secrets.
+
+    The renderer only receives a boolean/status summary.  The host-owned
+    secret is read inside this process and is never returned or logged.
+    """
+    selected_mode = normalize_provider_mode(mode)
+    cfg = provider_config(mode=selected_mode)
+    if not cfg.get("api_key"):
+        return {"ok": True, "configured": False, "status": "not_configured", "mode": selected_mode}
+    if selected_mode == MODE_VINIPER:
+        configured = await sync_harness_host_configuration()
+        profile_id = str((configured.get("provider") or {}).get("profileId") or "")
+        result = await VINIPER_TRANSPORT.application_port.control(
+            "harness.operation", target="provider.test", args={"profile_id": profile_id}
+        )
+        return {
+            "ok": True,
+            "configured": True,
+            "status": "connected" if bool(result.get("connected")) else "ready",
+            "mode": selected_mode,
+            "provider": str(cfg.get("provider") or ""),
+            "model": provider_model_id(cfg.get("model")),
+            "endpoint": messages_url(cfg["base_url"]),
+            "model_count": len(result.get("models") or []),
+        }
+    payload = {
+        "model": provider_model_id(cfg.get("model")),
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": False,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "x-api-key": cfg["api_key"],
+        "anthropic-version": "2023-06-01",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0), trust_env=True) as client:
+            response = await client.post(messages_url(cfg["base_url"]), headers=headers, json=payload)
+        return {
+            "ok": True,
+            "configured": True,
+            "status": "reachable" if response.is_success else f"http_{response.status_code}",
+            "mode": selected_mode,
+            "provider": cfg["provider"],
+            "model": provider_model_id(cfg.get("model")),
+            "endpoint": messages_url(cfg["base_url"]),
+        }
+    except Exception as exc:
+        return {
+            "ok": True,
+            "configured": True,
+            "status": "error",
+            "mode": selected_mode,
+            "error_type": type(exc).__name__,
+        }
+
+
+@app.post("/api/harness/mcp")
+async def workstation_loopback_mcp(request: Request):
+    """Workstation-owned, credential-free loopback MCP identity tool."""
+    body = await request.json()
+    if not isinstance(body, dict) or body.get("jsonrpc") != "2.0":
+        raise HTTPException(status_code=400, detail="invalid MCP JSON-RPC request")
+    request_id = body.get("id")
+    method = str(body.get("method") or "")
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "Viniper workstation loopback", "version": APP_VERSION},
+        }
+    elif method == "tools/list":
+        result = {"tools": [{
+            "name": "workstation.identity",
+            "description": "读取当前 Workstation 本地运行身份；不访问用户正文或凭据。",
+            "inputSchema": {"type": "object", "additionalProperties": False},
+        }]}
+    elif method == "tools/call":
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        if str(params.get("name") or "") != "workstation.identity":
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "MCP tool not found"}}
+        result = {"content": [{"type": "text", "text": f"{APP_TITLE} {APP_VERSION} / {ACTIVE_PROFILE}"}], "isError": False}
+    else:
+        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "MCP method not found"}}
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+@app.get("/api/capabilities")
+async def capability_status(mode: str = Query(default=MODE_CLAUDE), session_id: str = ""):
+    selected_mode = normalize_provider_mode(mode)
+    runtime = await runtime_probe_snapshot(refresh=True)
+    workdir = safe_session(session_id).get("workdir") if session_id and session_id in sessions else str(BASE_DIR)
+    runtime_ready = bool(runtime.get("ready"))
+    runtime_capabilities = runtime.get("capabilities") if isinstance(runtime.get("capabilities"), dict) else {}
+    peer = await native_peer_status_payload(session_id) if selected_mode == MODE_CLAUDE and session_id in sessions else None
+    harness_capabilities: dict[str, Any] = {}
+    harness_reason = ""
+    if selected_mode == MODE_VINIPER:
+        port = VINIPER_TRANSPORT.application_port
+        if port is None:
+            harness_reason = "Harness Application Port unavailable"
+        else:
+            try:
+                await sync_harness_host_configuration()
+                harness_capabilities = await port.control("capabilities.snapshot")
+            except Exception as exc:
+                harness_reason = str(exc) or "Harness capability control unavailable"
+    collaboration_available = bool(harness_capabilities.get("collaboration")) if selected_mode == MODE_VINIPER else bool(peer and peer.get("verified"))
+    subagents_available = bool(harness_capabilities.get("subagents")) if selected_mode == MODE_VINIPER else bool(runtime_capabilities.get("agent_registry"))
+    return {
+        "ok": True,
+        "mode": selected_mode,
+        "engine": "claude-code-cli" if selected_mode == MODE_CLAUDE else "harness-runtime",
+        "status": "available" if selected_mode == MODE_VINIPER or runtime_ready else "partial",
+        "summary": "Harness Application Port 已就绪" if selected_mode == MODE_VINIPER else ("Claude Code CLI 已发现" if runtime_ready else "Claude Code CLI 未就绪"),
+        "mcp": {
+            "status": "available" if (selected_mode == MODE_VINIPER or runtime_ready) else "unavailable",
+            "transport": "harness-tool-registry" if selected_mode == MODE_VINIPER else "claude-code-mcp",
+        },
+        "goal": {"status": "available", "count": len(goals)},
+        "target": {"status": "available", "session_id": session_id or ""},
+        "plan": {"status": "available", "count": len((sessions.get(session_id, {}).get("plan") or {}).get("steps") or [])},
+        "memory": {"status": "enabled" if load_app_settings().get("runtime", {}).get("memory_enabled", True) else "disabled"},
+        "project_index": {"status": "available", "workdir": str(workdir)},
+        "attachments": {"status": "available", "owner": "harness-runtime" if selected_mode == MODE_VINIPER else "claude-code-cli"},
+        "permissions": {"status": "available", "modes": [item["id"] for item in permission_mode_descriptors(selected_mode) if item.get("enabled")]},
+        "diff_view": {"status": "available", "source": "tool-file-events", "fallback": "unavailable"},
+        "skills": {"status": "available", "count": len(get_skills(selected_mode)), "isolated": True},
+        "collaboration": {
+            "status": "available" if collaboration_available else "unavailable",
+            "transport": "harness-coordination" if selected_mode == MODE_VINIPER else "claude-native-peer",
+            "reason": "" if collaboration_available else (harness_reason if selected_mode == MODE_VINIPER else str((peer or {}).get("reason") or "当前 Claude Code CLI 未声明协作能力")),
+        },
+        "subagents": {
+            "status": "available" if subagents_available else "unavailable",
+            "transport": "harness-subagent-service" if selected_mode == MODE_VINIPER else "claude-code---agents",
+            "reason": "" if subagents_available else (harness_reason if selected_mode == MODE_VINIPER else "当前 Claude Code CLI 未声明 --agents"),
+        },
+        "features": {
+            feature: {
+                "status": "available" if bool(harness_capabilities.get(feature)) and selected_mode == MODE_VINIPER else "unavailable",
+                "owner": "harness-runtime" if selected_mode == MODE_VINIPER else "claude-code-cli",
+            }
+            for feature in ("project_index", "lsp", "local_models", "extensions", "mcp", "review", "composition", "provider_settings")
+        },
+    }
+
+
+@app.get("/api/configuration-matrix")
+async def configuration_matrix(mode: str = Query(default=MODE_VINIPER)):
+    selected_mode = normalize_provider_mode(mode)
+    if selected_mode != MODE_VINIPER:
+        settings = public_settings(mode=MODE_CLAUDE)
+        provider = settings.get("provider") if isinstance(settings.get("provider"), dict) else {}
+        return {"ok": True, "mode": selected_mode, "items": [{
+            "id": "claude-code-cli",
+            "implemented": True,
+            "configured": bool(provider.get("api_key_configured")),
+            "connected": bool((await runtime_probe_snapshot(refresh=False)).get("ready")),
+            "verified": False,
+            "external_prerequisite": None,
+        }]}
+    configured = await sync_harness_host_configuration()
+    snapshot = await VINIPER_TRANSPORT.application_port.control("harness.snapshot")
+    profiles = ((snapshot.get("provider_settings") or {}).get("profiles") or {})
+    profile_id = str((configured.get("provider") or {}).get("profileId") or "")
+    profile = profiles.get(profile_id) if isinstance(profiles, dict) else {}
+    extensions = snapshot.get("extensions") if isinstance(snapshot.get("extensions"), dict) else {}
+    mcp = next((item for item in (extensions.get("mcpConnections") or []) if item.get("id") == "workstation-loopback"), {})
+    runner = local_model_runner_status()
+    update_source = read_update_source()
+    return {"ok": True, "mode": selected_mode, "items": [
+        {"id": "viniper-provider", "implemented": True, "configured": bool((configured.get("provider") or {}).get("configured")), "connected": str((profile or {}).get("connectionState") or "") == "connected", "verified": False, "external_prerequisite": None},
+        {"id": "builtin-coordination-plugin", "implemented": True, "configured": bool(configured.get("builtInCoordination")), "connected": bool(configured.get("builtInCoordination")), "verified": False, "external_prerequisite": None},
+        {"id": "workstation-loopback-mcp", "implemented": True, "configured": bool(mcp.get("configured")), "connected": bool(mcp.get("connected")), "verified": False, "external_prerequisite": None},
+        {"id": "project-index", "implemented": True, "configured": bool((snapshot.get("project_indexes") or [{}])[0].get("explicit")), "connected": str((snapshot.get("project_indexes") or [{}])[0].get("status")) == "ready", "verified": False, "external_prerequisite": None, "contextual_precondition": "选择包含有效项目目录的 Viniper 会话"},
+        {"id": "typescript-javascript-semantics", "implemented": True, "configured": str((snapshot.get("lsp") or {}).get("provider")) == "typescript-javascript", "connected": str((snapshot.get("lsp") or {}).get("status")) == "ready", "verified": False, "external_prerequisite": None, "contextual_precondition": "选择包含 TypeScript/JavaScript 文件的项目会话"},
+        {"id": "local-model-registry", "implemented": True, "configured": bool((snapshot.get("local_models") or {}).get("records")), "connected": False, "verified": False, "external_prerequisite": None if runner["available"] else runner["reason"]},
+        {"id": "external-plugin-marketplace", "implemented": False, "configured": False, "connected": False, "verified": False, "external_prerequisite": "配置可信且可验证的外部插件市场来源；当前不会自动信任或安装未知代码"},
+        {"id": "github-cli", "implemented": True, "configured": bool(shutil.which("gh")), "connected": False, "verified": False, "external_prerequisite": None if shutil.which("gh") else "安装 GitHub CLI"},
+        {"id": "update-manager", "implemented": True, "configured": bool(update_source.get("manifest_url")), "connected": False, "verified": False, "external_prerequisite": None if update_source.get("manifest_url") else "配置 Viniper workstation 官方 Release manifest URL"},
+    ]}
+
+
+@app.get("/api/claude-native-commands")
+async def claude_native_command_manifest(mode: str = Query(default=MODE_CLAUDE)):
+    if require_canonical_mode(mode) != MODE_CLAUDE:
+        raise HTTPException(status_code=409, detail="Claude 原生命令只属于 Claude code")
+    return {
+        "ok": True,
+        "owner": "claude-code-cli",
+        "cli_version": CLAUDE_NATIVE_COMMAND_VERSION,
+        "commands": [f"/{name}" for name in CLAUDE_NATIVE_COMMAND_NAMES],
+    }
+
+
+@app.post("/api/claude-native-commands/{session_id}")
+async def execute_claude_native_command(session_id: str, request: Request):
+    session = safe_session(session_id)
+    if normalize_session_mode(session.get("mode")) != MODE_CLAUDE:
+        raise HTTPException(status_code=409, detail="Viniper 会话不能执行 Claude Code CLI 原生命令")
+    body = await request.json()
+    raw_command = str(body.get("command") or "").strip().lower()
+    command = raw_command[1:] if raw_command.startswith("/") else raw_command
+    if command not in CLAUDE_NATIVE_COMMAND_NAMES:
+        raise HTTPException(status_code=404, detail="当前受管 Claude Code CLI 未声明该原生命令")
+    requested_version = str(body.get("cli_version") or "").strip()
+    if requested_version and requested_version != CLAUDE_NATIVE_COMMAND_VERSION:
+        raise HTTPException(status_code=409, detail="Claude Code CLI 命令清单版本不匹配")
+    # These commands are TUI-owned. The Workstation deliberately does not turn
+    # slash text into a model prompt or fall back to Harness APIs. Until the
+    # managed coordinator exposes an interactive-command channel, fail visibly
+    # at this explicit Claude-owned adapter boundary without writing messages.
+    return {
+        "ok": True,
+        "owner": "claude-code-cli",
+        "command": f"/{command}",
+        "cli_version": CLAUDE_NATIVE_COMMAND_VERSION,
+        "available": False,
+        "status": "native_interactive_required",
+        "summary": f"Claude Code 原生命令 /{command} 需要受管 CLI 交互界面；当前不会把它当作普通提示词发送。",
+    }
+
+
+@app.get("/api/goals")
+async def list_goals(session_id: str | None = None, mode: str = Query(default=MODE_VINIPER)):
+    selected_mode = normalize_session_mode(mode)
+    if selected_mode == MODE_CLAUDE:
+        return {
+            "ok": True,
+            "available": False,
+            "owner": "claude-code-cli",
+            "reason": "当前 Claude Code CLI 未暴露可验证的持久 Goal 原语",
+            "goals": [],
+        }
+    values = [public_goal(goal) for goal in goals.values() if not session_id or str(goal.get("session_id")) == str(session_id)]
+    values.sort(key=lambda item: (item.get("updated", 0), item.get("created", 0)), reverse=True)
+    return {"ok": True, "available": True, "owner": "harness-goal-service", "goals": values}
+
+
+@app.post("/api/goals")
+async def create_goal(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="goal body must be an object")
+    goal_id = str(uuid.uuid4())[:8]
+    session_id = str(body.get("session_id") or "")
+    if session_id and session_id not in sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    selected_mode = normalize_session_mode(body.get("mode") or (sessions.get(session_id) or {}).get("mode"))
+    if selected_mode != MODE_VINIPER:
+        raise HTTPException(status_code=409, detail="当前 Claude Code CLI 未暴露可验证的持久 Goal 原语")
+    goal = normalize_goal(goal_id, {
+        "id": goal_id,
+        "session_id": session_id,
+        "title": str(body.get("title") or "目标任务").strip()[:160],
+        "prompt": str(body.get("prompt") or "").strip()[:8000],
+        "status": "paused",
+        "model": str(body.get("model") or ""),
+        "permission_mode": str(body.get("permission_mode") or DEFAULT_PERMISSION_MODE),
+    })
+    goals[goal_id] = goal
+    save_goals_to_disk()
+    return {"ok": True, "goal": public_goal(goal), "summary": f"已创建目标：{goal['title']}"}
+
+
+@app.patch("/api/goals/{goal_id}")
+async def control_goal(goal_id: str, request: Request):
+    goal = get_goal_or_404(goal_id)
+    body = await request.json()
+    action = str(body.get("action") or "").strip().lower()
+    if action == "continue":
+        goal["status"] = "running"
+        goal["updated"] = now_ts()
+        goals[goal_id] = goal
+        save_goals_to_disk()
+        start_goal_task(goal_id)
+    elif action == "stop":
+        await stop_goal_task(goal_id, goal)
+        goal["status"] = "paused"
+        goal["updated"] = now_ts()
+        goals[goal_id] = goal
+        save_goals_to_disk()
+    elif action in {"complete", "blocked"}:
+        await stop_goal_task(goal_id, goal)
+        goal["status"] = "completed" if action == "complete" else "waiting"
+        goal["updated"] = now_ts()
+        goals[goal_id] = goal
+        save_goals_to_disk()
+    else:
+        raise HTTPException(status_code=400, detail="unknown goal action")
+    return {"ok": True, "goal": public_goal(goal)}
+
+
+@app.delete("/api/goals/{goal_id}")
+async def delete_goal(goal_id: str):
+    goal = get_goal_or_404(goal_id)
+    await stop_goal_task(goal_id, goal)
+    removed = goals.pop(goal_id, None)
+    if removed is None:
+        raise HTTPException(status_code=404, detail="goal not found")
+    try:
+        save_goals_to_disk()
+    except Exception as exc:
+        goals[goal_id] = removed
+        raise HTTPException(status_code=500, detail="Goal 删除失败，数据已保留") from exc
+    return {
+        "ok": True,
+        "deleted_goal_id": goal_id,
+        "session_id": str(removed.get("session_id") or ""),
+    }
+
+
+@app.get("/api/plans")
+async def list_plans(session_id: str | None = None):
+    if not session_id:
+        return {"ok": True, "session_id": "", "steps": [], "current": 0, "total": 0, "summary": "请选择会话"}
+    session = safe_session(str(session_id))
+    plan = session.get("plan") if isinstance(session.get("plan"), dict) else {}
+    steps = copy.deepcopy(plan.get("steps") or [])
+    current = next((index + 1 for index, step in enumerate(steps) if step.get("status") == "in_progress"), 0)
+    if not current and steps and all(step.get("status") == "completed" for step in steps):
+        current = len(steps)
+    return {
+        "ok": True,
+        "session_id": str(session_id),
+        "mode": normalize_session_mode(session.get("mode")),
+        "steps": steps,
+        "current": current,
+        "total": len(steps),
+        "updated": plan.get("updated"),
+        "source": plan.get("source", ""),
+        "run_id": plan.get("run_id", ""),
+        "explanation": plan.get("explanation", ""),
+        "terminal_status": plan.get("terminal_status", ""),
+        "summary": f"计划步骤 {len(steps)} 项",
+    }
+
+
+@app.post("/api/plans")
+async def replace_plan(request: Request):
+    body = await request.json()
+    session_id = str(body.get("session_id") or "")
+    session = safe_session(session_id)
+    raw_steps = body.get("steps")
+    if not isinstance(raw_steps, list):
+        text = str(body.get("text") or "").strip()
+        raw_steps = [part.strip() for part in re.split(r"(?:\r?\n|\s*\|\s*)", text) if part.strip()]
+    steps: list[dict[str, str]] = []
+    for index, item in enumerate(raw_steps[:40]):
+        if isinstance(item, dict):
+            title = str(item.get("title") or "").strip()
+            status = str(item.get("status") or ("in_progress" if index == 0 else "pending"))
+        else:
+            title = str(item or "").strip()
+            status = "in_progress" if index == 0 else "pending"
+        if not title:
+            continue
+        if status not in PLAN_STEP_STATUSES:
+            raise HTTPException(status_code=400, detail="invalid plan status")
+        steps.append({"id": str(uuid.uuid4())[:8], "title": title[:240], "status": status})
+    session["plan"] = {"steps": steps, "updated": now_ts()}
+    session["updated"] = now_ts()
+    save_sessions_to_disk()
+    return await list_plans(session_id)
+
+
+@app.patch("/api/plans/{session_id}/{step_id}")
+async def update_plan_step(session_id: str, step_id: str, request: Request):
+    session = safe_session(session_id)
+    body = await request.json()
+    status = str(body.get("status") or "")
+    if status not in PLAN_STEP_STATUSES:
+        raise HTTPException(status_code=400, detail="invalid plan status")
+    plan = session.get("plan") if isinstance(session.get("plan"), dict) else {"steps": []}
+    target = next((step for step in plan.get("steps") or [] if str(step.get("id")) == step_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="plan step not found")
+    if status == "in_progress":
+        for step in plan.get("steps") or []:
+            if step.get("status") == "in_progress":
+                step["status"] = "pending"
+    target["status"] = status
+    if status == "completed" and not any(step.get("status") == "in_progress" for step in plan.get("steps") or []):
+        next_pending = next((step for step in plan.get("steps") or [] if step.get("status") == "pending"), None)
+        if next_pending is not None:
+            next_pending["status"] = "in_progress"
+    plan["updated"] = now_ts()
+    session["plan"] = plan
+    session["updated"] = now_ts()
+    save_sessions_to_disk()
+    return await list_plans(session_id)
+
+
+@app.get("/api/project-index")
+async def project_index(session_id: str | None = None, query: str = "", mode: str = Query(default=MODE_VINIPER)):
+    selected_mode = normalize_provider_mode(mode)
+    session = sessions.get(str(session_id)) if session_id else None
+    workdir = str((session or {}).get("workdir") or "").strip()
+    if selected_mode == MODE_CLAUDE:
+        return {
+            "ok": True,
+            "status": "unavailable",
+            "engine": "claude-code-cli",
+            "root": workdir,
+            "entries": [],
+            "reason": "项目索引由 Viniper Harness 提供；当前 Claude Code CLI 未声明独立索引服务。",
+        }
+    packaged_resources_root = BASE_DIR.parent.resolve(strict=False)
+    selected_path = Path(workdir).resolve(strict=False) if workdir else None
+    if (
+        session is None
+        or selected_path is None
+        or not selected_path.is_dir()
+        or selected_path == packaged_resources_root
+        or packaged_resources_root in selected_path.parents
+    ):
+        return {
+            "ok": True,
+            "status": "context-required",
+            "engine": "harness-runtime",
+            "root": "",
+            "entries": [],
+            "reason": "请先选择包含有效项目目录的 Viniper 会话；未选择项目时不会读取或重建索引。",
+            "contextual_precondition": "selected-project-session",
+        }
+    workdir = str(selected_path)
+    port = VINIPER_TRANSPORT.application_port
+    if port is not None:
+        try:
+            args = {"project_root": workdir}
+            if query:
+                args["query"] = query
+                indexed = await port.control("harness.operation", target="project-index.search", args=args)
+                results = indexed.get("results") if isinstance(indexed, dict) else []
+                return {
+                    "ok": True,
+                    "status": "available",
+                    "engine": "harness-runtime",
+                    "root": workdir,
+                    "entries": [{"path": str(item.get("path") or ""), "size": 0, "match": item.get("match"), "snippet": item.get("snippet")} for item in results if item.get("path")],
+                    "source": indexed.get("source") if isinstance(indexed, dict) else "index",
+                }
+            snapshot = await port.control("harness.operation", target="project-index.snapshot", args={})
+            if not isinstance(snapshot, dict) or not snapshot.get("explicit") or str(snapshot.get("projectRoot") or "") != workdir:
+                snapshot = await port.control("harness.operation", target="project-index.build", args=args)
+            records = snapshot.get("records") if isinstance(snapshot, dict) else []
+            entries = [{"path": str(item.get("path") or ""), "size": int(item.get("sizeBytes") or 0), "symbols": item.get("symbols") or []} for item in records if item.get("path")]
+            return {"ok": True, "status": str(snapshot.get("status") or "ready"), "engine": "harness-runtime", "root": workdir, "entries": entries, "revision": snapshot.get("revision", 0), "source": "harness-project-index"}
+        except Exception as exc:
+            return {"ok": True, "status": "unavailable", "engine": "harness-runtime", "root": workdir, "entries": [], "reason": str(exc) or "Harness 项目索引服务不可用"}
+    return {
+        "ok": True,
+        "status": "unavailable",
+        "engine": "harness-runtime",
+        "root": workdir,
+        "entries": [],
+        "reason": "Harness Application Port unavailable; project index is not read directly by the server.",
+    }
+
+
+@app.get("/api/harness/snapshot")
+async def harness_snapshot(mode: str = Query(default=MODE_VINIPER), session_id: str = ""):
+    selected_mode = normalize_provider_mode(mode)
+    if selected_mode != MODE_VINIPER:
+        return {"ok": True, "mode": selected_mode, "engine": "claude-code-cli", "status": "unavailable", "reason": "该管理面板仅属于 Viniper Harness。"}
+    port = VINIPER_TRANSPORT.application_port
+    if port is None:
+        return {"ok": True, "mode": selected_mode, "engine": "harness-runtime", "status": "unavailable", "reason": "Harness Application Port unavailable"}
+    try:
+        await sync_harness_host_configuration()
+        data = await port.control("harness.snapshot", native_session_id=session_id)
+        local_models = data.get("local_models") if isinstance(data.get("local_models"), dict) else {}
+        local_models["runner_status"] = local_model_runner_status()
+        data["local_models"] = local_models
+        return {"ok": True, "mode": selected_mode, "engine": "harness-runtime", "status": "available", **data}
+    except Exception as exc:
+        return {"ok": True, "mode": selected_mode, "engine": "harness-runtime", "status": "unavailable", "reason": str(exc) or "Harness 能力快照不可用"}
+
+
+@app.post("/api/harness/action")
+async def harness_action(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Harness action body must be an object")
+    selected_mode = normalize_provider_mode(body.get("mode") or MODE_VINIPER)
+    if selected_mode != MODE_VINIPER:
+        raise HTTPException(status_code=409, detail="该能力仅属于 Viniper Harness；Claude code 保持原生 CLI")
+    port = VINIPER_TRANSPORT.application_port
+    if port is None:
+        raise HTTPException(status_code=409, detail="Harness Application Port unavailable")
+    target = str(body.get("target") or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="Harness action target is required")
+    if target in {"host.configure", "tools.snapshot", "provider.test"}:
+        raise HTTPException(status_code=409, detail="该操作仅属于 Workstation host；renderer 不可调用")
+    args = body.get("args") if isinstance(body.get("args"), dict) else {}
+    try:
+        data = await port.control("harness.operation", target=target, args=args, native_session_id=str(body.get("session_id") or ""))
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=str(exc) or "Harness operation unavailable") from exc
+    return {"ok": True, "mode": selected_mode, "owner": "harness-runtime", "target": target, "data": data}
+
+
+@app.get("/api/filesystem/roots")
+async def get_filesystem_roots():
+    settings = load_app_settings()
+    default_root = resolve_existing_directory(settings.get("workspace", {}).get("default_root"), platform_default_workspace_root())
+    return {
+        "ok": True,
+        "default_root": str(default_root),
+        "roots": filesystem_roots(),
+    }
+
+
+@app.get("/api/filesystem/children")
+async def get_filesystem_children(path: str | None = None):
+    current = resolve_existing_directory(path, platform_default_workspace_root())
+    directories: list[dict[str, Any]] = []
+    try:
+        for item in current.iterdir():
+            try:
+                if item.is_dir():
+                    directories.append({
+                        "path": str(item.resolve()),
+                        "name": item.name,
+                        "hidden": item.name.startswith("."),
+                    })
+            except Exception:
+                continue
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="permission denied")
+    directories.sort(key=lambda item: item["name"].lower())
+    return {
+        "ok": True,
+        "path": str(current),
+        "name": current.name or str(current),
+        "parent": str(current.parent) if current.parent != current else "",
+        "directories": directories[:500],
+    }
+
+
+@app.post("/api/filesystem/folders")
+async def create_filesystem_folder(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="folder body must be an object")
+    parent = resolve_existing_directory(body.get("parent"), platform_default_workspace_root())
+    name = validate_folder_name(body.get("name"))
+    target = parent / name
+    try:
+        target.mkdir(parents=False, exist_ok=True)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="permission denied")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "path": str(target.resolve()), "name": target.name}
+
+
+def resolve_local_artifact_path(value: Any) -> Path:
+    raw = str(value or "").strip().strip("\"'`")
+    if not raw:
+        raise HTTPException(status_code=400, detail="file path is required")
+    if os.name == "nt":
+        match = re.match(r"^/mnt/([a-zA-Z])/(.+)$", raw)
+        if match:
+            raw = f"{match.group(1).upper()}:/{match.group(2)}"
+    path = Path(raw).expanduser()
+    try:
+        resolved = path.resolve()
+    except Exception:
+        resolved = path
+    if not resolved.exists():
+        raise HTTPException(status_code=404, detail="file does not exist")
+    return resolved
+
+
+@app.post("/api/files/open")
+async def open_local_artifact(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="file body must be an object")
+    path = resolve_local_artifact_path(body.get("path"))
+    action = str(body.get("action") or "open")
+    try:
+        if os.name == "nt":
+            if action == "reveal":
+                if path.is_dir():
+                    subprocess.Popen(["explorer.exe", str(path)], close_fds=True)
+                else:
+                    subprocess.Popen(["explorer.exe", "/select,", str(path)], close_fds=True)
+            else:
+                os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            if action == "reveal":
+                subprocess.Popen(["open", "-R", str(path)], close_fds=True)
+            else:
+                subprocess.Popen(["open", str(path)], close_fds=True)
+        else:
+            target = str(path.parent if action == "reveal" and path.is_file() else path)
+            subprocess.Popen(["xdg-open", target], close_fds=True)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"open file failed: {exc}") from exc
+    return {"ok": True, "path": str(path), "action": action}
+
+
+@app.get("/api/diagnostics")
+async def diagnostics():
+    cfg = deepseek_config()
+    settings = load_app_settings()
+    shell = settings.get("shell", {})
+    shell_id = str(shell.get("id") or "claude-code")
+    runtime_status = await runtime_probe_snapshot(refresh=True)
+    runtime_ready = bool(runtime_status.get("ready"))
+    runtime_version = str(runtime_status.get("version") or "")
+    runtime_detail = (
+        f"ViniperRuntime / Claude Code {runtime_version}" if runtime_ready and runtime_version
+        else ("ViniperRuntime 已就绪" if runtime_ready else f"ViniperRuntime：{runtime_status.get('status') or '未就绪'}")
+    )
+    checks = [
+        {
+            "id": "python",
+            "label": "Python",
+            "ok": True,
+            "detail": sys.version.split()[0],
+        },
+        {
+            "id": "claude",
+            "label": "Claude Code CLI",
+            "ok": True if shell_id == "custom-cli" else runtime_ready,
+            "detail": "Custom CLI 不需要 ViniperRuntime" if shell_id == "custom-cli" else runtime_detail,
+        },
+        {
+            "id": "claude_compatibility",
+            "label": "Claude Code 兼容性",
+            "ok": True if shell_id == "custom-cli" else runtime_ready,
+            "detail": "Custom CLI 使用独立兼容合同" if shell_id == "custom-cli" else runtime_detail,
+        },
+        {
+            "id": "provider",
+            "label": "Model provider",
+            "ok": bool((cfg["api_key"] or shell_id == "custom-cli") and cfg["base_url"]),
+            "detail": f"{cfg['label']} / {cfg['base_url']}",
+        },
+        {
+            "id": "agent_shell",
+            "label": "Agent 执行壳",
+            "ok": runtime_ready if shell_id == "claude-code" else bool(str(shell.get("custom_command") or "").strip()),
+            "detail": runtime_detail if shell_id == "claude-code" else str(shell.get("custom_command") or "尚未配置"),
+        },
+        {
+            "id": "data",
+            "label": "User data",
+            "ok": DATA_DIR.exists() or DATA_DIR.parent.exists(),
+            "detail": str(DATA_DIR),
+        },
+        {
+            "id": "static",
+            "label": "Static assets",
+            "ok": STATIC_DIR.exists() and (STATIC_DIR / "app.js").exists(),
+            "detail": str(STATIC_DIR),
+        },
+    ]
+    return {
+        "ok": all(item["ok"] for item in checks),
+        "version": APP_VERSION,
+        "checks": checks,
+    }
+
+
+@app.post("/api/desktop/shortcut")
+async def create_desktop_shortcut():
+    if os.name != "nt":
+        return {"ok": False, "message": "当前系统不需要 Windows 桌面快捷方式。"}
+    await asyncio.to_thread(refresh_windows_shortcuts)
+    return {"ok": True, "message": f"桌面和开始菜单快捷方式已指向软件版 {APP_TITLE}。"}
+
+
+@app.post("/api/update/check")
+async def check_update(request: Request):
+    body: dict[str, Any] = {}
+    try:
+        if request.headers.get("content-type", "").startswith("application/json"):
+            body = await request.json()
+    except Exception:
+        body = {}
+
+    source = read_update_source()
+    manifest_url = str(body.get("manifest_url") or source.get("manifest_url") or "").strip()
+    if not manifest_url:
+        return {
+            "ok": True,
+            "configured": False,
+            "current_version": APP_VERSION,
+            "update_available": False,
+            "message": "未配置更新源。发布到 GitHub Release 后，在 update_source.json 中写入 manifest_url 即可启用。",
+        }
+
+    try:
+        manifest = await asyncio.to_thread(fetch_json_url, manifest_url)
+        latest_version = str(manifest.get("version") or "")
+        asset = choose_update_asset(manifest)
+        decision = update_decision(manifest)
+        update_available = bool(decision["automatic"])
+        if decision["manual_install_required"]:
+            update_message = "检测到更低的公开版本号。自动降级已关闭，请从正式 Release 手动运行 Viniper 安装器。"
+        elif update_available:
+            update_message = "发现可用更新。"
+        else:
+            update_message = "当前已经是最新版本。"
+        return {
+            "ok": True,
+            "configured": True,
+            "current_version": APP_VERSION,
+            "latest_version": latest_version,
+            "update_available": update_available,
+            "manual_install_required": bool(decision["manual_install_required"]),
+            "update_reason": decision["reason"],
+            "current_release_revision": decision["current_release_revision"],
+            "latest_release_revision": decision["latest_release_revision"],
+            "message": update_message,
+            "manifest_url": manifest_url,
+            "repository": source.get("repository", ""),
+            "notes": str(manifest.get("notes") or manifest.get("changelog") or ""),
+            "published_at": str(manifest.get("published_at") or ""),
+            "requires_installer": update_requires_installer(manifest),
+            "asset": {
+                "key": asset.get("key", "app"),
+                "name": asset.get("name", ""),
+                "size": asset.get("size", 0),
+            },
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "configured": True,
+            "current_version": APP_VERSION,
+            "update_available": False,
+            "manifest_url": manifest_url,
+            "message": f"检查更新失败：{exc}",
+        }
+
+
+@app.post("/api/update/install")
+async def install_update(request: Request):
+    body: dict[str, Any] = {}
+    try:
+        if request.headers.get("content-type", "").startswith("application/json"):
+            body = await request.json()
+    except Exception:
+        body = {}
+
+    source = read_update_source()
+    manifest_url = str(body.get("manifest_url") or source.get("manifest_url") or "").strip()
+    if not manifest_url:
+        raise HTTPException(status_code=400, detail="update manifest url is not configured")
+
+    try:
+        manifest = await asyncio.to_thread(fetch_json_url, manifest_url)
+        latest_version = str(manifest.get("version") or "")
+        decision = update_decision(manifest)
+        if decision["manual_install_required"]:
+            return {
+                "ok": True,
+                "updated": False,
+                "current_version": APP_VERSION,
+                "latest_version": latest_version,
+                "manual_install_required": True,
+                "message": "检测到更低的公开版本号。为避免自动降级，请从正式 Release 手动运行 Viniper 安装器；现有会话和设置不会被清空。",
+            }
+        if not decision["automatic"]:
+            return {
+                "ok": True,
+                "updated": False,
+                "current_version": APP_VERSION,
+                "latest_version": latest_version,
+                "message": "当前已经是最新版本。",
+            }
+        result = await asyncio.to_thread(install_update_from_manifest, manifest, body.get("asset"))
+        if result.get("installer_opened"):
+            message = (
+                "新版桌面安装器已下载并打开。请按安装器提示完成安装；"
+                f"安装后桌面快捷方式会指向软件版 {APP_TITLE}，历史会话不会被清空。"
+            )
+        else:
+            message = (
+                "更新完成！服务器即将自动重启，新版将在几秒后可用。"
+            )
+            _schedule_restart()
+        return {
+            "ok": True,
+            "updated": True,
+            "previous_version": APP_VERSION,
+            "latest_version": latest_version,
+            "restart_required": True,
+            "restarting": bool(result.get("restarting")) and not bool(result.get("installer_opened")),
+            "installer_opened": bool(result.get("installer_opened")),
+            "requires_installer": update_requires_installer(manifest),
+            "message": message,
+            "asset": result.get("asset", {}),
+            "dependencies": result.get("dependencies", ""),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"install update failed: {exc}")
+
+
+async def coordinated_agent_event_stream(session_id: str, run_id: str, after_sequence: int = 0):
+    async for payload in agent_run_coordinator().subscribe(
+        session_id,
+        run_id,
+        after_sequence=after_sequence,
+    ):
+        yield sse(payload)
+
+
+@app.post("/api/runs/{session_id}")
+async def submit_run(session_id: str, request: Request):
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    user_msg = str(body.get("message", "")).strip()
+    if not user_msg:
+        raise HTTPException(status_code=400, detail="message is required")
+    session = safe_session(session_id)
+    mode = normalize_session_mode(session.get("mode"))
+    requested_mode = str(body.get("mode") or "").strip()
+    if requested_mode and require_canonical_mode(requested_mode) != mode:
+        raise HTTPException(status_code=409, detail="run mode does not match the immutable session owner")
+    peer_target_session_id = str(body.get("peer_target_session_id") or "").strip()
+    peer_request: dict[str, str] | None = None
+    if mode == MODE_VINIPER:
+        if body.get("guidance"):
+            raise HTTPException(status_code=400, detail="Viniper runs do not accept Claude guidance envelopes")
+        if str(body.get("interaction_mode") or "").strip():
+            raise HTTPException(status_code=400, detail="interaction_mode is retired; session mode is immutable")
+        for field in ("skill", "skill_command", "slash_command", "command"):
+            if str(body.get(field) or "").strip():
+                raise HTTPException(status_code=400, detail="Viniper runs do not accept Claude command envelopes")
+        if peer_target_session_id:
+            raise HTTPException(status_code=400, detail="Viniper runs do not accept Claude peer envelopes")
+    elif body.get("guidance"):
+        raise HTTPException(status_code=400, detail="运行中引导必须使用当前 Agent run 的 guidance 接口")
+    elif peer_target_session_id:
+        if body.get("attachments") or body.get("guidance"):
+            raise HTTPException(status_code=400, detail="原生跨会话消息不接受附件或 guidance")
+        peer_request = await prepare_native_peer_request(session_id, peer_target_session_id, user_msg)
+    model = allowed_model(str(body.get("model") or ""), mode)
+    if mode in SESSION_MODES:
+        # A persisted mode may become unavailable after a provider/runtime or
+        # settings change.  Re-check the server-authoritative descriptor before
+        # accepting the turn so no message, coordinator run, or provider call
+        # can escape through a stale auto/bypass/dontAsk selection.
+        permission_mode = require_permission_mode(session_permission_mode(session), mode)
+        requested_permission_mode = str(body.get("permission_mode") or "").strip()
+        if requested_permission_mode:
+            validated_permission_mode = require_permission_mode(requested_permission_mode, mode)
+            if validated_permission_mode != permission_mode:
+                raise HTTPException(status_code=409, detail="permission_mode does not match this session")
+    attachments = save_run_attachments(session_id, body.get("attachments") or [])
+    coordinator = agent_run_coordinator()
+    if coordinator.has_active(session_id):
+        raise HTTPException(status_code=409, detail="当前 Agent 会话已有任务在运行")
+    display_prompt = user_msg
+    if peer_request:
+        display_prompt = (
+            f"发送给 {str(peer_request.get('target_display_name') or peer_request.get('target_peer_name') or '目标会话')}："
+            f"{str(peer_request.get('message') or user_msg)}"
+        )
+    accepted_turn_id = ""
+    if mode == MODE_CLAUDE:
+        accepted_turn_id = persist_accepted_agent_turn(
+            session_id,
+            display_prompt,
+            model,
+            attachments,
+        )
+    producer = (
+        stream_viniper_with_queue(
+            session_id,
+            user_msg,
+            bool(body.get("guidance")),
+            model,
+            permission_mode,
+            attachments,
+            accepted_turn_id=accepted_turn_id,
+        )
+        if mode == MODE_VINIPER
+        else stream_conversation(
+            session_id,
+            user_msg,
+            bool(body.get("guidance")),
+            model,
+            permission_mode,
+            attachments,
+            peer_request=peer_request,
+            accepted_turn_id=accepted_turn_id,
+        )
+    )
+    try:
+        record = coordinator.start(
+            session_id,
+            lambda: producer,
+            metadata={"model": model, "permission_mode": permission_mode, "mode": mode, "input_ready": False},
+        )
+    except ActiveRunExists as exc:
+        raise HTTPException(status_code=409, detail="当前 Agent 会话已有任务在运行") from exc
+    return StreamingResponse(
+        coordinated_agent_event_stream(session_id, record.run_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Viniper-Run-Id": record.run_id,
+        },
+    )
+
+
+@app.get("/api/runs/{session_id}/events")
+async def resume_agent_events(
+    session_id: str,
+    run_id: str = Query(min_length=1),
+    after_sequence: int = Query(default=0, ge=0),
+):
+    snapshot = coordinated_run_snapshot(session_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Agent run not found")
+    if str(snapshot.get("run_id") or "") != str(run_id):
+        raise HTTPException(status_code=409, detail="Agent run has changed")
+    return StreamingResponse(
+        coordinated_agent_event_stream(session_id, run_id, after_sequence),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Viniper-Run-Id": run_id},
+    )
+
+
+@app.get("/api/sessions/{session_id}/peers")
+async def get_native_peers(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"ok": True, "peer": await native_peer_status_payload(session_id)}
+
+
+async def ensure_viniper_coordination_sessions(port) -> dict[str, Any]:
+    """Project existing Viniper shell sessions through the host-owned Application Port."""
+    cfg = provider_config(None, MODE_VINIPER)
+    rows = []
+    for item in sessions.values():
+        if normalize_session_mode(item.get("mode")) != MODE_VINIPER:
+            continue
+        rows.append({
+            "native_session_id": str(item.get("id") or ""),
+            "workdir": str(item.get("workdir") or DATA_DIR),
+            "permission_mode": harness_permission_mode(session_permission_mode(item)),
+            "provider_id": str(cfg.get("provider") or "deepseek"),
+            "base_url": str(cfg.get("base_url") or ""),
+            "model": provider_model_id(cfg.get("model")),
+            # Host-to-bridge control channel only; never serialized to public API/logs.
+            "host_secret_value": str(cfg.get("api_key") or ""),
+            "agent": "viniper",
+        })
+    return await port.control("sessions.ensure", sessions=rows)
+
+
+def viniper_collaboration_session_ids() -> list[str]:
+    """Return the current Shell-owned Viniper session ids in display order."""
+    return [
+        str(session_id)
+        for session_id, item in sessions.items()
+        if normalize_session_mode(item.get("mode")) == MODE_VINIPER
+    ]
+
+
+def require_live_viniper_collaboration_session(session_id: str, field: str) -> str:
+    normalized = str(session_id or "").strip()
+    if normalized not in set(viniper_collaboration_session_ids()):
+        raise HTTPException(status_code=409, detail=f"{field} is not a current Viniper Shell session")
+    return normalized
+
+
+def filter_viniper_collaboration_snapshot(data: dict[str, Any], visible_ids: list[str]) -> dict[str, Any]:
+    """Keep persisted Harness state internal unless it belongs to a live Shell session."""
+    allowed = set(visible_ids)
+    projected = dict(data or {})
+    projected["sessions"] = [
+        item for item in projected.get("sessions", [])
+        if isinstance(item, dict) and str(item.get("native_session_id") or "") in allowed
+    ]
+    projected["envelopes"] = [
+        item for item in projected.get("envelopes", [])
+        if isinstance(item, dict)
+        and str(item.get("source_session_id") or "") in allowed
+        and str(item.get("target_session_id") or "") in allowed
+    ]
+    projected["waits"] = [
+        item for item in projected.get("waits", [])
+        if isinstance(item, dict)
+        and str(item.get("session_id") or "") in allowed
+        and (not item.get("from_session_id") or str(item.get("from_session_id")) in allowed)
+    ]
+    projected["subagents"] = [
+        item for item in projected.get("subagents", [])
+        if isinstance(item, dict)
+        and str(item.get("parent_session_id") or "") in allowed
+        and str(item.get("target_session_id") or "") in allowed
+    ]
+    return projected
+
+
+@app.get("/api/collaboration/{session_id}")
+async def collaboration_snapshot(session_id: str):
+    session = safe_session(session_id)
+    mode = normalize_session_mode(session.get("mode"))
+    if mode == MODE_VINIPER:
+        port = VINIPER_TRANSPORT.application_port
+        if port is None:
+            return {"ok": True, "mode": mode, "status": "unavailable", "reason": "Harness Application Port unavailable", "sessions": [], "subagents": []}
+        await ensure_viniper_coordination_sessions(port)
+        visible_ids = viniper_collaboration_session_ids()
+        data = await port.control("collaboration.snapshot", visible_native_session_ids=visible_ids)
+        data = filter_viniper_collaboration_snapshot(data, visible_ids)
+        return {"ok": True, "mode": mode, "status": "available", **data}
+    runtime = agent_runtime()
+    probe = await asyncio.to_thread(runtime.probe)
+    rows = await asyncio.to_thread(runtime.list_agent_view_sessions) if probe.capabilities.agent_view else []
+    return {
+        "ok": True,
+        "mode": mode,
+        "status": "available" if probe.capabilities.native_send_message else "unavailable",
+        "sessions": rows,
+        "subagents": copy.deepcopy(session.get("claude_agents") or []),
+        "reason": "" if probe.capabilities.native_send_message else "当前 Claude Code CLI 未在本会话暴露 SendMessage；--agents 仅代表子 Agent 定义能力",
+    }
+
+
+@app.post("/api/collaboration/{session_id}")
+async def collaboration_action(session_id: str, request: Request):
+    session = safe_session(session_id)
+    mode = normalize_session_mode(session.get("mode"))
+    body = await request.json()
+    action = str(body.get("action") or "")
+    if mode == MODE_VINIPER:
+        port = VINIPER_TRANSPORT.application_port
+        if port is None:
+            raise HTTPException(status_code=409, detail="Harness Application Port unavailable")
+        await ensure_viniper_coordination_sessions(port)
+        visible_ids = viniper_collaboration_session_ids()
+        visibility = {"visible_native_session_ids": visible_ids}
+        if action == "delegate":
+            target_session_id = require_live_viniper_collaboration_session(body.get("target_session_id"), "target_session_id")
+            data = await port.control(
+                "collaboration.delegate",
+                source_native_session_id=session_id,
+                target_native_session_id=target_session_id,
+                task=str(body.get("task") or "").strip(),
+                **visibility,
+            )
+        elif action == "send_message":
+            target_session_id = require_live_viniper_collaboration_session(body.get("target_session_id"), "target_session_id")
+            data = await port.control(
+                "collaboration.send",
+                source_native_session_id=session_id,
+                target_native_session_id=target_session_id,
+                message=str(body.get("message") or "").strip(),
+                **visibility,
+            )
+        elif action == "wait_for_result":
+            from_session_id = str(body.get("source_session_id") or "").strip()
+            if from_session_id:
+                from_session_id = require_live_viniper_collaboration_session(from_session_id, "source_session_id")
+            data = await port.control(
+                "collaboration.wait",
+                native_session_id=session_id,
+                from_native_session_id=from_session_id,
+                envelope_type=str(body.get("envelope_type") or "result"),
+                correlation_id=str(body.get("correlation_id") or ""),
+                timeout_ms=max(0, min(int(body.get("timeout_ms") or 0), 86_400_000)),
+                **visibility,
+            )
+        elif action == "cancel_wait":
+            data = await port.control(
+                "collaboration.cancel-wait",
+                native_session_id=session_id,
+                wait_id=str(body.get("wait_id") or ""),
+                **visibility,
+            )
+        elif action == "mark_read":
+            data = await port.control(
+                "collaboration.mark-read",
+                native_session_id=session_id,
+                envelope_id=str(body.get("envelope_id") or ""),
+                **visibility,
+            )
+        elif action == "spawn_subagent":
+            target_session_id = require_live_viniper_collaboration_session(body.get("target_session_id"), "target_session_id")
+            data = await port.control(
+                "subagent.spawn",
+                parent_native_session_id=session_id,
+                target_native_session_id=target_session_id,
+                prompt=str(body.get("task") or "").strip(),
+                permission_mode=session_permission_mode(session),
+                **visibility,
+            )
+        elif action == "cancel_subagent":
+            data = await port.control("subagent.cancel", id=str(body.get("subagent_id") or ""))
+        else:
+            raise HTTPException(status_code=400, detail="unknown collaboration action")
+        return {"ok": True, "mode": mode, "action": action, **data}
+    if action != "define_subagent":
+        raise HTTPException(status_code=409, detail="Claude code 当前只支持通过原生 --agents 定义子 Agent；直接委派需在运行中由 Claude 原生工具完成")
+    name = re.sub(r"[^A-Za-z0-9_-]", "-", str(body.get("name") or "subagent")).strip("-")[:48] or "subagent"
+    prompt = str(body.get("task") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="subagent prompt is required")
+    definitions = [item for item in session.get("claude_agents") or [] if isinstance(item, dict) and item.get("name") != name]
+    definitions.append({"name": name, "description": prompt[:160], "prompt": prompt[:8000]})
+    session["claude_agents"] = definitions[:16]
+    session["updated"] = now_ts()
+    save_sessions_to_disk()
+    return {"ok": True, "mode": mode, "action": action, "configured": True, "name": name, "count": len(session["claude_agents"])}
+
+
+@app.get("/api/runs/{session_id}/queue")
+async def get_agent_queue(session_id: str):
+    session = safe_session(session_id)
+    return {"ok": True, "session_id": session_id, "items": agent_queue_store().list(session_id)}
+
+
+@app.post("/api/runs/{session_id}/queue")
+async def enqueue_agent_message(session_id: str, request: Request):
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="queue body must be an object")
+    session = safe_session(session_id)
+    mode = normalize_session_mode(session.get("mode"))
+    requested_mode = str(body.get("mode") or "").strip()
+    if requested_mode and require_canonical_mode(requested_mode) != mode:
+        raise HTTPException(status_code=409, detail="queue mode does not match the immutable session owner")
+    coordinated_context = agent_run_coordinator().run_metadata(session_id)
+    if not coordinated_context:
+        raise HTTPException(status_code=409, detail="当前 Agent 未运行，请直接发送")
+    message = str(body.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="待发送内容不能为空")
+    attachments = save_run_attachments(session_id, body.get("attachments") or [])
+    item = agent_queue_store().enqueue(
+        session_id,
+        message,
+        mode=mode,
+        model=str(coordinated_context.get("model") or allowed_model("", mode)),
+        permission_mode=str(coordinated_context.get("permission_mode") or allowed_permission_mode(None, mode)),
+        attachments=attachments,
+    )
+    return {"ok": True, "queued": True, "item": item}
+
+
+@app.patch("/api/runs/{session_id}/queue/{item_id}")
+async def edit_agent_queue_item(session_id: str, item_id: str, request: Request):
+    safe_session(session_id)
+    try:
+        body = await request.json()
+        item = agent_queue_store().edit(session_id, item_id, str(body.get("message") or ""))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "item": item}
+
+
+@app.delete("/api/runs/{session_id}/queue/{item_id}")
+async def cancel_agent_queue_item(session_id: str, item_id: str):
+    safe_session(session_id)
+    try:
+        item = agent_queue_store().cancel(session_id, item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True, "cancelled": True, "item_id": item.get("id")}
+
+
+@app.post("/api/runs/{session_id}/cancel")
+async def cancel_run(session_id: str):
+    agent_queue_store().clear_authorization(session_id)
+    run = _active_runs.get(session_id)
+    snapshot = coordinated_run_snapshot(session_id)
+    coordinated_active = bool(snapshot and snapshot.get("active"))
+    if not run and not coordinated_active:
+        agent_interaction_broker.invalidate(session_id, reason="cancelled")
+        force_release_session_lock(session_id)
+        return {"ok": True, "cancelled": False}
+
+    if run:
+        run["cancel_requested"] = True
+    agent_interaction_broker.invalidate(session_id, reason="cancelled")
+    if run:
+        run["pending_interaction"] = None
+    if coordinated_active:
+        await agent_run_coordinator().request_cancel(session_id)
+    if run and run.get("kind") == MODE_VINIPER:
+        task = run.get("task") or _viniper_tasks.get(session_id)
+        if isinstance(task, asyncio.Task) and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+    elif run:
+        runtime = run.get("runtime")
+        if runtime is not None:
+            await runtime.cancel(session_id)
+        else:
+            await kill_process_tree(int(run.get("pid") or 0))
+    if coordinated_active:
+        await agent_run_coordinator().cancel(session_id)
+    force_release_session_lock(session_id)
+    return {"ok": True, "cancelled": True}
+
+
+@app.post("/api/runs/{session_id}/guidance")
+async def guide_active_agent(session_id: str, request: Request):
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="guidance body must be an object")
+    if set(body) - {"message"}:
+        raise HTTPException(status_code=400, detail="运行中引导只接受纯文本 message")
+    message = str(body.get("message") or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="运行中引导不能为空")
+    session = safe_session(session_id)
+    if normalize_session_mode(session.get("mode")) != MODE_CLAUDE:
+        raise HTTPException(status_code=409, detail="Viniper 不使用 Claude 运行中引导")
+    run = _active_runs.get(session_id)
+    if not isinstance(run, dict) or run.get("kind") != MODE_CLAUDE:
+        raise HTTPException(status_code=409, detail="当前会话没有正在运行的 Agent 任务")
+    if run.get("pending_interaction") or run.get("awaiting_interaction_ack") or agent_interaction_broker.unsettled_for(session_id):
+        raise HTTPException(status_code=409, detail="请先处理当前问题或权限请求")
+    try:
+        result = await active_agent_input_channel.send_guidance(session_id, message)
+    except ActiveAgentInputError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    run_session = run.get("session_record")
+    session = run_session if isinstance(run_session, dict) else safe_session(session_id)
+    session.setdefault("messages", []).append({
+        "role": "user",
+        "content": message,
+        "guidance": True,
+    })
+    session["updated"] = now_ts()
+    sessions[session_id] = session
+    save_sessions_to_disk()
+    return result
+
+
+@app.post("/api/runs/{session_id}/interaction")
+async def answer_run_interaction(session_id: str, request: Request):
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="interaction body must be an object")
+    run = _active_runs.get(session_id)
+    if run and run.get("kind") == MODE_VINIPER:
+        call_id = str(body.get("call_id") or body.get("request_id") or "")
+        decision = "allow-once" if str(body.get("action") or body.get("decision") or "") in {"allow", "allow-once", "allow_once", "accept"} else "reject"
+        try:
+            snapshot = coordinated_run_snapshot(session_id) or {}
+            pending = snapshot.get("pending_interaction") if isinstance(snapshot.get("pending_interaction"), dict) else {}
+            trace_run_id = str(snapshot.get("run_id") or "")
+            requested_run_id = str(body.get("run_id") or "")
+            pending_session_id = str(pending.get("session_id") or "")
+            pending_call_id = str(pending.get("call_id") or pending.get("request_id") or "")
+            engine_run_id = str(pending.get("engine_run_id") or "")
+            if not snapshot.get("active") or str(pending.get("type") or "") != "permission_request":
+                raise RuntimeError("Viniper permission interaction is stale or unknown")
+            if not requested_run_id or requested_run_id != trace_run_id:
+                raise RuntimeError("Viniper permission interaction belongs to a different coordinator run")
+            if pending_session_id and pending_session_id != session_id:
+                raise RuntimeError("Viniper permission interaction belongs to a different session")
+            if not call_id or call_id != pending_call_id:
+                raise RuntimeError("Viniper permission interaction belongs to a different tool call")
+            if not engine_run_id:
+                raise RuntimeError("Viniper permission interaction has no Harness engine run owner")
+            port = VINIPER_TRANSPORT.application_port
+            if port is None:
+                raise RuntimeError("Harness Application Port unavailable")
+            result = await port.resolve_permission(session_id, engine_run_id, call_id, decision)
+            if not result.get("resolved"):
+                raise RuntimeError("Viniper permission interaction is stale or unknown")
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"status": "resolved", "resolved": True, "call_id": call_id}
+    if not run or run.get("kind") != MODE_CLAUDE:
+        raise HTTPException(status_code=409, detail="没有正在等待交互的 Agent 任务")
+    try:
+        result = await agent_interaction_broker.resolve(
+            session_id,
+            str(body.get("request_id") or ""),
+            str(body.get("kind") or ""),
+            str(body.get("action") or ""),
+            stdin=run.get("stdin"),
+            run=run,
+            process_identity=str(run.get("process_identity") or ""),
+            answers=body.get("answers"),
+            value=body.get("value"),
+        )
+    except InteractionRequestError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    run["pending_interaction"] = None
+    request_id = str(body.get("request_id") or "")
+    if str(result.get("status") or "") == "awaiting_cli_ack":
+        run["awaiting_interaction_ack"] = request_id
+        await agent_run_coordinator().commit_interaction_response(
+            session_id,
+            request_id,
+            response_action=str(body.get("action") or ""),
+        )
+    else:
+        run["awaiting_interaction_ack"] = None
+        await agent_run_coordinator().resolve_interaction(session_id, request_id)
+    return result
+
+
+@app.post("/api/sessions")
+async def new_session(request: Request):
+    body: dict[str, Any] = {}
+    if request.headers.get("content-type", "").startswith("application/json"):
+        body = await request.json()
+    sid = str(uuid.uuid4())[:8]
+    mode = require_canonical_mode(body.get("mode"))
+    name = str(body.get("name") or "").strip()
+    if not name:
+        name = next_session_name(mode)
+    workdir = str(body.get("workdir") or BASE_DIR)
+    sessions[sid] = {
+        "id": sid,
+        "mode": mode,
+        "messages": [],
+        "created": now_ts(),
+        "updated": now_ts(),
+        "name": name,
+        "workdir": workdir,
+        "pinned": False,
+        "unread": False,
+        "last_run_status": "",
+        "claude_session_id": str(uuid.uuid4()),
+        "claude_initialized": False,
+        "summary": "",
+        "permission_mode": remembered_workdir_permission_mode(workdir, MODE_CLAUDE) if mode == MODE_CLAUDE else allowed_permission_mode(None, MODE_VINIPER),
+    }
+    save_sessions_to_disk()
+    return {
+        "session_id": sid,
+        "mode": mode,
+        "name": sessions[sid]["name"],
+        "workdir": sessions[sid]["workdir"],
+        "pinned": False,
+        "unread": False,
+        "runtime_state": "idle",
+        "updated": sessions[sid]["updated"],
+        "revision": context_revision(sessions[sid]),
+        "context_usage": context_usage_payload(sid),
+        "permission_mode": sessions[sid]["permission_mode"],
+    }
+
+
+@app.get("/api/sessions")
+async def list_sessions():
+    return {
+        "sessions": [
+            {
+                "id": sid,
+                "mode": normalize_session_mode(session.get("mode")),
+                "name": session.get("name") or sid,
+                "workdir": session.get("workdir") or "",
+                "count": len(session.get("messages", [])),
+                "created": session.get("created", 0),
+                "updated": session.get("updated", session.get("created", 0)),
+                "pinned": bool(session.get("pinned")),
+                "unread": bool(session.get("unread")),
+                "runtime_state": session_runtime_state(sid, session),
+                "pending_interaction": pending_interaction_for_session(sid),
+                "active_run": coordinated_run_snapshot(sid),
+                "revision": context_revision(session),
+                "context_usage": context_usage_payload(sid),
+                "permission_mode": str(session.get("permission_mode") or "default"),
+            }
+            for sid, session in sorted(sessions.items(), key=session_sort_key)
+        ]
+    }
+
+
+@app.get("/api/sessions/last")
+async def last_session(mode: str | None = None):
+    if not sessions:
+        return {"session": None}
+    target_mode = normalize_session_mode(mode) if mode is not None else None
+    scoped = [
+        (sid, session) for sid, session in sessions.items()
+        if target_mode is None or normalize_session_mode(session.get("mode")) == target_mode
+    ]
+    if not scoped:
+        return {"session": None}
+    # Workstation cold-starts intentionally land on the mode's durable empty
+    # home session.  Historical sessions remain available in the sidebar and
+    # are only restored after an explicit user click.
+    candidates = [(sid, session) for sid, session in scoped if not session.get("messages") and session_runtime_state(sid, session) == "idle"]
+    if not candidates:
+        candidates = scoped
+    sid, session = max(
+        candidates,
+        key=lambda item: item[1].get("updated", item[1].get("created", 0)),
+    )
+    return clean_payload_value({
+        "session": {
+            "session_id": sid,
+            "mode": normalize_session_mode(session.get("mode")),
+            "name": session.get("name", ""),
+            "workdir": session.get("workdir", str(BASE_DIR)),
+            "pinned": bool(session.get("pinned")),
+            "unread": bool(session.get("unread")),
+            "runtime_state": session_runtime_state(sid, session),
+            "pending_interaction": pending_interaction_for_session(sid),
+            "active_run": coordinated_run_snapshot(sid),
+            "messages": session.get("messages", []),
+            "message_count": len(session.get("messages", [])),
+            "updated": session.get("updated", session.get("created", 0)),
+            "revision": context_revision(session),
+            "context_usage": context_usage_payload(sid),
+            "permission_mode": str(session.get("permission_mode") or "default"),
+        }
+    })
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    sanitize_goal_session_messages(session_id)
+    session = safe_session(session_id)
+    session["unread"] = False
+    sessions[session_id] = session
+    save_sessions_to_disk()
+    return clean_payload_value({
+        "session_id": session_id,
+        "mode": normalize_session_mode(session.get("mode")),
+        "name": session.get("name", ""),
+        "workdir": session.get("workdir", str(BASE_DIR)),
+        "pinned": bool(session.get("pinned")),
+        "unread": bool(session.get("unread")),
+        "runtime_state": session_runtime_state(session_id, session),
+        "pending_interaction": pending_interaction_for_session(session_id),
+        "active_run": coordinated_run_snapshot(session_id),
+        "messages": session.get("messages", []),
+        "message_count": len(session.get("messages", [])),
+        "updated": session.get("updated", session.get("created", 0)),
+        "revision": context_revision(session),
+        "context_usage": context_usage_payload(session_id),
+        "permission_mode": str(session.get("permission_mode") or "default"),
+    })
+
+
+@app.get("/api/sessions/{session_id}/usage")
+async def get_session_usage(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"ok": True, "usage": context_usage_payload(session_id)}
+
+
+@app.put("/api/sessions/{session_id}")
+async def update_session(session_id: str, request: Request):
+    session = safe_session(session_id)
+    body = await request.json()
+    metadata_changed = False
+    if "name" in body:
+        session["name"] = str(body.get("name") or "")
+        metadata_changed = True
+    if "workdir" in body:
+        session["workdir"] = str(body.get("workdir") or BASE_DIR)
+        metadata_changed = True
+    if "pinned" in body:
+        session["pinned"] = bool(body.get("pinned"))
+    if "unread" in body:
+        session["unread"] = bool(body.get("unread"))
+    if "permission_mode" in body:
+        session_mode = normalize_session_mode(session.get("mode"))
+        session["permission_mode"] = require_permission_mode(body.get("permission_mode"), session_mode)
+        remember_workdir_permission_mode(session.get("workdir"), session["permission_mode"], session_mode)
+    if metadata_changed:
+        session["updated"] = now_ts()
+    save_sessions_to_disk()
+    return {"ok": True, "session": session}
+
+
+@app.post("/api/workspaces/remove")
+async def remove_workspace_binding(request: Request):
+    body = await request.json()
+    session_id = str(body.get("session_id") or "")
+    if not bool(body.get("confirm")):
+        return {"ok": True, "cancelled": True, "removed": False}
+    session = safe_session(session_id)
+    if _active_runs.get(session_id) or agent_run_coordinator().has_active(session_id):
+        raise HTTPException(status_code=409, detail="运行中的会话不能移除工作区绑定")
+    previous = str(session.get("workdir") or "")
+    existed_before = bool(previous and Path(previous).exists())
+    try:
+        session["workdir"] = ""
+        session["updated"] = now_ts()
+        save_sessions_to_disk()
+    except Exception:
+        session["workdir"] = previous
+        raise
+    return {
+        "ok": True,
+        "cancelled": False,
+        "removed": True,
+        "binding_cleared": True,
+        "physical_files_deleted": False,
+        "disk_exists_before": existed_before,
+        "disk_exists_after": bool(previous and Path(previous).exists()),
+    }
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session(session_id: str):
+    if _active_runs.get(session_id):
+        raise HTTPException(status_code=409, detail="运行中的会话必须先停止，才能删除。")
+    existed = session_id in sessions
+    session = sessions.get(session_id) or {}
+    if existed and normalize_provider_mode(session.get("mode")) == MODE_VINIPER:
+        try:
+            await VINIPER_TRANSPORT.application_port.delete_session(session_id)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=f"Harness 会话删除失败：{exc}") from exc
+    sessions.pop(session_id, None)
+    remove_session_runtime_data(session_id)
+    context_usage_ledger().remove(session_id)
+    save_sessions_to_disk()
+    return {"ok": True, "deleted": existed}
+
+
+@app.get("/api/skills")
+async def list_skills(mode: str = Query(default=MODE_VINIPER)):
+    selected_mode = normalize_provider_mode(mode)
+    return {
+        "ok": True,
+        "mode": selected_mode,
+        "engine": "claude-code-cli" if selected_mode == MODE_CLAUDE else "harness-runtime",
+        "skills": get_skills(selected_mode),
+        "sync": {"enabled": False, "reason": "两套引擎使用独立技能来源"},
+    }
+
+
+def claude_native_plugins() -> list[dict[str, Any]]:
+    roots = [Path.home() / ".claude" / "plugins", BASE_DIR / ".claude" / "plugins", APP_DIR / ".claude" / "plugins"]
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for manifest in sorted(root.glob("*/plugin.json"), key=lambda item: item.as_posix().casefold()):
+            try:
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            plugin_id = str(payload.get("id") or payload.get("name") or manifest.parent.name).strip()
+            if not plugin_id or plugin_id.casefold() in seen:
+                continue
+            seen.add(plugin_id.casefold())
+            records.append({"id": plugin_id, "name": str(payload.get("name") or plugin_id), "status": "available"})
+    return records
+
+
+@app.get("/api/plugins")
+async def list_plugins(mode: str = Query(default=MODE_VINIPER)):
+    selected_mode = normalize_provider_mode(mode)
+    if selected_mode == MODE_VINIPER:
+        port = VINIPER_TRANSPORT.application_port
+        if port is None:
+            return {"ok": True, "mode": selected_mode, "engine": "harness-runtime", "status": "unavailable", "plugins": []}
+        try:
+            payload = await port.control("plugins.snapshot")
+        except Exception:
+            return {"ok": True, "mode": selected_mode, "engine": "harness-runtime", "status": "unavailable", "plugins": []}
+        return {"ok": True, "mode": selected_mode, "engine": "harness-runtime", "status": "available", "plugins": payload.get("plugins") or []}
+    probe = await asyncio.to_thread(agent_runtime().probe)
+    return {
+        "ok": True,
+        "mode": selected_mode,
+        "engine": "claude-code-cli",
+        "status": "available" if probe.capabilities.native_cli else "unavailable",
+        "plugins": claude_native_plugins(),
+    }
+
+
+@app.get("/api/skills/{filename:path}")
+async def read_skill(filename: str, mode: str = Query(default=MODE_VINIPER)):
+    selected_mode = normalize_provider_mode(mode)
+    if not filename or not filename.endswith(".md"):
+        raise HTTPException(status_code=400, detail="invalid skill filename")
+    skill = next((item for item in get_skills(selected_mode) if item.get("id") == filename), None)
+    path = skill_file_from_record(skill, selected_mode) if skill else None
+    if not path:
+        raise HTTPException(status_code=404, detail="skill not found")
+    return {
+        "id": filename,
+        "filename": path.name,
+        "source": skill.get("source", "") if skill else "",
+        "display_name": skill.get("display_name", "") if skill else "",
+        "display_description": skill.get("display_description", "") if skill else "",
+        "display_category": skill.get("display_category", "") if skill else "",
+        "mode": selected_mode,
+        "availability": copy.deepcopy(skill.get("availability") or {}) if skill else {},
+        "content": path.read_text(encoding="utf-8", errors="replace"),
+    }
+
+
+DEFAULT_AUTO_COMPACT_THRESHOLD = 0.95
+CONTEXT_COMPRESS_THRESHOLD = DEFAULT_AUTO_COMPACT_THRESHOLD
+CONTEXT_LIMITS = {
+    "deepseek-v4-pro[1m]": 1000000,
+    "deepseek-v4-flash": 128000,
+}
+
+
+def context_limit_for_model(model: str) -> int:
+    return CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+
+
+def effective_auto_compact_threshold() -> float:
+    """Return the native Claude Code auto-compact threshold as a ratio."""
+    raw = env_value("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "").strip()
+    if not raw:
+        return DEFAULT_AUTO_COMPACT_THRESHOLD
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_AUTO_COMPACT_THRESHOLD
+    if value > 1:
+        value /= 100.0
+    return min(max(value, 0.5), 0.99)
+
+
+def context_revision(session: dict[str, Any]) -> str:
+    """Return a monotonic-enough revision without reading message contents."""
+    updated = float(session.get("updated") or session.get("created") or 0)
+    message_count = len(session.get("messages", []))
+    claude_session_id = str(session.get("claude_session_id") or "")
+    return f"{updated:.6f}:{message_count}:{claude_session_id}"
+
+
+def split_context_messages(messages: list[dict[str, Any]], threshold_tokens: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    keep_count = min(15, len(messages) // 2)
+    target_keep = 0
+    char_budget = threshold_tokens * 3
+    running = 0
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        running += len(str(message.get("content", ""))) + len(str(message.get("thinking", "")))
+        if running > char_budget * 0.4:
+            target_keep = len(messages) - index
+            break
+    keep_count = max(keep_count, min(target_keep, len(messages) - 1))
+    keep_count = max(5, min(keep_count, len(messages)))
+    return messages[:-keep_count], messages[-keep_count:]
+
+
+def compression_prompt(messages: list[dict[str, Any]], existing_summary: str, threshold_tokens: int) -> str:
+    old_messages, _ = split_context_messages(messages, threshold_tokens)
+    lines: list[str] = []
+    if existing_summary:
+        lines.append(f"[此前摘要]: {existing_summary}")
+    for message in old_messages:
+        role = "用户" if message.get("role") == "user" else ("摘要" if message.get("role") == "system" else "助手")
+        content = str(message.get("content", ""))[:800]
+        if content:
+            lines.append(f"[{role}]: {content}")
+    conversation_text = "\n".join(lines)
+    return (
+        "请用简洁的中文总结以下对话历史，保留关键决策、文件路径、错误和重要结论。"
+        "不要遗漏用户提出的需求或问题。控制在300字以内。\n\n"
+        f"{conversation_text}"
+    )
+
+
+async def summarize_with_deepseek(
+    messages: list[dict[str, Any]],
+    existing_summary: str,
+    model: str,
+) -> str:
+    """External fallback only; never used as proof of native Claude compaction."""
+    import urllib.request
+
+    cfg = deepseek_config()
+    api_key = cfg["api_key"]
+    if not api_key:
+        raise ContextAdapterUnavailable("no external summary API key")
+
+    threshold = int(context_limit_for_model(model) * effective_auto_compact_threshold())
+    summary_prompt = compression_prompt(messages, existing_summary, threshold)
+
+    try:
+        req_body = json.dumps({
+            "model": "deepseek-chat",
+            "messages": [
+                {"role": "system", "content": "你是一个对话摘要助手。输出简洁摘要。"},
+                {"role": "user", "content": summary_prompt},
+            ],
+            "max_tokens": 600,
+            "temperature": 0.3,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.deepseek.com/v1/chat/completions",
+            data=req_body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None, lambda: urllib.request.urlopen(req, timeout=30)
+        )
+        result = json.loads(resp.read().decode("utf-8"))
+        summary = result["choices"][0]["message"]["content"].strip()
+    except Exception as exc:
+        raise RuntimeError(f"summary failed: {exc}") from exc
+
+    if not summary:
+        raise ContextAdapterUnavailable("external summary was empty")
+    return summary
+
+
+async def persist_context_summary(
+    session_id: str,
+    revision: str,
+    summary: str,
+    snapshot: list[dict[str, Any]],
+    threshold_tokens: int,
+) -> bool:
+    current = safe_session(session_id)
+    if context_revision(current) != revision:
+        return False
+
+    _, recent_messages = split_context_messages(snapshot, threshold_tokens)
+    candidate = copy.deepcopy(current)
+    candidate["messages"] = [
+        {"role": "system", "content": f"[上下文摘要] {summary}"},
+        *recent_messages,
+    ]
+    candidate["summary"] = summary
+    candidate["claude_session_id"] = str(uuid.uuid4())
+    candidate["claude_initialized"] = False
+    candidate["updated"] = now_ts()
+    previous = sessions.get(session_id)
+    sessions[session_id] = candidate
+    try:
+        save_sessions_to_disk()
+    except Exception:
+        if previous is not None:
+            sessions[session_id] = previous
+        else:
+            sessions.pop(session_id, None)
+        raise
+    return True
+
+
+def context_lifecycle() -> ContextLifecycle:
+    global _context_lifecycle
+    if _context_lifecycle is None:
+        async def unavailable_external(messages: list[dict[str, Any]], existing_summary: str) -> str:
+            raise ContextAdapterUnavailable("external summary adapter requires a configured provider")
+
+        _context_lifecycle = ContextLifecycle(
+            NativeContextAdapter(),
+            ExternalSummaryAdapter(unavailable_external, semantic_key="external-summary:unavailable"),
+            threshold=CONTEXT_COMPRESS_THRESHOLD,
+        )
+    return _context_lifecycle
+
+
+@app.post("/api/compress/{session_id}")
+async def compress_context(session_id: str, request: Request):
+    """Compatibility endpoint; native Claude Code exclusively owns compaction."""
+    session = safe_session(session_id)
+    return {
+        "ok": True,
+        "compressed": False,
+        "reason": "native_compaction_only",
+        "status": "idle",
+        "session_id": session_id,
+        "claude_session_id": str(session.get("claude_session_id") or ""),
+        "usage": context_usage_payload(session_id),
+    }
+
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+def _startup_cleanup() -> None:
+    """Reconcile exact journaled owners and make interrupted turns visible."""
+    loaded = load_sessions_from_disk()
+    sessions.clear()
+    sessions.update(loaded)
+    recovered = reconcile_orphaned_agent_runs(
+        sessions,
+        journal=agent_run_journal(),
+        runtime=agent_runtime(),
+        interaction_store=durable_interaction_store(),
+    )
+    for sid, session in sessions.items():
+        cleaned_messages = []
+        session_changed = False
+        for msg in session.get("messages", []):
+            if isinstance(msg, dict) and is_leaked_goal_control_message(msg):
+                session_changed = True
+                continue
+            if isinstance(msg, dict) and msg.get("pending"):
+                session_changed = True
+                detail = "应用在任务完成前重新启动；本轮已中断，可重新发送。"
+                msg["content"] = str(msg.get("content") or detail)
+                msg["segments"] = finalize_transcript_segments(msg.get("segments"))
+                if not msg["segments"] and msg["content"]:
+                    msg["segments"] = [{"type": "text", "content": msg["content"]}]
+                msg["error"] = "backend_restarted"
+                msg["retryable"] = True
+                msg.pop("pending", None)
+                msg.pop("thinking", None)
+                session["last_run_status"] = "failed"
+                session["unread"] = True
+            cleaned_messages.append(msg)
+        session["messages"] = cleaned_messages
+        if session_changed:
+            session["updated"] = now_ts()
+    save_sessions_to_disk()
+    _session_locks.clear()
+    print(f"  Startup cleanup: {len(sessions)} sessions normalized; {len(recovered)} journal entries reconciled.")
+
+
+if __name__ == "__main__":
+    import webbrowser
+
+    import uvicorn
+
+    _startup_cleanup()
+
+    port = int(env_value("VINIPER_UI_PORT", "17373"))
+    url = f"http://127.0.0.1:{port}"
+    print(f"\n  {APP_TITLE} -> {url}\n")
+    if env_value("VINIPER_UI_OPEN_BROWSER", "1") != "0":
+        webbrowser.open(url)
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
+
+

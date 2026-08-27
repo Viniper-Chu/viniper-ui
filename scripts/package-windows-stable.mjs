@@ -1,0 +1,225 @@
+import { spawnSync } from "node:child_process";
+import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { stageLegacyUi } from "./stage-legacy-ui.mjs";
+
+// Stable release lane.  Preview packaging remains a separate script and
+// artifact; this lane has its own app id and installer identity while the
+// runtime deliberately leases the existing Workstation Preview data root.
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const desktopRoot = join(repositoryRoot, "resources", "viniper-ui", "desktop");
+// Keep all generated candidates and build residue under this checkout's
+// codex directory; the parent D:\Viniper workstation\codex is a separate
+// historical workspace and is never an output location for this release.
+const codexRoot = resolve(repositoryRoot, "codex");
+const outputRoot = resolve(process.env.VINIPER_WINDOWS_STABLE_OUTPUT_ROOT
+  || join(codexRoot, "工作输出", "viniper-github-workstation-v1.6.0-20260827", "workflow", "candidate", "stable"));
+const residueRoot = resolve(process.env.VINIPER_WINDOWS_STABLE_RESIDUE_ROOT
+  || join(codexRoot, "运行残留", "viniper-github-workstation-v1.6.0-20260827-stable"));
+const stageRoot = join(residueRoot, "stable-stage");
+const builderRoot = join(residueRoot, "stable-electron-builder");
+const portableFolderName = "Viniper-workstation-win32-x64";
+const stagePortable = join(stageRoot, portableFolderName);
+const finalPortable = join(outputRoot, portableFolderName);
+const zipPath = join(outputRoot, `${portableFolderName}.zip`);
+const installerPath = join(outputRoot, "Viniper-workstation-Setup.exe");
+const builderConfigPath = join(residueRoot, "stable-electron-builder.json");
+const builderTimeoutMs = Number(process.env.VINIPER_ELECTRON_BUILDER_TIMEOUT_MS || 1_200_000);
+
+if (process.platform !== "win32" || process.arch !== "x64") {
+  throw new Error(`Windows x64 Stable 只允许在 win32/x64 构建；当前为 ${process.platform}/${process.arch}。`);
+}
+
+const sourcePackage = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8"));
+if (sourcePackage.version !== "1.6.0") {
+  throw new Error(`Stable 仅支持 v1.6.0，当前为 ${sourcePackage.version}。`);
+}
+const profiles = JSON.parse(await readFile(join(repositoryRoot, "resources", "viniper-ui", "profiles.json"), "utf8"));
+const profile = profiles.stable;
+if (!profile || profile.port !== 17947 || profile.app_id !== "com.viniper.workstation") {
+  throw new Error("Stable profile 必须使用 com.viniper.workstation 与 17947。 ");
+}
+if (profile.data_dir_name !== "Viniper workstation Preview") {
+  throw new Error("Stable 必须保留 Workstation Preview 数据根兼容策略。 ");
+}
+
+await safeReset(stageRoot, residueRoot);
+await safeReset(builderRoot, residueRoot);
+await mkdir(stageRoot, { recursive: true });
+await mkdir(builderRoot, { recursive: true });
+await mkdir(outputRoot, { recursive: true });
+await safeReset(finalPortable, outputRoot);
+await safeRemoveFile(zipPath, outputRoot);
+await safeRemoveFile(installerPath, outputRoot);
+await safeRemoveFile(builderConfigPath, residueRoot);
+
+const electronDistribution = join(repositoryRoot, "node_modules", "electron", "dist");
+await access(join(electronDistribution, "electron.exe"));
+await access(join(repositoryRoot, "dist", "src", "platform", "desktop", "main.js"));
+const electronBuilder = join(desktopRoot, "node_modules", ".bin", "electron-builder.cmd");
+await access(electronBuilder);
+
+await cp(electronDistribution, stagePortable, { recursive: true });
+await rename(join(stagePortable, "electron.exe"), join(stagePortable, "Viniper workstation.exe"));
+const applicationRoot = join(stagePortable, "resources", "app");
+await mkdir(applicationRoot, { recursive: true });
+await stageLegacyUi({ repositoryRoot, stagePortable, desktopProfile: "stable" });
+await cp(join(repositoryRoot, "assets", "branding"), join(applicationRoot, "assets", "branding"), { recursive: true });
+
+const brandingManifest = JSON.parse(await readFile(join(repositoryRoot, "assets", "branding", "manifest.json"), "utf8"));
+const brandingAsset = (name) => ["resources/viniper-ui/static/assets", name].join("/");
+await writeFile(join(applicationRoot, "package.json"), `${JSON.stringify({
+  name: "viniper-workstation",
+  version: sourcePackage.version,
+  private: true,
+  main: "main.js",
+  viniperProfile: "stable",
+  releaseStage: "Stable",
+}, null, 2)}\n`, "utf8");
+await writeFile(join(applicationRoot, "portable-manifest.json"), `${JSON.stringify({
+  product: "Viniper workstation",
+  version: sourcePackage.version,
+  releaseStage: "Stable",
+  preview: false,
+  platform: "win32",
+  architecture: "x64",
+  capabilities: [
+    "sessions", "multi-run", "coordination", "token-cache", "scheduler", "skills", "mcp-plugin",
+    "provider-settings", "local-models", "memory", "context-compaction", "project-index", "artifacts",
+    "data-transfer", "credential-transfer", "diagnostics", "updates", "settings", "native-tray",
+  ],
+  entry: "main.js",
+  runtimeAssets: "resources/viniper-ui",
+  icon: {
+    runtime: brandingAsset(brandingManifest.nativeFallback),
+    tray: brandingAsset(brandingManifest.nativeSmall),
+    windowsIco: brandingAsset(brandingManifest.windowsIco),
+    pngRuntimeVerified: true,
+    icoRuntimeVerified: true,
+  },
+  dataCompatibility: {
+    profile: "stable",
+    dataRootName: "Viniper workstation Preview",
+    policy: "Stable 1.6.x leases the existing Preview root; no copy, migration, clear, or overwrite.",
+  },
+  userInstall: {
+    defaultDirectory: "%LOCALAPPDATA%\\Programs\\Viniper workstation",
+    desktopShortcut: "Viniper workstation.lnk",
+    startMenuShortcut: "Viniper workstation.lnk",
+    services: false,
+    scheduledTasks: false,
+    startup: false,
+    fileAssociations: false,
+    machineRegistry: false,
+  },
+}, null, 2)}\n`, "utf8");
+
+await cp(stagePortable, finalPortable, { recursive: true });
+await createZip(zipPath, outputRoot, portableFolderName);
+
+const builderConfig = {
+  appId: profile.app_id,
+  productName: profile.product_name,
+  directories: { output: builderRoot },
+  win: {
+    target: ["nsis"],
+    icon: resolve(repositoryRoot, "assets", "branding", "viniper-harness-circuit-node.ico"),
+    signAndEditExecutable: true,
+  },
+  nsis: {
+    oneClick: false,
+    perMachine: false,
+    allowToChangeInstallationDirectory: false,
+    createDesktopShortcut: true,
+    createStartMenuShortcut: true,
+    shortcutName: "Viniper workstation",
+    runAfterFinish: false,
+    artifactName: "Viniper-workstation-Setup.${ext}",
+  },
+};
+await writeFile(builderConfigPath, `${JSON.stringify(builderConfig, null, 2)}\n`, "utf8");
+const builder = spawnSync(process.env.ComSpec || "cmd.exe", [
+  "/d", "/c", "call", electronBuilder,
+  "--prepackaged", stagePortable,
+  "--win", "nsis", "--x64", "--publish", "never",
+  "--config", builderConfigPath,
+], {
+  cwd: desktopRoot,
+  encoding: "utf8",
+  windowsHide: true,
+  timeout: builderTimeoutMs,
+});
+if (builder.stdout) process.stdout.write(builder.stdout);
+if (builder.stderr) process.stderr.write(builder.stderr);
+if (builder.error?.code === "ETIMEDOUT") {
+  throw new Error(`electron-builder Stable 创建超时（${builderTimeoutMs}ms）。`);
+}
+if (builder.status !== 0) {
+  throw new Error(`electron-builder Stable 创建失败：${builder.stderr || builder.stdout || "无详情"}`);
+}
+const installerNames = (await readdir(builderRoot)).filter((name) => name === "Viniper-workstation-Setup.exe");
+if (installerNames.length !== 1) {
+  throw new Error(`Stable NSIS 应生成唯一 Viniper-workstation-Setup.exe：${JSON.stringify(installerNames)}`);
+}
+await cp(join(builderRoot, installerNames[0]), installerPath);
+const installerStat = await stat(installerPath);
+if (installerStat.size <= 0) throw new Error("Stable NSIS Setup 为空。 ");
+
+await writeFile(join(outputRoot, "install-metadata.json"), `${JSON.stringify({
+  product: "Viniper workstation",
+  version: sourcePackage.version,
+  releaseStage: "Stable",
+  appId: profile.app_id,
+  installerKind: "electron-builder-nsis",
+  portableDirectory: portableFolderName,
+  portableZip: `${portableFolderName}.zip`,
+  installer: "Viniper-workstation-Setup.exe",
+  defaultInstallDirectory: "%LOCALAPPDATA%\\Programs\\Viniper workstation",
+  dataRoot: "%APPDATA%\\Viniper workstation Preview",
+  dataRootPolicy: "reuse-and-lease-existing-preview-root",
+  desktopShortcut: "Viniper workstation.lnk",
+  nativeSetup: true,
+  publicRelease: true,
+  previewRollback: "scripts/package-windows-preview.mjs",
+}, null, 2)}\n`, "utf8");
+
+await safeReset(stageRoot, residueRoot);
+await safeReset(builderRoot, residueRoot);
+await safeRemoveFile(builderConfigPath, residueRoot);
+process.stdout.write(`${JSON.stringify({
+  status: "WINDOWS_STABLE_PACKAGE_READY",
+  installerKind: "electron-builder-nsis",
+  profile: "stable",
+  executable: join(finalPortable, "Viniper workstation.exe"),
+  portable: finalPortable,
+  archive: zipPath,
+  installer: installerPath,
+})}\n`);
+
+async function createZip(target, cwd, folder) {
+  const archive = spawnSync("tar.exe", ["-a", "-c", "-f", target, "-C", cwd, folder], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (archive.status !== 0) {
+    throw new Error(`Windows Stable portable 压缩失败：${archive.stderr || archive.stdout || "tar.exe 未提供详情"}`);
+  }
+}
+
+async function safeReset(target, expectedParent) {
+  assertDirectChild(target, expectedParent);
+  await rm(target, { recursive: true, force: true });
+}
+
+async function safeRemoveFile(target, expectedParent) {
+  assertDirectChild(target, expectedParent);
+  await rm(target, { force: true });
+}
+
+function assertDirectChild(target, expectedParent) {
+  if (resolve(dirname(target)) !== resolve(expectedParent)) {
+    throw new Error(`拒绝清理非预期路径：${target}`);
+  }
+}

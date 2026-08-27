@@ -1,0 +1,223 @@
+@import url("./v015-viniper-shell.css");
+
+/* v0.16: Viniper desktop shell. Cyan identity is retained; chrome and content
+   density follow the read-only Viniper reference instead of a dashboard. */
+:root {
+  --rail-width: 286px;
+  --context-width: 390px;
+  --titlebar-height: 48px;
+  --viniper-canvas: #fcfefe;
+  --viniper-rail: #f6faf9;
+  --viniper-hover: #edf7f6;
+  --viniper-border: #dce9e7;
+  --viniper-text: #13343a;
+  --viniper-muted: #6c8184;
+}
+
+html, body { overflow: hidden; background: var(--viniper-canvas); }
+body { color: var(--viniper-text); }
+.app-shell { background: var(--viniper-canvas); }
+
+/* Continuous custom window bar. */
+.app-titlebar {
+  min-height: var(--titlebar-height);
+  border-bottom: 1px solid var(--viniper-border);
+  background: rgba(252, 254, 254, .98);
+  box-shadow: none;
+}
+.titlebar-leading { padding-left: 10px; }
+.titlebar-brand .brand-mark { width: 32px; height: 32px; flex-basis: 32px; border-radius: 11px; box-shadow: none; }
+.titlebar-brand strong { max-width: 150px; color: var(--viniper-text); font-size: 15px; font-weight: 720; }
+.menu-trigger, .titlebar-action, .titlebar-icon { border-radius: 8px; }
+.menu-trigger:hover, .titlebar-action:hover { background: var(--viniper-hover); }
+
+/* Session rail. */
+.sidebar {
+  padding: 12px 10px 9px;
+  border-right: 1px solid var(--viniper-border);
+  background: var(--viniper-rail);
+  box-shadow: none;
+}
+.sidebar-quick-grid { gap: 2px; padding: 0 0 10px; }
+.sidebar-quick-action { height: 48px; border-radius: 9px; color: #5f777b; }
+.sidebar-quick-action:hover, .sidebar-quick-action:focus-visible { border-color: transparent; background: var(--viniper-hover); }
+.sidebar-quick-action span { font-size: 12px; }
+.session-rail-heading { border-top-color: var(--viniper-border); }
+.session-search { height: 38px; border-color: var(--viniper-border); border-radius: 10px; background: #fff; }
+.session-filter-drawer { margin-bottom: 2px; }
+.session-list { min-height: 0; flex: 1; }
+.session-group-label { padding: 12px 8px 4px; }
+.session-item { min-height: 55px; border-radius: 10px; }
+.session-item:hover { background: #f0f7f6; }
+.session-item.active { background: #e8f5f4; box-shadow: inset 3px 0 #168a91; }
+.session-main { padding-block: 8px; }
+.session-title { font-size: 14px; }
+.session-actions { padding-right: 3px; }
+.session-action, .session-action-remove { width: 26px; height: 26px; }
+.sidebar-footer-row {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: auto;
+  padding: 5px 2px 0;
+  border-top: 1px solid var(--viniper-border);
+}
+.sidebar-notification { min-width: 0; flex: 1; border: 0; padding: 4px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sidebar-settings-button {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  color: var(--ink-secondary);
+  background: transparent;
+}
+.sidebar-settings-button:hover, .sidebar-settings-button:focus-visible { color: var(--accent-deep); background: var(--viniper-hover); }
+.sidebar-settings-button .ui-icon { width: 18px; height: 18px; }
+
+/* Main conversation surface. */
+.main-column { min-width: 0; background: var(--viniper-canvas); }
+.session-header {
+  min-height: 76px;
+  padding: 0 22px 0 28px;
+  border-bottom: 1px solid var(--viniper-border);
+  background: var(--viniper-canvas);
+}
+.session-title-button h1 { color: #092f37; font-size: 21px; font-weight: 740; }
+.session-path { color: var(--viniper-muted); font-size: 13px; }
+.session-header-tools { gap: 6px; }
+.header-icon { width: 36px; height: 36px; border-radius: 9px; }
+.header-icon:hover, .header-icon:focus-visible, .header-icon.active { border-color: transparent; background: #eaf6f5; }
+.agent-view { background: var(--viniper-canvas); }
+.run-stack { width: min(920px, calc(100% - 44px)); margin: 0 auto; padding: 10px 0 0; }
+.run-stack:empty { display: none; }
+.run-stack-item { min-height: 42px; padding: 8px 12px; border: 1px solid var(--viniper-border); border-radius: 9px; background: #f6fbfa; }
+.conversation { padding: 28px clamp(24px, 7vw, 104px) 28px; }
+.message-list { width: min(860px, 100%); min-width: 0; margin: 0 auto; }
+.message {
+  min-width: 0;
+  max-width: 100%;
+  margin: 0 0 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.message.user { width: fit-content; max-width: min(720px, 88%); margin-left: auto; padding: 11px 14px; border-radius: 14px 14px 4px 14px; background: #eef7f6; }
+.message.assistant { margin-right: auto; }
+.message-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; color: var(--viniper-muted); font-size: 12px; }
+.message-heading strong { color: var(--viniper-text); font-size: 13px; }
+.message.assistant .message-heading { display: none; }
+.message-text {
+  min-width: 0;
+  color: #17383e;
+  font-size: 16px;
+  line-height: 1.72;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+.message.streaming .message-text::after { content: ""; display: inline-block; width: 6px; height: 1em; margin-left: 3px; border-radius: 2px; vertical-align: -.12em; background: var(--accent-main); animation: viniper-caret 1s steps(2, end) infinite; }
+@keyframes viniper-caret { 50% { opacity: .2; } }
+
+/* Viniper reasoning: a quiet disclosure row, never a giant timeline card. */
+.reasoning-block { width: 100%; min-width: 0; margin: 2px 0 24px; border: 0; color: var(--viniper-muted); }
+.reasoning-block > summary {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  padding: 5px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  list-style: none;
+}
+.reasoning-block > summary::-webkit-details-marker { display: none; }
+.reasoning-block > summary:hover { background: var(--viniper-hover); }
+.reasoning-block > summary strong { color: #466166; font-size: 13px; font-weight: 650; }
+.reasoning-pulse { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: #29b4b1; }
+.reasoning-block.running .reasoning-pulse { box-shadow: 0 0 0 4px rgba(41, 180, 177, .12); animation: reasoning-pulse 1.2s ease-in-out infinite; }
+@keyframes reasoning-pulse { 50% { opacity: .45; transform: scale(.82); } }
+.reasoning-status { font-size: 12px; }
+.reasoning-content { min-width: 0; margin: 4px 0 0 11px; padding: 2px 0 2px 14px; border-left: 1px solid #cee1df; }
+.reasoning-step {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 7px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 9px;
+  padding: 7px 4px 7px 0;
+}
+.reasoning-step-mark { width: 5px; height: 5px; margin-top: 7px; border-radius: 50%; background: #a5bdbd; }
+.reasoning-step.tool .reasoning-step-mark { background: #22a49f; }
+.reasoning-step.error .reasoning-step-mark, .reasoning-step.failed .reasoning-step-mark { background: #c45b69; }
+.reasoning-step > div { min-width: 0; }
+.reasoning-step strong { display: block; color: #38565b; font-size: 13px; font-weight: 630; }
+.reasoning-copy { max-width: 100%; margin: 3px 0 0; color: #6b8184; font-size: 13px; line-height: 1.58; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; }
+.reasoning-step-status { padding-top: 1px; color: #829598; font-size: 12px; white-space: nowrap; }
+
+.empty-state { color: var(--viniper-muted); }
+.empty-token-status { padding: 12px 16px; border-radius: 10px; }
+.empty-token-status strong { font-size: 15px; }
+
+/* Composer follows Viniper's compact bottom bar. */
+.composer-region { padding: 10px clamp(18px, 5vw, 74px) 18px; background: var(--viniper-canvas); }
+.composer { max-width: 920px; padding: 12px 13px 11px; border-color: #bcd8d6; border-radius: 14px; box-shadow: 0 10px 34px rgba(19, 72, 78, .08); }
+.composer:focus-within { border-color: #36a9aa; box-shadow: 0 10px 36px rgba(19, 108, 114, .12); }
+.composer textarea { min-height: 56px; font-size: 16px; }
+.composer-footer { align-items: flex-end; }
+.composer-controls select { height: 36px; border-color: var(--viniper-border); background: #f8fbfb; }
+#permissionSelect { min-width: 110px; color: #24585e; }
+.send-button { width: 38px; min-width: 38px; padding: 0; border-radius: 10px; }
+.cancel-button { min-height: 36px; }
+
+/* Viniper context meter and anchored usage popover. */
+.usage-trigger { position: relative; height: 36px; min-height: 36px; border-color: var(--viniper-border); border-radius: 9px; background: #f8fbfb; }
+.usage-ring { width: 31px; height: 31px; flex: 0 0 31px; border-color: #cbdedc; border-top-color: #21a3a3; font-size: 12px; line-height: 1; white-space: nowrap; }
+.usage-trigger-copy strong { font-size: 12px; }
+.usage-trigger-copy small { max-width: 74px; overflow: hidden; text-overflow: ellipsis; }
+.token-usage-popover {
+  position: fixed;
+  right: clamp(76px, 8vw, 132px);
+  bottom: 84px;
+  z-index: 120;
+  width: min(390px, calc(100vw - 28px));
+  max-height: min(560px, calc(100vh - 130px));
+  padding: 15px;
+  overflow: auto;
+  border: 1px solid var(--viniper-border);
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 18px 60px rgba(14, 55, 61, .17);
+}
+.token-usage-popover .dialog-heading { margin: 0 0 8px; padding: 0; }
+.token-usage-popover .dialog-heading h2 { font-size: 16px; }
+.token-usage-popover .usage-hero { margin: 0; padding: 10px 12px; border-radius: 9px; }
+.token-usage-popover .usage-hero > strong { font-size: 22px; }
+.token-usage-popover .usage-grid { grid-template-columns: 1fr 1fr; gap: 6px; }
+.token-usage-popover .usage-section { padding: 9px; }
+.token-usage-popover .usage-section h3 { font-size: 13px; }
+.token-usage-popover .usage-token-row strong { font-size: 12px; }
+.token-usage-popover .usage-total { grid-column: 1 / -1; }
+.token-usage-popover .usage-total > strong { font-size: 20px; }
+
+/* Right panel stays opt-in and continuous with the canvas. */
+.inspector { border-left-color: var(--viniper-border); background: #f8fbfb; }
+.context-drawer-heading, .inspector-tabs { border-bottom-color: var(--viniper-border); }
+.change-item { border-color: var(--viniper-border); box-shadow: none; }
+
+/* Settings remain a separate progressive layer but launch only from bottom-left. */
+.settings-dialog, #productSettingsDialog { border-radius: 16px; }
+
+@media (max-width: 760px) {
+  .sidebar-footer-row { margin-top: auto; }
+  .reasoning-step { grid-template-columns: 7px minmax(0, 1fr); }
+  .reasoning-step-status { display: none; }
+  .message.user { max-width: 94%; }
+  .token-usage-popover { right: 14px; bottom: 82px; }
+}

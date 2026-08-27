@@ -1,0 +1,60 @@
+{
+  "formal": {
+    "app_id": "com.viniper.desktop",
+    "product_name": "Viniper",
+    "port": 17373,
+    "data_dir_name": "Viniper",
+    "install_dir": "D:\\Viniper",
+    "shortcut_name": "Viniper.lnk",
+    "writable": true,
+    "mode": "future-target",
+    "compatibility_read_boundary": "only approved legacy sources may be read during a separately authorized migration; never write back to legacy"
+  },
+  "preview": {
+    "app_id": "com.viniper.workstation.preview",
+    "product_name": "Viniper workstation",
+    "port": 17947,
+    "data_dir_name": "Viniper workstation Preview",
+    "install_dir": "D:\\Viniper workstation\\codex\\工作输出\\viniper-native-workstation-rebase-20260817\\candidate\\Viniper workstation Preview",
+    "shortcut_name": "Viniper workstation.lnk",
+    "writable": true,
+    "mode": "isolated-workstation-preview",
+    "compatibility_read_boundary": "isolated workstation Preview root; no formal or legacy import by default, and any explicit import must land in a newly created Preview root"
+  },
+  "stable": {
+    "app_id": "com.viniper.workstation",
+    "product_name": "Viniper workstation",
+    "port": 17947,
+    "data_dir_name": "Viniper workstation Preview",
+    "install_dir": "%LOCALAPPDATA%\\Programs\\Viniper workstation",
+    "shortcut_name": "Viniper workstation.lnk",
+    "writable": true,
+    "mode": "stable-workstation-compatible-data-root",
+    "compatibility_read_boundary": "1.6.x Stable reuses the existing Workstation Preview data root under an exclusive data-root lease; no copy, migration, clear, or overwrite is performed"
+  },
+  "legacy_read_only": {
+    "app_ids": [
+      "com.viniper.ui.desktop",
+      "com.viniper.ui.desktop.preview"
+    ],
+    "product_names": [
+      "Viniper UI",
+      "Viniper UI Preview"
+    ],
+    "ports": [],
+    "data_dir_names": [
+      "Viniper UI",
+      "Viniper UI Preview"
+    ],
+    "install_dirs": [
+      "D:\\Viniper UI",
+      "D:\\Viniper UI Preview"
+    ],
+    "shortcut_names": [
+      "Viniper UI.lnk"
+    ],
+    "writable": false,
+    "mode": "read-only",
+    "compatibility_read_boundary": "read-only compatibility source; no runtime start, write, migration, deletion, overwrite, or lock-file update"
+  }
+}

@@ -1,29 +1,7 @@
-# Runtime data
-data/
-tmp/
-*.log
-verify_server.log
-update_source.json
-
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-
-# Build output
+node_modules/
 dist/
-desktop/node_modules/
-desktop/release/
-desktop/release-preview/
-*.zip
-*.tar.gz
-
-# Local/editor files
-codex/
+codex/运行残留/
+codex/工作输出/
+codex/脚本工具/
+codex/审查报告/
 .omx/
-.env
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/

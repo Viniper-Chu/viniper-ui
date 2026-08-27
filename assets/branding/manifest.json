@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "brand": "Viniper workstation",
+  "status": "UNIFIED_3D_NATIVE_SOURCE",
+  "variant": "circuit-node-3d",
+  "frame": {
+    "kind": "rounded-square",
+    "radius": 24,
+    "preserves": "existing V circuit-node mark"
+  },
+  "asset": "viniper-harness-circuit-node.png",
+  "nativeFallback": "viniper-harness-circuit-node.png",
+  "nativeSmall": "viniper-harness-circuit-node-32.png",
+  "windowsIco": "viniper-harness-circuit-node.ico",
+  "fallback": {
+    "kind": "code-native-fallback",
+    "text": "V"
+  }
+}

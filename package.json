@@ -1,0 +1,22 @@
+{
+  "name": "viniper-workstation",
+  "version": "1.6.0",
+  "private": true,
+  "description": "Viniper workstation v1.6.0 Stable dual-agent workspace",
+  "main": "dist/src/platform/desktop/main.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/clean-dist.mjs && tsc && node scripts/copy-assets.mjs",
+    "test": "npm run build && node --test --test-concurrency=4 dist/tests/**/*.test.js",
+    "start": "npm run build && electron dist/src/platform/desktop/main.js",
+    "cli": "node scripts/run-cli.mjs",
+    "package:portable": "npm run build && node scripts/package-portable.mjs",
+    "package:windows-preview": "npm run build && node scripts/package-windows-preview.mjs",
+    "package:windows-stable": "npm run build && node scripts/package-windows-stable.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "electron": "42.3.3",
+    "typescript": "^5.8.0"
+  }
+}

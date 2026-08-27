@@ -1,0 +1,36 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { test } from "node:test";
+
+test("CP5：能力方案中心先显示模式与主要能力，细节渐进展开", async () => {
+  const html = await readFile("src/renderer/shell/index.html", "utf8");
+  const app = await readFile("src/renderer/shell/app.js", "utf8");
+  const center = await readFile("src/renderer/composition/composition-center.js", "utf8");
+  const styles = `${await readFile("src/renderer/styles/app.css", "utf8")}\n${await readFile("src/renderer/styles/v016-viniper-shell.css", "utf8")}\n${await readFile("src/renderer/styles/v017-viniper-workbench.css", "utf8")}`;
+  assert.match(html, /id="compositionCenter"[^>]*aria-label="能力方案中心"/u);
+  assert.match(html, /id="compositionButton"[^>]*data-tooltip="模式"/u);
+  assert.match(html, /id="skillsButton"/u);
+  assert.match(html, /id="extensionsButton"/u);
+  assert.match(html, /id="sessionsButton"[^>]*aria-label="打开会话栏"[^>]*data-tooltip="会话"/u);
+  assert.match(html, /id="changeDrawerButton"[^>]*aria-label="查看文件改动"[^>]*data-tooltip="改动"/u);
+  assert.match(html, /id="plainSessionButton"/u);
+  assert.match(html, /id="newSessionButton"[\s\S]*<span>项目与目录<\/span>/u);
+  assert.match(html, /id="saveProductSettingsButton"[^>]*>保存设置/u);
+  assert.match(html, /id="runtimeUpdateInstallButton"[^>]*>确认安装/u);
+  assert.match(html, /id="submitCoordinationButton"[^>]*>发送/u);
+  assert.match(app, /state\.compositionCenter/u);
+  assert.match(app, /api\.selectCustomComposition/u);
+  assert.match(app, /api\.setCompositionCapability/u);
+  assert.match(center, /composition-primary-abilities/u);
+  assert.match(center, /能力详情/u);
+  assert.match(center, /阻塞原因|依赖\/冲突/u);
+  assert.match(center, /内置|需确认/u);
+  assert.match(center, /下一次运行生效/u);
+  assert.doesNotMatch(center, /建议模型：/u);
+  assert.match(center, /保存自定义方案/u);
+  assert.match(center, /恢复默认/u);
+  assert.match(center, /dataset\.tooltip/u);
+  assert.match(styles, /composition-preset-grid/u);
+  assert.match(styles, /composition-custom-row/u);
+  assert.doesNotMatch(`${html}\n${app}\n${center}`, /New Chat|新建 Chat|Chat 模式/u);
+});

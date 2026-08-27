@@ -1,0 +1,125 @@
+import { AgentIntent, AppSnapshot, PermissionMode, RunSnapshot } from "../../core/contracts";
+import { AgentEngineId } from "../../core/agent-engine-contracts";
+import { ArtifactReadInput, ArtifactReadResult } from "../../core/artifact-contracts";
+import { CoordinationEnvelopeType } from "../../core/coordination-contracts";
+import { ScheduleDraft } from "../../core/scheduler-contracts";
+import { ProviderEnabledCapabilities } from "../../core/provider-contracts";
+import { PermissionAccessSelection, ToolApprovalDecision } from "../../core/permission-contracts";
+import { TerminalOutputInput, TerminalOutputResult } from "../../features/terminal/contracts";
+import { SessionQuery, SessionQueryResult } from "../../core/session-query-contracts";
+import { MemoryCreateInput } from "../../core/memory-contracts";
+import { SmartRoutingStrategy } from "../../core/routing-contracts";
+import { StagedExtensionPackage } from "../../core/extension-contracts";
+import { ExtensionStageInput } from "../../features/extensions/extension-package-manager";
+import { ArchiveScope, DiagnosticPreview, ProductSettingsSnapshot, UpdateChannel } from "../../core/cp7-contracts";
+import { CompositionCenterSnapshot, CompositionPreset } from "../../core/composition-contracts";
+
+export type ProjectSessionSelectionResult =
+  | { status: "created"; sessionId: string; projectRoot: string }
+  | { status: "cancelled" }
+  | { status: "rejected"; message: string };
+
+export interface DesktopWindowState {
+  maximized: boolean;
+}
+
+export interface AgentDesktopApi {
+  getSnapshot(): Promise<AppSnapshot>;
+  subscribe(listener: (snapshot: AppSnapshot) => void): () => void;
+  createSession(engineId?: AgentEngineId): Promise<unknown>;
+  chooseProjectSession(engineId?: AgentEngineId): Promise<ProjectSessionSelectionResult>;
+  openExternalTerminal(sessionId: string): Promise<{ status: "opened" | "failed"; message: string }>;
+  setActiveSession(sessionId: string): Promise<boolean>;
+  renameSession(sessionId: string, title: string): Promise<boolean>;
+  togglePinned(sessionId: string): Promise<boolean>;
+  deleteSession(sessionId: string): Promise<boolean>;
+  querySessions(query?: SessionQuery): Promise<SessionQueryResult>;
+  setSmartRoutingEnabled(enabled: boolean): Promise<boolean>;
+  setSmartRoutingStrategy(strategy: SmartRoutingStrategy): Promise<boolean>;
+  createMemory(input: MemoryCreateInput): Promise<unknown>;
+  updateMemory(id: string, text: string): Promise<boolean>;
+  setMemoryEnabled(id: string, enabled: boolean): Promise<boolean>;
+  deleteMemory(id: string): Promise<boolean>;
+  buildProjectIndex(sessionId: string): Promise<unknown>;
+  searchProjectIndex(sessionId: string, query: string): Promise<unknown>;
+  setProjectIndexSemantic(enabled: boolean): Promise<unknown>;
+  setModel(sessionId: string, model: string): Promise<boolean>;
+  setProviderModel(sessionId: string, providerId: string, model: string): Promise<boolean>;
+  setPermissionMode(sessionId: string, permissionMode: PermissionMode): Promise<boolean>;
+  setPermissionAccess(sessionId: string, selection: PermissionAccessSelection): Promise<boolean>;
+  restoreProjectChange(sessionId: string, receiptId: string): Promise<unknown>;
+  readTerminalOutput(sessionId: string, input: TerminalOutputInput): Promise<TerminalOutputResult>;
+  send(intent: AgentIntent): Promise<unknown>;
+  cancel(sessionId: string): Promise<boolean>;
+  listRuns(sessionId?: string): Promise<RunSnapshot[]>;
+  cancelRun(runId: string): Promise<boolean>;
+  steer(runId: string, message: string): Promise<unknown>;
+  inject(runId: string, context: Record<string, unknown>): Promise<unknown>;
+  clearSteering(runId: string): Promise<unknown>;
+  listSteering(runId?: string): Promise<unknown[]>;
+  resolveToolApproval(sessionId: string, runId: string, callId: string, decision: ToolApprovalDecision): Promise<boolean>;
+  sendMessage(sourceSessionId: string, targetSessionId: string, text: string): Promise<unknown>;
+  delegateTask(sourceSessionId: string, targetSessionId: string, text: string): Promise<unknown>;
+  waitForMessage(sessionId: string, filter: { fromSessionId?: string; envelopeType?: CoordinationEnvelopeType; correlationId?: string; timeoutMs?: number }): Promise<unknown>;
+  cancelWait(sessionId: string, waitId?: string): Promise<boolean>;
+  markRead(sessionId: string, envelopeId: string): Promise<boolean>;
+  createSchedule(draft: ScheduleDraft): Promise<unknown>;
+  setScheduleEnabled(id: string, enabled: boolean): Promise<boolean>;
+  runScheduleNow(id: string): Promise<boolean>;
+  deleteSchedule(id: string): Promise<boolean>;
+  restoreSchedule(id: string): Promise<boolean>;
+  markNotificationRead(id: string): Promise<boolean>;
+  readArtifact(input: ArtifactReadInput): Promise<ArtifactReadResult>;
+  setSkillEnabled(sessionId: string, skillId: string, enabled: boolean): Promise<boolean>;
+  stageExtension(input: ExtensionStageInput): Promise<StagedExtensionPackage>;
+  installExtension(stagingId: string): Promise<unknown>;
+  trustExtension(id: string, version: string): Promise<boolean>;
+  enableExtension(id: string, enabled: boolean): Promise<boolean>;
+  requestExtensionUpdate(id: string, stagingId: string): Promise<boolean>;
+  confirmExtensionUpdate(id: string): Promise<boolean>;
+  requestExtensionRollback(id: string): Promise<boolean>;
+  confirmExtensionRollback(id: string): Promise<boolean>;
+  configureMcp(input: { id: string; endpoint: string }): Promise<unknown>;
+  connectMcp(id: string): Promise<unknown>;
+  saveProviderSecret(profileId: string, fieldId: string, value: string): Promise<unknown>;
+  deleteProviderSecret(profileId: string, fieldId: string): Promise<unknown>;
+  setProviderEndpoint(profileId: string, endpoint: string): Promise<boolean>;
+  setProviderManualModel(profileId: string, model: string): Promise<boolean>;
+  setCustomProviderOptions(input: {
+    authMode: "bearer" | "x-api-key" | "api-key";
+    capabilities: Partial<ProviderEnabledCapabilities>;
+  }): Promise<boolean>;
+  setProviderCapabilities(profileId: string, capabilities: Partial<ProviderEnabledCapabilities>): Promise<boolean>;
+  testProviderConnection(profileId: string): Promise<unknown>;
+  getWorkspaceSnapshot(workspaceId?: string): Promise<unknown>;
+  requestSharedCommit(workspaceId: string): Promise<boolean>;
+  commitShared(workspaceId: string, message: string, paths?: string[]): Promise<boolean>;
+  mergeWorkspace(workspaceId: string): Promise<boolean>;
+  restoreWorkspace(workspaceId: string): Promise<boolean>;
+  runReview(workspaceId: string): Promise<unknown>;
+  getWindowState(): Promise<DesktopWindowState>;
+  subscribeWindowState(listener: (state: DesktopWindowState) => void): () => void;
+  minimizeWindow(): Promise<void>;
+  toggleMaximizeWindow(): Promise<DesktopWindowState>;
+  closeWindow(): Promise<void>;
+  exportArchive(input: { targetPath: string; scope: ArchiveScope }): Promise<unknown>;
+  stageArchiveImport(sourcePath: string): Promise<unknown>;
+  previewArchiveImport(stagingId: string): Promise<unknown>;
+  mergeArchiveImport(stagingId: string, confirmed: boolean): Promise<unknown>;
+  exportCredentialBundle(input: { targetPath: string; entryIds: string[]; password: string }): Promise<void>;
+  importCredentialBundle(input: { sourcePath: string; password: string; confirm: boolean; overwrite?: boolean }): Promise<unknown>;
+  getDiagnosticsPreview(runId?: string): Promise<DiagnosticPreview>;
+  setDiagnosticsConsent(enabled: boolean): Promise<boolean>;
+  checkUpdates(channel: UpdateChannel): Promise<unknown>;
+  downloadUpdate(): Promise<unknown>;
+  confirmUpdateInstall(): Promise<unknown>;
+  getProductSettings(): Promise<ProductSettingsSnapshot>;
+  setProductSetting(key: string, value: unknown): Promise<ProductSettingsSnapshot>;
+  getCompositionCenter(): Promise<CompositionCenterSnapshot>;
+  setCompositionPreset(preset: CompositionPreset): Promise<CompositionCenterSnapshot>;
+  selectCustomComposition(name: string): Promise<CompositionCenterSnapshot>;
+  copyCompositionPreset(source: CompositionPreset, name: string): Promise<CompositionCenterSnapshot>;
+  setCompositionCapability(name: string, id: string, enabled: boolean): Promise<CompositionCenterSnapshot>;
+  reorderComposition(name: string, order: string[]): Promise<CompositionCenterSnapshot>;
+  restoreDefaultComposition(): Promise<CompositionCenterSnapshot>;
+}
