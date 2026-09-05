@@ -119,13 +119,13 @@ def _read_windows_system_proxy() -> dict[str, str]:
 
 
 class HarnessTerminalTimeoutError(TimeoutError):
-    """Raised when an owned Harness run never reaches a terminal state."""
+    """Raised when an owned Harness run stops reporting activity."""
 
     code = "terminal-timeout"
 
     def __init__(self, timeout_seconds: float) -> None:
         self.timeout_seconds = max(0.0, float(timeout_seconds))
-        super().__init__(f"Harness run exceeded terminal deadline ({self.timeout_seconds:g}s)")
+        super().__init__(f"Harness run stopped reporting activity ({self.timeout_seconds:g}s idle deadline)")
 
 
 async def await_run_queue_message(
@@ -149,7 +149,7 @@ async def await_run_queue_message(
 
 
 def _terminal_timeout_seconds() -> float:
-    """Resolve the bounded Harness terminal deadline without extending it."""
+    """Resolve the run's inactivity deadline; total task duration is unbounded."""
 
     raw_value = os.environ.get("VINIPER_HARNESS_TERMINAL_TIMEOUT_SECONDS", "90")
     try:
@@ -159,6 +159,42 @@ def _terminal_timeout_seconds() -> float:
     if value <= 0:
         value = 90.0
     return min(value, 900.0)
+
+
+def _track_pending_user_input(pending: dict[str, dict[str, Any]], event: dict[str, Any]) -> None:
+    """Track explicit user decisions, not internal locks or automatic tools."""
+    payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    event_type = str(event.get("type") or "")
+    aliases = {str(payload.get(key) or "") for key in ("id", "activityId", "callId", "request_id", "requestId")}
+    aliases.discard("")
+    if event_type in {"interaction.resolved", "question.resolved", "user.input.resolved"}:
+        for key, record in tuple(pending.items()):
+            if aliases.intersection(record["aliases"]):
+                pending.pop(key, None)
+        return
+    if event_type not in {"interaction.requested", "question.requested", "user.input.requested", "tool.requested"}:
+        return
+    status = str(payload.get("status") or "waiting")
+    if status not in {"waiting", "pending", "waiting_input", "running"}:
+        return
+    tool_input = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+    tool_name = str(payload.get("toolName") or payload.get("tool_name") or "").replace("_", "").casefold()
+    question = (
+        event_type in {"question.requested", "user.input.requested"}
+        or str(payload.get("kind") or "") in {"question", "questions", "request_user_input"}
+        or tool_name in {"askuserquestion", "requestuserinput", "questions"}
+        or bool(payload.get("questions") or tool_input.get("questions"))
+    )
+    permission = event_type == "interaction.requested" and _is_permission_interaction(payload)
+    if not aliases or not (permission or question):
+        return
+    call_id = str(payload.get("callId") or payload.get("request_id") or payload.get("requestId") or payload.get("id") or "")
+    pending[call_id] = {
+        "aliases": aliases,
+        "call_id": call_id,
+        "session_id": str(event.get("sessionId") or payload.get("sessionId") or ""),
+        "permission": permission and not question,
+    }
 
 
 def _runtime_event_to_provider_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -554,7 +590,7 @@ class HarnessApplicationPort:
             "permission.resolve", "collaboration.snapshot", "collaboration.send",
             "collaboration.delegate", "collaboration.wait", "collaboration.cancel-wait",
             "collaboration.mark-read", "subagent.spawn", "subagent.cancel",
-            "subagents.snapshot", "capabilities.snapshot", "sessions.ensure",
+            "subagents.snapshot", "capabilities.snapshot", "sessions.ensure", "permissions.snapshot",
         }
         if operation not in concurrent_controls and any(self.active_run(session_id) for session_id in tuple(self._active_runs)):
             raise RuntimeError("Harness control operations are unavailable while a run owns the Application Port")
@@ -610,7 +646,9 @@ class HarnessApplicationPort:
         try:
             await self._send({"op": "cancel", "native_session_id": str(session_id)})
         except (BrokenPipeError, ConnectionError, RuntimeError):
-            await self._terminate_bridge()
+            # A run cancellation never owns the shared bridge process. Other
+            # sessions must not be terminated because this channel is closing.
+            pass
 
     async def stream(
         self,
@@ -650,8 +688,9 @@ class HarnessApplicationPort:
         if host_secret_value:
             request["host_secret_value"] = str(host_secret_value)
         loop = asyncio.get_running_loop()
-        run_started_at = loop.time()
         terminal_timeout_seconds = _terminal_timeout_seconds()
+        idle_deadline = loop.time() + terminal_timeout_seconds
+        pending_user_inputs: dict[str, dict[str, Any]] = {}
         try:
             await self._send(request)
             # Runtime activity ids and provider call ids are not guaranteed to
@@ -660,28 +699,45 @@ class HarnessApplicationPort:
             tool_names: dict[str, str] = {}
             tool_calls: dict[str, str] = {}
             while True:
-                remaining_seconds = terminal_timeout_seconds - (loop.time() - run_started_at)
+                remaining_seconds = (
+                    min(15.0, terminal_timeout_seconds)
+                    if pending_user_inputs
+                    else max(0.001, idle_deadline - loop.time())
+                )
                 try:
-                    message = await await_run_queue_message(
-                        run_queue,
-                        remaining_seconds,
-                        lambda: self._cancel_owned_process(self._bridge_process, sid)  # type: ignore[arg-type]
-                        if self._bridge_process is not None
-                        else asyncio.sleep(0),
-                    )
-                except HarnessTerminalTimeoutError:
-                    # Cancellation is sent before terminating the bridge so a
-                    # cooperative runtime can persist its cancelled state;
-                    # terminate is the bounded fallback for a stuck provider.
-                    await self._terminate_bridge()
-                    raise
+                    message = await asyncio.wait_for(run_queue.get(), timeout=remaining_seconds)
+                except asyncio.TimeoutError as error:
+                    if pending_user_inputs:
+                        try:
+                            # Waiting for a person has no deadline, but the
+                            # owner must still answer a bounded read-only ping.
+                            if self._bridge_process is None or self._bridge_process.returncode is not None:
+                                raise RuntimeError("Harness bridge exited while waiting for user input")
+                            state = await asyncio.wait_for(self.control("permissions.snapshot"), timeout=20.0)
+                            approvals = state.get("pending") if isinstance(state.get("pending"), list) else []
+                            for key, pending in tuple(pending_user_inputs.items()):
+                                if pending["permission"] and not any(
+                                    str(item.get("callId") or "") == pending["call_id"]
+                                    and str(item.get("sessionId") or "") == pending["session_id"]
+                                    for item in approvals if isinstance(item, dict)
+                                ):
+                                    pending_user_inputs.pop(key, None)
+                            idle_deadline = loop.time() + terminal_timeout_seconds
+                            continue
+                        except (asyncio.TimeoutError, ConnectionError, RuntimeError):
+                            pass
+                    if self._bridge_process is not None:
+                        await self._cancel_owned_process(self._bridge_process, sid)
+                    raise HarnessTerminalTimeoutError(terminal_timeout_seconds) from error
                 message_type = str(message.get("type") or "")
                 native_message_id = str(message.get("native_session_id") or "")
                 if native_message_id and native_message_id != sid:
                     continue
+                idle_deadline = loop.time() + terminal_timeout_seconds
                 if message_type == "runtime.event" and isinstance(message.get("event"), dict):
                     runtime_event = message["event"]
                     runtime_type = str(runtime_event.get("type") or "")
+                    _track_pending_user_input(pending_user_inputs, runtime_event)
                     yield {"type": "runtime.event", "event": runtime_event}
                     projected = _runtime_event_to_provider_event(runtime_event)
                     if projected is not None:

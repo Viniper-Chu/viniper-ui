@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,9 +15,9 @@ const desktopRoot = join(repositoryRoot, "resources", "viniper-ui", "desktop");
 // historical workspace and is never an output location for this release.
 const codexRoot = resolve(repositoryRoot, "codex");
 const outputRoot = resolve(process.env.VINIPER_WINDOWS_STABLE_OUTPUT_ROOT
-  || join(codexRoot, "工作输出", "viniper-github-workstation-v1.6.0-20260827", "workflow", "candidate", "stable"));
+  || join(codexRoot, "工作输出", "windows-stable-package"));
 const residueRoot = resolve(process.env.VINIPER_WINDOWS_STABLE_RESIDUE_ROOT
-  || join(codexRoot, "运行残留", "viniper-github-workstation-v1.6.0-20260827-stable"));
+  || join(codexRoot, "运行残留", "windows-stable-package"));
 const stageRoot = join(residueRoot, "stable-stage");
 const builderRoot = join(residueRoot, "stable-electron-builder");
 const portableFolderName = "Viniper-workstation-win32-x64";
@@ -32,8 +33,8 @@ if (process.platform !== "win32" || process.arch !== "x64") {
 }
 
 const sourcePackage = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8"));
-if (sourcePackage.version !== "1.6.0") {
-  throw new Error(`Stable 仅支持 v1.6.0，当前为 ${sourcePackage.version}。`);
+if (!/^\d+\.\d+\.\d+$/.test(sourcePackage.version)) {
+  throw new Error(`Stable 需要正式语义版本，当前为 ${sourcePackage.version}。`);
 }
 const profiles = JSON.parse(await readFile(join(repositoryRoot, "resources", "viniper-ui", "profiles.json"), "utf8"));
 const profile = profiles.stable;
@@ -62,6 +63,9 @@ await access(electronBuilder);
 
 await cp(electronDistribution, stagePortable, { recursive: true });
 await rename(join(stagePortable, "electron.exe"), join(stagePortable, "Viniper workstation.exe"));
+// --prepackaged skips electron-builder's resource-editing phase entirely.
+// Brand this one staged executable before either portable or NSIS consumes it.
+await brandWindowsExecutable(join(stagePortable, "Viniper workstation.exe"), sourcePackage.version);
 const applicationRoot = join(stagePortable, "resources", "app");
 await mkdir(applicationRoot, { recursive: true });
 await stageLegacyUi({ repositoryRoot, stagePortable, desktopProfile: "stable" });
@@ -101,7 +105,7 @@ await writeFile(join(applicationRoot, "portable-manifest.json"), `${JSON.stringi
   dataCompatibility: {
     profile: "stable",
     dataRootName: "Viniper workstation Preview",
-    policy: "Stable 1.6.x leases the existing Preview root; no copy, migration, clear, or overwrite.",
+    policy: "Stable leases the existing Preview root; no copy, migration, clear, or overwrite.",
   },
   userInstall: {
     defaultDirectory: "%LOCALAPPDATA%\\Programs\\Viniper workstation",
@@ -128,6 +132,7 @@ const builderConfig = {
     signAndEditExecutable: true,
   },
   nsis: {
+    include: join(desktopRoot, "build", "installer.nsh"),
     oneClick: false,
     perMachine: false,
     allowToChangeInstallationDirectory: false,
@@ -222,4 +227,30 @@ function assertDirectChild(target, expectedParent) {
   if (resolve(dirname(target)) !== resolve(expectedParent)) {
     throw new Error(`拒绝清理非预期路径：${target}`);
   }
+}
+
+async function brandWindowsExecutable(executable, version) {
+  const { NtExecutable, NtExecutableResource, Resource, Data } = createRequire(join(desktopRoot, "package.json"))("resedit");
+  const image = NtExecutable.from(await readFile(executable));
+  const resources = NtExecutableResource.from(image);
+  const icons = Data.IconFile.from(await readFile(join(repositoryRoot, "assets", "branding", "viniper-harness-circuit-node.ico")));
+  const groups = Resource.IconGroupEntry.fromEntries(resources.entries);
+  const versions = Resource.VersionInfo.fromEntries(resources.entries);
+  if (!groups.length || !versions.length) throw new Error("Windows executable branding requires native icon and version resources.");
+  for (const group of groups) {
+    Resource.IconGroupEntry.replaceIconsForResource(resources.entries, group.id, group.lang, icons.icons.map((item) => item.data));
+  }
+  for (const info of versions) {
+    info.setFileVersion(version);
+    info.setProductVersion(version);
+    for (const language of info.getAvailableLanguages()) {
+      info.setStringValues(language, {
+        FileDescription: "Viniper workstation", ProductName: "Viniper workstation",
+        CompanyName: "Viniper", InternalName: "Viniper workstation", OriginalFilename: "Viniper workstation.exe",
+      });
+    }
+    info.outputToResourceEntries(resources.entries);
+  }
+  resources.outputResource(image);
+  await writeFile(executable, Buffer.from(image.generate()));
 }

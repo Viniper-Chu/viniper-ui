@@ -6,6 +6,8 @@ export interface ProviderRetryOptions {
   stream: () => AsyncIterable<ProviderEvent>;
   onAttempt?: (attempt: number) => void | Promise<void>;
   onRetry?: (input: { attempt: number; nextAttempt: number; error: unknown }) => void | Promise<void>;
+  onEvent?: (event: ProviderEvent) => void | Promise<void>;
+  signal?: AbortSignal;
   hasSemanticOutput?: (events: ProviderEvent[]) => boolean;
   sleep?: (milliseconds: number) => Promise<void>;
   retryDelayMs?: number | ((retryNumber: number) => number);
@@ -16,24 +18,42 @@ export type ProviderRetryResult =
   | { ok: false; error: unknown; attempts: number };
 
 /**
- * Collects one logical Provider response before publishing it to the runtime.
- * This keeps a failed pre-output request retryable without duplicating partial
- * events, while any semantic output or tool call freezes the attempt.
+ * Streams semantic output as it arrives. Pre-output metadata is held until the
+ * attempt commits, so retrying a failed connection cannot duplicate that data.
+ * Callers without onEvent retain the collected-response interface.
  */
 export async function runProviderWithRetries(options: ProviderRetryOptions): Promise<ProviderRetryResult> {
   const maxAttempts = Math.min(5, Math.max(1, Math.trunc(options.maxAttempts ?? 5)));
   const hasSemanticOutput = options.hasSemanticOutput ?? defaultHasSemanticOutput;
-  const sleep = options.sleep ?? ((milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
   let attempts = 0;
   while (attempts < maxAttempts) {
+    throwIfCancelled(options.signal);
     attempts += 1;
     await options.onAttempt?.(attempts);
     const events: ProviderEvent[] = [];
+    let published = 0;
+    let publicationStarted = false;
+    const publish = async () => {
+      if (!options.onEvent) return;
+      while (published < events.length) {
+        throwIfCancelled(options.signal);
+        publicationStarted = true;
+        await options.onEvent(events[published++]);
+      }
+    };
     try {
-      for await (const event of options.stream()) events.push(event);
+      throwIfCancelled(options.signal);
+      for await (const event of options.stream()) {
+        throwIfCancelled(options.signal);
+        events.push(event);
+        if (hasSemanticOutput(events)) await publish();
+      }
+      throwIfCancelled(options.signal);
+      await publish();
       return { ok: true, events, attempts };
     } catch (error) {
-      if (hasSemanticOutput(events)) throw error;
+      throwIfCancelled(options.signal);
+      if (publicationStarted || hasSemanticOutput(events)) throw error;
       if (!isRetryable(error) || attempts >= maxAttempts) {
         return { ok: false, error, attempts };
       }
@@ -42,10 +62,32 @@ export async function runProviderWithRetries(options: ProviderRetryOptions): Pro
       const delay = typeof options.retryDelayMs === "function"
         ? options.retryDelayMs(retryNumber)
         : options.retryDelayMs ?? 0;
-      if (delay > 0) await sleep(delay);
+      if (delay > 0) await waitForRetry(delay, options.signal, options.sleep);
     }
   }
   return { ok: false, error: new Error("Provider 重试已停止。"), attempts };
+}
+
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ProviderTransportError("cancelled");
+}
+
+async function waitForRetry(milliseconds: number, signal?: AbortSignal, sleep?: ProviderRetryOptions["sleep"]): Promise<void> {
+  throwIfCancelled(signal);
+  await new Promise<void>((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+    };
+    const finish = () => { cleanup(); resolve(); };
+    const fail = (error: unknown) => { cleanup(); reject(error); };
+    const abort = () => fail(new ProviderTransportError("cancelled"));
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
+    if (sleep) Promise.resolve().then(() => sleep(milliseconds)).then(finish, fail);
+    else timer = setTimeout(finish, milliseconds);
+  });
 }
 
 export function isRetryableProviderError(error: unknown): boolean {

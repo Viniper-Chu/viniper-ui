@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "provider": "deepseek",
+      "model": "deepseek-v4-pro",
+      "ui_models": ["deepseek-v4-pro[1m]"],
+      "context_window": 1048576,
+      "max_output_tokens": 393216,
+      "status": "verified",
+      "source": "DeepSeek official models.json",
+      "source_url": "https://api-docs.deepseek.com/quick_start/agent_integrations/codex/"
+    },
+    {
+      "provider": "deepseek",
+      "model": "deepseek-v4-flash",
+      "ui_models": ["deepseek-v4-flash"],
+      "context_window": 1048576,
+      "max_output_tokens": 393216,
+      "status": "verified",
+      "source": "DeepSeek official models and pricing",
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing/"
+    },
+    {
+      "provider": "anthropic",
+      "model": "Kimi-K3",
+      "ui_models": ["Kimi-K3"],
+      "context_window": 1048576,
+      "max_output_tokens": null,
+      "status": "verified",
+      "source": "Kimi official K3 full-context specification (user-selected; tokeasy deployment cap unverified)",
+      "source_url": "https://www.kimi.com/code/docs/en/kimi-code/models.html"
+    }
+  ]
+}

@@ -136,6 +136,7 @@ class ProviderRequestBudget {
 }
 
 export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<AgentToolLoopResult> {
+  throwIfCancelled(options.signal);
   const maxRounds = options.maxRounds ?? 24;
   const requestBudget = new ProviderRequestBudget(options.maxProviderRequests ?? maxRounds);
   const frozenTools = [...(options.frozenRunContext?.toolDescriptors ?? options.request.tools)];
@@ -155,6 +156,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
   }
 
   for (let round = 1; round <= maxRounds; round += 1) {
+    throwIfCancelled(options.signal);
     if (reviewNoProgress) {
       await options.emit("interaction.requested", {
         ...activity({
@@ -198,6 +200,38 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
     let reasoningText = "";
     let reasoningItemId: string | undefined;
 
+    const consumeProviderEvent = async (event: ProviderEvent) => {
+      throwIfCancelled(options.signal);
+      await options.onProviderEvent(event);
+      switch (event.kind) {
+        case "text.delta":
+          completeText += event.text;
+          roundText += event.text;
+          appendAdjacentText(roundItems, event.text);
+          break;
+        case "reasoning.delta":
+          reasoningText += event.text;
+          reasoningItemId = event.itemId ?? reasoningItemId;
+          appendAdjacentReasoning(roundItems, event.text, reasoningItemId, options.request.profileId);
+          break;
+        case "reasoning.completed":
+          replaceReasoning(roundItems, event.item);
+          reasoningText = event.item.text;
+          reasoningItemId = event.item.itemId;
+          break;
+        case "tool-call.completed":
+          toolCalls.push(clone(event.call));
+          roundItems.push(clone(event.call));
+          break;
+        case "continuation.updated":
+        case "model-step.completed":
+          roundItems.push(clone(event.item));
+          break;
+        default:
+          break;
+      }
+    };
+
     const preRequest = await options.lifecycle?.dispatch("provider/pre-request", {
       runId: options.runId ?? `standalone-${options.request.sessionId}`,
       sessionId: options.request.sessionId,
@@ -208,6 +242,8 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
     let providerResult;
     try {
       providerResult = await runProviderWithRetries({
+        onEvent: consumeProviderEvent,
+        signal: options.signal,
         stream: () => options.provider.stream({
           ...options.request,
           tools: clone(frozenTools),
@@ -240,39 +276,6 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       throw error;
     }
     if (!providerResult.ok) throw providerResult.error;
-    for (const event of providerResult.events) {
-      if (options.signal.aborted) throw new Error("Provider 请求已取消。");
-      await options.onProviderEvent(event);
-      switch (event.kind) {
-        case "text.delta":
-          completeText += event.text;
-          roundText += event.text;
-          appendAdjacentText(roundItems, event.text);
-          break;
-        case "reasoning.delta":
-          reasoningText += event.text;
-          reasoningItemId = event.itemId ?? reasoningItemId;
-          appendAdjacentReasoning(roundItems, event.text, reasoningItemId, options.request.profileId);
-          break;
-        case "reasoning.completed":
-          replaceReasoning(roundItems, event.item);
-          reasoningText = event.item.text;
-          reasoningItemId = event.item.itemId;
-          break;
-        case "tool-call.completed":
-          toolCalls.push(clone(event.call));
-          roundItems.push(clone(event.call));
-          break;
-        case "continuation.updated":
-          roundItems.push(clone(event.item));
-          break;
-        case "model-step.completed":
-          roundItems.push(clone(event.item));
-          break;
-        default:
-          break;
-      }
-    }
 
     if (reasoningText && !roundItems.some((item) => item.type === "reasoning")) {
       roundItems.unshift({
@@ -326,15 +329,17 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       if (options.reviewPlan) {
         const tool = options.toolRegistry.has(call.name) ? options.toolRegistry.get(call.name) : undefined;
         if (tool?.readOnly) {
-          const fingerprint = reviewToolFingerprint(call);
+          const fingerprint = reviewToolFingerprint(call, result);
           if (reviewFingerprints.has(fingerprint)) {
             reviewNoProgress = { checkpointId: options.reviewPlan.checkpointId, fingerprint };
           } else {
             reviewFingerprints.add(fingerprint);
           }
-        } else if (!result.isError) {
+        } else if (tool && !result.isError) {
           reviewFingerprints.clear();
-          advanceReviewPlan(options.reviewPlan);
+          reviewNoProgress = undefined;
+        }
+        if (tool && advanceReviewPlan(options.reviewPlan, tool.readOnly, result.isError === true)) {
           await options.emit("plan.updated", { plan: projectReviewPlan(options.reviewPlan) });
           await options.emit("run.checkpoint", {
             phase: "review",
@@ -350,31 +355,52 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
   return { assistantText: completeText, rounds: maxRounds };
 }
 
-function advanceReviewPlan(plan: ReviewExecutionPlan): void {
-  const currentIndex = plan.steps.findIndex((step) => step.id === plan.checkpointId);
-  if (currentIndex < 0) return;
-  plan.steps[currentIndex].status = "completed";
-  const next = plan.steps[currentIndex + 1];
-  if (next) {
-    next.status = "in_progress";
-    plan.checkpointId = next.id;
+function advanceReviewPlan(plan: ReviewExecutionPlan, readOnly: boolean, failed: boolean): boolean {
+  const current = plan.steps.find((step) => step.id === plan.checkpointId);
+  if (!current) return false;
+  if (failed) {
+    current.status = "blocked";
+    return true;
   }
+  // These are execution phases, not a counter of successful tools. Several
+  // edits still belong to execution; only a later read can begin verification.
+  const inspect = plan.steps.find((step) => step.id === "inspect");
+  const execute = plan.steps.find((step) => step.id === "execute");
+  const verify = plan.steps.find((step) => step.id === "verify");
+  if (!readOnly && inspect && execute && verify) {
+    inspect.status = "completed";
+    execute.status = "in_progress";
+    verify.status = "pending";
+    plan.checkpointId = execute.id;
+    return true;
+  }
+  if (readOnly && current.id === execute?.id && current.status === "in_progress" && verify) {
+    execute.status = "completed";
+    verify.status = "in_progress";
+    plan.checkpointId = verify.id;
+    return true;
+  }
+  if (readOnly && current !== execute && current.status === "blocked") {
+    current.status = "in_progress";
+    return true;
+  }
+  return false;
 }
 
 function projectReviewPlan(plan: ReviewExecutionPlan): RuntimePlanSnapshot {
   return {
-    explanation: "规划自动审核会按完成状态推进；超出计划范围的动作仍转为人工确认。",
+    explanation: "自动审核项目内动作；越界或高风险动作会被拒绝。进度依据工具结果更新，未核验的步骤保留待完成。",
     steps: plan.steps.map((step) => ({ id: step.id, step: step.title, status: step.status })),
   };
 }
 
 function completeReviewPlan(plan: ReviewExecutionPlan): void {
   const current = plan.steps.find((step) => step.id === plan.checkpointId);
-  if (current) current.status = "completed";
+  if (current?.status === "in_progress" && current.id !== "execute") current.status = "completed";
 }
 
-function reviewToolFingerprint(call: ProviderToolCallItem): string {
-  return `${call.name}:${stableJson(call.arguments)}`;
+function reviewToolFingerprint(call: ProviderToolCallItem, result: ProviderToolResultItem): string {
+  return `${call.name}:${stableJson(call.arguments)}:${result.content}`;
 }
 
 function stableJson(value: unknown): string {
@@ -393,6 +419,7 @@ export async function dispatchToolCall(
   options: ToolDispatchOptions,
   frozenTools: ProviderRequest["tools"],
 ): Promise<ProviderToolResultItem> {
+  throwIfCancelled(options.signal);
   const engineId = engineScopeOf(options.request.sessionId) ?? "viniper";
   const activityId = engineScopedId(engineId, "item", newId("tool-activity"));
   if (!frozenTools.some((tool) => tool.name === call.name)) {
@@ -574,7 +601,9 @@ export async function dispatchToolCall(
   }
 
   let lease: ToolResourceLease | undefined;
+  let waitActivityId: string | undefined;
   try {
+    throwIfCancelled(options.signal);
     const executionContext = {
       engineId,
       sessionId: options.request.sessionId,
@@ -597,7 +626,6 @@ export async function dispatchToolCall(
     const claims = tool.resourceClaims?.(request, executionContext) ?? [];
     const resourceCoordinator = options.resourceCoordinator;
     if (resourceCoordinator && claims.length > 0) {
-      let waitActivityId: string | undefined;
       if (!resourceCoordinator.canAcquire(claims)) {
         waitActivityId = engineScopedId(engineId, "item", newId("resource-wait"));
         await options.emit("interaction.requested", activity({
@@ -620,6 +648,7 @@ export async function dispatchToolCall(
           decision: "allow-once",
           detail: "资源锁已取得，继续本次工具调用。",
         });
+        waitActivityId = undefined;
       }
     }
     const executeDecision = await options.lifecycle?.dispatch("tool/execute", {
@@ -633,6 +662,7 @@ export async function dispatchToolCall(
       await options.emit("tool.failed", { activityId, result: message });
       return toolResult(call, message, true);
     }
+    throwIfCancelled(options.signal);
     const result = await tool.execute(request, {
       ...executionContext,
     });
@@ -648,7 +678,7 @@ export async function dispatchToolCall(
       runId: executionContext.runId,
       toolName: call.name,
       text: result.text,
-      isError: result.isError === true,
+      isError: result.isError === true || result.cancelled === true,
     });
     const modelText = !options.artifactService
       ? result.text
@@ -670,7 +700,7 @@ export async function dispatchToolCall(
       result: displayText,
       ...(result.presentation ? { presentation: clone(result.presentation) } : {}),
     });
-    const finalResult = toolResult(call, modelText, result.isError === true);
+    const finalResult = toolResult(call, modelText, result.isError === true || result.cancelled === true);
     const resultDecision = await options.lifecycle?.dispatch("tool/result", {
       runId: executionContext.runId,
       sessionId: executionContext.sessionId,
@@ -679,13 +709,25 @@ export async function dispatchToolCall(
     await emitLifecycleOutcome(options, resultDecision);
     return finalResult;
   } catch (error) {
-    if (options.signal.aborted) throw error;
+    if (waitActivityId) await options.emit("interaction.resolved", {
+      activityId: waitActivityId,
+      decision: "reject",
+      detail: options.signal.aborted ? "已取消资源等待。" : "资源等待已结束，工具未执行。",
+    });
+    if (options.signal.aborted) {
+      await options.emit("tool.cancelled", { activityId, result: "当前运行已取消。" });
+      throw error;
+    }
     const message = `工具执行失败：${error instanceof Error ? error.message : String(error)}`;
     await options.emit("tool.failed", { activityId, result: message });
     return toolResult(call, message, true);
   } finally {
     lease?.release();
   }
+}
+
+function throwIfCancelled(signal: AbortSignal): void {
+  if (signal.aborted) throw new Error("当前运行已取消。");
 }
 
 async function emitLifecycleOutcome(

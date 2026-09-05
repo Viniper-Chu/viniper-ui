@@ -337,6 +337,8 @@ class DurableInteractionStore:
         *,
         success: bool | None = None,
         exit_code: int | None = None,
+        accepted: bool | None = None,
+        protocol_ready: bool | None = None,
     ) -> dict[str, Any]:
         stage_value = str(stage or "")
         if stage_value not in self._ACK_STAGES:
@@ -351,14 +353,34 @@ class DurableInteractionStore:
             if stage_value == "cli_tool_result":
                 record["cli_tool_result_success"] = bool(success)
                 behavior = self.response_behavior(record.get("response"))
-                if behavior == "deny":
+                # A permitted tool can fail as a business operation (for
+                # example a missing path) and still completed the permission
+                # interaction.  Persist that distinction separately from the
+                # tool result so a reload cannot resurrect a stale approval.
+                # ``accepted`` is supplied by the broker once the transport
+                # ACK has been validated; direct callers retain the legacy
+                # decision-derived behaviour when it is omitted.
+                decision_matches = behavior != "deny" or not bool(success)
+                transport_ready = True if protocol_ready is None else bool(protocol_ready)
+                interaction_accepted = (
+                    bool(accepted)
+                    if accepted is not None
+                    else bool(transport_ready and decision_matches)
+                )
+                record["cli_protocol_ready"] = transport_ready
+                record["cli_result_accepted"] = interaction_accepted
+                if interaction_accepted and behavior == "deny":
                     state = "denied"
+                elif interaction_accepted:
+                    state = "accepted"
                 else:
-                    state = "accepted" if bool(success) else "failed"
+                    state = "failed"
                 record["state"] = state
                 record["terminal"] = True
-                if state != "failed":
-                    payload["active"].pop(str(session_id), None)
+                # Every cli_tool_result closes the interaction, including
+                # protocol/decision failures.  Leaving an active pointer for
+                # a terminal record makes a reload project a phantom card.
+                payload["active"].pop(str(session_id), None)
             elif str(record.get("state") or "") == "response_committed":
                 record["state"] = "awaiting_cli_ack"
             record["updated_at"] = time.time()
@@ -389,6 +411,11 @@ class DurableInteractionStore:
             if failure_code:
                 record["failure_code"] = str(failure_code)
             record["updated_at"] = time.time()
+            # A terminal owner failure must not leave the durable active
+            # pointer behind.  Keeping it made a completed/restarted session
+            # reload the old failed interaction as if it were current.
+            if str(payload["active"].get(str(session_id)) or "") == request_id:
+                payload["active"].pop(str(session_id), None)
             self._save(payload)
             return copy.deepcopy(record)
 
@@ -505,9 +532,19 @@ class DurableInteractionStore:
                 return None
             record = payload["records"].get(self._key(sid, request_id))
             if not isinstance(record, dict):
+                # A stale pointer can survive a crash or an older runtime.
+                # Remove only the pointer; durable records remain untouched.
+                payload["active"].pop(sid, None)
+                self._save(payload)
                 return None
             state = str(record.get("state") or "")
-            if state not in self._OPEN_STATES and state != "failed":
+            if state not in self._OPEN_STATES:
+                # Older releases left terminal failures in ``active``.  Treat
+                # those records as history after reload and lazily repair the
+                # pointer so a renderer cannot resurrect a phantom card.
+                if str(payload["active"].get(sid) or "") == request_id:
+                    payload["active"].pop(sid, None)
+                    self._save(payload)
                 return None
             return self._public_record(record)
 

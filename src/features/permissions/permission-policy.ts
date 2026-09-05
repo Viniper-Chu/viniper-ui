@@ -195,6 +195,12 @@ export class PermissionPolicy {
   }
 
   begin(input: ToolAuthorizationInput): ToolAuthorization {
+    if (input.signal.aborted) {
+      return {
+        state: "rejected",
+        resolution: Promise.resolve({ allowed: false, reason: "cancelled", message: "运行已取消，工具未执行。" }),
+      };
+    }
     if (input.permissionMode === "plan" && !input.tool.readOnly) {
       return {
         state: "rejected",

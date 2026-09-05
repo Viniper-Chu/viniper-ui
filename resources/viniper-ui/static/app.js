@@ -54,6 +54,7 @@ const state = {
   harnessSnapshot: null,
   harnessSettingsSection: "local-models",
   workspaceTab: "project",
+  workspaceRequestGeneration: 0,
   plan: { sessionId: "", steps: [], current: 0, total: 0 },
   theme: "light",
   language: "zh-CN",
@@ -92,10 +93,12 @@ const state = {
   settings: null,
   settingsDirty: false,
   settingsActiveSection: "account",
+  settingsView: { mode: null, generation: 0 },
   runtimeBusy: false,
   agentInstructions: { content: "", exists: false, path: "", updated_at: null },
   previewMode: false,
   updateInfo: null,
+  updateFlow: { checking: false, busy: "", snapshot: null, error: "", pollTimer: null, returnFocus: null },
   abortController: null,
   cancelRequested: false,
   followOutput: true,
@@ -233,6 +236,53 @@ function modeProjectionIsCurrent(token) {
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+
+// A cold Workstation start may render the first Claude status while the
+// bounded CLI capability probe is still running.  Keep this refresh strictly
+// mode-owned and bounded so a transient disabled descriptor is never treated
+// as the final permission menu state.
+const permissionStatusRefreshTimers = new Map();
+const permissionStatusRefreshAttempts = new Map();
+const MAX_PERMISSION_STATUS_REFRESH_ATTEMPTS = 6;
+
+function schedulePermissionStatusRefresh(mode, token, status) {
+  const requestedMode = mode === "claude" ? "claude" : "viniper";
+  if (requestedMode !== "claude" || !status?.permission_modes_pending) {
+    permissionStatusRefreshAttempts.delete(requestedMode);
+    const timer = permissionStatusRefreshTimers.get(requestedMode);
+    if (timer) {
+      clearTimeout(timer);
+      permissionStatusRefreshTimers.delete(requestedMode);
+    }
+    return;
+  }
+  const attempts = Number(permissionStatusRefreshAttempts.get(requestedMode) || 0);
+  if (attempts >= MAX_PERMISSION_STATUS_REFRESH_ATTEMPTS || permissionStatusRefreshTimers.has(requestedMode)) return;
+  permissionStatusRefreshAttempts.set(requestedMode, attempts + 1);
+  const timer = setTimeout(() => {
+    permissionStatusRefreshTimers.delete(requestedMode);
+    if (modeProjectionIsCurrent(token)) void loadStatus(requestedMode, token);
+  }, 300);
+  permissionStatusRefreshTimers.set(requestedMode, timer);
+}
+
+// If the bounded cold-start refresh window expires while the CLI capability
+// probe is still running, opening the permission menu is an explicit,
+// mode-owned recovery action.  This keeps the automatic path finite while
+// giving the user a deterministic way to observe the eventual capability
+// result without changing permission semantics or crossing agent owners.
+function requestPermissionStatusRefresh(mode = state.viewMode) {
+  const requestedMode = mode === "claude" ? "claude" : "viniper";
+  if (requestedMode !== "claude") return;
+  const timer = permissionStatusRefreshTimers.get(requestedMode);
+  if (timer) {
+    clearTimeout(timer);
+    permissionStatusRefreshTimers.delete(requestedMode);
+  }
+  permissionStatusRefreshAttempts.set(requestedMode, 0);
+  const token = modeProjectionToken(requestedMode, state.sessionId);
+  if (modeProjectionIsCurrent(token)) void loadStatus(requestedMode, token);
+}
 
 function emptyDailyUsageState() {
   return {
@@ -849,7 +899,7 @@ function syncCurrentSessionRuntimeUi() {
   }
   if (composer) composer.dataset.runtimeState = active ? (record?.status || "running") : "idle";
 
-  ["#file-btn", "#update-btn", "#model-picker-button", "#model-select",
+  ["#file-btn", "#model-picker-button", "#model-select",
     "#permission-picker-button", "#permission-select", "#change-workdir-btn"
   ].forEach((selector) => {
     const control = $(selector);
@@ -906,13 +956,14 @@ function rememberModel(model, mode = state.viewMode) {
   storageSet(modelStorageKey(mode), String(model || ""));
 }
 
-// Token estimation: ~3 chars per token for mixed Chinese/English text
-// Context window limits (approximate for DeepSeek V4 models):
+// Token estimation: ~3 chars per token for mixed Chinese/English text.
+// Context capacities are maintained by the server-side model registry; these
+// values are only a renderer fallback for the two verified DeepSeek IDs.
 const CONTEXT_LIMITS = {
-  "deepseek-v4-pro[1m]": 1000000,  // DeepSeek V4 Pro 1M
-  "deepseek-v4-flash": 128000,    // DeepSeek V4 Flash
+  "deepseek-v4-pro[1m]": 1048576,
+  "deepseek-v4-flash": 1048576,
 };
-const DEFAULT_CONTEXT_LIMIT = 128000;
+const DEFAULT_CONTEXT_LIMIT = 0;
 const DEFAULT_AUTO_COMPACT_THRESHOLD = 0.95;
 const VINIPER_PERMISSION_MODES = [
   {
@@ -946,6 +997,11 @@ const CLAUDE_PERMISSION_MODES = [
     id: "plan",
     label: "计划模式",
     description: "Claude Code CLI 先规划，减少直接执行动作"
+  },
+  {
+    id: "fullAccess",
+    label: "完全访问",
+    description: "Claude Code CLI 使用 bypassPermissions 自动执行工具；AskUserQuestion 仍需回答"
   }
 ];
 const VINIPER_HARNESS_COMMANDS = Object.freeze([
@@ -954,14 +1010,13 @@ const VINIPER_HARNESS_COMMANDS = Object.freeze([
   { command: "/target", title: "目标", description: "打开目标任务入口" },
   { command: "/plan", title: "计划", description: "查看当前会话计划与步骤" }
 ]);
-const CLAUDE_NATIVE_COMMAND_VERSION = "2.1.234";
 const CLAUDE_NATIVE_COMMANDS = Object.freeze([
-  "add-dir", "agents", "background", "branch", "btw", "clear", "color", "compact", "config", "context", "copy", "diff", "doctor", "effort", "exit", "export", "fast", "feedback", "focus", "fork", "goal", "help", "hooks", "ide", "init", "insights", "keybindings", "login", "logout", "mcp", "memory", "mobile", "model", "permissions", "plugin", "powerup", "recap", "release-notes", "reload-plugins", "reload-skills", "rename", "resume", "review", "rewind", "security-review", "skills", "status", "statusline", "tasks", "theme", "ui", "usage", "workflows"
-].map((name) => Object.freeze({
-  command: `/${name}`,
-  title: name,
-  description: `Claude Code CLI ${CLAUDE_NATIVE_COMMAND_VERSION} 原生命令`,
-  version: CLAUDE_NATIVE_COMMAND_VERSION,
+  ["model", "模型", "选择当前会话的模型"],
+  ["permissions", "权限", "选择工具执行权限"],
+  ["context", "上下文", "查看当前上下文用量"],
+  ["config", "设置", "打开 Claude code 独立设置"],
+].map(([name, title, description]) => Object.freeze({
+  command: `/${name}`, title, description, execution: "native-ui", ui_action: name, version: "",
 })));
 
 function slashCommandsForMode(mode = state.viewMode) {
@@ -978,7 +1033,8 @@ const PERMISSION_MODE_COPY = {
   claude: {
     default: "Claude Code CLI 在需要权限时暂停并询问",
     acceptEdits: "Claude Code CLI 自动接受文件编辑，其他操作遵循 CLI 权限",
-    plan: "Claude Code CLI 仅规划，不直接执行修改"
+    plan: "Claude Code CLI 仅规划，不直接执行修改",
+    fullAccess: "Claude Code CLI 使用 bypassPermissions 自动执行工具；AskUserQuestion 仍需回答"
   }
 };
 function permissionDescriptionForMode(id, mode = state.viewMode) {
@@ -1068,10 +1124,25 @@ function totalHistoryTokens() {
   return total;
 }
 
-function getContextLimit() {
-  const model = (state.status?.models || []).find((item) => item.id === state.selectedModel);
-  if (model?.context) return Number(model.context) || DEFAULT_CONTEXT_LIMIT;
-  return CONTEXT_LIMITS[state.selectedModel] || DEFAULT_CONTEXT_LIMIT;
+function modelCapacityMetadata(modelId = state.selectedModel) {
+  const id = String(modelId || "");
+  const model = (state.status?.models || []).find((item) => String(item?.id || "") === id);
+  const fallback = Number(CONTEXT_LIMITS[id]) || 0;
+  const rawLimit = Number(model?.context_window ?? model?.context ?? fallback);
+  const status = String(model?.context_status || (fallback > 0 ? "verified" : "unknown")).toLowerCase();
+  const trusted = status === "verified" && Number.isFinite(rawLimit) && rawLimit > 0;
+  return {
+    id,
+    limit: trusted ? rawLimit : 0,
+    status: trusted ? "verified" : "unknown",
+    source: String(model?.context_source || (fallback > 0 ? "packaged model registry" : "no trusted deployment metadata")),
+    sourceUrl: String(model?.context_source_url || ""),
+    maxOutputTokens: Math.max(0, Number(model?.max_output_tokens) || 0),
+  };
+}
+
+function getContextLimit(modelId = state.selectedModel) {
+  return modelCapacityMetadata(modelId).limit;
 }
 
 function applySettingsFromServer(settings) {
@@ -1269,11 +1340,13 @@ function setViewMode(mode) {
   const nextMode = mode === "claude" ? "claude" : "viniper";
   const previousMode = state.viewMode === "claude" ? "claude" : "viniper";
   if (previousMode !== nextMode) {
+    closeSettingsModal({ restoreNavigation: false });
     saveActiveModeState(previousMode);
     // The interaction dock is a single shell surface. Never carry the
     // previous owner's actionable card across an Agent switch; the next
     // owner restores only its own SessionRunRegistry projection below.
     clearInteractionDock();
+    $("#native-command-status")?.remove();
     state.pendingInteraction = null;
     restoreModeOwnedState(nextMode);
   }
@@ -1311,6 +1384,11 @@ function setViewMode(mode) {
 
 function updateModeChrome() {
   const agent = state.viewMode === "claude";
+  $$(".claude-only").forEach((node) => node.classList.toggle("hidden", !agent));
+  Object.entries({ claude: "行为与权限", provider: "连接与模型", capabilities: "工具与扩展" }).forEach(([key, label]) => {
+    const node = $(`[data-settings-nav="${key}"] span`);
+    if (node) node.textContent = label;
+  });
   $$(".viniper-only").forEach((node) => {
     node.classList.toggle("hidden", agent);
     if (agent) node.setAttribute("aria-hidden", "true");
@@ -2063,6 +2141,9 @@ function bindEvents() {
       ]).then(() => renderHarnessSettings());
     }
     const target = document.getElementById(result.dataset.settingsSearchTarget || "");
+    for (let parent = target?.parentElement; parent; parent = parent.parentElement) {
+      if (parent.tagName === "DETAILS") parent.open = true;
+    }
     target?.scrollIntoView?.({ block: "center" });
     target?.querySelector?.("input, select, textarea, button")?.focus?.();
   });
@@ -2077,11 +2158,32 @@ function bindEvents() {
   $("#update-btn").addEventListener("click", () => checkForUpdates({ silent: false }));
   $("#cancel-update-btn").addEventListener("click", closeUpdateModal);
   $("#install-update-btn").addEventListener("click", installUpdate);
+  $("#update-modal").addEventListener("keydown", handleUpdateModalKeydown);
   $("#settings-close-btn")?.addEventListener("click", closeSettingsModal);
   $("#cancel-settings-btn")?.addEventListener("click", closeSettingsModal);
   $("#save-settings-btn").addEventListener("click", saveSettings);
   $("#run-diagnostics-btn").addEventListener("click", runDiagnostics);
-  $("#settings-models").addEventListener("input", renderSettingsModelSelect);
+  $("#settings-models").addEventListener("input", () => { renderSettingsModelSelect(); renderSettingsModelRows(); });
+  $("#settings-model-table")?.addEventListener("input", syncSettingsModelRows);
+  $("#settings-model-table")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-remove-model]");
+    if (!button) return;
+    button.closest("[data-model-row]")?.remove();
+    syncSettingsModelRows();
+    if (!$("#settings-model-table [data-model-row]")) renderSettingsModelRows();
+  });
+  $("#settings-add-model-btn")?.addEventListener("click", () => {
+    const models = parseModelsText($("#settings-models").value);
+    let suffix = models.length + 1;
+    while (models.some((model) => model.id === `new-model-${suffix}`)) suffix += 1;
+    models.push({ id: `new-model-${suffix}`, label: "新模型", context: 0 });
+    $("#settings-models").value = modelsToText(models);
+    renderSettingsModelRows();
+    renderSettingsModelSelect();
+    markSettingsDirty("已添加模型，请填写服务商提供的模型 ID 后保存。");
+    const input = $$("#settings-model-table [data-model-field=id]").at(-1);
+    input?.focus(); input?.select();
+  });
   $("#settings-provider-test-btn")?.addEventListener("click", testProviderConnection);
   $(".settings-center-content")?.addEventListener("input", (event) => {
     if (event.target.matches("input, select, textarea")) markSettingsDirty();
@@ -2176,6 +2278,7 @@ function bindEvents() {
   bindClipboardPaste();
 
   document.addEventListener("keydown", (event) => {
+    if (!$("#update-modal")?.classList.contains("hidden")) return;
     if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "i") {
       event.preventDefault();
       setAnchoredMenuOpen("model", true, { focus: true });
@@ -2741,16 +2844,18 @@ function handleSlashSuggestionKeydown(event) {
 async function loadStatus(mode = state.viewMode, token = modeProjectionToken(mode, state.sessionId)) {
   const requestedMode = mode === "claude" ? "claude" : "viniper";
   try {
-    const response = await fetch(`/api/status?mode=${encodeURIComponent(requestedMode)}`);
+    const response = await fetch(`/api/status?mode=${encodeURIComponent(requestedMode)}&session_id=${encodeURIComponent(token.sessionId || state.sessionId || "")}`);
     const status = await response.json();
     const owner = modeOwnedState(requestedMode);
     owner.status = status;
     if (requestedMode === "claude" && status?.native_commands?.owner === "claude-code-cli") {
       const version = String(status.native_commands.cli_version || "");
-      owner.commandManifest = (status.native_commands.commands || []).map((command) => ({
-        command: String(command),
-        title: String(command).replace(/^\//, ""),
-        description: `Claude Code CLI ${version} 原生命令`,
+      const commands = status.native_commands.descriptors || status.native_commands.commands || [];
+      owner.commandManifest = commands.map((item) => ({
+        ...(typeof item === "object" ? item : {}),
+        command: String(typeof item === "object" ? item.command : item),
+        title: typeof item === "object" ? (item.title || item.command) : String(item).replace(/^\//, ""),
+        description: typeof item === "object" ? (item.description || "Claude Code 原生命令") : `Claude Code CLI ${version} 原生命令`,
         version,
       }));
     }
@@ -2775,6 +2880,7 @@ async function loadStatus(mode = state.viewMode, token = modeProjectionToken(mod
     renderRuntimeSettings(state.status.runtime);
     translateChrome();
     saveActiveModeState(requestedMode);
+    schedulePermissionStatusRefresh(requestedMode, token, status);
     return status;
   } catch {
     if (modeProjectionIsCurrent(token)) $("#status-line").textContent = "服务未就绪";
@@ -2783,106 +2889,201 @@ async function loadStatus(mode = state.viewMode, token = modeProjectionToken(mod
 }
 
 function renderUpdateButton() {
-  const button = $("#update-btn");
-  if (!button) return;
+  const flow = state.updateFlow;
+  const info = state.updateInfo;
+  const snapshot = flow.snapshot;
+  const version = state.status?.version ? `v${state.status.version}` : "版本信息";
+  const downloading = snapshot?.status === "downloading";
+  const ready = snapshot?.status === "ready";
+  const busy = Boolean(flow.checking || flow.busy);
+  const label = flow.checking ? "正在检查更新…" : downloading ? "查看下载进度" : ready ? "安装更新" : info?.update_available ? "查看新版本" : "检查更新";
+  for (const selector of ["#update-btn", "#settings-check-update-btn", '[data-account-action="update"]']) {
+    const button = $(selector);
+    if (!button) continue;
+    button.disabled = busy;
+    button.title = label;
+    button.setAttribute("aria-label", `${version} · ${label}`);
+    if (selector === "#update-btn") {
+      button.textContent = `${version} · ${label}`;
+      button.classList.toggle("update-available", Boolean(info?.update_available || ready));
+    } else if (selector === "#settings-check-update-btn") button.textContent = label;
+  }
+  const status = $("#settings-update-status");
+  if (status) status.textContent = flow.error || (flow.checking ? "正在连接 GitHub，检查正式版…" : snapshot?.message || info?.message || (info?.update_available ? `可更新至 v${info.latest_version}。` : `当前 ${version} · GitHub 正式版。两个 Agent 一起更新，会话与设置保留。`));
+}
 
-  const version = state.status?.version ? `v${state.status.version}` : t("update");
-  if (state.updateInfo?.update_available) {
-    button.textContent = `更新 ${state.updateInfo.latest_version || ""}`.trim();
-    button.classList.add("update-available");
-    button.title = `发现新版本 ${state.updateInfo.latest_version}`;
-  } else {
-    button.textContent = version;
-    button.classList.remove("update-available");
-    const configured = state.status?.update?.configured;
-    button.title = configured ? "检查更新" : "未配置更新源";
+async function requestUpdate(path, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const response = await fetch(path, {
+      method: body === undefined ? "GET" : "POST",
+      ...(body === undefined ? {} : { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+      cache: "no-store", signal: controller.signal
+    });
+    const data = await response.json().catch(() => null);
+    if (!data || typeof data !== "object") throw new Error("更新服务返回了无效响应，请稍后重试。");
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.detail || data.message || `请求失败（HTTP ${response.status}），请稍后重试。`);
+    }
+    return data;
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("连接超时，请检查网络后重试。");
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 async function checkForUpdates({ silent = false } = {}) {
-  const button = $("#update-btn");
-  if (button) button.disabled = true;
+  const flow = state.updateFlow;
+  if (!silent) showUpdateModal();
+  if (flow.checking || flow.busy) return state.updateInfo;
+  if (["downloading", "ready", "installer_opened"].includes(flow.snapshot?.status)) {
+    await refreshUpdateStatus();
+    return state.updateInfo;
+  }
+  flow.checking = true;
+  flow.error = "";
+  renderUpdateModal();
   try {
-    const response = await fetch("/api/update/check", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({})
-    });
-    const data = await response.json();
-    state.updateInfo = data;
-    renderUpdateButton();
-
-    if (data.update_available) {
-      showUpdateModal(data);
-      return data;
-    }
-    if (!silent) {
-      showInlineStatus(data.message || (data.configured === false ? "还没有配置更新源。" : "当前已经是最新版本。"), { kind: "info", timeout: 4200 });
-    }
-    return data;
+    state.updateInfo = await requestUpdate("/api/update/check", {});
+    await refreshUpdateStatus();
+    return state.updateInfo;
   } catch (error) {
-    if (!silent) showInlineStatus(`检查更新失败：${error.message}`, { kind: "error", timeout: 5200 });
+    state.updateInfo = null;
+    flow.error = `检查更新失败：${error.message}`;
     return null;
   } finally {
-    if (button) button.disabled = false;
+    flow.checking = false;
+    renderUpdateModal();
   }
 }
 
-function showUpdateModal(info) {
+function showUpdateModal() {
   const modal = $("#update-modal");
   if (!modal) return;
-  const strategy = info.requires_installer ? " 此版本包含 WSL2 运行时迁移，必须使用完整 Windows 安装器。" : "";
-  $("#update-summary").textContent = `当前版本 v${info.current_version || "?"}，最新版本 v${info.latest_version || "?"}。${strategy}`;
-  $("#update-notes").textContent = info.notes || "这个版本包含最新修复和功能更新。";
-  $("#install-update-btn").textContent = info.requires_installer ? "打开完整安装器" : "立即更新";
+  if (modal.classList.contains("hidden")) state.updateFlow.returnFocus = document.activeElement;
   modal.classList.remove("hidden");
-  $("#install-update-btn").focus();
+  renderUpdateModal();
+  $("#cancel-update-btn").focus();
 }
 
 function closeUpdateModal() {
-  const modal = $("#update-modal");
-  if (modal) modal.classList.add("hidden");
+  $("#update-modal")?.classList.add("hidden");
+  state.updateFlow.returnFocus?.focus?.();
+}
+
+function handleUpdateModalKeydown(event) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    event.stopPropagation();
+    closeUpdateModal();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const controls = Array.from($("#update-modal").querySelectorAll('button:not(:disabled), a[href], [tabindex="0"]')).filter((node) => !node.closest(".hidden"));
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+  else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+}
+
+function updateSizeLabel(value) {
+  const bytes = Math.max(0, Number(value) || 0);
+  return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
+}
+
+function renderUpdateModal() {
+  renderUpdateButton();
+  const flow = state.updateFlow;
+  const info = state.updateInfo || {};
+  const snapshot = flow.snapshot || {};
+  const phase = snapshot.status || "idle";
+  const downloading = phase === "downloading";
+  const ready = phase === "ready";
+  const opened = phase === "installer_opened" || snapshot.installer_opened === true;
+  const busy = Boolean(flow.checking || flow.busy);
+  const available = Boolean(info.update_available);
+  const latest = snapshot.latest_version || info.latest_version || "";
+  const current = info.current_version || state.status?.version || "";
+  $("#update-title").textContent = opened ? "继续完成安装" : ready ? "更新已下载" : downloading ? "正在下载更新" : "应用更新";
+  $("#update-summary").textContent = current ? `当前 v${current}${latest && latest !== current ? ` → v${latest}` : ""} · GitHub 正式版` : "从 GitHub 获取正式版更新";
+  $("#update-notes").textContent = info.notes || "暂无版本说明。";
+  $("#update-notes-section").classList.toggle("hidden", !info.notes);
+  const message = flow.error || (flow.checking ? "正在连接 GitHub，检查正式版…" : flow.busy === "apply" ? "正在打开安装器…" : flow.busy === "download" ? "正在准备下载…" : opened ? (snapshot.desktop_quit_requested ? "安装器已打开，工作台即将退出。请按安装器提示完成更新，再重新打开工作台。" : "安装器已打开。请先从托盘退出工作台，再在安装器中继续；完成后重新打开工作台。") : snapshot.message || info.message || (available ? "下载安装包后再确认安装。更新保留两个 Agent 的会话、设置和密钥。" : "点击检查更新，获取最新正式版。"));
+  $("#update-feedback").textContent = message;
+  $("#update-feedback").dataset.kind = flow.error || phase === "failed" ? "error" : "status";
+  $("#update-modal").setAttribute("aria-busy", String(busy));
+  const progress = $("#update-progress");
+  const downloaded = Math.max(0, Number(snapshot.downloaded_bytes) || 0);
+  const total = Math.max(0, Number(snapshot.total_bytes) || 0);
+  $("#update-progress-section").classList.toggle("hidden", !["downloading", "ready", "installer_opened"].includes(phase));
+  if (total > 0) {
+    progress.max = total;
+    progress.value = Math.min(downloaded, total);
+    progress.setAttribute("aria-valuetext", `${updateSizeLabel(downloaded)} / ${updateSizeLabel(total)}`);
+  } else {
+    progress.removeAttribute("value");
+    progress.removeAttribute("aria-valuetext");
+  }
+  $("#update-progress-label").textContent = total > 0 ? `${updateSizeLabel(downloaded)} / ${updateSizeLabel(total)}` : downloaded > 0 ? `已下载 ${updateSizeLabel(downloaded)}` : "等待下载数据…";
+  $("#update-install-hint").classList.toggle("hidden", !ready);
+  $("#update-install-hint").textContent = typeof window.viniperDesktop?.installAppUpdate === "function"
+    ? "请先完成两个 Agent 的运行中任务。点击后会打开 Windows 安装器并退出工作台，由你确认安装。"
+    : "请先完成两个 Agent 的运行中任务。点击后会打开 Windows 安装器；请从托盘退出工作台，再在安装器中继续。";
+  const button = $("#install-update-btn");
+  button.disabled = busy || (downloading && !flow.error) || opened;
+  button.textContent = flow.checking ? "正在检查…" : flow.busy === "apply" ? "正在打开…" : downloading && flow.error ? "重试连接" : downloading || flow.busy === "download" ? "下载中…" : opened ? "安装器已打开" : ready ? "安装更新" : available ? (phase === "failed" ? "重新下载" : "下载安装包") : "检查更新";
+  $("#cancel-update-btn").textContent = downloading ? "后台下载" : opened ? "关闭" : "稍后";
+}
+
+function scheduleUpdateStatusPoll() {
+  const flow = state.updateFlow;
+  if (flow.pollTimer) clearTimeout(flow.pollTimer);
+  flow.pollTimer = null;
+  if (flow.snapshot?.status === "downloading" || (flow.snapshot?.status === "installer_opened" && !flow.snapshot.desktop_quit_requested)) {
+    flow.pollTimer = setTimeout(() => { flow.pollTimer = null; void refreshUpdateStatus(); }, flow.snapshot.status === "downloading" ? 1000 : 3000);
+  }
+}
+
+async function refreshUpdateStatus() {
+  const flow = state.updateFlow;
+  try {
+    flow.snapshot = await requestUpdate("/api/update/status");
+    flow.error = "";
+  } catch (error) {
+    flow.error = `暂时无法读取更新进度：${error.message}`;
+  } finally {
+    renderUpdateModal();
+    scheduleUpdateStatusPoll();
+  }
 }
 
 async function installUpdate() {
-  const info = state.updateInfo?.update_available ? state.updateInfo : await checkForUpdates({ silent: true });
-  if (!info?.update_available) {
-    showInlineStatus("当前没有可安装的新版本。", { kind: "info", timeout: 4200 });
-    return;
-  }
-
-  const button = $("#install-update-btn");
-  const oldText = button.textContent;
-  button.disabled = true;
-  $("#cancel-update-btn").disabled = true;
-  button.textContent = "更新中";
-
+  const flow = state.updateFlow;
+  if (flow.busy || flow.checking || flow.snapshot?.status === "installer_opened") return;
+  if (flow.snapshot?.status === "downloading") { if (flow.error) await refreshUpdateStatus(); return; }
+  const ready = flow.snapshot?.status === "ready";
+  if (!ready && !state.updateInfo?.update_available) { await checkForUpdates(); return; }
+  flow.busy = ready ? "apply" : "download";
+  flow.error = "";
+  renderUpdateModal();
   try {
-    const response = await fetch("/api/update/install", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({})
-    });
-    const data = await response.json();
-    if (!response.ok || data.ok === false) {
-      throw new Error(data.detail || data.message || `更新失败: ${response.status}`);
-    }
-    $("#update-notes").textContent = data.message || "更新已安装，请重启 UI。";
-    button.textContent = "已安装";
-    if (data.restarting) {
-      button.textContent = "正在重启...";
-      await waitForAppRestart(info.latest_version || data.version || "");
-      return;
-    }
-    renderUpdateButton();
-    if (!data.restarting) {
-      showInlineStatus(data.message || `更新已安装，请重新打开 ${APP_TITLE}。`, { kind: "info", timeout: 5200 });
-    }
+    const data = ready && typeof window.viniperDesktop?.installAppUpdate === "function"
+      ? await window.viniperDesktop.installAppUpdate()
+      : await requestUpdate(ready ? "/api/update/apply" : "/api/update/install", {});
+    if (data.ok === false) throw new Error(data.detail || data.message || "安装器未能启动，请重试。");
+    flow.snapshot = { ...flow.snapshot, ...data };
+    if (data.started === false && data.status === "idle" && state.updateInfo) state.updateInfo.update_available = false;
+    if (data.installer_opened) flow.snapshot.status = "installer_opened";
+    else await refreshUpdateStatus();
   } catch (error) {
-    $("#update-notes").textContent = `更新失败：${error.message}`;
-    button.textContent = oldText;
-    button.disabled = false;
-    $("#cancel-update-btn").disabled = false;
+    flow.error = `${ready ? "暂时不能安装" : "下载未开始"}：${error.message}`;
+  } finally {
+    flow.busy = "";
+    renderUpdateModal();
+    scheduleUpdateStatusPoll();
   }
 }
 
@@ -2983,14 +3184,13 @@ function runtimeSetupViewModel(runtime = {}) {
 }
 
 function renderRuntimeSettings(runtime = state.status?.runtime || {}) {
-  const view = runtimeSetupViewModel(runtime);
   const isClaudeCode = state.viewMode === "claude";
-  const engineLabel = isClaudeCode ? "Claude code · Claude Code CLI" : "Viniper · Harness Runtime";
-  const providerLabel = isClaudeCode
-    ? "CLI transport"
-    : String(state.settings?.provider?.label || "Harness provider");
+  const view = isClaudeCode ? runtimeSetupViewModel(runtime) : { ready: Boolean(state.status?.configured || state.settings?.provider?.api_key_configured), canInstall: false };
+  const engineLabel = isClaudeCode ? "Claude code · 原生 CLI" : "Viniper · 自研 Agent";
+  const providerLabel = String(state.settings?.provider?.label || "模型服务");
   const modelLabel = String(state.settings?.provider?.model || state.selectedModel || "默认模型");
-  const permissionLabel = String(state.permissionMode || state.settings?.runtime?.permission_mode || "default");
+  const permissionId = String(state.permissionMode || state.settings?.runtime?.permission_mode || "default");
+  const permissionLabel = (isClaudeCode ? CLAUDE_PERMISSION_MODES : VINIPER_PERMISSION_MODES).find((item) => item.id === permissionId)?.label || permissionId;
   const status = $("#settings-runtime-status");
   const setupButton = $("#settings-runtime-setup-btn");
   const updateButton = $("#settings-runtime-update-btn");
@@ -3000,16 +3200,17 @@ function renderRuntimeSettings(runtime = state.status?.runtime || {}) {
     // Keep one fixed two-line status block in the shared Agent settings
     // position, while exposing the active engine/provider/model/permission
     // tuple so Viniper and Claude code cannot appear to share state.
-    const detail = `${providerLabel} · ${modelLabel} · 权限 ${permissionLabel} · ${view.ready ? "可用" : "未就绪"}`;
+    const readiness = isClaudeCode ? (view.ready ? "可用" : "未就绪") : (view.ready ? "连接已配置" : "请配置连接");
+    const detail = `${providerLabel} · ${modelLabel} · ${permissionLabel} · ${readiness}`;
     status.innerHTML = `<strong>${escapeHtml(engineLabel)}</strong><span>${escapeHtml(detail)}</span>`;
   }
   if (setupButton) {
     setupButton.textContent = state.runtimeBusy ? "正在处理" : view.actionLabel;
     setupButton.disabled = state.runtimeBusy || !view.canInstall;
-    setupButton.classList.toggle("hidden", view.ready);
+    setupButton.classList.toggle("hidden", !isClaudeCode || view.ready);
   }
   if (updateButton) {
-    updateButton.classList.toggle("hidden", !view.ready);
+    updateButton.classList.toggle("hidden", !isClaudeCode || !view.ready);
     updateButton.disabled = state.runtimeBusy;
     const update = runtime?.update || {};
     updateButton.textContent = ["current", "compatible"].includes(update.status)
@@ -3097,28 +3298,6 @@ async function openRuntimeDiagnostics() {
   await runDiagnostics();
 }
 
-async function waitForAppRestart(expectedVersion = "") {
-  const started = Date.now();
-  const deadline = started + 90000;
-  $("#update-notes").textContent = "更新已安装，正在自动关闭旧服务并重启窗口。";
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 1800));
-    try {
-      const response = await fetch(`/api/status?mode=${encodeURIComponent(state.viewMode)}&restart_probe=${Date.now()}`, { cache: "no-store" });
-      if (!response.ok) continue;
-      const status = await response.json();
-      if (!expectedVersion || status.version === expectedVersion) {
-        location.reload();
-        return;
-      }
-      $("#update-notes").textContent = `服务已恢复，等待新版本生效：当前 v${status.version}，目标 v${expectedVersion}`;
-    } catch {
-      $("#update-notes").textContent = "旧服务已关闭，等待新服务启动。";
-    }
-  }
-  $("#update-notes").textContent = `更新已安装，但自动刷新超时。请手动重新打开 ${APP_TITLE}。`;
-}
-
 function modelsToText(models = []) {
   return models.map((model) => [
     model.id || "",
@@ -3137,18 +3316,34 @@ function parseModelsText(text) {
     const id = parts[0];
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    const context = Number(parts[2] || DEFAULT_CONTEXT_LIMIT);
+    const hasContext = parts.length > 2 && parts[2] !== "";
+    const context = hasContext ? Number(parts[2]) : 0;
     models.push({
       id,
       label: parts[1] || id,
       description: "",
-      context: Number.isFinite(context) ? Math.max(context, 8192) : DEFAULT_CONTEXT_LIMIT
+      context: Number.isFinite(context) ? Math.max(context, 0) : 0
     });
   }
-  return models.length ? models : [
-    { id: "deepseek-v4-pro[1m]", label: "DeepSeek V4 Pro", description: "", context: 1000000 },
-    { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", description: "", context: 128000 }
-  ];
+  return models;
+}
+
+const settingsSaves = new Map();
+
+function settingsViewToken() {
+  return Object.freeze({ ...state.settingsView });
+}
+
+function settingsViewIsCurrent(token) {
+  return token?.mode === state.viewMode && token.mode === state.settingsView.mode
+    && token.generation === state.settingsView.generation
+    && !$("#settings-modal")?.classList.contains("hidden");
+}
+
+async function settingsResponse(response, fallback) {
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.ok === false) throw new Error(data.detail || fallback);
+  return data;
 }
 
 function renderSettingsOptions(select, options, selected) {
@@ -3174,13 +3369,44 @@ function renderSettingsModelSelect() {
 async function openSettingsModal({ history = true, section = null } = {}) {
   closeAccountMenu({ restoreFocus: false });
   closeSkillsView({ restoreNavigation: false });
-  const [data, instructionData, runtimeData] = await Promise.all([
-    fetch(`/api/settings?mode=${encodeURIComponent(state.viewMode)}`).then((response) => response.json()).catch(() => ({})),
-    fetch(`/api/agent-instructions?mode=${encodeURIComponent(state.viewMode)}`).then((response) => response.json()).catch(() => ({})),
-    fetch("/api/runtime/status").then((response) => response.json()).catch(() => ({}))
-  ]);
+  const mode = state.viewMode === "claude" ? "claude" : "viniper";
+  state.settingsView = { mode, generation: state.settingsView.generation + 1 };
+  const token = settingsViewToken();
+  const owner = modeOwnedState(mode);
+  const modal = $("#settings-modal");
+  modal.classList.remove("hidden");
+  modal.classList.add("settings-loading");
+  modal.setAttribute("aria-busy", "true");
+  $("#settings-title").textContent = mode === "claude" ? "Claude code 设置" : "Viniper 设置";
+  $("#save-settings-btn").disabled = true;
+  $("#settings-api-key").value = "";
+  clearSettingsDirty();
+  let data, instructionData, runtimeData;
+  try {
+    [data, instructionData, runtimeData] = await Promise.all([
+      fetch(`/api/settings?mode=${encodeURIComponent(mode)}`).then((response) => settingsResponse(response, "设置读取失败")),
+      fetch(`/api/agent-instructions?mode=${encodeURIComponent(mode)}`).then((response) => settingsResponse(response, "自定义指令读取失败")),
+      mode === "claude" ? fetch("/api/runtime/status").then((response) => settingsResponse(response, "运行环境读取失败")) : Promise.resolve({ runtime: state.status?.runtime || {} }),
+    ]);
+  } catch (error) {
+    if (settingsViewIsCurrent(token)) {
+      modal.classList.remove("settings-loading");
+      modal.setAttribute("aria-busy", "false");
+      modal.classList.add("settings-load-error");
+      $("#settings-save-status").textContent = `读取失败：${error.message}。关闭后重新打开可重试。`;
+      $("#settings-action-bar").classList.remove("hidden");
+    }
+    return;
+  }
+  if (!settingsViewIsCurrent(token)) return;
+  modal.classList.remove("settings-loading", "settings-load-error");
+  modal.setAttribute("aria-busy", "false");
+  $("#save-settings-btn").disabled = settingsSaves.has(mode);
+  $("#save-settings-btn").textContent = settingsSaves.has(mode) ? "保存中" : "保存";
+  $("#settings-provider-test-btn").disabled = false;
   if (data.settings) {
     state.settings = data.settings;
+    owner.settings = data.settings;
     state.status = {
       ...(state.status || {}),
       shells: data.shells,
@@ -3197,6 +3423,7 @@ async function openSettingsModal({ history = true, section = null } = {}) {
       path: instructionData.path || "",
       updated_at: instructionData.updated_at ?? null
     };
+    owner.agentInstructions = state.agentInstructions;
   }
 
   const settings = state.settings || state.status?.settings || {};
@@ -3209,7 +3436,6 @@ async function openSettingsModal({ history = true, section = null } = {}) {
   const runtime = runtimeData.runtime || runtimeData;
 
   $("#settings-display-name").value = account.display_name || "";
-  $("#settings-signed-in").checked = Boolean(account.signed_in);
   renderSettingsOptions($("#settings-language"), state.status?.languages || [], appearance.language || state.language);
   renderSettingsOptions($("#settings-theme"), state.status?.themes || [], appearance.theme || state.theme);
   renderSettingsOptions($("#settings-font-size"), state.status?.font_sizes || FONT_SIZE_OPTIONS, appearance.font_size || state.fontSize);
@@ -3228,17 +3454,20 @@ async function openSettingsModal({ history = true, section = null } = {}) {
   $("#settings-base-url-env").value = provider.base_url_env || "ANTHROPIC_BASE_URL";
   $("#settings-model-env").value = provider.model_env || "ANTHROPIC_MODEL";
   $("#settings-models").value = modelsToText(provider.models || state.status?.models || []);
+  renderSettingsModelRows();
   renderSettingsModelSelect();
   $("#settings-provider-model").value = provider.model || state.selectedModel;
   $("#settings-provider-test-status").textContent = provider.api_key_configured ? "已配置 · 尚未测试" : "未配置";
   $("#agent-md-editor").value = state.agentInstructions.content || "";
   $("#agent-md-path").textContent = state.agentInstructions.path || "保存后将在当前数据目录创建 AGENT.md";
   const instructionHeading = $('[data-settings-panel="agent-md"] .settings-panel-header h3');
-  if (instructionHeading) instructionHeading.textContent = state.viewMode === "claude" ? "CLAUDE.md" : "AGENT.md";
+  if (instructionHeading) instructionHeading.textContent = mode === "claude" ? "CLAUDE.md" : "AGENT.md";
   const instructionNavLabel = $('[data-settings-nav="agent-md"] span');
-  if (instructionNavLabel) instructionNavLabel.textContent = state.viewMode === "claude" ? "CLAUDE.md" : "AGENT.md";
+  if (instructionNavLabel) instructionNavLabel.textContent = mode === "claude" ? "CLAUDE.md" : "AGENT.md";
   const instructionEditor = $("#agent-md-editor");
-  if (instructionEditor) instructionEditor.placeholder = state.viewMode === "claude" ? "# Claude code 独立指令" : "# Viniper Harness 独立指令";
+  if (instructionEditor) instructionEditor.placeholder = mode === "claude" ? "# Claude code 独立指令" : "# Viniper 独立指令";
+  const instructionDescription = $('[data-settings-panel="agent-md"] .settings-panel-header p');
+  if (instructionDescription) instructionDescription.textContent = mode === "claude" ? "Claude code 使用这些长期指令；项目中的 CLAUDE.md 也会生效。" : "Viniper 开始或恢复任务时读取这些长期指令。";
   const runtimeStatus = $("#settings-runtime-status");
   if (runtimeStatus) renderRuntimeSettings(runtime);
   $("#diagnostics-panel").innerHTML = "";
@@ -3247,7 +3476,7 @@ async function openSettingsModal({ history = true, section = null } = {}) {
   clearSettingsDirty();
   $("#settings-modal").classList.remove("hidden");
   const selected = normalizeSettingsSection(section || "account");
-  if (state.viewMode === "viniper") {
+  if (mode === "viniper" && selected === "capabilities") {
     await loadHarnessSnapshot({ render: false });
     if (selected === "capabilities") {
       await Promise.all([
@@ -3255,11 +3484,12 @@ async function openSettingsModal({ history = true, section = null } = {}) {
         loadHarnessConfigurationMatrix({ render: false }),
       ]);
     }
-  } else {
+  } else if (mode === "claude") {
     state.harnessSnapshot = null;
     state.capabilities = null;
     state.configurationMatrix = null;
   }
+  if (!settingsViewIsCurrent(token)) return;
   activateSettingsSection(selected, { recordLocation: false });
   updateModeChrome();
   if (state.viewMode === "viniper" && selected === "capabilities") renderHarnessSettings();
@@ -3267,9 +3497,30 @@ async function openSettingsModal({ history = true, section = null } = {}) {
   $("#settings-search").focus();
 }
 
+function renderSettingsModelRows() {
+  const host = $("#settings-model-table");
+  if (!host) return;
+  const models = parseModelsText($("#settings-models").value);
+  host.innerHTML = models.map((model, index) => `<div class="settings-model-row" data-model-row="${index}">
+    <label><span>模型 ID</span><input data-model-field="id" aria-label="模型 ${index + 1} ID" value="${escapeAttr(model.id)}" placeholder="服务商提供的模型 ID"></label>
+    <label><span>显示名称</span><input data-model-field="label" aria-label="模型 ${index + 1} 显示名称" value="${escapeAttr(model.label)}" placeholder="便于识别的名称"></label>
+    <label><span>上下文上限（Token）</span><input data-model-field="context" aria-label="模型 ${index + 1} 上下文上限（自动识别）" type="number" readonly value="${model.context || ""}" placeholder="尚未识别"></label>
+    <button type="button" class="ghost-button settings-model-remove" data-remove-model="${index}" aria-label="删除模型 ${escapeAttr(model.label || model.id)}">删除</button>
+  </div>`).join("") || `<p class="settings-help">还没有模型。添加服务商提供的模型 ID 后即可选择。</p>`;
+}
+
+function syncSettingsModelRows() {
+  const rows = $$("#settings-model-table [data-model-row]");
+  $("#settings-models").value = rows.map((row) => ["id", "label", "context"].map((field) => row.querySelector(`[data-model-field="${field}"]`)?.value.trim() || "").join(" | ")).join("\n");
+  renderSettingsModelSelect();
+  markSettingsDirty();
+}
+
 function closeSettingsModal({ restoreNavigation = true } = {}) {
+  state.settingsView = { mode: null, generation: state.settingsView.generation + 1 };
   const modal = $("#settings-modal");
   if (modal) modal.classList.add("hidden");
+  $("#settings-api-key").value = "";
   filterSettingsCenter("");
   clearSettingsDirty();
   if (restoreNavigation && state.navigation.current?.kind === "settings") {
@@ -3277,35 +3528,49 @@ function closeSettingsModal({ restoreNavigation = true } = {}) {
   }
 }
 
-async function saveAgentInstructions() {
-  const content = $("#agent-md-editor")?.value || "";
-  if (content === state.agentInstructions.content) return state.agentInstructions;
+async function saveAgentInstructions({ mode, content, previousContent, token }) {
+  const owner = modeOwnedState(mode);
+  if (content === previousContent) return owner.agentInstructions;
   const response = await fetch("/api/agent-instructions", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content, mode: state.viewMode })
+    body: JSON.stringify({ content, mode })
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.ok === false) {
     throw new Error(data.detail || "保存 AGENT.md 失败；原内容已保留。");
   }
-  state.agentInstructions = {
+  owner.agentInstructions = {
     content: data.content || "",
     exists: Boolean(data.exists),
     path: data.path || "",
     updated_at: data.updated_at ?? null
   };
-  $("#agent-md-path").textContent = state.agentInstructions.path;
-  return state.agentInstructions;
+  if (state.viewMode === mode) state.agentInstructions = owner.agentInstructions;
+  if (settingsViewIsCurrent(token)) {
+    $("#agent-md-path").textContent = owner.agentInstructions.path;
+  }
+  return owner.agentInstructions;
 }
 
 async function saveSettings() {
+  const token = settingsViewToken();
+  if (!settingsViewIsCurrent(token) || settingsSaves.has(token.mode)) return;
+  const mode = token.mode;
+  const owner = modeOwnedState(mode);
   const models = parseModelsText($("#settings-models").value);
+  if (!models.length) {
+    markSettingsDirty("请至少添加一个模型，并填写服务商提供的模型 ID。");
+    activateSettingsSection("provider");
+    $("#settings-add-model-btn")?.focus();
+    return;
+  }
+  const instructionSnapshot = { mode, token, content: $("#agent-md-editor")?.value || "", previousContent: state.agentInstructions.content };
   const apiKey = $("#settings-api-key").value.trim();
   const settings = {
     account: {
       display_name: $("#settings-display-name").value.trim() || "Viniper 用户",
-      signed_in: $("#settings-signed-in").checked
+      signed_in: Boolean(state.settings?.account?.signed_in)
     },
     appearance: {
       language: $("#settings-language").value,
@@ -3337,7 +3602,7 @@ async function saveSettings() {
     }
   };
   const button = $("#save-settings-btn");
-  const oldText = button.textContent;
+  settingsSaves.set(mode, token);
   button.disabled = true;
   button.textContent = "保存中";
   $("#settings-save-status").textContent = "正在保存…";
@@ -3347,26 +3612,33 @@ async function saveSettings() {
       if (typeof saveSecret !== "function") {
         throw new Error("API Key 必须由桌面安全存储保存");
       }
-      const result = await saveSecret(state.viewMode, apiKey);
+      const result = await saveSecret(mode, apiKey);
       if (!result?.ok) throw new Error(result?.reason || "安全存储不可用");
     }
     const response = await fetch("/api/settings", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ settings, mode: state.viewMode })
+      body: JSON.stringify({ settings, mode })
     });
     const data = await response.json();
     if (!response.ok || data.ok === false) {
       throw new Error(data.detail || "保存失败");
     }
-    await saveAgentInstructions();
-    state.settings = data.settings;
-    state.status = {
-      ...(state.status || {}),
+    await saveAgentInstructions(instructionSnapshot);
+    owner.settings = data.settings;
+    owner.status = {
+      ...(owner.status || {}),
       models: data.models,
       settings: data.settings,
-      permission_modes: data.permission_modes || state.status?.permission_modes || [],
+      permission_modes: data.permission_modes || owner.status?.permission_modes || [],
     };
+    owner.selectedModel = data.settings.provider?.model || owner.selectedModel;
+    rememberModel(owner.selectedModel, mode);
+    if (state.viewMode === mode) {
+      state.settings = owner.settings;
+      state.status = owner.status;
+    }
+    if (!settingsViewIsCurrent(token)) return;
     applySettingsFromServer(data.settings);
     state.selectedModel = data.settings.provider?.model || state.selectedModel;
     rememberModel(state.selectedModel, state.viewMode);
@@ -3377,10 +3649,13 @@ async function saveSettings() {
     clearSettingsDirty();
     closeSettingsModal();
   } catch (error) {
-    markSettingsDirty(`保存失败：${error.message}`);
+    if (settingsViewIsCurrent(token)) markSettingsDirty(`保存失败：${error.message}`);
   } finally {
-    button.disabled = false;
-    button.textContent = oldText;
+    settingsSaves.delete(mode);
+    if (state.settingsView.mode === mode) {
+      button.disabled = false;
+      button.textContent = "保存";
+    }
   }
 }
 
@@ -3432,20 +3707,25 @@ function closeFolderPicker() {
 }
 
 async function testProviderConnection() {
+  const token = settingsViewToken();
+  if (!settingsViewIsCurrent(token)) return;
   const button = $("#settings-provider-test-btn");
   const status = $("#settings-provider-test-status");
   if (!button || !status) return;
   button.disabled = true;
   status.textContent = "测试中…";
   try {
-    const response = await fetch(`/api/provider/test?mode=${encodeURIComponent(state.viewMode)}`, { method: "POST" });
+    const response = await fetch(`/api/provider/test?mode=${encodeURIComponent(token.mode)}`, { method: "POST" });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) throw new Error(data.detail || "Provider 不可用");
-    status.textContent = data.configured ? `已配置 · ${data.status || "可连接"}` : "未配置";
+    if (String(data.status || "").startsWith("http_") || data.status === "error") throw new Error(data.detail || data.error_type || data.status);
+    if (settingsViewIsCurrent(token)) status.textContent = !data.configured ? "请先保存连接地址和密钥"
+      : ["connected", "reachable"].includes(data.status) ? "连接测试通过"
+        : data.status === "ready" ? "配置已读取，尚未验证实际请求" : `连接检查：${data.status || "尚未验证"}`;
   } catch (error) {
-    status.textContent = `不可用 · ${error.message || error}`;
+    if (settingsViewIsCurrent(token)) status.textContent = `连接失败：${error.message || error}`;
   } finally {
-    button.disabled = false;
+    if (settingsViewIsCurrent(token)) button.disabled = false;
   }
 }
 
@@ -3640,8 +3920,31 @@ function selectModel(modelId, { closeMenu = false, restoreFocus = false } = {}) 
   renderCurrentSession();
   updateContextMeter();
   persistSelectedModel();
+  void refreshContextUsageForSelectedModel();
   if (closeMenu) setAnchoredMenuOpen("model", false, { restoreFocus });
   return true;
+}
+
+async function refreshContextUsageForSelectedModel() {
+  const sessionId = String(state.sessionId || "");
+  if (!sessionId) return null;
+  const mode = state.viewMode === "claude" ? "claude" : "viniper";
+  const model = encodeURIComponent(String(state.selectedModel || ""));
+  try {
+    const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/usage?model=${model}&mode=${mode}`, { cache: "no-store" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false || !data.usage) return null;
+    if (sessionId !== String(state.sessionId || "") || mode !== (state.viewMode === "claude" ? "claude" : "viniper")) return null;
+    state.contextUsage = normalizeContextUsage(data.usage, state.selectedModel);
+    state.contextUsageBySession[sessionId] = state.contextUsage;
+    updateContextMeter({ schedule: false });
+    return data.usage;
+  } catch {
+    // The local status projection remains authoritative; no Provider call is
+    // made for a model switch and the existing usage stays visible.
+    updateContextMeter({ schedule: false });
+    return null;
+  }
 }
 
 function menuNextIndex(index, delta, count) {
@@ -3672,6 +3975,12 @@ function setAnchoredMenuOpen(kind, open, { focus = false, restoreFocus = false }
   if (open) {
     const other = kind === "model" ? "permission" : "model";
     setAnchoredMenuOpen(other, false);
+    const claudePermissionUnavailable = kind === "permission"
+      && state.viewMode === "claude"
+      && (state.status?.permission_modes_pending || permissionModeOptions().some((item) => item.enabled === false));
+    if (claudePermissionUnavailable) {
+      requestPermissionStatusRefresh("claude");
+    }
   }
   state[parts.stateKey] = Boolean(open);
   parts.menu.classList.toggle("hidden", !open);
@@ -3785,7 +4094,7 @@ function sanitizePermissionMode(mode) {
   const raw = String(mode || "");
   const isClaude = state.viewMode === "claude";
   const migration = isClaude
-    ? { ask: "default", manual: "default", auto: "acceptEdits" }
+    ? { ask: "default", manual: "default", auto: "acceptEdits", full: "fullAccess", bypassPermissions: "fullAccess" }
     : { default: "ask", manual: "ask", acceptEdits: "review", auto: "review", plan: "review", full: "fullAccess", bypassPermissions: "fullAccess" };
   const value = migration[raw] || raw;
   const fallback = isClaude ? "default" : "ask";
@@ -6806,7 +7115,7 @@ function structuredActivities() {
 }
 
 function normalizePlanSnapshot(value = {}) {
-  const planStatuses = ["completed", "in_progress", "pending", "skipped", "failed"];
+  const planStatuses = ["completed", "in_progress", "pending", "skipped", "failed", "blocked"];
   const steps = Array.isArray(value.steps) ? value.steps.map((step, index) => ({
     id: String(step?.id || `step-${index + 1}`),
     title: String(step?.title || "未命名步骤"),
@@ -6980,13 +7289,16 @@ function harnessStatusText(status) {
 
 async function loadHarnessSnapshot({ render = true } = {}) {
   if (state.viewMode !== "viniper") return null;
+  const token = modeProjectionToken("viniper", state.sessionId);
   try {
     const response = await fetch(`/api/harness/snapshot?mode=viniper&session_id=${encodeURIComponent(state.sessionId || "")}`, { cache: "no-store" });
     const data = await response.json().catch(() => ({}));
+    if (!modeProjectionIsCurrent(token)) return data;
     state.harnessSnapshot = data;
     if (render) renderHarnessSettings();
     return data;
   } catch (error) {
+    if (!modeProjectionIsCurrent(token)) return null;
     state.harnessSnapshot = { ok: true, status: "unavailable", reason: error.message || "Harness 能力快照不可用" };
     if (render) renderHarnessSettings();
     return state.harnessSnapshot;
@@ -6995,16 +7307,18 @@ async function loadHarnessSnapshot({ render = true } = {}) {
 
 async function loadHarnessCapabilities({ sessionId = state.sessionId || "", render = false } = {}) {
   if (state.viewMode !== "viniper") {
-    state.capabilities = null;
     return null;
   }
+  const token = modeProjectionToken("viniper", sessionId);
   try {
     const response = await fetch(`/api/capabilities?mode=viniper&session_id=${encodeURIComponent(sessionId)}`, { cache: "no-store" });
     const data = await response.json().catch(() => ({}));
+    if (!modeProjectionIsCurrent(token)) return data;
     state.capabilities = response.ok && data.ok !== false
       ? data
       : { ok: false, mode: "viniper", status: "unavailable", reason: data.reason || data.detail || `HTTP ${response.status}` };
   } catch (error) {
+    if (!modeProjectionIsCurrent(token)) return null;
     state.capabilities = { ok: false, mode: "viniper", status: "unavailable", reason: error.message || "Harness 能力状态读取失败" };
   }
   if (render) renderHarnessCapabilityStatus();
@@ -7013,16 +7327,18 @@ async function loadHarnessCapabilities({ sessionId = state.sessionId || "", rend
 
 async function loadHarnessConfigurationMatrix({ render = false } = {}) {
   if (state.viewMode !== "viniper") {
-    state.configurationMatrix = null;
     return null;
   }
+  const token = modeProjectionToken("viniper", state.sessionId);
   try {
     const response = await fetch("/api/configuration-matrix?mode=viniper", { cache: "no-store" });
     const data = await response.json().catch(() => ({}));
+    if (!modeProjectionIsCurrent(token)) return data;
     state.configurationMatrix = response.ok && data.ok !== false
       ? data
       : { ok: false, mode: "viniper", items: [], reason: data.reason || data.detail || `HTTP ${response.status}` };
   } catch (error) {
+    if (!modeProjectionIsCurrent(token)) return null;
     state.configurationMatrix = { ok: false, mode: "viniper", items: [], reason: error.message || "Harness 配置状态读取失败" };
   }
   if (render) renderHarnessCapabilityStatus();
@@ -7301,12 +7617,14 @@ async function postCollaborationAction(sessionId, body) {
 async function renderCollaborationWorkspace(host) {
   const mode = state.viewMode;
   const sessionId = state.sessionId || "";
+  const token = modeProjectionToken(mode, sessionId);
   const [capabilityResponse, snapshotResponse] = await Promise.all([
     fetch(`/api/capabilities?mode=${encodeURIComponent(mode)}&session_id=${encodeURIComponent(sessionId)}`),
     fetch(`/api/collaboration/${encodeURIComponent(sessionId)}`),
   ]);
   const capabilities = await capabilityResponse.json().catch(() => ({}));
   const snapshot = await snapshotResponse.json().catch(() => ({}));
+  if (!modeProjectionIsCurrent(token)) return;
   state.capabilities = capabilities;
   const collaboration = capabilities.collaboration || {};
   const subagentCapability = capabilities.subagents || {};
@@ -7340,6 +7658,14 @@ async function renderCollaborationWorkspace(host) {
       <ul class="harness-record-list">${subagents.map((item) => `<li class="harness-record"><div><strong>${escapeHtml(item.id || "子 Agent")}</strong><small>${escapeHtml(item.status || "unknown")}</small></div><span>${escapeHtml(item.output || item.error || "等待状态更新")}</span>${["queued", "running"].includes(item.status) && mode === "viniper" ? `<button type="button" class="ghost-button" data-cancel-subagent="${escapeAttr(item.id)}">取消</button>` : ""}</li>`).join("") || `<li class="workspace-unavailable">暂无子 Agent 记录。</li>`}</ul>
     </section>`;
   const form = host.querySelector("#collaboration-form");
+  if (mode === "claude") {
+    const nativeButton = document.createElement("button");
+    nativeButton.className = "ghost-button";
+    nativeButton.type = "button";
+    nativeButton.textContent = "管理 Claude Code 原生子 Agent";
+    nativeButton.addEventListener("click", () => void executeWorkspaceSlashCommand("/agents"));
+    host.querySelector(".collaboration-subagents")?.prepend(nativeButton);
+  }
   const syncFields = () => {
     const waiting = form?.elements.action.value === "wait_for_result";
     form?.querySelector("[data-collaboration-content]")?.classList.toggle("hidden", waiting);
@@ -7370,6 +7696,10 @@ async function renderCollaborationWorkspace(host) {
 async function openWorkspaceTab(tab = "project") {
   const rail = $("#workspace-rail");
   if (!rail) return;
+  const token = modeProjectionToken(state.viewMode, state.sessionId);
+  const generation = ++state.workspaceRequestGeneration;
+  const isCurrent = () => modeProjectionIsCurrent(token) && generation === state.workspaceRequestGeneration;
+  try {
   state.workspaceTab = ["project", "plan", "index", "changes", "collaboration", "capabilities"].includes(tab) ? tab : "project";
   if (state.viewMode === "claude" && state.workspaceTab === "capabilities") state.workspaceTab = "project";
   rail.classList.remove("hidden");
@@ -7386,10 +7716,21 @@ async function openWorkspaceTab(tab = "project") {
     browser.innerHTML = `<div class="workspace-panel-header"><h2>${state.workspaceTab === "index" ? "项目索引" : "项目与目录"}</h2><span>${escapeHtml(state.workdir || "未选择")}</span></div><div class="workspace-loading">正在读取…</div>`;
     const response = await fetch(`/api/project-index?session_id=${encodeURIComponent(state.sessionId || "")}&mode=${encodeURIComponent(state.viewMode)}&query=${encodeURIComponent(state.projectIndexQuery || "")}`);
     const data = await response.json().catch(() => ({}));
+    if (!isCurrent()) return;
+    if (!response.ok || data.ok === false) throw new Error(data.detail || "项目目录读取失败");
     const entries = Array.isArray(data.entries) ? data.entries : [];
     state.projectIndexEntries = entries;
     browser.innerHTML = `<div class="workspace-panel-header"><h2>${state.workspaceTab === "index" ? "项目索引" : "项目与目录"}</h2><button type="button" class="ghost-button" data-workspace-change-dir>选择目录</button></div><div class="project-index-toolbar"><input id="project-index-query" type="search" value="${escapeAttr(state.projectIndexQuery || "")}" placeholder="搜索文件或符号"><button type="button" class="ghost-button" data-project-index-search>搜索</button><button type="button" class="ghost-button" data-project-index-build>重建索引</button></div><code class="workspace-root">${escapeHtml(data.root || state.workdir || "")}</code>${data.ok === false || data.status === "unavailable" ? `<p class="workspace-unavailable">${escapeHtml(data.reason || "当前项目索引不可用。")}</p>` : `<div class="project-index-list">${entries.slice(0, 120).map((entry) => `<button type="button" data-index-path="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.path)}</span><small>${formatBytes(entry.size)}${entry.symbols?.length ? ` · ${entry.symbols.length} 个符号` : ""}</small></button>`).join("") || `<p class="workspace-unavailable">项目中没有可显示的文件。</p>`}</div>`}<div class="lsp-navigator"><h3>LSP 语义导航</h3><div class="lsp-form"><input id="lsp-path" placeholder="相对文件路径"><input id="lsp-symbol" placeholder="符号"><select id="lsp-operation"><option value="definition">定义</option><option value="references">引用</option><option value="implementation">实现</option><option value="hover">悬停</option></select><button type="button" class="ghost-button" data-lsp-navigate>查询</button></div><div id="lsp-results" class="lsp-results"></div></div>`;
     browser.querySelector("[data-workspace-change-dir]")?.addEventListener("click", () => void changeWorkdir());
+    if (token.mode === "claude") {
+      browser.querySelector("[data-project-index-build]")?.remove();
+      browser.querySelector(".lsp-navigator")?.remove();
+      const heading = browser.querySelector(".workspace-panel-header h2");
+      if (heading) heading.textContent = "项目文件";
+      const search = browser.querySelector("#project-index-query");
+      if (search) search.placeholder = "搜索文件";
+      if (data.truncated) browser.insertAdjacentHTML("beforeend", '<p class="workspace-unavailable">文件较多，仅显示部分结果。输入文件名可缩小范围。</p>');
+    }
     const projectIndexQuery = browser.querySelector("#project-index-query");
     const submitProjectIndexSearch = () => {
       state.projectIndexQuery = String(projectIndexQuery?.value || "").trim();
@@ -7403,7 +7744,35 @@ async function openWorkspaceTab(tab = "project") {
       }
     });
     browser.querySelector("[data-project-index-build]")?.addEventListener("click", async () => { try { await harnessAction("project-index.build", { project_root: state.workdir || "" }); toast("项目索引已更新", "success"); await openWorkspaceTab(state.workspaceTab); } catch (error) { toast(error.message || "索引不可用", "error"); } });
-    browser.querySelectorAll("[data-index-path]").forEach((button) => button.addEventListener("click", () => {
+    let previewRequest = 0;
+    browser.querySelectorAll("[data-index-path]").forEach((button) => button.addEventListener("click", async () => {
+      if (token.mode === "claude") {
+        const relativePath = button.dataset.indexPath || "";
+        const request = ++previewRequest;
+        browser.querySelector("#project-file-preview")?.remove();
+        const preview = document.createElement("section");
+        preview.id = "project-file-preview";
+        preview.className = "project-file-preview";
+        preview.innerHTML = `<div class="workspace-panel-header"><h3>${escapeHtml(relativePath)}</h3><span>只读预览</span></div><p class="workspace-unavailable">正在读取文件…</p>`;
+        browser.append(preview);
+        try {
+          const response = await fetch(`/api/project-file?session_id=${encodeURIComponent(token.sessionId)}&mode=claude&path=${encodeURIComponent(relativePath)}`);
+          const file = await response.json().catch(() => ({}));
+          if (!isCurrent() || request !== previewRequest) return;
+          if (!response.ok || file.ok === false) throw new Error(file.detail || file.reason || "文件读取失败");
+          const readable = file.status === "available" && typeof file.content === "string";
+          preview.innerHTML = `<div class="workspace-panel-header"><h3>${escapeHtml(file.path || relativePath)}</h3><span>只读预览${file.size ? ` · ${formatBytes(file.size)}` : ""}</span></div>${readable ? `<button type="button" class="ghost-button" data-copy-project-file>复制内容</button><pre><code>${escapeHtml(file.content)}</code></pre>` : `<p class="workspace-unavailable">${escapeHtml(file.reason || "这个文件无法在工作台内预览。可在本机文件管理器中查看。")}</p>`}`;
+          preview.querySelector("[data-copy-project-file]")?.addEventListener("click", async (event) => {
+            const copyButton = event.currentTarget;
+            try { await navigator.clipboard.writeText(file.content); copyButton.textContent = "已复制"; }
+            catch { showInlineStatus("复制失败，请选中内容后手动复制。", { kind: "error", timeout: 5000 }); }
+          });
+          preview.scrollIntoView({ block: "nearest" });
+        } catch (error) {
+          if (isCurrent() && request === previewRequest) preview.innerHTML = `<p class="workspace-unavailable">${escapeHtml(error.message || "文件读取失败")}。重新选择文件可重试。</p>`;
+        }
+        return;
+      }
       const lspPath = browser.querySelector("#lsp-path");
       if (lspPath) {
         lspPath.value = button.dataset.indexPath || "";
@@ -7421,6 +7790,7 @@ async function openWorkspaceTab(tab = "project") {
   } else if (state.workspaceTab === "plan") {
     planArea.classList.remove("hidden");
     const snapshot = await loadPlanSnapshot();
+    if (!isCurrent()) return;
     const plan = normalizePlanSnapshot(snapshot || {});
     planArea.innerHTML = plan.steps.length ? `<div class="workspace-panel-header"><h2>规划步骤</h2><span>第 ${plan.current || 1} / ${plan.total} 步</span></div><ol class="plan-step-list">${plan.steps.map((step) => `<li class="plan-step plan-step-${escapeAttr(step.status)}"><span class="plan-step-state">${step.status === "completed" ? "✓" : ""}</span><span class="plan-step-title">${escapeHtml(step.title)}</span></li>`).join("")}</ol>` : `<p class="workspace-unavailable">当前会话还没有结构化计划。输入 /plan 步骤一 | 步骤二 创建。</p>`;
   } else if (state.workspaceTab === "changes") {
@@ -7438,8 +7808,14 @@ async function openWorkspaceTab(tab = "project") {
       loadHarnessConfigurationMatrix({ render: false }),
     ]);
     const snapshot = state.harnessSnapshot || await loadHarnessSnapshot({ render: false }) || {};
+    if (!isCurrent()) return;
     capabilityArea.innerHTML = `<div class="workspace-panel-header"><h2>Harness 能力</h2><span>Viniper · Harness Runtime</span></div><div class="capability-status-grid">${harnessFeatureRecords().map(([label, status, reason]) => `<div class="capability-status-item"><span>${escapeHtml(label)}</span><strong data-status="${escapeAttr(status || "unavailable")}"${reason ? ` title="${escapeAttr(reason)}"` : ""}>${escapeHtml(harnessStatusText(status))}</strong></div>`).join("")}</div><p class="workspace-unavailable">详细管理位于设置 → Harness 能力；项目索引/LSP 与协作分别位于对应工作区页。</p><button type="button" class="ghost-button" data-open-harness-settings>打开 Harness 设置</button>`;
     capabilityArea.querySelector("[data-open-harness-settings]")?.addEventListener("click", () => void openSettingsModal({ section: "capabilities" }));
+  }
+  } catch (error) {
+    if (!isCurrent()) return;
+    rail.querySelector(".workspace-loading")?.remove();
+    showInlineStatus(`读取工作区失败：${error.message || error}。可重新打开重试。`, { kind: "error", timeout: 6500 });
   }
 }
 
@@ -7634,36 +8010,85 @@ async function enqueueAgentMessage(sessionId, input = $("#user-input")) {
 }
 
 async function executeClaudeNativeSlashCommand(text) {
-  const match = String(text || "").trim().match(/^\/([a-z0-9-]+)(?:\s+([\s\S]*))?$/i);
+  const match = String(text || "").trim().match(/^\/([a-z0-9_:-]+)(?:\s+([\s\S]*))?$/i);
   if (!match) return false;
   const command = match[1].toLowerCase();
   const detail = String(match[2] || "").trim();
-  if (!CLAUDE_NATIVE_COMMANDS.some((item) => item.command === `/${command}`)) return false;
-  const response = await fetch(`/api/claude-native-commands/${encodeURIComponent(state.sessionId || "")}`, {
+  const descriptor = slashCommandsForMode("claude").find((item) => item.command === `/${command}`);
+  if (!descriptor) return false;
+  const sessionId = String(state.sessionId || "");
+  const token = modeProjectionToken("claude", sessionId);
+  const response = await fetch(`/api/claude-native-commands/${encodeURIComponent(sessionId)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ command: `/${command}`, arguments: detail, cli_version: CLAUDE_NATIVE_COMMAND_VERSION }),
+    body: JSON.stringify({ command: `/${command}`, arguments: detail, cli_version: descriptor.version || "" }),
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.ok === false) throw new Error(data.detail || `/${command} 原生命令不可用`);
-  const summary = data.summary || `Claude Code 原生命令 /${command} 需要受管 CLI 交互界面完成。`;
-  addMessage("user", text, { slash_command: command, command_owner: "claude-code-cli" });
-  addMessage("assistant", summary, { slash_command: command, command_owner: "claude-code-cli", completed: true, native_status: data.status });
-  showInlineStatus(summary, { kind: data.available === false ? "info" : "success", timeout: 5200 });
+  if (!modeProjectionIsCurrent(token)) return true;
+  const result = { ...descriptor, ...data.descriptor, ...data };
+  if (result.execution === "native-ui" && result.ui_action) {
+    await openClaudeCommandUi(result.ui_action);
+  } else if (["opened", "native_terminal_opened"].includes(result.status) || (result.execution === "cli" && result.status === "completed")) {
+    showNativeCommandStatus(result);
+  } else {
+    showInlineStatus(result.summary || result.reason || `/${command} 当前不可用`, { kind: result.available === false ? "error" : "info", timeout: 6500 });
+  }
   return true;
+}
+
+async function openClaudeCommandUi(action) {
+  if (state.viewMode !== "claude") return;
+  if (action === "model" || action === "permissions") {
+    setAnchoredMenuOpen(action === "model" ? "model" : "permission", true, { focus: true });
+  } else if (action === "context") {
+    setContextPopoverOpen(true);
+  } else if (action === "config" || action === "settings" || action === "status") {
+    await openSettingsModal({ section: action === "status" ? "claude" : "provider" });
+  } else if (action === "sessions") {
+    setSidebarVisible(true);
+    $("#session-list")?.focus();
+    showInlineStatus("在左侧选择要继续的 Claude code 会话", { kind: "info", timeout: 5000 });
+  } else if (action === "skills" || action === "plugins") {
+    openSkillsView();
+  } else if (["tasks", "plan", "agents", "project", "diff"].includes(action)) {
+    const tab = { tasks: "plan", plan: "plan", agents: "collaboration", project: "project", diff: "changes" }[action];
+    await openWorkspaceTab(tab);
+  } else {
+    throw new Error("这个原生命令的桌面入口尚不可用，请使用 Claude Code 原生终端。");
+  }
+}
+
+function showNativeCommandStatus(result) {
+  $("#native-command-status")?.remove();
+  const host = document.createElement("div");
+  host.id = "native-command-status";
+  host.className = "native-command-status";
+  host.setAttribute("role", "status");
+  const command = String(result.command_to_type || result.command || "");
+  const output = result.execution === "cli" ? String(result.summary || "原生命令已返回") : "";
+  host.innerHTML = `<div><strong>${output ? `Claude Code ${escapeHtml(command)}` : "Claude Code 原生窗口已打开"}</strong>${output ? `<pre>${escapeHtml(output)}</pre>` : `<p>${escapeHtml(result.summary || "在原生窗口中继续完成操作。")}</p>${command ? `<code>${escapeHtml(command)}</code>` : ""}`}</div><div class="native-command-actions">${command ? `<button type="button" class="ghost-button" data-native-command-copy>${output ? "复制输出" : "复制命令"}</button>` : ""}<button type="button" class="ghost-button" data-native-command-dismiss aria-label="关闭原生命令提示">关闭</button></div>`;
+  host.querySelector("[data-native-command-copy]")?.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(output || command); host.querySelector("[data-native-command-copy]").textContent = "已复制"; }
+    catch { showInlineStatus("复制失败，请选中命令手动复制。", { kind: "error", timeout: 5000 }); }
+  });
+  host.querySelector("[data-native-command-dismiss]")?.addEventListener("click", () => host.remove());
+  $("#composer")?.before(host);
 }
 
 async function executeWorkspaceSlashCommand(text) {
   if (state.viewMode === "claude") {
+    const token = modeProjectionToken("claude", state.sessionId);
     try {
       return await executeClaudeNativeSlashCommand(text);
     } catch (error) {
-      showInlineStatus(`${text}：${error.message || error}`, { kind: "error", timeout: 5200 });
-      return true;
+      if (modeProjectionIsCurrent(token)) showInlineStatus(`${text}：${error.message || error}`, { kind: "error", timeout: 5200 });
+      return "failed";
     }
   }
   const match = String(text || "").trim().match(/^\/(mcp|goal|target|plan)(?:\s+([\s\S]*))?$/i);
   if (!match) return false;
+  const token = modeProjectionToken("viniper", state.sessionId);
   const command = match[1].toLowerCase();
   const detail = String(match[2] || "").trim();
   const endpoint = command === "goal"
@@ -7685,6 +8110,7 @@ async function executeWorkspaceSlashCommand(text) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) throw new Error(data.detail || `/${command} 不可用`);
+    if (!modeProjectionIsCurrent(token)) return true;
     const summary = data.summary || (command === "goal"
       ? (data.available === false ? data.reason : (data.goal ? `已创建目标：${data.goal.title}` : `Goal：${(data.goals || []).length} 项`))
       : command === "plan"
@@ -7696,7 +8122,8 @@ async function executeWorkspaceSlashCommand(text) {
     if (command === "goal") renderGoalDock(data.goal ? { available: true, goals: [data.goal] } : data);
     showInlineStatus(summary, { kind: "info", timeout: 4200 });
   } catch (error) {
-    showInlineStatus(`${text}：${error.message || error}`, { kind: "error", timeout: 5200 });
+    if (modeProjectionIsCurrent(token)) showInlineStatus(`${text}：${error.message || error}`, { kind: "error", timeout: 5200 });
+    return "failed";
   }
   return true;
 }
@@ -7883,11 +8310,14 @@ async function sendMessageForSession() {
   const text = input.value.trim();
   if (!text) return;
 
-  if (await executeWorkspaceSlashCommand(text)) {
-    input.value = "";
-    modeOwnedState(runMode).draft = "";
-    autoResize(input);
-    hideSlashSuggestions();
+  const slashResult = await executeWorkspaceSlashCommand(text);
+  if (slashResult) {
+    if (slashResult !== "failed" && state.viewMode === runMode && String(state.sessionId) === runSessionId && input.value.trim() === text) {
+      input.value = "";
+      modeOwnedState(runMode).draft = "";
+      autoResize(input);
+      hideSlashSuggestions();
+    }
     return;
   }
 
@@ -8195,13 +8625,17 @@ async function doRetrySend(
   }
 }
 
-function normalizeContextUsage(value) {
+function normalizeContextUsage(value, selectedModel = state.selectedModel) {
   const source = ["real", "unavailable"].includes(value?.source) ? value.source : "unavailable";
   const tokens = Math.max(0, Number(value?.used_tokens) || 0);
-  const limit = Math.max(0, Number(value?.context_limit) || 0);
-  const effectiveWindow = Math.max(0, Number(value?.effective_context_window) || limit);
-  const rawRatio = Number(value?.ratio);
-  const ratio = Number.isFinite(rawRatio) ? Math.min(Math.max(rawRatio, 0), 1) : (limit ? Math.min(tokens / limit, 1) : 0);
+  const rawLimit = Math.max(0, Number(value?.context_limit) || 0);
+  const capacity = modelCapacityMetadata(selectedModel);
+  const reportedStatus = String(value?.capacity_status || value?.model_capacity?.status || "").toLowerCase();
+  const reportedModel = String(value?.model || "");
+  const trustedReportedLimit = reportedStatus === "verified" && rawLimit > 0 && (!reportedModel || reportedModel === String(selectedModel || ""));
+  const limit = capacity.status === "verified" ? capacity.limit : (trustedReportedLimit ? rawLimit : 0);
+  const effectiveWindow = limit;
+  const ratio = limit ? Math.min(tokens / limit, 1) : 0;
   return {
     used_tokens: tokens,
     context_limit: limit,
@@ -8209,7 +8643,11 @@ function normalizeContextUsage(value) {
     ratio,
     source,
     updated_at: Number(value?.updated_at) || 0,
-    model: String(value?.model || ""),
+    model: reportedModel || String(selectedModel || ""),
+    capacity_status: capacity.status,
+    capacity_source: capacity.source,
+    capacity_source_url: capacity.sourceUrl,
+    max_output_tokens: capacity.maxOutputTokens,
     input_tokens: Math.max(0, Number(value?.input_tokens) || 0),
     cache_creation_input_tokens: Math.max(0, Number(value?.cache_creation_input_tokens) || 0),
     cache_read_input_tokens: Math.max(0, Number(value?.cache_read_input_tokens) || 0),
@@ -8224,8 +8662,9 @@ function normalizeContextUsage(value) {
 function contextStats() {
   const usage = normalizeContextUsage(state.contextUsage);
   const tokens = usage.used_tokens;
-  const limit = usage.effective_context_window || usage.context_limit;
-  const ratio = usage.ratio;
+  const capacity = modelCapacityMetadata(state.selectedModel);
+  const limit = capacity.status === "verified" ? capacity.limit : 0;
+  const ratio = limit ? Math.min(tokens / limit, 1) : 0;
   const autoCompactThreshold = usage.effective_auto_compact_threshold || DEFAULT_AUTO_COMPACT_THRESHOLD;
   return {
     tokens,
@@ -8235,6 +8674,9 @@ function contextStats() {
     autoCompactThreshold,
     percent: Math.round(ratio * 100),
     source: usage.source,
+    capacityStatus: capacity.status,
+    capacitySource: capacity.source,
+    capacitySourceUrl: capacity.sourceUrl,
     compacting: usage.compacting,
     available: usage.source !== "unavailable" && limit > 0,
     shouldCompress: usage.source !== "unavailable" && ratio >= autoCompactThreshold,
@@ -8288,10 +8730,12 @@ function updateContextMeter({ announce = false, schedule = true } = {}) {
   const stats = contextStats();
   const percentText = stats.available ? `${stats.percent}%` : "—";
   const number = new Intl.NumberFormat("zh-CN");
-  const sourceLabels = { real: "Claude 实际用量", unavailable: "不可用" };
+  const sourceLabels = { real: "Provider 实际用量", unavailable: "不可用" };
   const usageTooltip = stats.available
     ? `已用 ${number.format(stats.tokens)} / ${number.format(stats.limit)} 令牌 · ${stats.percent}% · 来源：${sourceLabels[stats.source] || "不可用"}`
-    : "上下文用量暂不可用";
+    : (stats.capacityStatus === "unknown"
+      ? `模型 ${state.selectedModel || "当前模型"} 的部署上下文容量未知，无法计算占用比例`
+      : "上下文用量暂不可用");
   $("#context-percent").textContent = percentText;
   const ring = meter.querySelector(".context-ring");
   if (ring) {
@@ -8309,14 +8753,18 @@ function updateContextMeter({ announce = false, schedule = true } = {}) {
     ring.setAttribute("aria-label", usageTooltip);
     ring.setAttribute("aria-busy", stats.compacting ? "true" : "false");
   }
-  $("#context-label").textContent = stats.available ? `上下文窗口已用 ${stats.percent}%` : "上下文用量暂不可用";
+  $("#context-label").textContent = stats.available
+    ? `上下文窗口已用 ${stats.percent}%`
+    : (stats.capacityStatus === "unknown" ? "模型上下文容量未知" : "上下文用量暂不可用");
   meter.title = usageTooltip;
   meter.setAttribute("aria-label", meter.title);
 
   $("#context-usage-detail").textContent = stats.available
     ? `${number.format(stats.tokens)} / ${number.format(stats.limit)} 令牌（${stats.percent}%）`
-    : "暂时没有真实用量";
-  $("#context-usage-source").textContent = `来源：${sourceLabels[stats.source] || "不可用"}`;
+    : (stats.capacityStatus === "unknown" ? `${number.format(stats.tokens)} 令牌已记录；模型容量未知` : "暂时没有真实用量");
+  $("#context-usage-source").textContent = stats.capacityStatus === "unknown"
+    ? `容量来源：${stats.capacitySource || "未找到可信部署元数据"}`
+    : `来源：${sourceLabels[stats.source] || "不可用"}`;
 
   meter.classList.toggle("warn", stats.shouldCompress && !stats.critical);
   meter.classList.toggle("critical", stats.critical);
@@ -8626,6 +9074,7 @@ function renderContextFiles() {
 }
 
 async function loadSkills() {
+  const token = modeProjectionToken(state.viewMode, state.sessionId);
   try {
     const mode = encodeURIComponent(state.viewMode);
     const [skillsResponse, pluginsResponse] = await Promise.all([
@@ -8634,12 +9083,14 @@ async function loadSkills() {
     ]);
     const data = await skillsResponse.json();
     const pluginData = await pluginsResponse.json().catch(() => ({}));
+    if (!modeProjectionIsCurrent(token)) return;
     state.skills = data.skills || [];
     state.plugins = pluginData.plugins || [];
     renderSkillCategories();
     renderSkillList();
     renderPluginList(pluginData);
   } catch {
+    if (!modeProjectionIsCurrent(token)) return;
     state.skills = [];
     state.plugins = [];
     renderPluginList({ status: "unavailable" });

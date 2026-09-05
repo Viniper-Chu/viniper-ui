@@ -261,7 +261,7 @@ function renderAgentSettingsContext(engine) {
   const factsData = [
     ["运行时", isClaude ? "Claude Code CLI" : "Harness Runtime"],
     ["传输", isClaude ? (transportLabels[engine?.transport] ?? "未探测") : "Application Port"],
-    ["版本", isClaude ? (engine?.version ?? "未探测") : "1.6.0 Stable"],
+    ["版本", isClaude ? (engine?.version ?? "未探测") : "1.8.1 Stable"],
     ["认证模式", isClaude ? "API key · 安全存储" : "本地 Provider"],
     ["浏览器登录", "不使用"],
     ["API-key 状态", isClaude ? (claudeApiKeyReady ? "已配置 · 不回显" : "待配置") : "不适用"],

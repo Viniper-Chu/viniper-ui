@@ -5,3 +5,7 @@ codex/工作输出/
 codex/脚本工具/
 codex/审查报告/
 .omx/
+__pycache__/
+*.pyc
+resources/viniper-ui/desktop/release/
+resources/viniper-ui/harness-runtime/dist/

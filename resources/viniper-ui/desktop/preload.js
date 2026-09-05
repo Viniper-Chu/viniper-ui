@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld("viniperDesktop", {
   toggleAlwaysOnTop: () => ipcRenderer.invoke("viniper:toggle-always-on-top"),
   setTitlebarTheme: (theme) => ipcRenderer.invoke("viniper:set-titlebar-theme", theme || {}),
   enableWslPlatform: () => ipcRenderer.invoke("viniper:enable-wsl-platform"),
+  installAppUpdate: () => ipcRenderer.invoke("viniper:install-app-update"),
   saveProviderSecret: (mode, value) => ipcRenderer.invoke("viniper:save-provider-secret", { mode, value }),
   clearProviderSecret: (mode) => ipcRenderer.invoke("viniper:clear-provider-secret", { mode }),
   conversationCompleted: () => ipcRenderer.send("viniper:conversation-completed"),

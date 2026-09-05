@@ -98,6 +98,21 @@ test("plan mode rejects side effects without creating a pending approval", async
   });
 });
 
+test("all permission modes reject already cancelled work before granting or prompting", async () => {
+  for (const permissionMode of ["ask", "auto", "review", "full", "plan"] as const) {
+    const policy = new PermissionPolicy("interactive", () => 100);
+    const controller = new AbortController();
+    controller.abort();
+    const authorization = policy.begin({
+      sessionId: "cancelled-session", runId: "cancelled-run", permissionMode,
+      tool: tool("cancelled-tool", true), signal: controller.signal,
+    });
+    assert.equal(authorization.state, "rejected", permissionMode);
+    assert.equal((await authorization.resolution).reason, "cancelled", permissionMode);
+    assert.equal(policy.snapshot().pending.length, 0, permissionMode);
+  }
+});
+
 function tool(id: string, readOnly: boolean) {
   return {
     id,

@@ -1,8 +1,8 @@
 {
   "name": "viniper-workstation",
-  "version": "1.6.0",
+  "version": "1.8.1",
   "private": true,
-  "description": "Viniper workstation v1.6.0 Stable dual-agent workspace",
+  "description": "Viniper workstation v1.8.1 Stable dual-agent workspace",
   "main": "dist/src/platform/desktop/main.js",
   "scripts": {
     "typecheck": "tsc --noEmit",

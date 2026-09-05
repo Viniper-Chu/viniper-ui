@@ -34,7 +34,7 @@ test("CP7 failed local update keeps the current version and exposes failure inst
   await service.download();
   const result = await service.confirmInstall();
   assert.equal(result.status, "failed");
-  assert.equal(result.currentVersion, "1.6.0");
+  assert.equal(result.currentVersion, "1.8.1");
   assert.match(result.failure ?? "", /fixture install failed/u);
 });
 

@@ -348,15 +348,23 @@ def build_permission_prompt_mcp_config(
 
 def _atomic_json(path: Path, payload: Any, *, create_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    # Keep the temporary basename independent of the target: acknowledgement
+    # names already approach MAX_PATH in deeply nested Windows data roots.
+    temp = path.with_name(f".v-{uuid.uuid4().hex}.tmp")
+    created = False
     try:
-        temp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        # Exclusive creation also keeps an unlikely random-name collision from
+        # overwriting or deleting a file this write does not own.
+        with temp.open("x", encoding="utf-8") as stream:
+            created = True
+            json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
         if create_only:
             os.link(temp, path)
         else:
             os.replace(temp, path)
     finally:
-        temp.unlink(missing_ok=True)
+        if created:
+            temp.unlink(missing_ok=True)
 
 
 def _safe_identifier(value: Any) -> str:

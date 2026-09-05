@@ -21,7 +21,8 @@ test("CP8 Windows Preview packaging exposes portable and current-user installer 
   assert.match(source, /Viniper workstation Preview/u);
   assert.match(source, /Viniper workstation\.lnk/u);
   assert.match(source, /resources["',\s]+["']app/u);
-  assert.match(source, /1\.6\.0/u);
+  assert.match(source, /version: sourcePackage\.version/u);
+  assert.match(source, /有效语义版本/u);
   assert.match(source, /nativeSetup/u);
   assert.match(source, /installerKind:\s*"electron-builder-nsis"/u);
   assert.match(source, /safeReset\(stageRoot, residueRoot\)/u);

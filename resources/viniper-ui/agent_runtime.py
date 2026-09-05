@@ -140,6 +140,7 @@ class AgentRunSpec:
     bridge_keys: tuple[str, ...] = ()
     effective_context_window: int = 0
     agents: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    debug_file: str = ""
 
 
 @dataclass
@@ -281,6 +282,25 @@ def _cli_permission_mode(semantic_mode: str, choices: Sequence[str] | None) -> s
     return semantic
 
 
+def _cli_autocompact_value(
+    context_window: int,
+    *,
+    supported: bool | None,
+) -> str | None:
+    """Return the CLI compression strategy without shrinking context capacity.
+
+    ``effective_context_window`` is model metadata used by the context meter;
+    it is not a valid numeric value for every Claude Code ``--autocompact``
+    parser (the current CLI accepts ``auto`` or a decimal token shorthand).
+    Keep those concerns separate and let the native CLI choose its supported
+    automatic threshold.  A zero/unknown capacity or an explicit capability
+    denial leaves the flag out entirely.
+    """
+    if max(0, int(context_window or 0)) <= 0 or supported is False:
+        return None
+    return "auto"
+
+
 def _claude_arguments(
     spec: AgentRunSpec,
     path_mapper: Callable[[str], str],
@@ -303,8 +323,9 @@ def _claude_arguments(
         spec.claude_session_id,
     ]
     compact_window = max(0, int(getattr(spec, "effective_context_window", 0) or getattr(spec, "autocompact_window", 0) or 0))
-    if compact_window and auto_compact_supported is not False:
-        args.extend(["--autocompact", str(compact_window)])
+    autocompact_value = _cli_autocompact_value(compact_window, supported=auto_compact_supported)
+    if autocompact_value:
+        args.extend(["--autocompact", autocompact_value])
     cli_permission_mode = _cli_permission_mode(spec.permission_mode, permission_choices)
     if cli_permission_mode == "bypassPermissions":
         args.append("--allow-dangerously-skip-permissions")
@@ -321,6 +342,8 @@ def _claude_arguments(
         args.extend(["--settings", path_mapper(spec.settings_file)])
     if spec.mcp_config_file:
         args.extend(["--mcp-config", path_mapper(spec.mcp_config_file)])
+    if spec.debug_file:
+        args.extend(["--debug-file", path_mapper(spec.debug_file)])
     if spec.permission_prompt_tool:
         args.extend(["--permission-prompt-tool", spec.permission_prompt_tool])
     if spec.agents:

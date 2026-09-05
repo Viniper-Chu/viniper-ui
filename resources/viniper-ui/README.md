@@ -1,6 +1,6 @@
 # Viniper workstation
 
-这是 1.6.0 Stable 的本地 Windows Workstation 运行资源。Viniper Harness 与原生 Claude Code CLI 是两个独立 Agent：共享前端位置、控件和状态语义，但不共享 runtime、transport、会话、模型、权限、Skills/插件、MCP 或安全存储。
+这是 1.8.1 Stable 的 Windows Workstation 运行资源。Viniper Harness 与原生 Claude Code CLI 是两个独立 Agent：使用相同前端位置、控件和状态语义，但不共享 runtime、transport、会话、模型、权限、Skills/插件、MCP 或安全存储。
 
 Viniper Harness 由 Application Port 驱动工具、附件、结构化 plan/goal、跨会话协作、委派和子 Agent；Claude code 只投影本机 Claude Code CLI 的原生事件和权限。ask/review/full 与 default/acceptEdits/plan 的映射分别由各自 owner 执行。
 

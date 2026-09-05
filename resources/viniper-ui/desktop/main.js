@@ -78,6 +78,10 @@ let secretBroker = null;
 let secretBrokerToken = "";
 let hostMigrationToken = "";
 let hostMigrationConsumed = false;
+let updateApplyPromise = null;
+let updateQuitRequested = false;
+let updateQuitReady = false;
+let updateQuitPromise = null;
 
 const SECRET_REFS_BY_MODE = Object.freeze({
   viniper: "provider.deepseek",
@@ -653,6 +657,119 @@ function requestJson(urlPath, timeoutMs = SERVER_STATUS_PROBE_TIMEOUT_MS) {
   });
 }
 
+function isTrustedUpdateSender(event) {
+  if (!mainWindow || mainWindow.isDestroyed() || event?.sender !== mainWindow.webContents) return false;
+  if (!event.senderFrame || event.senderFrame !== mainWindow.webContents.mainFrame) return false;
+  try {
+    const sender = new URL(event.senderFrame.url);
+    return !sender.username && !sender.password && sender.origin === new URL(localUrl()).origin;
+  } catch {
+    return false;
+  }
+}
+
+function requestAppUpdateInstall() {
+  return new Promise((resolve) => {
+    const unavailable = { ok: false, status: "failed", message: "无法联系本地更新服务，请稍后重试。" };
+    let settled = false;
+    const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+    const request = http.request({
+      hostname: "127.0.0.1", port, path: "/api/update/apply", method: "POST", timeout: 15000,
+      headers: { "Content-Type": "application/json", "Content-Length": "2", "Origin": new URL(localUrl()).origin },
+    }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 65536) { finish(unavailable); request.destroy(); }
+      });
+      response.on("error", () => finish(unavailable));
+      response.on("end", () => {
+        try {
+          const payload = JSON.parse(body);
+          if (!payload || typeof payload !== "object" || Array.isArray(payload)) return finish(unavailable);
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            return finish({ ...payload, ok: false, status: "failed", message: payload.message || payload.detail || unavailable.message });
+          }
+          finish(payload);
+        } catch { finish(unavailable); }
+      });
+    });
+    request.on("timeout", () => { finish(unavailable); request.destroy(); });
+    request.on("error", () => finish(unavailable));
+    request.end("{}");
+  });
+}
+
+async function installAppUpdate(event) {
+  if (!isTrustedUpdateSender(event)) return { ok: false, status: "rejected", message: "更新只能由工作台主窗口发起。" };
+  if (process.platform !== "win32" || !app.isPackaged || !IS_STABLE) {
+    return { ok: false, status: "unavailable", message: "应用内安装更新仅支持已安装的 Windows 正式桌面版。" };
+  }
+  if (updateQuitRequested) return { ok: false, status: "installing", message: "正在退出工作台，请在安装器中继续。" };
+  if (!serverProcess || !serverProcess.pid || serverProcess.exitCode !== null || serverProcess.killed) {
+    return { ok: false, status: "unavailable", message: "当前本地服务不是由此窗口启动。请先从原工作台托盘退出，再重新打开后安装更新。" };
+  }
+  if (updateApplyPromise) return updateApplyPromise;
+  updateApplyPromise = (async () => {
+    const result = await requestAppUpdateInstall();
+    if (result.ok === true && result.status === "installer_opened" && result.updated === false) {
+      updateQuitRequested = true;
+      // Return the acknowledged handoff first. Closing a window only hides this
+      // app; app.quit runs the owned-service cleanup instead of NSIS taskkill.
+      setImmediate(() => app.quit());
+      return { ...result, desktop_quit_requested: true };
+    }
+    return result;
+  })();
+  try { return await updateApplyPromise; } finally { updateApplyPromise = null; }
+}
+
+function stopOwnedUpdateServer(owned, timeoutMs = 5000) {
+  if (!owned || owned.exitCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    let timer;
+    const finish = (error) => {
+      clearTimeout(timer);
+      owned.removeListener("exit", exited);
+      owned.removeListener("error", failed);
+      error ? reject(error) : resolve();
+    };
+    const exited = () => finish();
+    const failed = () => finish(new Error("owned-server-stop-failed"));
+    owned.once("exit", exited);
+    owned.once("error", failed);
+    timer = setTimeout(() => finish(new Error("owned-server-stop-timeout")), timeoutMs);
+    try { if (!owned.kill()) failed(); } catch { failed(); }
+  });
+}
+
+async function finishUpdateQuit() {
+  const owned = serverProcess;
+  try {
+    await stopOwnedUpdateServer(owned);
+    if (serverProcess === owned) serverProcess = null;
+    await waitForUpdateServerClosed();
+    await closeSecretBroker();
+    updateQuitReady = true;
+    app.quit();
+  } catch {
+    isQuitting = false;
+    updateQuitRequested = false;
+    updateQuitPromise = null;
+    dialog.showErrorBox("暂时无法退出工作台", "安装器已经打开，但本地服务尚未退出。请取消安装，稍后从托盘退出工作台再试；未强制结束其他进程。");
+  }
+}
+
+async function waitForUpdateServerClosed(timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (!(await requestReadiness(250))) return;
+    await delay(100);
+  } while (Date.now() < deadline);
+  throw new Error("owned-server-port-still-open");
+}
+
 async function requestReadiness(timeoutMs = SERVER_STATUS_PROBE_TIMEOUT_MS) {
   return requestJson("/api/readiness", timeoutMs);
 }
@@ -715,11 +832,20 @@ function findPython() {
       ];
 
   for (const candidate of candidates) {
-    const probe = spawnSync(candidate.command, [...candidate.args, "--version"], {
+    const probe = spawnSync(candidate.command, [...candidate.args, "-E", "-c", "import json, sys; print(json.dumps(sys.executable))"], {
       windowsHide: true,
-      stdio: "ignore"
+      encoding: "utf8",
+      timeout: 10000,
     });
-    if (probe.status === 0) return candidate;
+    if (probe.status !== 0) continue;
+    try {
+      const executable = JSON.parse(String(probe.stdout || "").trim());
+      if (typeof executable === "string" && path.isAbsolute(executable) && fs.statSync(executable).isFile()) {
+        // py.exe is a launcher, not the listening Python process. Owning the
+        // actual interpreter makes normal and update shutdown target one PID.
+        return { command: path.resolve(executable), args: [] };
+      }
+    } catch { /* Try the next configured interpreter without logging stdout. */ }
   }
   return null;
 }
@@ -1081,6 +1207,7 @@ ipcMain.handle("viniper:set-always-on-top", (_event, enabled) => setAlwaysOnTop(
 ipcMain.handle("viniper:toggle-always-on-top", () => toggleAlwaysOnTop());
 ipcMain.handle("viniper:set-titlebar-theme", (_event, theme) => setTitlebarTheme(theme));
 ipcMain.handle("viniper:enable-wsl-platform", () => enableWslPlatform());
+ipcMain.handle("viniper:install-app-update", (event) => installAppUpdate(event));
 ipcMain.handle("viniper:save-provider-secret", (_event, payload = {}) =>
   writeSecureSecret(payload.mode, payload.value));
 ipcMain.handle("viniper:clear-provider-secret", (_event, payload = {}) =>
@@ -1108,8 +1235,13 @@ if (!app.requestSingleInstanceLock()) {
 
 app.on("activate", showMainWindow);
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
   isQuitting = true;
+  if (updateQuitRequested && !updateQuitReady) {
+    event.preventDefault();
+    if (!updateQuitPromise) updateQuitPromise = finishUpdateQuit();
+    return;
+  }
   if (serverProcess) {
     serverProcess.kill();
     serverProcess = null;

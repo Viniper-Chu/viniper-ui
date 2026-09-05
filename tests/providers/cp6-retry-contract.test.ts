@@ -34,3 +34,32 @@ test("CP6 provider retry never repeats after semantic output", async () => {
   }));
   assert.equal(calls, 1);
 });
+
+test("pre-output metadata from a failed attempt is not published twice", async () => {
+  let calls = 0;
+  const received: string[] = [];
+  const result = await runProviderWithRetries({
+    onEvent: (event) => { received.push(event.kind); },
+    stream: async function* () {
+      calls += 1;
+      yield { kind: "thinking.started" };
+      if (calls === 1) throw new ProviderTransportError("server");
+      yield { kind: "text.delta", text: "成功" };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(calls, 2);
+  assert.deepEqual(received, ["thinking.started", "text.delta"]);
+});
+
+test("an event consumer error never triggers another Provider request", async () => {
+  let calls = 0;
+  await assert.rejects(runProviderWithRetries({
+    onEvent: () => { throw new ProviderTransportError("network"); },
+    stream: async function* () {
+      calls += 1;
+      yield { kind: "thinking.started" };
+    },
+  }), ProviderTransportError);
+  assert.equal(calls, 1);
+});

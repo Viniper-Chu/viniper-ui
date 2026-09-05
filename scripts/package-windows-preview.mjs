@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { access, cp, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,8 +29,8 @@ if (process.platform !== "win32" || process.arch !== "x64") {
 }
 
 const sourcePackage = JSON.parse(await readFile(join(repositoryRoot, "package.json"), "utf8"));
-if (sourcePackage.version !== "1.6.0") {
-  throw new Error(`Windows Preview 仅支持 v1.6.0，当前为 ${sourcePackage.version}。`);
+if (!/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(sourcePackage.version)) {
+  throw new Error(`Windows Preview 需要有效语义版本，当前为 ${sourcePackage.version}。`);
 }
 const profile = JSON.parse(await readFile(join(repositoryRoot, "resources", "viniper-ui", "profiles.json"), "utf8")).preview;
 if (!profile || profile.port !== 17947 || profile.app_id !== "com.viniper.workstation.preview") {
@@ -54,6 +55,9 @@ await access(electronBuilder);
 
 await cp(electronDistribution, stagePortable, { recursive: true });
 await rename(join(stagePortable, "electron.exe"), join(stagePortable, "Viniper workstation.exe"));
+// --prepackaged skips electron-builder's resource-editing phase entirely.
+// Brand this one staged executable before either portable or NSIS consumes it.
+await brandWindowsExecutable(join(stagePortable, "Viniper workstation.exe"), sourcePackage.version);
 const applicationRoot = join(stagePortable, "resources", "app");
 await mkdir(applicationRoot, { recursive: true });
 await stageLegacyUi({ repositoryRoot, stagePortable, desktopProfile: "preview" });
@@ -115,6 +119,7 @@ const builderConfig = {
     signAndEditExecutable: true,
   },
   nsis: {
+    include: join(desktopRoot, "build", "installer.nsh"),
     oneClick: false,
     perMachine: false,
     allowToChangeInstallationDirectory: false,
@@ -209,4 +214,30 @@ function assertDirectChild(target, expectedParent) {
   if (resolve(dirname(target)) !== resolve(expectedParent)) {
     throw new Error(`拒绝清理非预期路径：${target}`);
   }
+}
+
+async function brandWindowsExecutable(executable, version) {
+  const { NtExecutable, NtExecutableResource, Resource, Data } = createRequire(join(desktopRoot, "package.json"))("resedit");
+  const image = NtExecutable.from(await readFile(executable));
+  const resources = NtExecutableResource.from(image);
+  const icons = Data.IconFile.from(await readFile(join(repositoryRoot, "assets", "branding", "viniper-harness-circuit-node.ico")));
+  const groups = Resource.IconGroupEntry.fromEntries(resources.entries);
+  const versions = Resource.VersionInfo.fromEntries(resources.entries);
+  if (!groups.length || !versions.length) throw new Error("Windows executable branding requires native icon and version resources.");
+  for (const group of groups) {
+    Resource.IconGroupEntry.replaceIconsForResource(resources.entries, group.id, group.lang, icons.icons.map((item) => item.data));
+  }
+  for (const info of versions) {
+    info.setFileVersion(version);
+    info.setProductVersion(version);
+    for (const language of info.getAvailableLanguages()) {
+      info.setStringValues(language, {
+        FileDescription: "Viniper workstation", ProductName: "Viniper workstation",
+        CompanyName: "Viniper", InternalName: "Viniper workstation", OriginalFilename: "Viniper workstation.exe",
+      });
+    }
+    info.outputToResourceEntries(resources.entries);
+  }
+  resources.outputResource(image);
+  await writeFile(executable, Buffer.from(image.generate()));
 }

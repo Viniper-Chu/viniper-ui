@@ -207,9 +207,9 @@ test("version and Stable stage are consistent in package, title and settings/abo
   const packageJson = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as { version: string };
   const core = await readFile(join(process.cwd(), "src", "core", "contracts.ts"), "utf8");
   const html = await readFile(join(process.cwd(), "src", "renderer", "shell", "index.html"), "utf8");
-  assert.equal(packageJson.version, "1.6.0");
+  assert.equal(packageJson.version, "1.8.1");
   assert.match(core, /Stable（稳定版）/u);
-  assert.equal((html.match(/v1\.6\.0 · Stable（稳定版）/gu) ?? []).length >= 1, true);
+  assert.equal(html.includes(`v${packageJson.version} · Stable（稳定版）`), true);
   assert.doesNotMatch(html, /Beta|公测|\bRC\b|正式版|首次公测更新/u);
 });
 

@@ -51,6 +51,19 @@ test("Claude Code maps every shared permission mode to a CLI 2.1.x accepted valu
   assert.deepEqual(mapped, ["manual", "acceptEdits", "bypassPermissions", "plan"]);
 });
 
+test("Claude Code full access opts into native bypass acknowledgement", () => {
+  const invocation = buildClaudeCodeInvocation({ ...request(), permissionMode: "full" }, {
+    executable: "claude",
+    prefixArgs: [],
+    transport: "native-cli",
+    version: "fixture",
+    useSpawnCwd: true,
+  });
+  const permissionIndex = invocation.args.indexOf("--permission-mode");
+  assert.equal(invocation.args[permissionIndex + 1], "bypassPermissions");
+  assert.ok(invocation.args.includes("--allow-dangerously-skip-permissions"));
+});
+
 test("Claude Code WSL adapter inserts the Windows project root before the delegated CLI", () => {
   const invocation = buildClaudeCodeInvocation(request(), {
     executable: "wsl.exe",

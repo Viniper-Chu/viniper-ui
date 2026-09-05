@@ -1,11 +1,11 @@
-# Viniper workstation 1.6.0 Stable
+# Viniper workstation 1.8.1 Stable
 
 Viniper workstation 是面向 Windows 的双 Agent 工作台。它保留熟悉的 Viniper 壳与浅青视觉，同时把两个运行时严格分开：
 
 - **Viniper Harness**：自研 Harness Runtime/Application Port，负责 Viniper 会话、工具、权限、计划、目标、协作、跨会话消息与子 Agent。
 - **Claude Code CLI**：只调用本机原生 Claude Code CLI；其会话、权限、任务/计划投影、Skills 与插件数据不复用 Harness。
 
-两边共享前端语义和位置（消息框、附件、模型、上下文环、Token、状态、设置层级），不共享 transport、runtime、store、会话、模型、权限持久化或密钥。权限档位的语义也由各自 owner 执行：Viniper 的 ask/review/full 与 Claude Code 的原生 default/acceptEdits/plan 分别映射到各自后端。
+两边使用相同的前端语义和位置（消息框、附件、模型、上下文环、Token、状态、设置层级），但不共享会话、运行时、模型、权限持久化或密钥。Viniper 提供每次询问、规划自动审核、完全访问；Claude Code 提供原生权限档位及完全访问，选择方向的问题仍由用户回答。
 
 ## 能力范围
 
@@ -13,7 +13,22 @@ Viniper workstation 是面向 Windows 的双 Agent 工作台。它保留熟悉�
 
 ## Windows 安装与数据兼容
 
-稳定安装器为 `Viniper-workstation-Setup.exe`，产品 AppId 为 `com.viniper.workstation`，默认用户级目录为 `%LOCALAPPDATA%\\Programs\\Viniper workstation`。1.6.x Stable 会独占租用既有 `%APPDATA%\\Viniper workstation Preview` Workstation 数据根，直接保留原有会话、SQLite、设置、记忆和安全存储；安装、卸载和回滚都不复制、清空、覆盖或删除该数据根。Preview 安装器仍作为上一版本回滚边界保留。
+稳定安装器为 `Viniper-workstation-Setup.exe`，产品 AppId 为 `com.viniper.workstation`，默认用户级目录为 `%LOCALAPPDATA%\\Programs\\Viniper workstation`。Stable 继续使用 `%APPDATA%\\Viniper workstation Preview` 兼容数据根，保留原有会话、SQLite、设置、记忆和安全存储。
+
+在任一 Agent 的 **设置 → 应用更新 → 检查更新** 中检查 GitHub 正式版。发现新版本后，查看版本说明、下载安装包，再点击“安装更新”。桌面工作台会退出并打开安装器，按提示完成安装；下载失败可以重试，正在执行任务时不会自动退出。更新使用当前安装目录，不重置个人数据。首次安装或旧版本无法检查更新时，从 [GitHub Releases](https://github.com/Viniper-Chu/viniper-ui/releases/latest) 下载完整安装包。
+
+运行需要本机 Node.js、Python 及 PowerShell 7；Claude Code 还需安装原生 CLI，并在其独立设置中配置可用的兼容 Provider。发行包不包含个人凭据，第三方用户应填写自己的配置。
+
+## 1.8.1 的主要改进
+
+- 应用内完整安装包更新、真实下载进度、失败重试和活动任务保护。
+- 独立的双 Agent 设置与模型管理，修复切换 Agent 时的迟到响应、草稿与工作区串页。
+- Claude Code 原生初始化、命令发现、权限确认和会话恢复；深层 Windows 路径下权限交互不再误报 CLI 未安装。
+- 原生子 Agent 输出保留在工具记录内，不混入主回答；官方 DeepSeek 主模型和子模型映射独立配置。
+- Viniper 实时输出、取消、审批等待和工具进度反馈；计划不会把尚未验证的步骤标为完成。
+- 浅青色设置排版与正确的 Windows 应用、任务栏及托盘品牌图标。
+
+当前边界：Viniper 运行中续发是排队，不是实时引导；部分 Claude Code 交互式命令打开原生终端。更新失败时保留当前版本，不承诺网络、Provider 或所有长任务均无故障。
 
 ## 从旧 Viniper UI 的变化
 

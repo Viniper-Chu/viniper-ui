@@ -262,9 +262,9 @@ export class FakeCliApplicationPort implements CliApplicationPort {
 export function createAppSnapshot(): AppSnapshot {
   const session = namedSession("session-1", "主会话", 100);
   return {
-    productVersion: "1.6.0",
+    productVersion: "1.8.1",
     releaseStage: "Stable",
-    productBadge: "v1.6.0 · Stable（稳定版）",
+    productBadge: "v1.8.1 · Stable（稳定版）",
     activeSessionId: session.id,
     sessions: [session],
     providers: [{

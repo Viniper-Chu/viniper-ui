@@ -11,13 +11,13 @@ export function createTerminalTools(service: TerminalService): ToolExecutor[] {
 
 class TerminalRunTool implements ToolExecutor {
   readonly name = "terminal.run";
-  readonly description = "在当前显式项目中运行受控 PowerShell 命令，并保留可续读的 stdout/stderr。";
+  readonly description = "在当前项目中运行 PowerShell 7 脚本，保留可续读的输出。";
   readonly readOnly = false;
   readonly authorizationScope = "project" as const;
   readonly inputSchema = {
     type: "object" as const,
     properties: {
-      command: { type: "string" as const, description: "要在 Windows PowerShell 中运行的本机命令。" },
+      command: { type: "string" as const, description: "直接提供 PowerShell 7 脚本；宿主已是 pwsh，不要再包一层 pwsh / powershell -Command，以免变量提前展开。The host is already PowerShell 7; pass the script directly." },
       cwd: { type: "string" as const, description: "可选的项目内相对工作目录；默认项目根。" },
       timeoutMs: { type: "number" as const, description: "可解释超时，默认 120000 毫秒，范围 100–1800000。" },
       purpose: { type: "string" as const, description: "command/dependency/build/test/lint/typecheck 之一。" },

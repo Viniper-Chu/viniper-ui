@@ -117,6 +117,13 @@ export function buildClaudeCodeInvocation(
     "--no-session-persistence",
     "--permission-mode", permissionMode(request.permissionMode),
   ];
+  if (permissionMode(request.permissionMode) === "bypassPermissions") {
+    // Claude Code requires the explicit acknowledgement flag alongside the
+    // native bypassPermissions mode.  This is only emitted for the
+    // user-selected Claude full-access mode; AskUserQuestion remains a
+    // structured interaction handled by the host bridge.
+    claudeArgs.push("--allow-dangerously-skip-permissions");
+  }
   if (request.selectedModel !== "claude-code-default") claudeArgs.push("--model", request.selectedModel);
   claudeArgs.push(prompt);
   const projectRoot = request.workingDirectory;

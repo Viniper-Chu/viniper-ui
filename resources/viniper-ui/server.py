@@ -2,7 +2,6 @@ import asyncio
 import base64
 import copy
 import difflib
-import http.client
 import httpx
 import inspect
 import json
@@ -13,18 +12,17 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
+import urllib.error
 import uuid
-import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from context_lifecycle import (
@@ -66,9 +64,17 @@ from agent_run_coordinator import (
     DurableInteractionStore,
 )
 from native_peer import ClaudeCrossSessionAdapter, NativePeerMessaging, build_native_send_instruction
+from native_commands import build_native_command_manifest, resolve_native_command, build_native_cli_argv, build_native_terminal_argv
+from native_stream_protocol import initialize_native_stream, native_control_success, native_failure_message, NativeStartupError
+from native_project_browser import browse_project_files, preview_project_file, ProjectBrowserError
 from skill_sync import localized_skill_fields
 from wsl_runtime import RuntimeUpdateCoordinator, WslRuntimeProvisioner
 from harness_application_port import HarnessApplicationPort
+from update_manager import (
+    OFFICIAL_REPOSITORY, OFFICIAL_MANIFEST_URL, UpdateState,
+    official_manifest_url, fetch_official_manifest, validate_installer_manifest,
+    download_installer, verify_windows_installer, installer_command_line,
+)
 
 
 PROFILE_NAME = "agent-shell"
@@ -94,9 +100,9 @@ def read_app_version() -> str:
     if env_version:
         return env_version
     try:
-        return VERSION_FILE.read_text(encoding="utf-8").strip() or "1.6.0"
+        return VERSION_FILE.read_text(encoding="utf-8").strip() or "1.8.1"
     except Exception:
-        return "1.6.0"
+        return "1.8.1"
 
 
 def read_release_revision() -> int:
@@ -200,6 +206,11 @@ CLAUDE_PERMISSION_MODE_OPTIONS = [
         "label": "计划模式",
         "description": "Claude Code CLI 先规划，减少直接执行动作",
     },
+    {
+        "id": "fullAccess",
+        "label": "完全访问",
+        "description": "Claude Code CLI 使用 bypassPermissions 自动执行工具；AskUserQuestion 仍需回答",
+    },
 ]
 VINIPER_PERMISSION_MODE_IDS = {item["id"] for item in VINIPER_PERMISSION_MODE_OPTIONS}
 CLAUDE_PERMISSION_MODE_IDS = {item["id"] for item in CLAUDE_PERMISSION_MODE_OPTIONS}
@@ -242,6 +253,9 @@ def migrate_permission_mode(value: Any, mode: str = MODE_CLAUDE) -> str | None:
         "acceptEdits": "acceptEdits",
         "auto": "acceptEdits",
         "plan": "plan",
+        "full": "fullAccess",
+        "fullAccess": "fullAccess",
+        "bypassPermissions": "fullAccess",
     }.get(raw)
 CLAUDE_REQUIRED_OPTIONS = [
     "-p",
@@ -276,8 +290,8 @@ NO_OUTPUT_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_NO_OUTPUT_TIMEOUT", str(40
 CLI_INTERACTION_ACK_TIMEOUT_SECONDS = float(env_value("VINIPER_UI_CLI_ACK_TIMEOUT", "30"))
 CLI_ACK_TIMEOUT_FAILURE_MESSAGE = "用户已允许，但 CLI 未确认；请求未执行或状态未知。"
 HOST_HOOK_COMPATIBILITY_GRACE_SECONDS = float(env_value("VINIPER_UI_HOOK_COMPAT_GRACE", "0.35"))
-MODEL_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_MODEL_IDLE_TIMEOUT", str(25 * 60)))
-MODEL_STALL_RECOVERY_ATTEMPTS = int(env_value("VINIPER_UI_MODEL_STALL_RECOVERY_ATTEMPTS", "2"))
+MODEL_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_MODEL_IDLE_TIMEOUT", "180"))
+MODEL_STALL_RECOVERY_ATTEMPTS = int(env_value("VINIPER_UI_MODEL_STALL_RECOVERY_ATTEMPTS", "0"))
 GUI_COMMAND_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_GUI_COMMAND_TIMEOUT", "0"))
 ACTION_TASK_IDLE_TIMEOUT_SECONDS = int(env_value("VINIPER_UI_ACTION_IDLE_TIMEOUT", "0"))
 SAFETY_GUARDS_ENABLED = env_value("VINIPER_UI_SAFETY_GUARDS", "0") == "1"
@@ -319,15 +333,17 @@ MODEL_OPTIONS = [
         "id": "deepseek-v4-pro[1m]",
         "label": "DeepSeek V4 Pro",
         "description": "复杂编码与长上下文工作",
-        "context": 1000000,
+        "context": 1048576,
     },
     {
         "id": "deepseek-v4-flash",
         "label": "DeepSeek V4 Flash",
         "description": "更快完成日常工作",
-        "context": 128000,
+        "context": 1048576,
     },
 ]
+MODEL_CAPABILITIES_FILE = VERSION_FILE.with_name("model-capabilities.json")
+_model_capabilities_cache: list[dict[str, Any]] | None = None
 PROVIDER_MODE_IDS = (MODE_VINIPER, MODE_CLAUDE)
 MODE_SECRET_REFS = {
     MODE_VINIPER: "provider.deepseek",
@@ -637,7 +653,7 @@ def runtime_payload_from_probe(probe: RuntimeProbe) -> dict[str, Any]:
     # Runtime status and the selected model's context ring share one effective
     # window source; the per-run AgentRunSpec carries the same value.
     selected_model = allowed_model("", MODE_CLAUDE)
-    effective_window = context_limit_for_model(selected_model)
+    effective_window = context_limit_for_model(selected_model, mode=MODE_CLAUDE)
     payload["effective_context_window"] = effective_window
     payload.setdefault("capabilities", {})["effective_context_window"] = effective_window
     payload["install_location"] = str(managed_runtime_location())
@@ -673,6 +689,11 @@ async def _refresh_runtime_probe() -> RuntimeProbe:
     _runtime_probe_payload = runtime_payload_from_probe(probe)
     _runtime_probe_owner_id = id(agent_runtime())
     _runtime_probe_updated_at = time.monotonic()
+    # Permission descriptors are part of the short-lived status-base cache,
+    # while the capability probe is single-flight and asynchronous.  Drop the
+    # Claude entry as soon as the probe settles so a follow-up status request
+    # observes the actual declared modes instead of the probe-time fallback.
+    _status_base_cache.pop(MODE_CLAUDE, None)
     return probe
 
 
@@ -743,11 +764,19 @@ def context_usage_ledger() -> ContextUsageLedger:
 def context_usage_payload(session_id: str, model: str = "") -> dict[str, Any]:
     mode = normalize_session_mode(sessions.get(str(session_id), {}).get("mode")) if str(session_id) in sessions else MODE_CLAUDE
     selected_model = allowed_model(model, mode) if model else allowed_model("", mode)
+    provider = provider_for_mode(load_app_settings(), mode)
+    capacity = model_capacity_metadata(selected_model, provider_id=provider.get("id"), mode=mode)
     payload = context_usage_ledger().get(
         session_id,
         model=selected_model,
-        context_limit=context_limit_for_model(selected_model),
+        context_limit=context_limit_for_model(selected_model, mode=mode, provider_id=provider.get("id")),
     ).as_dict()
+    payload["mode"] = mode
+    payload["provider"] = str(provider.get("id") or "")
+    payload["capacity_status"] = capacity["status"]
+    payload["capacity_source"] = capacity["source"]
+    payload["capacity_source_url"] = capacity["source_url"]
+    payload["max_output_tokens"] = capacity["max_output_tokens"]
     payload["effective_auto_compact_threshold"] = effective_auto_compact_threshold()
     return payload
 
@@ -770,6 +799,9 @@ def prepare_agent_host_channel(
     runtime: WslAgentRuntime | WindowsNativeRuntime,
     session_id: str,
     run_id: str,
+    *,
+    provider_cfg: Mapping[str, Any] | None = None,
+    mode: str = MODE_CLAUDE,
 ) -> tuple[HostInteractionChannel, Path, Path | None]:
     safe_session_id = re.sub(r"[^A-Za-z0-9_-]", "-", str(session_id or "session"))[:80] or "session"
     root = DATA_DIR / "runtime" / "agent-host" / safe_session_id / str(run_id)
@@ -796,6 +828,11 @@ def prepare_agent_host_channel(
         hook_channel = str(root)
         settings_payload = build_hook_settings(script_path=hook_script, channel_path=hook_channel)
         mcp_config_path = None
+    model_env = official_deepseek_claude_models(provider_cfg, mode=mode)
+    if model_env:
+        # --settings has higher precedence than user/project settings.env. Only
+        # route model names here; preserve permissions, TLS/proxy and credentials.
+        settings_payload["env"] = {**settings_payload.get("env", {}), **model_env}
     settings_path = root / "hook-settings.json"
     settings_path.write_text(
         json.dumps(settings_payload, ensure_ascii=False, separators=(",", ":")),
@@ -988,7 +1025,7 @@ def normalize_session(session_id: str, raw: dict[str, Any]) -> dict[str, Any]:
         normalized["permission_mode"] = stored_permission_mode
     # These user-owned collections may be present in older/newer compatible
     # session records. Normalization must not discard them during startup.
-    for key in ("queue", "attachments", "plan", "claude_agents"):
+    for key in ("queue", "attachments", "plan", "claude_agents", "native_capabilities"):
         if key in raw:
             normalized[key] = raw[key]
     for key in (
@@ -1424,7 +1461,95 @@ def merge_dict(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def normalize_model_options(value: Any) -> list[dict[str, Any]]:
+def _model_capacity_entries() -> list[dict[str, Any]]:
+    """Load the maintained model-capacity registry without trusting settings.
+
+    Settings may contain an old context value, but capacity is a deployment
+    property and must come from this packaged registry (or remain unknown).
+    """
+    global _model_capabilities_cache
+    if _model_capabilities_cache is not None:
+        return _model_capabilities_cache
+    try:
+        payload = json.loads(MODEL_CAPABILITIES_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    raw_entries = payload.get("entries") if isinstance(payload, dict) else None
+    entries: list[dict[str, Any]] = []
+    if isinstance(raw_entries, list):
+        for raw in raw_entries:
+            if isinstance(raw, dict) and str(raw.get("model") or "").strip():
+                entries.append(dict(raw))
+    _model_capabilities_cache = entries
+    return entries
+
+
+def model_capacity_metadata(
+    model: Any,
+    *,
+    provider_id: Any = "",
+    mode: Any = "",
+) -> dict[str, Any]:
+    """Return trusted capacity metadata for a provider-facing model.
+
+    An unknown third-party deployment is explicit: it has no numeric window,
+    so callers must not silently substitute the legacy 128K default.
+    """
+    model_id = str(model or "").strip()
+    provider_key = str(provider_id or "").strip().lower()
+    if not provider_key:
+        mode_key = normalize_provider_mode(mode) if mode else ""
+        provider_key = "deepseek" if mode_key == MODE_VINIPER else "anthropic" if mode_key == MODE_CLAUDE else ""
+    candidates: list[dict[str, Any]] = []
+    for entry in _model_capacity_entries():
+        entry_provider = str(entry.get("provider") or "").strip().lower()
+        if provider_key and entry_provider != provider_key:
+            continue
+        ids = {str(entry.get("model") or "").strip()}
+        raw_ui_models = entry.get("ui_models")
+        if isinstance(raw_ui_models, list):
+            ids.update(str(value or "").strip() for value in raw_ui_models)
+        if model_id in ids:
+            candidates.append(entry)
+    if not candidates and provider_key:
+        # A missing provider-specific record is unknown even if another
+        # provider has a model with the same display identifier.
+        candidates = []
+    entry = candidates[0] if len(candidates) == 1 else None
+    status = str(entry.get("status") or "unknown").strip().lower() if entry else "unknown"
+    if status not in {"verified", "unknown"}:
+        status = "unknown"
+    context_window = 0
+    max_output_tokens = 0
+    if entry and status == "verified":
+        try:
+            context_window = max(0, int(entry.get("context_window") or 0))
+        except (TypeError, ValueError):
+            context_window = 0
+        try:
+            max_output_tokens = max(0, int(entry.get("max_output_tokens") or 0))
+        except (TypeError, ValueError):
+            max_output_tokens = 0
+        if context_window <= 0:
+            status = "unknown"
+            max_output_tokens = 0
+    return {
+        "status": status,
+        "context_window": context_window,
+        "max_output_tokens": max_output_tokens,
+        "source": str(entry.get("source") or "no trusted deployment metadata") if entry else "no trusted deployment metadata",
+        "source_url": str(entry.get("source_url") or "") if entry else "",
+        "provider": str(entry.get("provider") or provider_key) if entry else provider_key,
+        "model": model_id,
+    }
+
+
+def normalize_model_options(
+    value: Any,
+    *,
+    provider_id: Any = "",
+    mode: Any = "",
+) -> list[dict[str, Any]]:
     raw_items = value if isinstance(value, list) else MODEL_OPTIONS
     normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1437,19 +1562,29 @@ def normalize_model_options(value: Any) -> list[dict[str, Any]]:
         seen.add(model_id)
         label = str(item.get("label") or model_id).strip()
         description = str(item.get("description") or "").strip()
-        try:
-            context = int(item.get("context") or DEFAULT_CONTEXT_LIMIT)
-        except Exception:
-            context = DEFAULT_CONTEXT_LIMIT
+        capacity = model_capacity_metadata(model_id, provider_id=provider_id, mode=mode)
+        # Persisted context values are display history only.  A verified
+        # registry entry wins; an unknown deployment remains unavailable.
+        context = int(capacity.get("context_window") or 0)
         normalized.append(
             {
                 "id": model_id,
                 "label": label,
                 "description": description,
-                "context": max(context, 8192),
+                "context": context,
+                "context_window": context,
+                "max_output_tokens": int(capacity.get("max_output_tokens") or 0),
+                "context_status": str(capacity.get("status") or "unknown"),
+                "context_source": str(capacity.get("source") or "no trusted deployment metadata"),
+                "context_source_url": str(capacity.get("source_url") or ""),
             }
         )
-    return normalized or [dict(item) for item in MODEL_OPTIONS]
+    if normalized:
+        return normalized
+    # Ensure the built-in fallback also passes through the same registry.
+    if raw_items is not MODEL_OPTIONS:
+        return normalize_model_options(MODEL_OPTIONS, provider_id=provider_id, mode=mode)
+    return []
 
 
 def normalize_provider_base_url(provider_id: Any, value: Any, mode: str = MODE_VINIPER) -> str:
@@ -1572,7 +1707,11 @@ def normalize_provider_record(raw: Any, mode: str) -> dict[str, Any]:
     provider["api_key_env"] = str(provider.get("api_key_env") or "ANTHROPIC_AUTH_TOKEN").strip() or "ANTHROPIC_AUTH_TOKEN"
     provider["base_url_env"] = str(provider.get("base_url_env") or "ANTHROPIC_BASE_URL").strip() or "ANTHROPIC_BASE_URL"
     provider["model_env"] = str(provider.get("model_env") or "ANTHROPIC_MODEL").strip() or "ANTHROPIC_MODEL"
-    provider["models"] = normalize_model_options(provider.get("models"))
+    provider["models"] = normalize_model_options(
+        provider.get("models"),
+        provider_id=provider["id"],
+        mode=mode_key,
+    )
     ids = {item["id"] for item in provider["models"]}
     if provider.get("model") not in ids:
         provider["model"] = provider["models"][0]["id"]
@@ -1884,22 +2023,11 @@ def append_attachment_prompt(prompt: str, attachments: list[dict[str, Any]]) -> 
 
 
 def read_update_source() -> dict[str, str]:
-    source: dict[str, str] = {}
-    if UPDATE_SOURCE_FILE.exists():
-        try:
-            raw = json.loads(UPDATE_SOURCE_FILE.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                source.update({str(k): str(v) for k, v in raw.items() if v})
-        except Exception:
-            pass
-    if UPDATE_REPOSITORY_ENV:
-        source["repository"] = UPDATE_REPOSITORY_ENV
-    if UPDATE_MANIFEST_URL_ENV:
-        source["manifest_url"] = UPDATE_MANIFEST_URL_ENV
-    repository = source.get("repository", "").strip().strip("/")
-    if repository and not source.get("manifest_url"):
-        source["manifest_url"] = f"https://github.com/{repository}/releases/latest/download/latest.json"
-    return source
+    # Update execution is pinned to the publisher's stable release assets.
+    # Renderer payloads, stale local fixtures and environment variables cannot
+    # turn this endpoint into an arbitrary download-and-execute facility.
+    return {"repository": OFFICIAL_REPOSITORY, "manifest_url": OFFICIAL_MANIFEST_URL,
+            "channel": "stable", "version": APP_VERSION}
 
 
 def version_key(value: str) -> tuple[int, ...]:
@@ -1960,13 +2088,7 @@ def update_decision(
 
 
 def fetch_json_url(url: str) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={"User-Agent": f"ViniperUI/{APP_VERSION}"})
-    with urllib.request.urlopen(request, timeout=UPDATE_HTTP_TIMEOUT_SECONDS) as response:
-        raw = response.read().decode("utf-8", errors="replace")
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise ValueError("update manifest is not a JSON object")
-    return data
+    return fetch_official_manifest(version=APP_VERSION, url=url, timeout=UPDATE_HTTP_TIMEOUT_SECONDS)
 
 
 def update_requires_installer(manifest: dict[str, Any]) -> bool:
@@ -1974,285 +2096,94 @@ def update_requires_installer(manifest: dict[str, Any]) -> bool:
     return bool(manifest.get("requires_installer") is True or migration.get("requires_installer") is True)
 
 
-def _installer_asset(assets: Any) -> dict[str, Any] | None:
-    if isinstance(assets, dict):
-        for key in ("installer", "windows-installer", "nsis", "setup"):
-            item = assets.get(key)
-            if isinstance(item, dict) and item.get("url"):
-                result = dict(item)
-                result["key"] = key
-                return result
-        for key, item in assets.items():
-            if not isinstance(item, dict) or not item.get("url"):
-                continue
-            name = str(item.get("name") or item.get("url") or "")
-            if name.casefold().endswith(".exe"):
-                result = dict(item)
-                result["key"] = str(key)
-                return result
-    if isinstance(assets, list):
-        for item in assets:
-            if isinstance(item, dict) and str(item.get("name") or item.get("url") or "").casefold().endswith(".exe"):
-                return dict(item)
-    return None
-
-
 def choose_update_asset(manifest: dict[str, Any], requested_asset: str | None = None) -> dict[str, Any]:
-    assets = manifest.get("assets")
-    if update_requires_installer(manifest):
-        installer = _installer_asset(assets)
-        if installer is None:
-            raise ValueError("this update requires a full Windows installer, but the manifest has no installer asset")
-        if requested_asset and str(installer.get("key") or "") != str(requested_asset):
-            raise ValueError("this runtime migration cannot use a portable update asset")
-        return installer
-    if isinstance(assets, dict):
-        if requested_asset and isinstance(assets.get(requested_asset), dict):
-            return dict(assets[requested_asset])
-        # In-app updates should prefer the small portable package. Full platform
-        # installers are still published for manual downloads, but they are large
-        # enough to fail more often on flaky GitHub/proxy connections.
-        for key in ("app", "portable", "source", "zip"):
-            item = assets.get(key)
-            if isinstance(item, dict) and item.get("url"):
-                item = dict(item)
-                item["key"] = key
-                return item
-        system_name = platform.system().lower()
-        preferred: list[str] = []
-        if "darwin" in system_name:
-            preferred.extend(["macos", "darwin"])
-        elif "windows" in system_name:
-            preferred.extend(["windows", "win"])
-        elif "linux" in system_name:
-            preferred.append("linux")
-        for key in preferred:
-            item = assets.get(key)
-            if isinstance(item, dict) and item.get("url"):
-                item = dict(item)
-                item["key"] = key
-                return item
-        for key, item in assets.items():
-            if isinstance(item, dict) and item.get("url"):
-                item = dict(item)
-                item["key"] = str(key)
-                return item
-    if isinstance(assets, list):
-        for item in assets:
-            if isinstance(item, dict) and item.get("url"):
-                return dict(item)
-    raise ValueError("update manifest has no downloadable asset")
+    # Never hot-overlay Python files while leaving Electron or Harness stale.
+    return validate_installer_manifest(manifest, requested_asset)
 
 
-def download_update_asset(asset: dict[str, Any], target_path: Path) -> None:
-    url = str(asset.get("url") or "")
-    if not url:
-        raise ValueError("selected update asset has no url")
-
-    expected_size = int(asset.get("size") or 0)
-    if expected_size <= 0:
-        raise ValueError("selected update asset has no positive size")
-    part_path = target_path.with_name(f"{target_path.name}.part")
-    last_error: Exception | None = None
-
-    for attempt in range(max(1, UPDATE_DOWNLOAD_RETRIES)):
-        downloaded = part_path.stat().st_size if part_path.exists() else 0
-        headers = {"User-Agent": f"ViniperUI/{APP_VERSION}"}
-        if downloaded > 0:
-            headers["Range"] = f"bytes={downloaded}-"
-        request = urllib.request.Request(url, headers=headers)
-
-        try:
-            with urllib.request.urlopen(request, timeout=UPDATE_HTTP_TIMEOUT_SECONDS) as response:
-                status = int(getattr(response, "status", response.getcode() or 200))
-                if downloaded > 0 and status != 206:
-                    downloaded = 0
-                mode = "ab" if downloaded > 0 else "wb"
-                with part_path.open(mode) as handle:
-                    while True:
-                        try:
-                            chunk = response.read(UPDATE_DOWNLOAD_CHUNK_SIZE)
-                        except http.client.IncompleteRead as exc:
-                            if exc.partial:
-                                handle.write(exc.partial)
-                            raise
-                        if not chunk:
-                            break
-                        handle.write(chunk)
-
-            actual_size = part_path.stat().st_size
-            if expected_size and actual_size != expected_size:
-                raise ValueError(f"incomplete update download: {actual_size} of {expected_size} bytes")
-            part_path.replace(target_path)
-            return
-        except Exception as exc:
-            last_error = exc
-            if attempt < UPDATE_DOWNLOAD_RETRIES - 1:
-                time.sleep(min(2 ** attempt, 8))
-
-    raise ValueError(f"download update failed after {UPDATE_DOWNLOAD_RETRIES} attempts: {last_error}")
+_update_state = UpdateState(APP_VERSION)
+_update_download_task: asyncio.Task | None = None
+_update_ready: dict[str, Any] | None = None
+_update_installer_process: subprocess.Popen | None = None
 
 
-def safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
-    with zipfile.ZipFile(zip_path) as archive:
-        for member in archive.infolist():
-            destination = (target_dir / member.filename).resolve()
-            if not str(destination).startswith(str(target_dir.resolve())):
-                raise ValueError(f"unsafe zip entry: {member.filename}")
-        archive.extractall(target_dir)
+def active_update_blockers() -> int:
+    """All engines, pending permissions, native terminals and goal workers."""
+    active = set(_active_runs)
+    active.update(sid for sid, task in _viniper_tasks.items() if not task.done())
+    active.update(f"goal:{sid}" for sid, task in _goal_tasks.items() if not task.done())
+    active.update(sid for sid in sessions if (coordinated_run_snapshot(sid) or {}).get("active"))
+    active.update(sid for sid in tuple(_native_terminal_processes) if native_terminal_active(sid))
+    return len(active)
 
 
-def find_update_app_root(extract_dir: Path) -> Path:
-    candidates = [
-        extract_dir / "viniper-ui",
-        extract_dir / f"ViniperUI-{APP_VERSION}" / "viniper-ui",
-    ]
-    candidates.extend(path for path in extract_dir.rglob("viniper-ui") if path.is_dir())
-    candidates.extend(path for path in [extract_dir] if (path / "server.py").exists())
-    for candidate in candidates:
-        if (candidate / "server.py").exists() and (candidate / "static").exists():
-            return candidate
-    raise ValueError("downloaded package does not contain Viniper app files")
-
-
-def copy_update_tree(src: Path, dst: Path) -> None:
-    batch = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-    backup_dir = DATA_DIR / "update-backups" / batch
-    staging_dir = DATA_DIR / "update-staging" / batch
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    staging_dir.mkdir(parents=True, exist_ok=False)
-    allowed_files = [
-        "server.py", "context_lifecycle.py", "context_usage.py", "daily_usage.py", "skill_sync.py",
-        "agent_instructions.py", "agent_runtime.py", "agent_host_bridge.py",
-        "agent_queue.py", "agent_run_coordinator.py", "native_peer.py", "wsl_runtime.py",
-        "profiles.json", "requirements.txt", "VERSION", "update_source.json", "start.bat",
-    ]
-    allowed_dirs = ["static", "scripts", ".agents"]
-    required_runtime = [name for name in allowed_files if name.endswith(".py")]
-    missing = [name for name in required_runtime if not (src / name).is_file()]
-    if missing:
-        raise ValueError(f"update package missing runtime modules: {', '.join(missing)}")
-
-    for name in allowed_files:
-        source = src / name
-        if source.is_file():
-            shutil.copy2(source, staging_dir / name)
-    for name in allowed_dirs:
-        source = src / name
-        if source.is_dir():
-            shutil.copytree(source, staging_dir / name)
-
-    applied: list[str] = []
-    try:
-        for name in [*allowed_files, *allowed_dirs]:
-            staged = staging_dir / name
-            if not staged.exists():
-                continue
-            target = dst / name
-            previous = backup_dir / name
-            if target.exists():
-                os.replace(target, previous)
-            applied.append(name)
-            os.replace(staged, target)
-    except Exception:
-        for name in reversed(applied):
-            target = dst / name
-            previous = backup_dir / name
-            if target.exists():
-                failed = backup_dir / f"failed-new-{name.replace('/', '_')}"
-                os.replace(target, failed)
-            if previous.exists():
-                os.replace(previous, target)
-        raise
-
-
-def install_update_from_manifest(manifest: dict[str, Any], requested_asset: str | None = None) -> dict[str, Any]:
-    asset = choose_update_asset(manifest, requested_asset)
-    url = str(asset.get("url") or "")
-    if not url:
-        raise ValueError("selected update asset has no url")
-
-    with tempfile.TemporaryDirectory(prefix="viniper-ui-update-") as tmp:
-        tmp_dir = Path(tmp)
-        package_path = tmp_dir / "update.zip"
-        download_update_asset(asset, package_path)
-
-        asset_name = str(asset.get("name") or package_path.name)
-        if update_requires_installer(manifest) and not asset_name.lower().endswith(".exe"):
-            raise ValueError("runtime migration requires the full Windows installer")
-        if os.name == "nt" and asset_name.lower().endswith(".exe"):
-            updates_dir = DATA_DIR / "updates"
-            updates_dir.mkdir(parents=True, exist_ok=True)
-            installer_path = updates_dir / safe_attachment_filename(asset_name)
-            shutil.copy2(package_path, installer_path)
-            subprocess.Popen([str(installer_path)], cwd=str(updates_dir), close_fds=True)
-            return {
-                "asset": asset,
-                "installer": str(installer_path),
-                "installer_opened": True,
-                "requires_installer": update_requires_installer(manifest),
-                "dependencies": "",
-            }
-
-        extract_dir = tmp_dir / "extract"
-        extract_dir.mkdir()
-        safe_extract_zip(package_path, extract_dir)
-        update_root = find_update_app_root(extract_dir)
-        copy_update_tree(update_root, APP_DIR)
-
-    deps_output = ""
-    requirements = APP_DIR / "requirements.txt"
-    if requirements.exists():
-        try:
-            completed = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-q", "-r", str(requirements)],
-                cwd=str(APP_DIR),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=180,
-                check=False,
-            )
-            deps_output = completed.stdout[-1200:] if completed.stdout else ""
-        except Exception as exc:
-            deps_output = f"dependency install skipped: {exc}"
-
-    if os.name == "nt":
-        refresh_windows_shortcuts()
-
-    return {
-        "asset": asset,
-        "dependencies": deps_output,
-        "restarting": True,
-    }
-
-
-def _schedule_restart() -> None:
-    """Schedule a delayed restart of the server after the HTTP response is sent."""
-    if os.name != "nt":
+async def ensure_harness_update_idle() -> None:
+    """Do not stop an independently delegated child when its parent is idle."""
+    port = VINIPER_TRANSPORT.application_port
+    process = getattr(port, "_bridge_process", None) if port is not None else None
+    if process is None or process.returncode is not None:
+        # Merely checking for an update must not boot an unused agent runtime.
         return
-
-    async def _restart():
-        await asyncio.sleep(0.5)
-        try:
-            if env_value("VINIPER_UI_DESKTOP", "") == "1":
-                pass
-            else:
-                start_script = APP_DIR / "start.bat"
-                if start_script.exists():
-                    subprocess.Popen(
-                        ["cmd.exe", "/c", "start", "", "cmd", "/c", str(start_script)],
-                        cwd=str(APP_DIR),
-                        close_fds=True,
-                    )
-        except Exception:
-            pass
-        os._exit(0)
-
     try:
-        asyncio.create_task(_restart())
-    except Exception:
-        pass
+        managed = await asyncio.wait_for(port.control("harness.snapshot"), timeout=4)
+        collaboration = await asyncio.wait_for(port.control("collaboration.snapshot"), timeout=4)
+    except Exception as exc:
+        raise ValueError("暂时无法确认后台 Agent 是否空闲。未启动安装器，请稍后再试。") from exc
+    if (managed.get("subagents") or {}).get("active"):
+        raise ValueError("Viniper 仍有后台子 Agent 正在执行，请等待或停止后再安装。")
+    busy_states = {"queued", "running", "thinking", "responding", "waiting", "waiting_input", "waiting_permission", "waiting_approval", "in_progress", "active"}
+    sessions_busy = any(str(item.get("state") or "") in busy_states for item in collaboration.get("sessions", []) if isinstance(item, dict))
+    workflows_busy = any(str(item.get("status") or "") in busy_states for item in (managed.get("workflows") or {}).get("runs", []) if isinstance(item, dict))
+    if sessions_busy or workflows_busy:
+        raise ValueError("Viniper 仍有后台委派、排队或工作流任务，请结束后再安装。")
+
+
+def update_error_message(exc: Exception, *, action: str) -> str:
+    if isinstance(exc, ValueError):
+        return str(exc)
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 404:
+            return "正式更新尚未发布或安装包不存在，请稍后重试。"
+        if exc.code == 429:
+            return "GitHub 暂时限制请求频率，请稍后重试。"
+        return f"{action}失败（HTTP {exc.code}），请检查网络后重试。"
+    if isinstance(exc, (TimeoutError, OSError)):
+        return f"{action}失败，请检查 GitHub 网络连接及磁盘空间后重试。"
+    return f"{action}失败，请重试；当前安装和会话未被更改。"
+
+
+def configured_update_desktop() -> Path:
+    raw = env_value("VINIPER_UI_DESKTOP_EXE", "").strip()
+    if os.name != "nt" or not raw:
+        raise ValueError("应用内安装仅支持 Windows 桌面版；请从正式发布页手动下载。")
+    return Path(raw)
+
+
+async def prepare_desktop_update(manifest: dict[str, Any], requested_asset: str | None) -> None:
+    global _update_ready
+    try:
+        asset = choose_update_asset(manifest, requested_asset)
+        version = str(manifest["version"]).removeprefix("v")
+        updates_dir = DATA_DIR / "updates" / version
+        target = updates_dir / str(asset["name"])
+        # Resolve both before download and again before launch. No renderer path
+        # is accepted, and a junction cannot redirect a staged installer.
+        if not (DATA_DIR / "updates").resolve().is_relative_to(DATA_DIR.resolve()) or not target.resolve().is_relative_to((DATA_DIR / "updates").resolve()):
+            raise ValueError("更新暂存目录无效。")
+        _update_state.set(status="downloading", message="正在从官方 GitHub 下载完整安装包。",
+                          latest_version=version, total_bytes=asset["size"], retryable=False)
+        await asyncio.to_thread(
+            download_installer, asset, target, version=APP_VERSION,
+            progress=_update_state.progress, timeout=UPDATE_HTTP_TIMEOUT_SECONDS,
+            retries=UPDATE_DOWNLOAD_RETRIES, chunk_size=UPDATE_DOWNLOAD_CHUNK_SIZE,
+        )
+        _update_ready = {"manifest": manifest, "asset": asset, "path": target}
+        _update_state.set(status="ready", message="安装包已下载并校验。请保存工作、结束两个 Agent 的任务后，点击安装更新。",
+                          downloaded_bytes=asset["size"], total_bytes=asset["size"],
+                          progress_percent=100, retryable=False)
+    except Exception as exc:
+        _update_ready = None
+        _update_state.set(status="failed", retryable=True, message=update_error_message(exc, action="下载安装包"))
 
 
 migrate_legacy_data_dir()
@@ -2397,7 +2328,12 @@ def merged_env(include_app_settings: bool = True, mode: str = MODE_CLAUDE) -> di
 
 def effective_model_options(mode: str = MODE_VINIPER) -> list[dict[str, Any]]:
     selected_mode = normalize_provider_mode(mode)
-    return normalize_model_options(provider_for_mode(load_app_settings(), selected_mode).get("models"))
+    provider = provider_for_mode(load_app_settings(), selected_mode)
+    return normalize_model_options(
+        provider.get("models"),
+        provider_id=provider.get("id"),
+        mode=selected_mode,
+    )
 
 
 def allowed_model(model: str | None, mode: str = MODE_VINIPER) -> str:
@@ -2421,12 +2357,53 @@ DEEPSEEK_PROVIDER_MODEL_ALIASES = {
 def provider_model_id(model: str | None) -> str:
     """Normalize only the Provider-facing DeepSeek model identifier.
 
-    The bracketed 1m suffix remains the UI/context-window identifier. Raw
-    Anthropic requests and Claude Code CLI argv/env receive the official model
-    id so neither boundary silently falls back to another model.
+    Raw Anthropic requests use the bare model ID. Claude Code's separate native
+    boundary preserves the supported context suffix and strips it itself before
+    contacting the Provider.
     """
     normalized = str(model or "").strip()
     return DEEPSEEK_PROVIDER_MODEL_ALIASES.get(normalized, normalized)
+
+
+def official_deepseek_claude_models(
+    cfg: Mapping[str, Any] | None, *, mode: str = MODE_CLAUDE,
+) -> dict[str, str]:
+    """Run-local official DeepSeek model aliases, never a cross-engine default."""
+    if normalize_provider_mode(mode) != MODE_CLAUDE or not cfg:
+        return {}
+    if str(cfg.get("base_url") or "").strip().rstrip("/") != "https://api.deepseek.com/anthropic":
+        return {}
+    model = str(cfg.get("model") or "").strip()
+    if model not in {"deepseek-v4-pro", "deepseek-v4-pro[1m]", "deepseek-v4-flash"}:
+        return {}
+    return {
+        "ANTHROPIC_MODEL": "deepseek-v4-flash" if model == "deepseek-v4-flash" else "deepseek-v4-pro[1m]",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro[1m]",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-pro[1m]",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash",
+    }
+
+
+def claude_native_model_id(
+    model: str | None, cfg: Mapping[str, Any] | None, *, mode: str = MODE_CLAUDE,
+) -> str:
+    mapping = official_deepseek_claude_models({**(cfg or {}), "model": model}, mode=mode)
+    return mapping.get("ANTHROPIC_MODEL", provider_model_id(model))
+
+
+def claude_fallback_model(cfg: Mapping[str, Any] | None, transport_model: str) -> str:
+    """Return the explicitly configured Claude fallback, if one exists.
+
+    Claude Code is an independent provider boundary.  Never inject the
+    Viniper/DeepSeek model as an implicit fallback for a Claude run: doing so
+    silently changes the selected provider and makes a Kimi request appear to
+    have succeeded under a different model.  A future Claude-owned fallback
+    setting can be threaded through this function without coupling it to the
+    Viniper provider configuration; until then the safe value is empty.
+    """
+    _ = cfg, transport_model
+    return ""
 
 
 def permission_mode_descriptors(mode: str = MODE_CLAUDE) -> list[dict[str, Any]]:
@@ -2440,7 +2417,11 @@ def permission_mode_descriptors(mode: str = MODE_CLAUDE) -> list[dict[str, Any]]
     except Exception:
         capabilities = None
     declared = {str(item) for item in (getattr(capabilities, "permission_modes", ()) or ())}
-    supports = lambda value: value in CLAUDE_PERMISSION_MODE_IDS or value in declared or (value == "default" and "manual" in declared)
+    supports = lambda value: (
+        value in declared
+        or (value == "default" and "manual" in declared)
+        or (value == "fullAccess" and "bypassPermissions" in declared)
+    )
     result: list[dict[str, Any]] = []
     for option in permission_options_for_mode(selected_mode):
         item = dict(option)
@@ -2542,7 +2523,12 @@ def harness_permission_mode(mode: str | None) -> str:
 def claude_permission_mode(mode: str | None) -> str:
     """Map the shared presentation choice to native Claude Code semantics."""
     value = allowed_permission_mode(mode, MODE_CLAUDE)
-    return {"default": "default", "acceptEdits": "acceptEdits", "plan": "plan"}[value]
+    return {
+        "default": "default",
+        "acceptEdits": "acceptEdits",
+        "plan": "plan",
+        "fullAccess": "bypassPermissions",
+    }[value]
 
 
 def provider_config(model_override: str | None = None, mode: str = MODE_VINIPER) -> dict[str, str]:
@@ -2803,8 +2789,9 @@ def build_claude_env(
         auto_compact_supported=auto_compact_supported,
     )
     env["ANTHROPIC_BASE_URL"] = cfg.get("base_url", "")
-    transport_model = provider_model_id(cfg.get("model", ""))
+    transport_model = claude_native_model_id(cfg.get("model", ""), cfg, mode=selected_mode)
     env["ANTHROPIC_MODEL"] = transport_model
+    env.update(official_deepseek_claude_models(cfg, mode=selected_mode))
     provider = provider_for_mode(load_app_settings(), selected_mode)
     names = provider_env_names(provider)
     if names.get("model"):
@@ -2814,12 +2801,21 @@ def build_claude_env(
         other = "ANTHROPIC_API_KEY" if (cfg.get("api_key_env") or "").upper() == "ANTHROPIC_AUTH_TOKEN" else "ANTHROPIC_AUTH_TOKEN"
         env.pop(other, None)
     env["NO_COLOR"] = "1"
+    # Native CLI defaults to ten retries, hiding authentication failures behind
+    # long exponential backoff. Keep one transport retry; never replay the task.
+    env.setdefault("CLAUDE_CODE_MAX_RETRIES", "1")
     return env
 
 
-def runtime_bridge_keys(mode: str = MODE_CLAUDE) -> tuple[str, ...]:
-    names = provider_env_names(provider_for_mode(load_app_settings(), mode))
+def runtime_bridge_keys(
+    mode: str = MODE_CLAUDE, cfg: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    provider = provider_for_mode(load_app_settings(), mode)
+    names = provider_env_names(provider)
+    model_keys = tuple(official_deepseek_claude_models(cfg if cfg is not None else provider, mode=mode))
     return tuple(dict.fromkeys((
+        *model_keys,
+        "CLAUDE_CODE_MAX_RETRIES",
         names["api_key"],
         names["base_url"],
         names["model"],
@@ -3131,7 +3127,7 @@ def file_change_records(
     return records
 
 
-PLAN_STEP_STATUSES = {"pending", "in_progress", "completed", "skipped", "failed"}
+PLAN_STEP_STATUSES = {"pending", "in_progress", "completed", "skipped", "failed", "blocked"}
 
 
 def _normalize_plan_steps(session: dict[str, Any], raw_steps: list[Any]) -> list[dict[str, str]]:
@@ -3236,7 +3232,7 @@ def update_plan_from_tool_event(
 
 
 def finalize_plan_for_terminal(session_id: str, terminal_status: str, run_id: str = "") -> dict[str, Any] | None:
-    """Close unresolved steps so a terminal run never leaves pending state."""
+    """Stop active steps without inventing verification or skipped work."""
     session = safe_session(str(session_id))
     plan = session.get("plan") if isinstance(session.get("plan"), dict) else None
     if not plan or not isinstance(plan.get("steps"), list) or not plan.get("steps"):
@@ -3245,13 +3241,13 @@ def finalize_plan_for_terminal(session_id: str, terminal_status: str, run_id: st
     if run_id and plan_run_id and plan_run_id != str(run_id):
         return None
     terminal = str(terminal_status or "failed").casefold()
-    unresolved_status = "failed" if terminal in {"failed", "error"} else "skipped"
+    unresolved_status = "failed" if terminal in {"failed", "error"} else "blocked"
     changed = False
     for step in plan["steps"]:
         if not isinstance(step, dict):
             continue
         status = str(step.get("status") or "pending")
-        if status in {"pending", "in_progress"}:
+        if status == "in_progress":
             step["status"] = unresolved_status
             changed = True
     if plan.get("terminal_status") != terminal:
@@ -3600,19 +3596,15 @@ def build_control_response_envelope(record: dict[str, Any], action: str, answers
                 }
         else:
             response = {"behavior": "allow", "updatedInput": copy.deepcopy(record.get("input") or {})}
-        return {"type": "control_response", "request_id": request_id, "response": response}
+        return native_control_success(request_id, response)
     answer_value = _question_answer_map(copy.deepcopy(answers if answers is not None else value))
     original_questions = copy.deepcopy(record.get("_original_questions"))
     if not isinstance(original_questions, list):
         original_questions = copy.deepcopy(record.get("questions") or [])
-    return {
-        "type": "control_response",
-        "request_id": request_id,
-        "response": {
-            "behavior": "allow",
-            "updatedInput": {"questions": original_questions, "answers": answer_value},
-        },
-    }
+    return native_control_success(request_id, {
+        "behavior": "allow",
+        "updatedInput": {"questions": original_questions, "answers": answer_value},
+    })
 
 
 def build_question_continuation_envelope(record: dict[str, Any], action: str, answers: Any = None) -> dict[str, Any]:
@@ -4062,11 +4054,56 @@ class AgentInteractionBroker:
             except ValueError:
                 continue
 
+    @staticmethod
+    def _cli_consumed_response(record: dict[str, Any]) -> bool:
+        """Return whether the child CLI has consumed the committed decision.
+
+        ``response_committed`` only means that the host wrote a response file;
+        it is not evidence that Claude read it.  Once the hook (or the
+        permission-prompt MCP server) has reported its downstream flush/exit
+        stages, the broker must keep the same-run record available until the
+        matching ``tool_result`` arrives.  The outer run/no-output deadlines
+        still bound a child that never produces that result.
+        """
+        channel = record.get("_host_channel")
+        if not isinstance(channel, HostInteractionChannel):
+            return False
+        try:
+            acknowledgement = channel.acknowledgement(str(record.get("bridge_request_id") or ""))
+        except (OSError, ValueError):
+            return False
+        if not acknowledgement.get("response_read"):
+            return False
+        response_mode = str(record.get("_response_mode") or "")
+        if response_mode == "permission_prompt_mcp":
+            return bool(acknowledgement.get(MCP_RESPONSE_ACK_STAGE))
+        return bool(
+            acknowledgement.get("stdout_written_and_flushed")
+            and acknowledgement.get("hook_exit")
+            and int(acknowledgement.get("hook_exit_code") or 0) == 0
+        )
+
+    def cli_response_consumed_for(self, session_id: str) -> bool:
+        """Expose the ACK-consumed state for accurate process-exit reasons."""
+        record = self._pending.get(str(session_id))
+        if record is None:
+            store = self._store()
+            durable = store.latest_for_session(str(session_id)) if store is not None else None
+            if durable and str(durable.get("state") or "") in {"response_committed", "awaiting_cli_ack"}:
+                record = self._record_from_durable(session_id, str(durable.get("request_id") or ""))
+        return bool(record and self._cli_consumed_response(record))
+
     def expire_unacknowledged(self, *, now: float | None = None, timeout_seconds: float) -> list[dict[str, str]]:
         current = float(now if now is not None else time.time())
         expired: list[dict[str, str]] = []
         for sid, record in list(self._pending.items()):
             if str(record.get("state") or "") != "awaiting_cli_ack":
+                continue
+            # A downstream hook/MCP ACK proves that the child consumed the
+            # response.  It may now be executing a long-running tool; keep
+            # the request correlated until its matching tool_result arrives.
+            if self._cli_consumed_response(record):
+                record.setdefault("cli_response_consumed_at", current)
                 continue
             if current - float(record.get("response_committed_at") or current) < max(0.01, float(timeout_seconds)):
                 continue
@@ -4113,7 +4150,11 @@ class AgentInteractionBroker:
         if not isinstance(committed_response, dict) and isinstance(durable, dict):
             committed_response = durable.get("response")
         response_behavior = DurableInteractionStore.response_behavior(committed_response)
-        expected_tool_result_success = response_behavior != "deny"
+        # A successful permission decision authorizes the tool; it does not
+        # promise that the tool itself will exit with code 0.  A legitimate
+        # tool error must still complete the interaction correlation so the
+        # Claude run can receive the result and continue.  Only a denied
+        # decision has a required failure result.
         deadline = time.monotonic() + 0.25
         while True:
             acknowledgement = channel.acknowledgement(bridge_id)
@@ -4128,7 +4169,7 @@ class AgentInteractionBroker:
             if protocol_ready or time.monotonic() >= deadline:
                 break
             time.sleep(0.005)
-        tool_result_matches = bool(success) == expected_tool_result_success
+        tool_result_matches = response_behavior != "deny" or not bool(success)
         accepted = bool(protocol_ready and tool_result_matches)
         self._sync_durable_ack(record, acknowledgement)
         if store is not None:
@@ -4138,6 +4179,8 @@ class AgentInteractionBroker:
                     str(request_id),
                     "cli_tool_result",
                     success=bool(success),
+                    accepted=accepted,
+                    protocol_ready=protocol_ready,
                 )
             except ValueError:
                 pass
@@ -5155,6 +5198,7 @@ def sanitize_goal_session_messages(session_id: str) -> None:
 
 
 def start_goal_task(goal_id: str) -> None:
+    ensure_update_not_installing()
     task = _goal_tasks.get(goal_id)
     if task and not task.done():
         return
@@ -6337,6 +6381,39 @@ def _unresolved_parallel_tool_count(segments: list[dict[str, Any]]) -> int:
     return unresolved
 
 
+def native_local_file_failure(exc: FileNotFoundError, *, process_started: bool) -> str:
+    """Log bounded filesystem metadata, never raw exception paths or payloads."""
+    def safe_basename(value: Any) -> str:
+        basename = re.split(r"[\\/]", str(value or ""))[-1]
+        if re.fullmatch(r"(?:\.?[0-9a-f-]{32,36}(?:\.[a-z_]+)?\.json(?:\.[0-9a-f]{32}\.tmp)?|\.v-[0-9a-f]{32}\.tmp|channel-meta\.json|audit-summary\.json|claude(?:\.exe|\.cmd)?|wsl\.exe)", basename):
+            return basename
+        suffix = Path(basename).suffix.lower()
+        return "[redacted]" + (suffix if suffix in {".json", ".txt", ".tmp", ".py", ".exe", ".cmd", ".ps1"} else "")
+
+    filenames = [str(value) for value in (exc.filename, exc.filename2) if value is not None]
+    frame = None
+    cursor = exc.__traceback__
+    source_names = {"server.py", "agent_host_bridge.py", "agent_run_coordinator.py", "agent_runtime.py"}
+    while cursor is not None:
+        if Path(cursor.tb_frame.f_code.co_filename).name in source_names:
+            frame = cursor
+        cursor = cursor.tb_next
+    code_basename = Path(frame.tb_frame.f_code.co_filename).name if frame is not None else ""
+    print(json.dumps({
+        "event": "native_local_file_error",
+        "process_started": bool(process_started),
+        "error_type": "FileNotFoundError",
+        "errno": exc.errno,
+        "winerror": getattr(exc, "winerror", None),
+        "files": [{"basename": safe_basename(name), "path_length": len(name)} for name in filenames],
+        "code_file": code_basename if code_basename in source_names else "[redacted]",
+        "code_line": frame.tb_lineno if frame is not None else None,
+    }, ensure_ascii=False), file=sys.stderr, flush=True)
+    if not process_started:
+        return "找不到 claude 命令，请确认 Claude Code 已安装并在 PATH 中。"
+    return "Claude Code 已启动，但本地运行或交互文件操作失败。请检查工作台数据目录的路径长度与可访问性后重试。"
+
+
 async def stream_claude_impl(
     session_id: str,
     user_msg: str,
@@ -6353,6 +6430,11 @@ async def stream_claude_impl(
     queued_item_id: str = "",
     accepted_turn_id: str = "",
 ):
+    def trace_native_phase(phase: str) -> None:
+        # No prompts, credentials or filesystem contents enter the startup log.
+        print(json.dumps({"event": "native_run_phase", "session_id": session_id, "phase": phase}), file=sys.stderr, flush=True)
+
+    trace_native_phase("preparing")
     settings = load_app_settings()
     if is_custom_shell(settings.get("shell", {})):
         async for chunk in stream_custom_cli_impl(
@@ -6377,6 +6459,7 @@ async def stream_claude_impl(
         return
 
     runtime = WindowsNativeRuntime(claude_launcher(), process_factory=process_factory) if process_factory else agent_runtime()
+    trace_native_phase("runtime_probe")
     if isinstance(runtime, WslAgentRuntime):
         runtime_probe = runtime.probe()
         if not runtime_probe.ready:
@@ -6401,7 +6484,7 @@ async def stream_claude_impl(
     session = safe_session(session_id)
     selected_model = cfg["model"]
     runtime_caps = runtime.capabilities()
-    effective_context_window = context_limit_for_model(selected_model)
+    effective_context_window = context_limit_for_model(selected_model, mode=MODE_CLAUDE)
     selected_permission_mode = claude_permission_mode(permission_mode)
     attachments = attachments or []
     prompt = user_msg.strip()
@@ -6439,18 +6522,19 @@ async def stream_claude_impl(
 
     context_prompt = append_attachment_prompt(prompt, attachments)
 
-    transport_model = provider_model_id(selected_model)
-    fallback_model = "deepseek-v4-flash" if transport_model != "deepseek-v4-flash" else ""
+    transport_model = claude_native_model_id(selected_model, cfg)
+    fallback_model = claude_fallback_model(cfg, transport_model)
     system_prompt_path = prepare_agent_system_prompt(session)
     usage_run_id = str(uuid.uuid4())
     host_channel, host_settings_path, host_mcp_config_path = prepare_agent_host_channel(
-        runtime, session_id, usage_run_id,
+        runtime, session_id, usage_run_id, provider_cfg=cfg,
     )
 
     cwd = existing_workdir(str(session.get("workdir") or ""))
     run_spec = AgentRunSpec(
         session_id=session_id,
         claude_session_id=claude_session_id,
+        debug_file=str(host_channel.root / "native-debug.txt") if env_value("VINIPER_UI_NATIVE_DEBUG", "0") == "1" else "",
         session_name=stable_session_name(str(session.get("name") or "session"), session_id),
         workdir=str(cwd),
         model=transport_model,
@@ -6471,7 +6555,7 @@ async def stream_claude_impl(
             effective_context_window=effective_context_window,
             auto_compact_supported=runtime_caps.auto_compact,
         ),
-        bridge_keys=runtime_bridge_keys(MODE_CLAUDE),
+        bridge_keys=runtime_bridge_keys(MODE_CLAUDE, cfg),
         effective_context_window=effective_context_window,
         agents={
             str(item.get("name")): {
@@ -6483,6 +6567,7 @@ async def stream_claude_impl(
         },
     )
     watched_file_roots = file_change_watch_roots(cwd)
+    trace_native_phase("file_snapshot")
     before_file_state = snapshot_watch_files(watched_file_roots)
     before_file_text = snapshot_watch_text(watched_file_roots)
     assistant_text = ""
@@ -6490,6 +6575,7 @@ async def stream_claude_impl(
     assistant_segments: list[dict[str, Any]] = []
     message_started_at = time.monotonic()
     final_result = ""
+    native_result_failed = False
     stderr_text = ""
     timed_out = False
     blocked_command = ""
@@ -6699,9 +6785,11 @@ async def stream_claude_impl(
     stderr_task = None
     try:
         cleanup_stale = getattr(runtime, "cleanup_stale", None)
+        trace_native_phase("cleanup_stale")
         if cleanup_stale is not None:
             await cleanup_stale(run_spec)
         proc = await runtime.spawn_session(run_spec)
+        trace_native_phase("spawned")
         process_identity = proc.process_identity
         coordinator_snapshot = coordinated_run_snapshot(session_id) or {}
         coordinator_run_id = str(coordinator_snapshot.get("run_id") or usage_run_id)
@@ -6764,16 +6852,77 @@ async def stream_claude_impl(
         yield sse({"type": "runtime_started", "session_id": session_id, "run_id": usage_run_id})
         if proc.stdin is None:
             raise RuntimeError("Claude Code stream-json stdin is unavailable")
+        stderr_task = asyncio.create_task(read_stderr(proc))
+        assert proc.stdout is not None
+        stdout_reader = ChunkedLineReader(proc.stdout)
+        startup_events = []
+        if isinstance(runtime, WslAgentRuntime):
+            yield sse({"type": "working_status", "content": "正在初始化 Claude Code…"})
+            trace_native_phase("initialize")
+            async def write_initialize(envelope):
+                await active_agent_input_channel.write(
+                    session_id, run_info, envelope, process_identity=process_identity,
+                )
+            try:
+                metadata, startup_events = await initialize_native_stream(
+                    stdout_reader, write_initialize, f"{usage_run_id}:initialize",
+                    cancelled=lambda: bool(run_info.get("cancel_requested")),
+                )
+            except NativeStartupError as exc:
+                if (
+                    not resume_existing or retry_missing_session or peer_request
+                    or run_info.get("cancel_requested")
+                    or not is_missing_claude_session_error(exc.detail)
+                ):
+                    raise
+                # A missing transcript can fail before the initialize ACK.
+                # No user event has been sent, so rebuild exactly once without
+                # replaying an accepted turn or treating auth/lock errors alike.
+                if proc.returncode is None:
+                    await runtime.cancel(session_id)
+                await asyncio.wait_for(proc.wait(), timeout=5)
+                mark_finished = getattr(runtime, "mark_finished", None)
+                if mark_finished is not None:
+                    mark_finished(session_id, proc)
+                if stderr_task is not None:
+                    stderr_task.cancel()
+                    await asyncio.gather(stderr_task, return_exceptions=True)
+                if _active_runs.get(session_id) is run_info:
+                    _active_runs.pop(session_id, None)
+                recovery_turn_id = accepted_turn_id or str(uuid.uuid4())
+                ensure_assistant_message()["turn_id"] = recovery_turn_id
+                session["claude_initialized"] = False
+                session["claude_session_id"] = str(uuid.uuid4())
+                session["updated"] = now_ts()
+                save_sessions_to_disk()
+                trace_native_phase("missing_session_recovery")
+                yield sse({"type": "working_status", "content": "原生会话记录已失效，正在重建会话；本轮消息尚未发送。"})
+                # The inner run owns this same assistant message. Prevent the
+                # outer finally from writing its empty startup draft over it.
+                finalized = True
+                async for chunk in stream_claude_impl(
+                    session_id, user_msg, is_guidance, model, permission_mode,
+                    attachments, retry_missing_session=True,
+                    retry_session_in_use=retry_session_in_use,
+                    suppress_user_message=True,
+                    stall_recovery_count=stall_recovery_count,
+                    process_factory=process_factory,
+                    queued_item_id=queued_item_id,
+                    accepted_turn_id=recovery_turn_id,
+                ):
+                    yield chunk
+                return
+            session["native_capabilities"] = metadata
+            trace_native_phase("initialized")
+            save_assistant_progress(force=True)
+            yield sse({"type": "working_status", "content": "Claude Code 已就绪，等待模型响应…"})
         await active_agent_input_channel.write(
             session_id,
             run_info,
             build_stream_json_user_envelope(context_prompt, claude_session_id),
             process_identity=process_identity,
         )
-        stderr_task = asyncio.create_task(read_stderr(proc))
-
-        assert proc.stdout is not None
-        stdout_reader = ChunkedLineReader(proc.stdout)
+        trace_native_phase("user_sent")
         run_started_at = time.monotonic()
         started = run_started_at
         last_heartbeat = started
@@ -6885,7 +7034,7 @@ async def stream_claude_impl(
                 break
             try:
                 read_timeout = 0.2 if remaining is None else min(0.2, remaining)
-                raw_line = await stdout_reader.readline(read_timeout)
+                raw_line = startup_events.pop(0) if startup_events else await stdout_reader.readline(read_timeout)
             except asyncio.TimeoutError:
                 now = time.monotonic()
                 expired_acks = agent_interaction_broker.expire_unacknowledged(
@@ -6992,7 +7141,7 @@ async def stream_claude_impl(
                 session_id,
                 data,
                 model=selected_model,
-                fallback_limit=context_limit_for_model(selected_model),
+                fallback_limit=context_limit_for_model(selected_model, mode=MODE_CLAUDE),
             )
             if usage_snapshot is not None:
                 yield sse({"type": "usage", "usage": usage_snapshot.as_dict()})
@@ -7003,7 +7152,7 @@ async def stream_claude_impl(
                     session_id,
                     data,
                     model=selected_model,
-                    fallback_limit=context_limit_for_model(selected_model),
+                    fallback_limit=context_limit_for_model(selected_model, mode=MODE_CLAUDE),
                 )
                 yield sse({
                     "type": "compact_boundary",
@@ -7403,8 +7552,10 @@ async def stream_claude_impl(
                 waiting_for = "done"
                 tool_finalization_deadline = None
                 final_result = clean_stream_text(str(data.get("result") or ""))
-                if data.get("is_error"):
-                    error_text = final_result or clean_stream_text(str(data))
+                if data.get("is_error") or str(data.get("subtype") or "").startswith("error"):
+                    native_result_failed = True
+                    errors = data.get("errors") or []
+                    error_text = final_result or "\n".join(str(item) for item in errors) or "Claude Code 未能完成本轮任务。"
                     if str(run_info.get("pending_interaction") or "") in fallback_question_tool_ids:
                         final_result = ""
                         continue
@@ -7413,7 +7564,7 @@ async def stream_claude_impl(
                         (is_missing_claude_session_error(error_text) and not retry_missing_session)
                         or (is_claude_session_in_use_error(error_text) and not retry_session_in_use)
                     ):
-                        yield sse({"type": "error", "content": error_text})
+                        yield sse({"type": "error", "content": native_failure_message(error_text)})
                 if not run_info.get("pending_interaction"):
                     close_fallback_stream_input()
                 continue
@@ -7429,7 +7580,11 @@ async def stream_claude_impl(
         unsettled_at_exit = agent_interaction_broker.unsettled_for(session_id)
         if unsettled_at_exit and not interaction_protocol_failure:
             ack = agent_interaction_broker.ack_status_for(session_id) or {}
-            interaction_protocol_failure = "process_exited_before_cli_ack"
+            interaction_protocol_failure = (
+                "process_exited_before_cli_tool_result"
+                if agent_interaction_broker.cli_response_consumed_for(session_id)
+                else "process_exited_before_cli_ack"
+            )
             await agent_run_coordinator().acknowledge_interaction(
                 session_id,
                 str(ack.get("request_id") or run_info.get("pending_interaction") or ""),
@@ -7444,7 +7599,11 @@ async def stream_claude_impl(
             detail = (
                 "官方交互入口未接管底层结构化交互，任务已安全停止并恢复输入。"
                 if interaction_protocol_failure == "interaction_owner_request_missing"
-                else "底层 CLI 未完成本次交互确认，任务已安全停止并恢复输入。"
+                else (
+                    "CLI 已确认本次交互，但工具结果未返回，任务已安全停止并恢复输入。"
+                    if interaction_protocol_failure == "process_exited_before_cli_tool_result"
+                    else "底层 CLI 未完成本次交互确认，任务已安全停止并恢复输入。"
+                )
             )
             yield sse({"type": "error", "content": detail})
             finalize_assistant(f"错误：{detail}")
@@ -7614,8 +7773,8 @@ async def stream_claude_impl(
             yield sse({"type": "done"})
             return
 
-        if return_code != 0:
-            detail = stderr_text or final_result or f"claude exited with code {return_code}"
+        if return_code != 0 or native_result_failed:
+            detail = final_result or stderr_text or f"claude exited with code {return_code}"
             if is_claude_session_in_use_error(detail) and not retry_session_in_use and not peer_request:
                 remove_last_attempt_messages(session, display_prompt)
                 was_initialized = bool(session.get("claude_initialized"))
@@ -7668,7 +7827,8 @@ async def stream_claude_impl(
                 ):
                     yield chunk
                 return
-            yield sse({"type": "error", "content": detail[:3000]})
+            detail = native_failure_message(detail)
+            yield sse({"type": "error", "content": detail})
             finalize_assistant(f"错误：{detail}")
             save_sessions_to_disk()
             yield sse({"type": "done"})
@@ -7701,8 +7861,8 @@ async def stream_claude_impl(
             stderr_task.cancel()
         force_release_session_lock(session_id)
         raise
-    except FileNotFoundError:
-        detail = "找不到 claude 命令，请确认 Claude Code 已安装并在 PATH 中。"
+    except FileNotFoundError as exc:
+        detail = native_local_file_failure(exc, process_started=proc is not None)
         finalize_assistant(f"错误：{detail}")
         yield sse({"type": "error", "content": detail})
         yield sse({"type": "done"})
@@ -7892,13 +8052,31 @@ async def attachment_file(session_id: str, filename: str):
 
 
 @app.get("/api/status")
-async def status(mode: str = Query(default=MODE_VINIPER)):
+async def status(mode: str = Query(default=MODE_VINIPER), session_id: str | None = None):
     selected_mode = normalize_provider_mode(mode)
     base = status_base_snapshot(selected_mode)
     cfg = base["cfg"]
     update_source = base["update_source"]
     settings = base["settings"]
     runtime_status = await runtime_probe_snapshot(refresh=True)
+    observed_commands = None
+    if selected_mode == MODE_CLAUDE and session_id:
+        current = sessions.get(session_id)
+        if current and normalize_session_mode(current.get("mode")) == MODE_CLAUDE:
+            observed_commands = (current.get("native_capabilities") or {}).get("commands")
+    # The first status request can race the bounded Claude CLI capability
+    # probe.  Keep the real descriptor result (unsupported modes remain
+    # disabled), but tell the renderer that a refresh is required before it
+    # treats a probe-time disabled result as final.  This avoids caching a
+    # transient "CLI 未声明" result as a permanent menu state.
+    permission_modes_pending = bool(
+        selected_mode == MODE_CLAUDE
+        and (
+            runtime_status.get("refreshing")
+            or runtime_status.get("stale")
+            or str(runtime_status.get("status") or "") in {"checking", "configuring"}
+        )
+    )
     shell = settings.get("shell", {})
     shell_id = str(shell.get("id") or "claude-code")
     runtime_configured = bool(cfg["api_key"]) if shell_id == "claude-code" else bool(str(shell.get("custom_command") or "").strip())
@@ -7939,13 +8117,10 @@ async def status(mode: str = Query(default=MODE_VINIPER)):
         "font_sizes": FONT_SIZE_OPTIONS,
         "claude_available": bool(runtime_status.get("ready")),
         "runtime": runtime_status,
-        "native_commands": ({
-            "owner": "claude-code-cli",
-            "cli_version": CLAUDE_NATIVE_COMMAND_VERSION,
-            "commands": [f"/{name}" for name in CLAUDE_NATIVE_COMMAND_NAMES],
-        } if selected_mode == MODE_CLAUDE else None),
+        "native_commands": (build_native_command_manifest(runtime_status, observed_commands) if selected_mode == MODE_CLAUDE else None),
         "permission_mode": base["permission_mode"],
         "permission_modes": base["permission_modes"],
+        "permission_modes_pending": permission_modes_pending,
         "data_dir": str(DATA_DIR),
         "update": {
             "configured": bool(update_source.get("manifest_url")),
@@ -8130,9 +8305,12 @@ async def test_provider_connection(mode: str = Query(default=MODE_VINIPER)):
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "x-api-key": cfg["api_key"],
         "anthropic-version": "2023-06-01",
     }
+    if str(cfg.get("api_key_env") or "ANTHROPIC_AUTH_TOKEN").upper() == "ANTHROPIC_AUTH_TOKEN":
+        headers["Authorization"] = f"Bearer {cfg['api_key']}"
+    else:
+        headers["x-api-key"] = cfg["api_key"]
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=3.0), trust_env=True) as client:
             response = await client.post(messages_url(cfg["base_url"]), headers=headers, json=payload)
@@ -8283,15 +8461,29 @@ async def configuration_matrix(mode: str = Query(default=MODE_VINIPER)):
 
 
 @app.get("/api/claude-native-commands")
-async def claude_native_command_manifest(mode: str = Query(default=MODE_CLAUDE)):
+async def claude_native_command_manifest(mode: str = Query(default=MODE_CLAUDE), session_id: str | None = None):
     if require_canonical_mode(mode) != MODE_CLAUDE:
         raise HTTPException(status_code=409, detail="Claude 原生命令只属于 Claude code")
-    return {
-        "ok": True,
-        "owner": "claude-code-cli",
-        "cli_version": CLAUDE_NATIVE_COMMAND_VERSION,
-        "commands": [f"/{name}" for name in CLAUDE_NATIVE_COMMAND_NAMES],
-    }
+    observed = None
+    if session_id:
+        session = safe_session(session_id)
+        if normalize_session_mode(session.get("mode")) != MODE_CLAUDE:
+            raise HTTPException(status_code=409, detail="会话不属于 Claude code")
+        observed = (session.get("native_capabilities") or {}).get("commands")
+    return build_native_command_manifest(await runtime_probe_snapshot(refresh=True), observed)
+
+
+_native_terminal_processes: dict[str, subprocess.Popen] = {}
+
+
+def native_terminal_active(session_id: str) -> bool:
+    process = _native_terminal_processes.get(session_id)
+    if process is None:
+        return False
+    if process.poll() is None:
+        return True
+    _native_terminal_processes.pop(session_id, None)
+    return False
 
 
 @app.post("/api/claude-native-commands/{session_id}")
@@ -8300,26 +8492,65 @@ async def execute_claude_native_command(session_id: str, request: Request):
     if normalize_session_mode(session.get("mode")) != MODE_CLAUDE:
         raise HTTPException(status_code=409, detail="Viniper 会话不能执行 Claude Code CLI 原生命令")
     body = await request.json()
-    raw_command = str(body.get("command") or "").strip().lower()
-    command = raw_command[1:] if raw_command.startswith("/") else raw_command
-    if command not in CLAUDE_NATIVE_COMMAND_NAMES:
-        raise HTTPException(status_code=404, detail="当前受管 Claude Code CLI 未声明该原生命令")
-    requested_version = str(body.get("cli_version") or "").strip()
-    if requested_version and requested_version != CLAUDE_NATIVE_COMMAND_VERSION:
-        raise HTTPException(status_code=409, detail="Claude Code CLI 命令清单版本不匹配")
-    # These commands are TUI-owned. The Workstation deliberately does not turn
-    # slash text into a model prompt or fall back to Harness APIs. Until the
-    # managed coordinator exposes an interactive-command channel, fail visibly
-    # at this explicit Claude-owned adapter boundary without writing messages.
-    return {
-        "ok": True,
-        "owner": "claude-code-cli",
-        "command": f"/{command}",
-        "cli_version": CLAUDE_NATIVE_COMMAND_VERSION,
-        "available": False,
-        "status": "native_interactive_required",
-        "summary": f"Claude Code 原生命令 /{command} 需要受管 CLI 交互界面；当前不会把它当作普通提示词发送。",
-    }
+    probe = await runtime_probe_snapshot(refresh=True)
+    try:
+        route = resolve_native_command(body.get("command"), body.get("arguments"), probe, (session.get("native_capabilities") or {}).get("commands"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if route["execution"] == "native-ui":
+        return {**route, "status": "open_ui"}
+    if not route.get("available"):
+        raise HTTPException(status_code=503, detail="Claude Code 运行环境尚未就绪，请到设置中检查。")
+    runtime = agent_runtime()
+    if not isinstance(runtime, WslAgentRuntime):
+        raise HTTPException(status_code=501, detail="此原生终端入口目前支持 Windows 的受管 WSL 环境。")
+    cwd = str(existing_workdir(str(session.get("workdir") or "")))
+    linux_cwd = await asyncio.to_thread(runtime.map_path, cwd)
+    if route["execution"] == "cli":
+        argv = build_native_cli_argv(route["command"], workdir=linux_cwd, distro=runtime.distro, user=runtime.user)
+        try:
+            result = await asyncio.to_thread(subprocess.run, argv, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(status_code=504, detail="原生诊断尚未返回，请稍后重试或打开原生终端。") from exc
+        output = clean_stream_text(result.stdout or result.stderr or "")[:16000]
+        return {**route, "ok": result.returncode == 0, "status": "completed" if result.returncode == 0 else "failed", "summary": output or "原生命令已返回", "exit_code": result.returncode}
+    if native_terminal_active(session_id) or session_id in _active_runs or (coordinated_run_snapshot(session_id) or {}).get("active"):
+        raise HTTPException(status_code=409, detail="此会话仍在运行或已打开原生窗口。请结束当前任务或关闭原生窗口后再继续。")
+    cfg = provider_config(mode=MODE_CLAUDE)
+    selected_model = str(session.get("model") or cfg.get("model") or "")
+    cfg = {**cfg, "model": selected_model}
+    transport_model = claude_native_model_id(selected_model, cfg)
+    caps = runtime.capabilities()
+    permission = str(session.get("permission_mode") or "default")
+    native_permission = "bypassPermissions" if permission == "fullAccess" else permission
+    # A fresh TUI is a separate native session. It must not consume a UUID that
+    # the Workstation later incorrectly starts as a new stream-json session.
+    cli_id = str(session.get("claude_session_id") or "") if session.get("claude_initialized") else ""
+    terminal_settings_file = ""
+    if official_deepseek_claude_models(cfg):
+        _, settings_path, _ = prepare_agent_host_channel(
+            runtime, session_id, str(uuid.uuid4()), provider_cfg=cfg,
+        )
+        terminal_settings_file = await asyncio.to_thread(runtime.map_path, settings_path)
+    argv = build_native_terminal_argv(
+        workdir=linux_cwd, model=transport_model, permission_mode=native_permission,
+        permission_modes=caps.permission_modes, claude_session_id=cli_id,
+        resume=bool(session.get("claude_initialized")),
+        name=stable_session_name(str(session.get("name") or "session"), session_id),
+        settings_file=terminal_settings_file,
+        distro=runtime.distro, user=runtime.user,
+    )
+    spec = AgentRunSpec(session_id=session_id, claude_session_id=cli_id, session_name="", workdir=cwd,
+        model=transport_model, permission_mode=permission, resume=bool(session.get("claude_initialized")),
+        environment=build_claude_env(cfg, session, mode=MODE_CLAUDE), bridge_keys=runtime_bridge_keys(MODE_CLAUDE, cfg))
+    ensure_update_not_installing()
+    try:
+        process = subprocess.Popen(argv, env=runtime._bridge_environment(spec), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="无法打开原生终端，请检查 WSL 运行环境。") from exc
+    _native_terminal_processes[session_id] = process
+    detail = "已恢复此原生会话。" if cli_id else "这是独立的原生配置窗口，其中的聊天保存在 Claude Code CLI。"
+    return {**route, "status": "native_terminal_opened", "summary": f"已打开 Claude Code 原生窗口。{detail}请在那里输入 {route['command_to_type']}；关闭窗口后可回到工作台继续。"}
 
 
 @app.get("/api/goals")
@@ -8492,20 +8723,34 @@ async def update_plan_step(session_id: str, step_id: str, request: Request):
     return await list_plans(session_id)
 
 
+@app.get("/api/project-file")
+async def project_file_preview(session_id: str, path: str, mode: str = Query(default=MODE_CLAUDE)):
+    session = safe_session(session_id)
+    if normalize_session_mode(session.get("mode")) != require_canonical_mode(mode):
+        raise HTTPException(status_code=409, detail="文件不属于当前 Agent 工作区")
+    root = str(session.get("workdir") or "").strip()
+    if not root:
+        raise HTTPException(status_code=400, detail="请先选择项目目录")
+    try:
+        return await asyncio.to_thread(preview_project_file, root, path)
+    except ProjectBrowserError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/project-index")
 async def project_index(session_id: str | None = None, query: str = "", mode: str = Query(default=MODE_VINIPER)):
     selected_mode = normalize_provider_mode(mode)
     session = sessions.get(str(session_id)) if session_id else None
+    if session and normalize_session_mode(session.get("mode")) != selected_mode:
+        raise HTTPException(status_code=409, detail="工作区不属于当前 Agent")
     workdir = str((session or {}).get("workdir") or "").strip()
     if selected_mode == MODE_CLAUDE:
-        return {
-            "ok": True,
-            "status": "unavailable",
-            "engine": "claude-code-cli",
-            "root": workdir,
-            "entries": [],
-            "reason": "项目索引由 Viniper Harness 提供；当前 Claude Code CLI 未声明独立索引服务。",
-        }
+        if not workdir or not Path(workdir).is_dir():
+            return {"ok": True, "status": "context-required", "engine": "desktop-file-browser", "root": "", "entries": [], "reason": "请先为此会话选择项目目录。"}
+        try:
+            return await asyncio.to_thread(browse_project_files, workdir, query)
+        except ProjectBrowserError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     packaged_resources_root = BASE_DIR.parent.resolve(strict=False)
     selected_path = Path(workdir).resolve(strict=False) if workdir else None
     if (
@@ -8776,134 +9021,177 @@ async def create_desktop_shortcut():
     return {"ok": True, "message": f"桌面和开始菜单快捷方式已指向软件版 {APP_TITLE}。"}
 
 
-@app.post("/api/update/check")
-async def check_update(request: Request):
+_update_other_mutations = 0
+
+
+def ensure_update_not_installing() -> None:
+    refresh_update_install_state()
+    if _update_state.snapshot()["status"] in {"installing", "installer_opened"}:
+        raise HTTPException(status_code=409, detail="更新安装器已打开，请先完成或取消安装，再开始新任务。")
+
+
+def refresh_update_install_state() -> None:
+    global _update_installer_process
+    if _update_installer_process is not None and _update_installer_process.poll() is not None:
+        _update_installer_process = None
+        _update_state.set(status="ready" if _update_ready else "idle",
+                          message="安装器已关闭。如已完成安装，请退出并重新打开工作台；也可以再次安装。")
+
+
+@app.middleware("http")
+async def guard_update_mutations(request: Request, call_next):
+    global _update_other_mutations
+    mutation = request.method not in {"GET", "HEAD", "OPTIONS"}
+    is_update = request.url.path.startswith("/api/update/")
+    if mutation and is_update:
+        origin = request.headers.get("origin", "")
+        port = int(env_value("VINIPER_UI_PORT", "17373"))
+        if origin and origin not in {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}:
+            return JSONResponse(status_code=403, content={"detail": "更新请求必须来自当前工作台。"})
+    if mutation and not is_update:
+        try:
+            ensure_update_not_installing()
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        _update_other_mutations += 1
+        try:
+            return await call_next(request)
+        finally:
+            _update_other_mutations -= 1
+    return await call_next(request)
+
+
+async def update_request_body(request: Request) -> dict[str, Any]:
     body: dict[str, Any] = {}
     try:
         if request.headers.get("content-type", "").startswith("application/json"):
-            body = await request.json()
-    except Exception:
-        body = {}
-
-    source = read_update_source()
-    manifest_url = str(body.get("manifest_url") or source.get("manifest_url") or "").strip()
-    if not manifest_url:
-        return {
-            "ok": True,
-            "configured": False,
-            "current_version": APP_VERSION,
-            "update_available": False,
-            "message": "未配置更新源。发布到 GitHub Release 后，在 update_source.json 中写入 manifest_url 即可启用。",
-        }
-
+            value = await request.json()
+            if not isinstance(value, dict):
+                raise ValueError()
+            body = value
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="更新请求格式无效。") from exc
     try:
-        manifest = await asyncio.to_thread(fetch_json_url, manifest_url)
+        official_manifest_url(str(body.get("manifest_url") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return body
+
+
+@app.post("/api/update/check")
+async def check_update(request: Request):
+    await update_request_body(request)
+    source = read_update_source()
+    try:
+        manifest = await asyncio.to_thread(fetch_json_url, source["manifest_url"])
         latest_version = str(manifest.get("version") or "")
         asset = choose_update_asset(manifest)
         decision = update_decision(manifest)
-        update_available = bool(decision["automatic"])
         if decision["manual_install_required"]:
-            update_message = "检测到更低的公开版本号。自动降级已关闭，请从正式 Release 手动运行 Viniper 安装器。"
-        elif update_available:
-            update_message = "发现可用更新。"
+            message = "公开正式版本低于当前版本，不会自动降级。"
+        elif decision["automatic"]:
+            message = "发现正式更新，可下载完整安装包。"
         else:
-            update_message = "当前已经是最新版本。"
+            message = "当前已经是最新正式版本。"
         return {
-            "ok": True,
-            "configured": True,
-            "current_version": APP_VERSION,
-            "latest_version": latest_version,
-            "update_available": update_available,
+            "ok": True, "configured": True, "current_version": APP_VERSION,
+            "latest_version": latest_version, "update_available": bool(decision["automatic"]),
             "manual_install_required": bool(decision["manual_install_required"]),
             "update_reason": decision["reason"],
             "current_release_revision": decision["current_release_revision"],
             "latest_release_revision": decision["latest_release_revision"],
-            "message": update_message,
-            "manifest_url": manifest_url,
-            "repository": source.get("repository", ""),
+            "message": message, "manifest_url": source["manifest_url"],
+            "repository": source["repository"], "channel": "stable",
             "notes": str(manifest.get("notes") or manifest.get("changelog") or ""),
             "published_at": str(manifest.get("published_at") or ""),
-            "requires_installer": update_requires_installer(manifest),
-            "asset": {
-                "key": asset.get("key", "app"),
-                "name": asset.get("name", ""),
-                "size": asset.get("size", 0),
-            },
+            "requires_installer": True,
+            "asset": {"key": asset["key"], "name": asset["name"], "size": asset["size"]},
         }
     except Exception as exc:
-        return {
-            "ok": False,
-            "configured": True,
-            "current_version": APP_VERSION,
-            "update_available": False,
-            "manifest_url": manifest_url,
-            "message": f"检查更新失败：{exc}",
-        }
+        return {"ok": False, "configured": True, "current_version": APP_VERSION,
+                "update_available": False, "manifest_url": source["manifest_url"],
+                "repository": source["repository"], "retryable": True,
+                "message": update_error_message(exc, action="检查更新")}
+
+
+@app.get("/api/update/status")
+async def get_update_status():
+    # Also refreshed on the next mutation: cancelling a wizard never requires
+    # keeping this status panel open to make normal work usable again.
+    refresh_update_install_state()
+    return {**_update_state.snapshot(), "active_tasks": active_update_blockers(),
+            "release_url": f"https://github.com/{OFFICIAL_REPOSITORY}/releases/latest"}
 
 
 @app.post("/api/update/install")
 async def install_update(request: Request):
-    body: dict[str, Any] = {}
+    global _update_download_task, _update_ready
+    body = await update_request_body(request)
+    if (_update_download_task is not None and not _update_download_task.done()) or _update_state.snapshot()["status"] in {"downloading", "installing", "installer_opened"}:
+        raise HTTPException(status_code=409, detail="更新操作正在进行，请勿重复点击。")
     try:
-        if request.headers.get("content-type", "").startswith("application/json"):
-            body = await request.json()
-    except Exception:
-        body = {}
-
-    source = read_update_source()
-    manifest_url = str(body.get("manifest_url") or source.get("manifest_url") or "").strip()
-    if not manifest_url:
-        raise HTTPException(status_code=400, detail="update manifest url is not configured")
-
+        configured_update_desktop()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # The synchronous reservation prevents two callers passing the check while
+    # the manifest fetch is awaiting the network.
+    _update_state.set(status="downloading", downloaded_bytes=0, total_bytes=0,
+                      progress_percent=0, retryable=False, message="正在核对正式发布版本。")
+    _update_ready = None
     try:
-        manifest = await asyncio.to_thread(fetch_json_url, manifest_url)
-        latest_version = str(manifest.get("version") or "")
+        manifest = await asyncio.to_thread(fetch_json_url, OFFICIAL_MANIFEST_URL)
         decision = update_decision(manifest)
-        if decision["manual_install_required"]:
-            return {
-                "ok": True,
-                "updated": False,
-                "current_version": APP_VERSION,
-                "latest_version": latest_version,
-                "manual_install_required": True,
-                "message": "检测到更低的公开版本号。为避免自动降级，请从正式 Release 手动运行 Viniper 安装器；现有会话和设置不会被清空。",
-            }
         if not decision["automatic"]:
-            return {
-                "ok": True,
-                "updated": False,
-                "current_version": APP_VERSION,
-                "latest_version": latest_version,
-                "message": "当前已经是最新版本。",
-            }
-        result = await asyncio.to_thread(install_update_from_manifest, manifest, body.get("asset"))
-        if result.get("installer_opened"):
-            message = (
-                "新版桌面安装器已下载并打开。请按安装器提示完成安装；"
-                f"安装后桌面快捷方式会指向软件版 {APP_TITLE}，历史会话不会被清空。"
-            )
-        else:
-            message = (
-                "更新完成！服务器即将自动重启，新版将在几秒后可用。"
-            )
-            _schedule_restart()
-        return {
-            "ok": True,
-            "updated": True,
-            "previous_version": APP_VERSION,
-            "latest_version": latest_version,
-            "restart_required": True,
-            "restarting": bool(result.get("restarting")) and not bool(result.get("installer_opened")),
-            "installer_opened": bool(result.get("installer_opened")),
-            "requires_installer": update_requires_installer(manifest),
-            "message": message,
-            "asset": result.get("asset", {}),
-            "dependencies": result.get("dependencies", ""),
-        }
-    except HTTPException:
+            _update_state.set(status="idle", latest_version=str(manifest["version"]),
+                              message="当前没有可安装的新正式版本，不会自动降级。")
+            return {**_update_state.snapshot(), "updated": False, "started": False}
+        choose_update_asset(manifest, body.get("asset"))
+        _update_download_task = asyncio.create_task(prepare_desktop_update(manifest, body.get("asset")))
+        return {**_update_state.snapshot(), "updated": False, "started": True}
+    except asyncio.CancelledError:
+        _update_state.set(status="failed", retryable=True, message="更新检查已中断，可以重新下载。")
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"install update failed: {exc}")
+        _update_state.set(status="failed", retryable=True, message=update_error_message(exc, action="准备更新"))
+        return {**_update_state.snapshot(), "ok": False, "updated": False}
+
+
+@app.post("/api/update/apply")
+async def apply_update(request: Request):
+    global _update_installer_process
+    await update_request_body(request)
+    if _update_state.snapshot()["status"] != "ready" or _update_ready is None:
+        raise HTTPException(status_code=409, detail="请先完成安装包下载，或等待当前更新操作结束。")
+    if _update_other_mutations or active_update_blockers():
+        raise HTTPException(status_code=409, detail="仍有任务、交互或保存操作正在进行。请结束两个 Agent 的任务及原生终端后再安装；已下载的安装包会保留。")
+    _update_state.set(status="installing", message="正在打开安装器，请稍候。")
+    try:
+        # Freeze new mutations before awaiting the runtime's authoritative
+        # child/task snapshot. A failed probe restores ready and is retryable.
+        await ensure_harness_update_idle()
+        if _update_other_mutations or active_update_blockers():
+            raise ValueError("仍有任务正在结束或等待输入，请稍后再安装。")
+        asset = choose_update_asset(_update_ready["manifest"], _update_ready["asset"]["key"])
+        installer = Path(_update_ready["path"])
+        if not (DATA_DIR / "updates").resolve().is_relative_to(DATA_DIR.resolve()) or not installer.resolve().is_relative_to((DATA_DIR / "updates").resolve()):
+            raise ValueError("更新暂存路径已改变，请重新下载。")
+        verify_windows_installer(installer, int(asset["size"]))
+        command_line, _ = installer_command_line(installer, configured_update_desktop(), app_dir=APP_DIR)
+        # No /S or --updated: the official NSIS wizard must retain its prompts.
+        # A raw string preserves the literal /D="path with spaces" for StdUtils.
+        _update_installer_process = subprocess.Popen(
+            command_line, executable=str(installer.resolve()), cwd=str(installer.parent),
+            shell=False, close_fds=True,
+        )
+        return {**_update_state.set(status="installer_opened", retryable=False,
+                    message="安装器已打开。桌面版将退出工作台；如仍在浏览器中，请通过托盘退出工作台，再按安装器提示完成更新。历史会话和设置将保留。"),
+                "updated": False, "restart_required": True}
+    except asyncio.CancelledError:
+        _update_state.set(status="ready", retryable=True, message="安装准备已中断，安装包仍保留，可以重试。")
+        raise
+    except Exception as exc:
+        _update_state.set(status="ready", retryable=True, message=update_error_message(exc, action="打开安装器"))
+        raise HTTPException(status_code=500, detail=_update_state.snapshot()["message"]) from exc
 
 
 async def coordinated_agent_event_stream(session_id: str, run_id: str, after_sequence: int = 0):
@@ -8925,6 +9213,8 @@ async def submit_run(session_id: str, request: Request):
     if not user_msg:
         raise HTTPException(status_code=400, detail="message is required")
     session = safe_session(session_id)
+    if native_terminal_active(session_id):
+        raise HTTPException(status_code=409, detail="此会话已在 Claude Code 原生窗口打开，请关闭该窗口后再发送。")
     mode = normalize_session_mode(session.get("mode"))
     requested_mode = str(body.get("mode") or "").strip()
     if requested_mode and require_canonical_mode(requested_mode) != mode:
@@ -8999,6 +9289,7 @@ async def submit_run(session_id: str, request: Request):
             accepted_turn_id=accepted_turn_id,
         )
     )
+    ensure_update_not_installing()
     try:
         record = coordinator.start(
             session_id,
@@ -9566,10 +9857,13 @@ async def get_session(session_id: str):
 
 
 @app.get("/api/sessions/{session_id}/usage")
-async def get_session_usage(session_id: str):
+async def get_session_usage(
+    session_id: str,
+    model: str = Query(default=""),
+):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="session not found")
-    return {"ok": True, "usage": context_usage_payload(session_id)}
+    return {"ok": True, "usage": context_usage_payload(session_id, model=model)}
 
 
 @app.put("/api/sessions/{session_id}")
@@ -9723,13 +10017,30 @@ async def read_skill(filename: str, mode: str = Query(default=MODE_VINIPER)):
 DEFAULT_AUTO_COMPACT_THRESHOLD = 0.95
 CONTEXT_COMPRESS_THRESHOLD = DEFAULT_AUTO_COMPACT_THRESHOLD
 CONTEXT_LIMITS = {
-    "deepseek-v4-pro[1m]": 1000000,
-    "deepseek-v4-flash": 128000,
+    "deepseek-v4-pro[1m]": 1048576,
+    "deepseek-v4-flash": 1048576,
 }
 
 
-def context_limit_for_model(model: str) -> int:
-    return CONTEXT_LIMITS.get(model, DEFAULT_CONTEXT_LIMIT)
+def context_limit_for_model(
+    model: str,
+    *,
+    mode: str = MODE_VINIPER,
+    provider_id: Any = None,
+) -> int:
+    selected_mode = normalize_provider_mode(mode)
+    selected_provider = provider_id
+    if selected_provider is None:
+        try:
+            selected_provider = provider_for_mode(load_app_settings(), selected_mode).get("id")
+        except Exception:
+            selected_provider = "deepseek" if selected_mode == MODE_VINIPER else "anthropic"
+    capacity = model_capacity_metadata(model, provider_id=selected_provider, mode=selected_mode)
+    if capacity["status"] == "verified":
+        return max(0, int(capacity["context_window"] or 0))
+    # Unknown deployments are deliberately unavailable; do not silently use
+    # the historical 128K fallback when a third-party capacity is unverified.
+    return 0
 
 
 def effective_auto_compact_threshold() -> float:

@@ -6,7 +6,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -119,16 +119,44 @@ class ContextUsageLedger:
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(temporary, self.path)
 
-    def get(self, session_id: str, *, model: str = "", context_limit: int = 0) -> ContextUsageSnapshot:
+    def get(self, session_id: str, *, model: str = "", context_limit: int | None = None) -> ContextUsageSnapshot:
         with self._lock:
             current = self._snapshots.get(str(session_id))
             if current is not None:
+                requested_model = str(model or "").strip()
+                requested_limit = (
+                    max(0, int(context_limit or 0))
+                    if context_limit is not None
+                    else current.context_limit
+                )
+                # A session's token count is durable conversation state, while
+                # model capacity belongs to the currently selected provider.
+                # Rebind the read projection when either changes so a model
+                # switch cannot keep a stale 128K denominator.
+                if (
+                    (requested_model and requested_model != current.model)
+                    or (context_limit is not None and requested_limit != current.context_limit)
+                ):
+                    effective_window = requested_limit
+                    ratio = (
+                        min(current.used_tokens / effective_window, 1.0)
+                        if effective_window
+                        else 0.0
+                    )
+                    return replace(
+                        current,
+                        model=requested_model or current.model,
+                        context_limit=requested_limit,
+                        effective_context_window=effective_window,
+                        ratio=ratio,
+                    )
                 return current
+        requested_limit = max(0, int(context_limit or 0)) if context_limit is not None else 0
         return ContextUsageSnapshot(
             session_id=str(session_id),
             used_tokens=0,
-            context_limit=max(0, int(context_limit or 0)),
-            effective_context_window=max(0, int(context_limit or 0)),
+            context_limit=requested_limit,
+            effective_context_window=requested_limit,
             ratio=0.0,
             source="unavailable",
             updated_at=0.0,
