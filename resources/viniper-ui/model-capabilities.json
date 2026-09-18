@@ -1,9 +1,18 @@
 {
-  "version": 1,
+  "version": 2,
+  "default_deepseek_model": "deepseek-flash",
+  "provider_model_aliases": {
+    "deepseek-v4-pro[1m]": "deepseek-v4-pro",
+    "deepseek-flash[1m]": "deepseek-flash",
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek-v4-flash[1m]": "deepseek-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash"
+  },
   "entries": [
     {
       "provider": "deepseek",
       "model": "deepseek-v4-pro",
+      "label": "DeepSeek V4 Pro",
       "ui_models": ["deepseek-v4-pro[1m]"],
       "context_window": 1048576,
       "max_output_tokens": 393216,
@@ -13,8 +22,9 @@
     },
     {
       "provider": "deepseek",
-      "model": "deepseek-v4-flash",
-      "ui_models": ["deepseek-v4-flash"],
+      "model": "deepseek-flash",
+      "label": "DeepSeek V4.1 Flash",
+      "ui_models": ["deepseek-flash", "deepseek-flash[1m]", "deepseek-v4-flash", "deepseek-v4-flash[1m]", "deepseek-v4-flash-vision-exp"],
       "context_window": 1048576,
       "max_output_tokens": 393216,
       "status": "verified",

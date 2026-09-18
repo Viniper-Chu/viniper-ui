@@ -48,7 +48,7 @@ function setup() {
   vm.runInContext(["renderUpdateButton", "requestUpdate", "checkForUpdates", "showUpdateModal", "closeUpdateModal", "handleUpdateModalKeydown", "updateSizeLabel", "renderUpdateModal", "scheduleUpdateStatusPoll", "refreshUpdateStatus", "installUpdate"].map(functionSource).join("\n"), sandbox);
   return { sandbox, state, node, document, requests, responses, timers };
 }
-const available = { ok: true, configured: true, current_version: "1.8.0", latest_version: "1.8.1", update_available: true, notes: "修复并更新。" };
+const available = { ok: true, configured: true, current_version: "1.8.0", latest_version: "1.8.2", update_available: true, notes: "修复并更新。" };
 
 test("R29 startup check records a real available update without opening a modal", async () => {
   const ctx = setup();
@@ -117,7 +117,7 @@ test("R29 update progress is derived only from backend byte counters", () => {
 test("R29 downloaded package requires a second explicit install click", async () => {
   const ctx = setup();
   ctx.state.updateInfo = available;
-  ctx.responses.push(response({ ok: true, started: true, status: "downloading" }), response({ ok: true, status: "ready", downloaded_bytes: 100, total_bytes: 100, latest_version: "1.8.1" }));
+  ctx.responses.push(response({ ok: true, started: true, status: "downloading" }), response({ ok: true, status: "ready", downloaded_bytes: 100, total_bytes: 100, latest_version: "1.8.2" }));
   await ctx.sandbox.installUpdate();
   assert.deepEqual(ctx.requests.map((r) => r.url), ["/api/update/install", "/api/update/status"]);
   assert.equal(ctx.node("#install-update-btn").textContent, "安装更新");
@@ -133,7 +133,7 @@ test("R29 downloaded package requires a second explicit install click", async ()
 test("R29 active-task install refusal retains downloaded package and supports retry", async () => {
   const ctx = setup();
   ctx.state.updateInfo = available;
-  ctx.state.updateFlow.snapshot = { status: "ready", latest_version: "1.8.1" };
+  ctx.state.updateFlow.snapshot = { status: "ready", latest_version: "1.8.2" };
   ctx.responses.push(response({ detail: "仍有任务正在运行，请先完成任务。" }, 409));
   await ctx.sandbox.installUpdate();
   assert.equal(ctx.state.updateFlow.snapshot.status, "ready");

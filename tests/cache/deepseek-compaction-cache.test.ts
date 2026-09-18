@@ -8,6 +8,7 @@ import { ProviderHistoryEntry } from "../../src/core/provider-contracts";
 
 test("DeepSeek V4 does not rewrite a healthy append-only prefix at the generic 32k-character threshold", async () => {
   assert.equal(defaultCompactionThresholdChars("deepseek", "deepseek-v4-flash"), 384_000);
+  assert.equal(defaultCompactionThresholdChars("deepseek", "deepseek-flash"), 384_000);
   assert.equal(defaultCompactionThresholdChars("other", "model"), 32_000);
   const history = longHistory(140_000);
   const deepseek = new ContextCompactionService();

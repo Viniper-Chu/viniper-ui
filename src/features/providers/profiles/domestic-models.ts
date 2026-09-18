@@ -13,7 +13,7 @@ export const DOMESTIC_MODEL_PROFILES: ProviderProfile[] = [
     capabilities: capabilities(official, official, official, official, official), evidenceLevel: official,
     evidenceLabel: "Chat、tools、reasoning 与 cache usage 由官网确认", documentation: ["https://api-docs.deepseek.com/api/create-chat-completion"],
     cachePolicyId: "provider-reported", continuationMode: "local-history",
-    currentModels: ["deepseek-v4-flash", "deepseek-v4-pro"],
+    currentModels: ["deepseek-flash", "deepseek-v4-pro"],
   }),
   fixedProfile({
     id: "zhipu-glm", label: "智谱 GLM", category: "domestic-model", vendor: "智谱 AI", protocol: "openai-chat",

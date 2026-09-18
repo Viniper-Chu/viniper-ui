@@ -9,6 +9,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable
@@ -565,7 +566,7 @@ class AgentRunRecord:
     run_id: str
     metadata: dict[str, Any] = field(default_factory=dict)
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
-    events: list[dict[str, Any]] = field(default_factory=list)
+    events: deque[dict[str, Any]] = field(default_factory=deque)
     sequence: int = 0
     status: str = "running"
     pending_interaction: dict[str, Any] | None = None
@@ -611,6 +612,7 @@ class AgentRunCoordinator:
             session_id=sid,
             run_id=str(uuid.uuid4()),
             metadata=copy.deepcopy(metadata or {}),
+            events=deque(maxlen=self._max_events),
         )
         self._records[sid] = record
         producer = producer_factory() if callable(producer_factory) else producer_factory
@@ -628,6 +630,7 @@ class AgentRunCoordinator:
             "terminal": record.terminal,
             "status": record.status,
             "sequence": record.sequence,
+            "first_sequence": record.events[0]["sequence"] if record.events else record.sequence + 1,
             "pending_interaction": copy.deepcopy(record.pending_interaction),
             "awaiting_interaction_ack": copy.deepcopy(record.awaiting_interaction_ack),
             "cancel_requested": record.cancel_requested,
@@ -657,12 +660,16 @@ class AgentRunCoordinator:
         cursor = max(0, int(after_sequence or 0))
         while True:
             async with record.condition:
+                gap = bool(record.events and cursor < record.events[0]["sequence"] - 1)
                 ready = [event for event in record.events if int(event.get("sequence") or 0) > cursor]
                 if not ready and record.terminal:
                     return
                 if not ready:
                     await record.condition.wait()
                     continue
+            if gap:
+                yield {"type": "replay_gap", "session_id": record.session_id, "run_id": record.run_id}
+                return
             for event in ready:
                 cursor = max(cursor, int(event.get("sequence") or 0))
                 yield copy.deepcopy(event)
@@ -776,8 +783,6 @@ class AgentRunCoordinator:
         event["run_id"] = record.run_id
         event.setdefault("session_id", record.session_id)
         record.events.append(event)
-        if len(record.events) > self._max_events:
-            del record.events[: len(record.events) - self._max_events]
         async with record.condition:
             record.condition.notify_all()
         return event

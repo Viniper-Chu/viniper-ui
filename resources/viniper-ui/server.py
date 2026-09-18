@@ -33,6 +33,7 @@ from context_lifecycle import (
 )
 from context_usage import ContextUsageLedger, ContextUsageSnapshot
 from daily_usage import DailyUsageLedger, merge_turn_usage
+from model_catalog import DEFAULT_DEEPSEEK_MODEL, PROVIDER_MODEL_ALIASES, capacity_provider_id, deepseek_model_options, migrate_official_deepseek_provider
 from agent_runtime import (
     AUTO_COMPACT_WINDOW_ENV,
     AgentRunSpec,
@@ -328,20 +329,7 @@ LEGACY_DEEPSEEK_BASE_URLS = {
     "http://127.0.0.1:57322",
     "http://localhost:57322",
 }
-MODEL_OPTIONS = [
-    {
-        "id": "deepseek-v4-pro[1m]",
-        "label": "DeepSeek V4 Pro",
-        "description": "复杂编码与长上下文工作",
-        "context": 1048576,
-    },
-    {
-        "id": "deepseek-v4-flash",
-        "label": "DeepSeek V4 Flash",
-        "description": "更快完成日常工作",
-        "context": 1048576,
-    },
-]
+MODEL_OPTIONS = deepseek_model_options()
 MODEL_CAPABILITIES_FILE = VERSION_FILE.with_name("model-capabilities.json")
 _model_capabilities_cache: list[dict[str, Any]] | None = None
 PROVIDER_MODE_IDS = (MODE_VINIPER, MODE_CLAUDE)
@@ -765,7 +753,7 @@ def context_usage_payload(session_id: str, model: str = "") -> dict[str, Any]:
     mode = normalize_session_mode(sessions.get(str(session_id), {}).get("mode")) if str(session_id) in sessions else MODE_CLAUDE
     selected_model = allowed_model(model, mode) if model else allowed_model("", mode)
     provider = provider_for_mode(load_app_settings(), mode)
-    capacity = model_capacity_metadata(selected_model, provider_id=provider.get("id"), mode=mode)
+    capacity = model_capacity_metadata(selected_model, provider_id=capacity_provider_id(provider), mode=mode)
     payload = context_usage_ledger().get(
         session_id,
         model=selected_model,
@@ -1393,7 +1381,7 @@ def default_settings() -> dict[str, Any]:
         "api_key_env": "ANTHROPIC_AUTH_TOKEN",
         "base_url_env": "ANTHROPIC_BASE_URL",
         "model_env": "ANTHROPIC_MODEL",
-        "model": "deepseek-v4-pro[1m]",
+        "model": DEFAULT_DEEPSEEK_MODEL,
         "models": copy.deepcopy(MODEL_OPTIONS),
         "secret_ref": MODE_SECRET_REFS[MODE_VINIPER],
     }
@@ -1405,7 +1393,7 @@ def default_settings() -> dict[str, Any]:
         "api_key_env": "ANTHROPIC_AUTH_TOKEN",
         "base_url_env": "ANTHROPIC_BASE_URL",
         "model_env": "ANTHROPIC_MODEL",
-        "model": "deepseek-v4-pro[1m]",
+        "model": DEFAULT_DEEPSEEK_MODEL,
         "models": copy.deepcopy(MODEL_OPTIONS),
         "secret_ref": MODE_SECRET_REFS[MODE_CLAUDE],
     }
@@ -1700,6 +1688,7 @@ def normalize_provider_record(raw: Any, mode: str) -> dict[str, Any]:
     provider["id"] = str(provider.get("id") or ("anthropic" if mode_key == MODE_CLAUDE else "deepseek")).strip()
     provider["label"] = str(provider.get("label") or ("Claude code" if mode_key == MODE_CLAUDE else "DeepSeek")).strip()
     provider["base_url"] = normalize_provider_base_url(provider["id"], provider.get("base_url"), mode_key)
+    provider = migrate_official_deepseek_provider(provider)
     # Secrets are host-owned.  Never retain an incoming plaintext value in
     # settings.json, including files written by earlier previews.
     provider["api_key"] = ""
@@ -1709,7 +1698,7 @@ def normalize_provider_record(raw: Any, mode: str) -> dict[str, Any]:
     provider["model_env"] = str(provider.get("model_env") or "ANTHROPIC_MODEL").strip() or "ANTHROPIC_MODEL"
     provider["models"] = normalize_model_options(
         provider.get("models"),
-        provider_id=provider["id"],
+        provider_id=capacity_provider_id(provider),
         mode=mode_key,
     )
     ids = {item["id"] for item in provider["models"]}
@@ -2331,7 +2320,7 @@ def effective_model_options(mode: str = MODE_VINIPER) -> list[dict[str, Any]]:
     provider = provider_for_mode(load_app_settings(), selected_mode)
     return normalize_model_options(
         provider.get("models"),
-        provider_id=provider.get("id"),
+        provider_id=capacity_provider_id(provider),
         mode=selected_mode,
     )
 
@@ -2349,9 +2338,7 @@ def allowed_model(model: str | None, mode: str = MODE_VINIPER) -> str:
     return env_model if env_model in ids else models[0]["id"]
 
 
-DEEPSEEK_PROVIDER_MODEL_ALIASES = {
-    "deepseek-v4-pro[1m]": "deepseek-v4-pro",
-}
+DEEPSEEK_PROVIDER_MODEL_ALIASES = PROVIDER_MODEL_ALIASES
 
 
 def provider_model_id(model: str | None) -> str:
@@ -2373,15 +2360,15 @@ def official_deepseek_claude_models(
         return {}
     if str(cfg.get("base_url") or "").strip().rstrip("/") != "https://api.deepseek.com/anthropic":
         return {}
-    model = str(cfg.get("model") or "").strip()
-    if model not in {"deepseek-v4-pro", "deepseek-v4-pro[1m]", "deepseek-v4-flash"}:
+    model = provider_model_id(cfg.get("model"))
+    if model not in {"deepseek-v4-pro", "deepseek-flash"}:
         return {}
     return {
-        "ANTHROPIC_MODEL": "deepseek-v4-flash" if model == "deepseek-v4-flash" else "deepseek-v4-pro[1m]",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro[1m]",
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-pro[1m]",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash",
-        "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-v4-flash",
+        "ANTHROPIC_MODEL": f"{model}[1m]",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-flash[1m]",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-flash[1m]",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-flash",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek-flash",
     }
 
 
@@ -9327,6 +9314,14 @@ async def resume_agent_events(
     )
 
 
+@app.get("/api/runs/{session_id}")
+async def get_agent_run_state(session_id: str):
+    """Compact authoritative lifecycle state; no transcript or provider secrets."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"ok": True, "run": coordinated_run_snapshot(session_id)}
+
+
 @app.get("/api/sessions/{session_id}/peers")
 async def get_native_peers(session_id: str):
     if session_id not in sessions:
@@ -9408,11 +9403,12 @@ async def collaboration_snapshot(session_id: str):
         port = VINIPER_TRANSPORT.application_port
         if port is None:
             return {"ok": True, "mode": mode, "status": "unavailable", "reason": "Harness Application Port unavailable", "sessions": [], "subagents": []}
-        await ensure_viniper_coordination_sessions(port)
+        ensured = await ensure_viniper_coordination_sessions(port)
         visible_ids = viniper_collaboration_session_ids()
         data = await port.control("collaboration.snapshot", visible_native_session_ids=visible_ids)
         data = filter_viniper_collaboration_snapshot(data, visible_ids)
-        return {"ok": True, "mode": mode, "status": "available", **data}
+        unavailable = [row for row in ensured.get("ensured", []) if row.get("state") == "unavailable"]
+        return {"ok": True, "mode": mode, "status": "available", **data, "unavailable_sessions": unavailable}
     runtime = agent_runtime()
     probe = await asyncio.to_thread(runtime.probe)
     rows = await asyncio.to_thread(runtime.list_agent_view_sessions) if probe.capabilities.agent_view else []
@@ -9436,7 +9432,10 @@ async def collaboration_action(session_id: str, request: Request):
         port = VINIPER_TRANSPORT.application_port
         if port is None:
             raise HTTPException(status_code=409, detail="Harness Application Port unavailable")
-        await ensure_viniper_coordination_sessions(port)
+        ensured = await ensure_viniper_coordination_sessions(port)
+        blocked = {row.get("native_session_id") for row in ensured.get("ensured", []) if row.get("state") == "unavailable"}
+        if any(value in blocked for value in (session_id, body.get("target_session_id"), body.get("source_session_id"))):
+            raise HTTPException(status_code=409, detail="所选会话的项目目录不存在或不可访问，请重新选择目录；历史会话未删除。")
         visible_ids = viniper_collaboration_session_ids()
         visibility = {"visible_native_session_ids": visible_ids}
         if action == "delegate":
@@ -10016,10 +10015,6 @@ async def read_skill(filename: str, mode: str = Query(default=MODE_VINIPER)):
 
 DEFAULT_AUTO_COMPACT_THRESHOLD = 0.95
 CONTEXT_COMPRESS_THRESHOLD = DEFAULT_AUTO_COMPACT_THRESHOLD
-CONTEXT_LIMITS = {
-    "deepseek-v4-pro[1m]": 1048576,
-    "deepseek-v4-flash": 1048576,
-}
 
 
 def context_limit_for_model(
@@ -10032,7 +10027,7 @@ def context_limit_for_model(
     selected_provider = provider_id
     if selected_provider is None:
         try:
-            selected_provider = provider_for_mode(load_app_settings(), selected_mode).get("id")
+            selected_provider = capacity_provider_id(provider_for_mode(load_app_settings(), selected_mode))
         except Exception:
             selected_provider = "deepseek" if selected_mode == MODE_VINIPER else "anthropic"
     capacity = model_capacity_metadata(model, provider_id=selected_provider, mode=selected_mode)

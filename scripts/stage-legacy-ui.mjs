@@ -10,6 +10,7 @@ const LEGACY_RUNTIME_FILES = [
   "context_lifecycle.py",
   "context_usage.py",
   "model-capabilities.json",
+  "model_catalog.py",
   "daily_usage.py",
   "harness_application_port.py",
   "harness_provider_boundary.js",

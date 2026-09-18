@@ -1,5 +1,5 @@
 export const BRAND_NAME = "Viniper workstation";
-export const BRAND_BADGE = "v1.8.1 · Stable（稳定版）";
+export const BRAND_BADGE = "v1.8.2 · Stable（稳定版）";
 export const BRAND_ASSET_STATUS = "UNIFIED_3D_NATIVE_SOURCE";
 
 export function initializeBranding(root = document) {

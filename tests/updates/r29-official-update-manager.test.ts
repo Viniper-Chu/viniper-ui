@@ -18,9 +18,9 @@ from pathlib import Path
 from unittest.mock import patch
 from update_manager import *
 def manifest():
-    return {"version":"1.8.1", "channel":"stable", "requires_installer":True,
+    return {"version":"1.8.2", "channel":"stable", "requires_installer":True,
         "assets":{"installer":{"name":"Viniper-workstation-Setup.exe", "size":128,
-        "url":"https://github.com/Viniper-Chu/viniper-ui/releases/download/v1.8.1/Viniper-workstation-Setup.exe"}}}
+        "url":"https://github.com/Viniper-Chu/viniper-ui/releases/download/v1.8.2/Viniper-workstation-Setup.exe"}}}
 def exe_bytes():
     value=bytearray(128); value[:2]=b'MZ'; struct.pack_into('<I',value,0x3c,96); value[96:100]=b'PE\0\0'
     return bytes(value)
@@ -36,9 +36,9 @@ test("official updater accepts full stable installer only and rejects untrusted 
 assert official_manifest_url() == OFFICIAL_MANIFEST_URL
 assert validate_installer_manifest(manifest())["key"] == "installer"
 invalid = []
-for key, value in (("version","1.8.1-beta.1"),("channel","preview"),("draft",True),("prerelease",True)):
+for key, value in (("version","1.8.2-beta.1"),("channel","preview"),("draft",True),("prerelease",True)):
     item=manifest(); item[key]=value; invalid.append(item)
-for key,value in (("url","file:///C:/evil.exe"),("url","https://github.com/other/repo/releases/download/v1.8.1/Viniper-workstation-Setup.exe"),
+for key,value in (("url","file:///C:/evil.exe"),("url","https://github.com/other/repo/releases/download/v1.8.2/Viniper-workstation-Setup.exe"),
                   ("url","https://github.com/Viniper-Chu/viniper-ui/releases/download/v9.0.0/Viniper-workstation-Setup.exe"),
                   ("name","../Viniper-workstation-Setup.exe"),("size",0),("size",MAX_INSTALLER_BYTES+1)):
     item=manifest(); item["assets"]["installer"][key]=value; invalid.append(item)
@@ -150,7 +150,7 @@ class Request:
     async def json(self): return {}
 async def no_background_tasks(): return None
 with tempfile.TemporaryDirectory() as directory:
-    root=Path(directory); target=root/'updates'/'1.8.1'/'Viniper-workstation-Setup.exe'; target.parent.mkdir(parents=True); target.write_bytes(exe_bytes())
+    root=Path(directory); target=root/'updates'/'1.8.2'/'Viniper-workstation-Setup.exe'; target.parent.mkdir(parents=True); target.write_bytes(exe_bytes())
     exe=root/'Application with spaces'/'Viniper workstation.exe'; exe.parent.mkdir(); exe.write_bytes(b'placeholder')
     app_dir=exe.parent/'resources'/'viniper-ui'; app_dir.mkdir(parents=True)
     state=UpdateState('1.8.0'); state.set(status='ready')

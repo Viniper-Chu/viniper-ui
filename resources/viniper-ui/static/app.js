@@ -40,7 +40,7 @@ const state = {
   currentSkill: null,
   skillsViewRestore: null,
   status: null,
-  selectedModel: "deepseek-v4-pro[1m]",
+  selectedModel: "deepseek-flash",
   permissionMode: "ask",
   modelMenuOpen: false,
   modelMenuIndex: 0,
@@ -160,7 +160,7 @@ function createModeOwnedState(mode) {
     settingsActiveSection: "account",
     agentInstructions: { content: "", exists: false, path: "", updated_at: null },
     status: null,
-    selectedModel: mode === "claude" ? "" : "deepseek-v4-pro[1m]",
+    selectedModel: mode === "claude" ? "" : "deepseek-flash",
     permissionMode: mode === "claude" ? "default" : "ask",
     peerCapability: { available: false, verified: false, reason: "", discovery: "unavailable", targets: [] },
     peerTarget: null,
@@ -957,12 +957,7 @@ function rememberModel(model, mode = state.viewMode) {
 }
 
 // Token estimation: ~3 chars per token for mixed Chinese/English text.
-// Context capacities are maintained by the server-side model registry; these
-// values are only a renderer fallback for the two verified DeepSeek IDs.
-const CONTEXT_LIMITS = {
-  "deepseek-v4-pro[1m]": 1048576,
-  "deepseek-v4-flash": 1048576,
-};
+// Only the backend registry can attest to a deployment's context capacity.
 const DEFAULT_CONTEXT_LIMIT = 0;
 const DEFAULT_AUTO_COMPACT_THRESHOLD = 0.95;
 const VINIPER_PERMISSION_MODES = [
@@ -1127,15 +1122,14 @@ function totalHistoryTokens() {
 function modelCapacityMetadata(modelId = state.selectedModel) {
   const id = String(modelId || "");
   const model = (state.status?.models || []).find((item) => String(item?.id || "") === id);
-  const fallback = Number(CONTEXT_LIMITS[id]) || 0;
-  const rawLimit = Number(model?.context_window ?? model?.context ?? fallback);
-  const status = String(model?.context_status || (fallback > 0 ? "verified" : "unknown")).toLowerCase();
+  const rawLimit = Number(model?.context_window ?? model?.context ?? 0);
+  const status = String(model?.context_status || "unknown").toLowerCase();
   const trusted = status === "verified" && Number.isFinite(rawLimit) && rawLimit > 0;
   return {
     id,
     limit: trusted ? rawLimit : 0,
     status: trusted ? "verified" : "unknown",
-    source: String(model?.context_source || (fallback > 0 ? "packaged model registry" : "no trusted deployment metadata")),
+    source: String(model?.context_source || "no trusted deployment metadata"),
     sourceUrl: String(model?.context_source_url || ""),
     maxOutputTokens: Math.max(0, Number(model?.max_output_tokens) || 0),
   };
@@ -2847,6 +2841,7 @@ async function loadStatus(mode = state.viewMode, token = modeProjectionToken(mod
     const response = await fetch(`/api/status?mode=${encodeURIComponent(requestedMode)}&session_id=${encodeURIComponent(token.sessionId || state.sessionId || "")}`);
     const status = await response.json();
     const owner = modeOwnedState(requestedMode);
+    if (owner.generation !== token.generation) return status;
     owner.status = status;
     if (requestedMode === "claude" && status?.native_commands?.owner === "claude-code-cli") {
       const version = String(status.native_commands.cli_version || "");
@@ -2870,7 +2865,7 @@ async function loadStatus(mode = state.viewMode, token = modeProjectionToken(mod
     const available = (state.status.models || []).map((model) => model.id);
     state.selectedModel = available.includes(rememberedModel)
       ? rememberedModel
-      : (state.status.model || "deepseek-v4-pro[1m]");
+      : (state.status.model || "deepseek-flash");
     state.permissionMode = sanitizePermissionMode(state.status.permission_mode || "default");
     renderModelSelect();
     renderPermissionSelect();
@@ -3889,8 +3884,7 @@ function renderModelSelect() {
 
 function availableModels() {
   return state.status?.models || [
-    { id: "deepseek-v4-pro[1m]", label: "DeepSeek V4 Pro", description: "" },
-    { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", description: "" }
+    { id: "deepseek-flash", label: "DeepSeek V4.1 Flash", description: "" }
   ];
 }
 
@@ -3929,11 +3923,13 @@ async function refreshContextUsageForSelectedModel() {
   const sessionId = String(state.sessionId || "");
   if (!sessionId) return null;
   const mode = state.viewMode === "claude" ? "claude" : "viniper";
-  const model = encodeURIComponent(String(state.selectedModel || ""));
+  const selectedModel = String(state.selectedModel || "");
+  const model = encodeURIComponent(selectedModel);
   try {
     const response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/usage?model=${model}&mode=${mode}`, { cache: "no-store" });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false || !data.usage) return null;
+    if (selectedModel !== String(state.selectedModel || "")) return null;
     if (sessionId !== String(state.sessionId || "") || mode !== (state.viewMode === "claude" ? "claude" : "viniper")) return null;
     state.contextUsage = normalizeContextUsage(data.usage, state.selectedModel);
     state.contextUsageBySession[sessionId] = state.contextUsage;
@@ -6764,10 +6760,19 @@ function ensureRunTimer(sessionId) {
   transport.timer = window.setInterval(() => renderSessionRun(sessionId), 1000);
 }
 
+const runRenderScheduler = AgentStream.createRenderScheduler();
+
+function scheduleRunRender(sessionId) {
+  const record = SessionRunRegistry.get(sessionId);
+  runRenderScheduler.schedule(sessionId, () => {
+    if (SessionRunRegistry.get(sessionId) === record) renderSessionRun(sessionId);
+  });
+}
+
 function createStreamRenderer(sessionId) {
   const id = String(sessionId || "");
   ensureRunTimer(id);
-  const sync = () => renderSessionRun(id);
+  const sync = () => scheduleRunRender(id);
   const api = {
     append(type, content) {
       const value = repairTextForDisplay(content || "");
@@ -6854,6 +6859,7 @@ function createStreamRenderer(sessionId) {
     finish() {
       SessionRunRegistry.applyEvent(id, { type: "done" });
       sync();
+      runRenderScheduler.flush(id);
     }
   };
   return api;
@@ -6950,9 +6956,42 @@ function projectCoordinatedRunEvent(sessionId, payload = {}, { accepted = false 
   }
   if (["tool_start", "tool_result", "artifact"].includes(type) && String(state.sessionId) === id) recordActivity(payload);
   if (String(state.sessionId) === id) {
-    renderSessionRun(id);
+    scheduleRunRender(id);
     syncCurrentSessionRuntimeUi();
   }
+  return true;
+}
+
+async function consumeAgentRunResponse(response, record, transport, project) {
+  const runId = String(response.headers?.get("X-Viniper-Run-Id") || record.runId || "");
+  if (runId) record.runId = runId;
+  await AgentStream.readJsonEvents(response.body, (payload) => {
+    if (payload.type === "replay_gap") {
+      const error = new Error("运行事件已超出回放窗口，正在重新读取会话");
+      error.code = "REPLAY_GAP";
+      throw error;
+    }
+    project(payload);
+  }, (reader) => { transport.reader = reader; });
+  const outcome = await AgentStream.confirmRunState(fetch, record.sessionId, record.runId);
+  if (outcome.kind !== "terminal") throw new Error("运行连接已结束，正在核实后台任务");
+  record.status = outcome.run.status;
+  record.cancelRequested = outcome.run.cancel_requested;
+}
+
+function reconnectAgentRun(sessionId, record, transport) {
+  if (SessionRunRegistry.get(sessionId) !== record || record.cancelRequested || !record.runId) return false;
+  if (SessionTransportRegistry.get(sessionId) === transport) SessionTransportRegistry.finish(sessionId);
+  record.active = true;
+  record.completed = false;
+  record.workingLabel = "正在恢复运行连接…";
+  record.reconnectAttempts = (record.reconnectAttempts || 0) + 1;
+  if (String(state.sessionId) === sessionId) syncCurrentSessionRuntimeUi();
+  window.setTimeout(() => {
+    if (SessionRunRegistry.get(sessionId) === record && record.active && !SessionTransportRegistry.get(sessionId)) {
+      void resumeAgentRun(sessionId, { run_id: record.runId });
+    }
+  }, Math.min(10000, 1000 * 2 ** Math.min(4, record.reconnectAttempts - 1)));
   return true;
 }
 
@@ -6964,62 +7003,40 @@ async function resumeAgentRun(sessionId, snapshot = {}) {
   const abortController = new AbortController();
   const transport = SessionTransportRegistry.start(id, { abortController, runId });
   let terminal = false;
+  let replaced = false;
   try {
+    const current = await AgentStream.confirmRunState(fetch, id, runId);
+    if (current.kind === "replaced") { replaced = true; return false; }
     const after = Math.max(0, Number(record.serverSequence) || 0);
     const response = await fetch(`/api/runs/${encodeURIComponent(id)}/events?run_id=${encodeURIComponent(runId)}&after_sequence=${after}`, {
       signal: abortController.signal,
     });
     if (!response.ok || !response.body) throw new Error(`恢复运行流失败: ${response.status}`);
-    const reader = response.body.getReader();
-    transport.reader = reader;
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-    const consume = (final = false) => {
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-      if (final && buffer.trim()) { parts.push(buffer); buffer = ""; }
-      for (const part of parts) {
-        const line = part.split("\n").find((item) => item.startsWith("data: "));
-        if (!line) continue;
-        try {
-          const payload = JSON.parse(line.slice(6));
-          projectCoordinatedRunEvent(id, payload);
-        } catch {}
-      }
-    };
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        buffer += decoder.decode();
-        consume(true);
-        terminal = true;
-        break;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      consume();
-    }
+    await consumeAgentRunResponse(response, record, transport, (payload) => projectCoordinatedRunEvent(id, payload));
+    terminal = true;
   } catch (error) {
+    if (error.code === "REPLAY_GAP") replaced = true;
     if (error.name !== "AbortError" && String(state.sessionId) === id) {
       $("#status-line").textContent = "运行仍在后台，正在恢复界面连接…";
     }
   } finally {
     if (SessionTransportRegistry.get(id) === transport) SessionTransportRegistry.finish(id);
-    if (terminal && SessionRunRegistry.get(id) === record) {
-      const status = record.cancelRequested ? "cancelled" : (record.error ? "failed" : "completed");
-      SessionRunRegistry.finish(id, status);
+    if ((terminal || replaced) && SessionRunRegistry.get(id) === record) {
+      SessionRunRegistry.finish(id, replaced ? "idle" : record.status);
+      runRenderScheduler.flush(id);
       if (String(state.sessionId) === id) {
         clearInteractionDock();
         try { await switchSession(id, { quiet: true, history: false }); } catch {}
       } else {
         await loadSessionList();
       }
-    } else if (!terminal && record.active && !record.cancelRequested) {
-      window.setTimeout(() => {
-        if (record.active && !SessionTransportRegistry.get(id)) void resumeAgentRun(id, {
-          run_id: record.runId,
-          sequence: record.serverSequence,
-        });
-      }, 1000);
+    } else if (!terminal) {
+      if (record.cancelRequested) {
+        SessionRunRegistry.finish(id, "cancelled");
+        if (String(state.sessionId) === id) syncCurrentSessionRuntimeUi();
+      } else {
+        reconnectAgentRun(id, record, transport);
+      }
     }
   }
   return terminal;
@@ -7628,7 +7645,9 @@ async function renderCollaborationWorkspace(host) {
   state.capabilities = capabilities;
   const collaboration = capabilities.collaboration || {};
   const subagentCapability = capabilities.subagents || {};
-  const available = collaboration.status === "available";
+  const unavailableSessions = Array.isArray(snapshot.unavailable_sessions) ? snapshot.unavailable_sessions : [];
+  const ownerUnavailable = unavailableSessions.some(item => String(item.native_session_id) === sessionId);
+  const available = collaboration.status === "available" && snapshotResponse.ok && snapshot.status === "available" && !ownerUnavailable;
   const sessions = Array.isArray(snapshot.sessions)
     ? snapshot.sessions.filter((item) => String(item.native_session_id || item.id || "") !== sessionId)
     : [];
@@ -7637,10 +7656,12 @@ async function renderCollaborationWorkspace(host) {
   const inbox = envelopes.filter((item) => String(item.target_session_id || "") === sessionId).slice(-20).reverse();
   const waits = Array.isArray(snapshot.waits) ? snapshot.waits.filter((item) => String(item.session_id || "") === sessionId) : [];
   const subagents = Array.isArray(snapshot.subagents) ? snapshot.subagents : [];
-  const unavailableReason = collaboration.reason || snapshot.reason || "当前 owner 未暴露原生跨会话消息能力。";
+  const unavailableReason = ownerUnavailable ? "当前会话的项目目录不可用，请重新选择目录。"
+    : (!snapshotResponse.ok ? "协作状态读取失败，请重试。" : collaboration.reason || snapshot.reason || "当前 owner 未暴露原生跨会话消息能力。");
   host.innerHTML = `<div class="workspace-panel-header"><h2>协作与子 Agent</h2><span>${escapeHtml(capabilities.engine || "")}</span></div>
     <dl class="capability-list"><div><dt>跨会话协作</dt><dd data-status="${escapeAttr(collaboration.status || "unavailable")}">${available ? "可用" : "不可用"}</dd></div><div><dt>子 Agent</dt><dd data-status="${escapeAttr(subagentCapability.status || "unavailable")}">${subagentCapability.status === "available" ? "可用" : "不可用"}</dd></div></dl>
     ${available ? "" : `<p class="workspace-unavailable" role="status">${escapeHtml(unavailableReason)}</p>`}
+    ${unavailableSessions.map(item => `<p class="workspace-unavailable" role="status">会话 ${escapeHtml(item.native_session_id)}：${escapeHtml(item.reason)}</p>`).join("")}
     <form id="collaboration-form" class="collaboration-form" data-owner="${escapeAttr(mode)}">
       <label>动作<select name="action"><option value="send_message">发送消息</option><option value="delegate">委派任务</option><option value="wait_for_result">等待结果</option></select></label>
       <label>目标会话<select name="target_session_id">${targetOptions}</select></label>
@@ -8421,50 +8442,13 @@ async function sendMessageForSession() {
       throw new Error(`请求失败: ${response.status}`);
     }
 
-    const reader = response.body.getReader();
-    transportRecord.reader = reader;
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-
-    const handleSsePart = (part) => {
-      const line = part.split("\n").find((item) => item.startsWith("data: "));
-      if (!line) return;
-
-      let payload = null;
-      try {
-        payload = JSON.parse(line.slice(6));
-      } catch {
-        return;
-      }
-
-      projection.project(payload);
-    };
-
-    const consumeSseBuffer = (final = false) => {
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-      if (final && buffer.trim()) {
-        parts.push(buffer);
-        buffer = "";
-      }
-      for (const part of parts) handleSsePart(part);
-    };
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        buffer += decoder.decode();
-        consumeSseBuffer(true);
-        // Stream closed by server, but we may not have received an explicit "done" SSE event
-        if (!projection.receivedDone) {
-          if (runIsVisible()) showThinking(false);
-        }
-        break;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      consumeSseBuffer();
-    }
+    await consumeAgentRunResponse(response, runRecord, transportRecord, projection.project);
+    projection.completedNormally = runRecord.status === "completed";
   } catch (error) {
+    if (runRecord.runId && !runRecord.cancelRequested) {
+      transportRecord.reconnecting = true;
+      return;
+    }
     if (runIsVisible()) showThinking(false);
     projection.hadError = true;
     runRecord.status = "failed";
@@ -8479,6 +8463,7 @@ async function sendMessageForSession() {
     }
   } finally {
     clearTimeout(safetyTimer);
+    if (transportRecord.reconnecting && reconnectAgentRun(runSessionId, runRecord, transportRecord)) return;
     runRecord.active = false;
     runRecord.status = projection.completedNormally ? "completed" : (runRecord.cancelRequested ? "cancelled" : (runRecord.status || "failed"));
     runRecord.waitingInput = false;
@@ -8567,33 +8552,13 @@ async function doRetrySend(
       throw new Error(`请求失败: ${response.status}`);
     }
 
-    const reader = response.body.getReader();
-    transportRecord.reader = reader;
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-
-    const handleSsePart = (part) => {
-      const line = part.split("\n").find((item) => item.startsWith("data: "));
-      if (!line) return;
-      let payload = null;
-      try { payload = JSON.parse(line.slice(6)); } catch { return; }
-      projection.project(payload);
-    };
-
-    const consumeSseBuffer = (final = false) => {
-      const parts = buffer.split("\n\n");
-      buffer = parts.pop() || "";
-      if (final && buffer.trim()) { parts.push(buffer); buffer = ""; }
-      for (const part of parts) handleSsePart(part);
-    };
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) { buffer += decoder.decode(); consumeSseBuffer(true); break; }
-      buffer += decoder.decode(value, { stream: true });
-      consumeSseBuffer();
-    }
+    await consumeAgentRunResponse(response, runRecord, transportRecord, projection.project);
+    projection.completedNormally = runRecord.status === "completed";
   } catch (error) {
+    if (runRecord.runId && !runRecord.cancelRequested) {
+      transportRecord.reconnecting = true;
+      return;
+    }
     projection.hadError = true;
     runRecord.status = "failed";
     if (error.name !== "AbortError" && !runRecord.cancelRequested) {
@@ -8605,6 +8570,7 @@ async function doRetrySend(
     }
   } finally {
     clearTimeout(safetyTimer);
+    if (transportRecord.reconnecting && reconnectAgentRun(runSessionId, runRecord, transportRecord)) return;
     runRecord.active = false;
     runRecord.status = projection.completedNormally ? "completed" : (runRecord.cancelRequested ? "cancelled" : (runRecord.status || "failed"));
     renderRun("finish");
@@ -8924,17 +8890,30 @@ async function cancelCurrentTask() {
   const runRecord = SessionRunRegistry.get(runSessionId);
   const transportRecord = SessionTransportRegistry.get(runSessionId);
   if (!runRecord?.active) return;
+  const previousStatus = runRecord.status;
+  const previousInteraction = runRecord.pendingInteraction;
+  const previouslyWaiting = runRecord.waitingInput;
   runRecord.cancelRequested = true;
   runRecord.pendingInteraction = null;
   runRecord.waitingInput = false;
   SessionRunRegistry.update(runSessionId, { cancelRequested: true, pendingInteraction: null, waitingInput: false, status: "cancelled" });
   try {
-    await fetch(`/api/runs/${encodeURIComponent(runSessionId)}/cancel`, { method: "POST" });
-  } catch {}
+    const response = await fetch(`/api/runs/${encodeURIComponent(runSessionId)}/cancel`, { method: "POST" });
+    if (!response.ok) throw new Error(`停止请求失败（${response.status}）`);
+  } catch (error) {
+    runRecord.cancelRequested = false;
+    SessionRunRegistry.update(runSessionId, { cancelRequested: false, status: previousStatus, pendingInteraction: previousInteraction, waitingInput: previouslyWaiting });
+    showInlineStatus(error.message || "暂时无法停止后台任务，请重试", { kind: "error", sessionId: runSessionId });
+    return;
+  }
 
   if (transportRecord?.abortController) {
     transportRecord.abortController.abort();
   }
+  // A user can cancel while a reconnect timer owns no active HTTP reader.
+  // The acknowledged backend cancel must still unlock the composer.
+  SessionRunRegistry.finish(runSessionId, "cancelled");
+  if (String(state.sessionId) === runSessionId) syncCurrentSessionRuntimeUi();
 }
 
 function autoResize(element) {

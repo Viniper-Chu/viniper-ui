@@ -1,4 +1,14 @@
-# Viniper workstation 1.8.1 Stable
+# Viniper workstation 1.8.2 Stable
+
+## 1.8.2 的主要改进
+
+- DeepSeek 默认模型更新为 V4.1 Flash（API 名称 `deepseek-flash`）；官方部署的旧 Flash 别名自动兼容，Key 和自定义 Provider 保留。V4 Pro 仍为可选模型。
+- 模型目录与迁移从 HTTP 服务拆出；上下文容量以服务端目录为准，前端不再重复维护容量表。
+- 发送、重试、恢复共用流式传输模块；连接结束后核实后台运行状态，断线只恢复订阅，不重复发送任务。
+- 输出重绘按会话合并；模型切换的过期用量响应不再覆盖当前模型。
+- 后端回放使用有界环形缓冲，超出回放窗口时明确重读持久会话，不静默丢失中间输出。
+
+Windows 通过完整安装程序升级，沿用已有数据目录。macOS 架构路径同步，但未进行真机验证。
 
 Viniper workstation 是面向 Windows 的双 Agent 工作台。它保留熟悉的 Viniper 壳与浅青视觉，同时把两个运行时严格分开：
 

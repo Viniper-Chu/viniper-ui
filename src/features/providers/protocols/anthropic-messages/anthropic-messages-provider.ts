@@ -207,7 +207,7 @@ function toolCallsFromItems(items: ProviderHistoryEntry["items"]): Array<[string
 }
 
 function isDeepSeekAnthropicModel(profile: ProviderProfile, model: string): boolean {
-  return profile.id === "anthropic" && /^(deepseek-v4-pro|deepseek-v4-flash)$/u.test(model);
+  return profile.id === "anthropic" && /^(deepseek-flash|deepseek-v4-pro|deepseek-v4-flash(?:-vision-exp)?)$/u.test(model);
 }
 
 function anthropicMessages(history: ProviderHistoryEntry[], toolNames: ToolNameProjection): Array<Record<string, unknown>> {

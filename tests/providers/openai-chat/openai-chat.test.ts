@@ -55,7 +55,7 @@ test("OpenAI Chat maps representative errors and cancellation", async () => {
 test("DeepSeek profile exposes only the current V4 model facts", () => {
   const deepseek = DOMESTIC_MODEL_PROFILES.find((profile) => profile.id === "deepseek")!;
   const currentModels = (deepseek as typeof deepseek & { currentModels?: string[] }).currentModels;
-  assert.deepEqual(currentModels, ["deepseek-v4-flash", "deepseek-v4-pro"]);
+  assert.deepEqual(currentModels, ["deepseek-flash", "deepseek-v4-pro"]);
 });
 
 test("DeepSeek session user_id stays stable, isolated and inside its serializer boundary", () => {

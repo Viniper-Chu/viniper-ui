@@ -16,7 +16,7 @@ export class ProviderRegistry {
 
   get(id: string): ModelProvider {
     const provider = this.providers.get(id);
-    if (!provider) throw new Error(`Provider '${id}' 在 v1.8.1 Stable 中仅提供配置占位。`);
+    if (!provider) throw new Error(`Provider '${id}' 在 v1.8.2 Stable 中仅提供配置占位。`);
     return provider;
   }
 

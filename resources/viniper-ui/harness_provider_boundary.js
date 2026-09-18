@@ -3,9 +3,7 @@
 // Provider-boundary normalization is deliberately kept outside the renderer
 // and outside the CLI environment builder. The UI keeps its display model and
 // SDK-style base URL; only the raw Harness transport sees these values.
-const DEEPSEEK_MODEL_ALIASES = new Map([
-  ["deepseek-v4-pro[1m]", "deepseek-v4-pro"],
-]);
+const DEEPSEEK_MODEL_ALIASES = new Map(Object.entries(require("./model-capabilities.json").provider_model_aliases));
 
 function normalizeRawAnthropicEndpoint(value) {
   const normalized = String(value || "").trim().replace(/\/+$/u, "");

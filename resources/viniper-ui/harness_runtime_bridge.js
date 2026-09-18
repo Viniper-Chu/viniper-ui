@@ -121,7 +121,7 @@ function profileFor(providerId) {
 function requestedModel(request, profileId) {
   const raw = String(request.model || "").trim();
   if (raw) return normalizeProviderModel(raw);
-  if (["deepseek", "anthropic"].includes(profileId)) return "deepseek-v4-flash";
+  if (["deepseek", "anthropic"].includes(profileId)) return require("./model-capabilities.json").default_deepseek_model;
   return "demo-default";
 }
 
@@ -160,6 +160,29 @@ async function configureProvider(request) {
     await application.services.providerSettings.saveSecret(provider.providerId, "api-key", secret);
   }
   return { ...provider, secret };
+}
+
+async function ensureCollaborationSessions(rows) {
+  const ensured = [];
+  for (const row of rows) {
+    const nativeId = String(row?.native_session_id || row?.session_id || "");
+    const mapped = sessionMap.sessions[nativeId];
+    // A read-side projection must not reconfigure a running/persisted owner.
+    // Provider, workspace and permission changes belong to run preparation.
+    let session = mapped?.harnessSessionId ? runtime.getSession(mapped.harnessSessionId) : null;
+    if (!session) {
+      const workdir = String(row?.workdir || "");
+      const directory = await fsp.stat(workdir).catch(() => null);
+      if (!directory?.isDirectory()) {
+        ensured.push({ native_session_id: nativeId, state: "unavailable", reason: "项目目录不存在或不可访问，请重新选择目录；历史会话仍保留。" });
+        continue;
+      }
+      const provider = await configureProvider(row || {});
+      session = await ensureSession(row || {}, provider, { setActive: false });
+    }
+    ensured.push({ native_session_id: nativeId, harness_session_id: session.id });
+  }
+  return ensured;
 }
 
 async function ensureSession(request, provider, { setActive = true } = {}) {
@@ -666,13 +689,7 @@ async function handleControl(command) {
       data = publicCollaborationSnapshot(command.visible_native_session_ids);
     } else if (command.op === "sessions.ensure") {
       const rows = Array.isArray(command.sessions) ? command.sessions : [];
-      const ensured = [];
-      for (const row of rows) {
-        const provider = await configureProvider(row || {});
-        const session = await ensureSession(row || {}, provider, { setActive: false });
-        ensured.push({ native_session_id: String(row?.native_session_id || ""), harness_session_id: session.id });
-      }
-      data = { ensured };
+      data = { ensured: await ensureCollaborationSessions(rows) };
     } else if (command.op === "sessions.snapshot") {
       data = publicSessionSnapshot();
     } else if (command.op === "sessions.delete") {

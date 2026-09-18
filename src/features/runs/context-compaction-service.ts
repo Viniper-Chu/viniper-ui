@@ -97,7 +97,7 @@ export class ContextCompactionService {
  * tokens, leaving substantial room for the current turn and output.
  */
 export function defaultCompactionThresholdChars(providerId: string, modelId: string): number {
-  if (providerId === "deepseek" && /^deepseek-v4-/u.test(modelId)) return 384_000;
+  if (providerId === "deepseek" && /^(deepseek-flash|deepseek-v4-)/u.test(modelId)) return 384_000;
   return 32_000;
 }
 

@@ -13,6 +13,7 @@ root = Path(sys.argv[1])
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(root / 'resources' / 'viniper-ui'))
 import agent_runtime
+from model_catalog import PROVIDER_MODEL_ALIASES
 from agent_runtime import AgentRunSpec, WslAgentRuntime
 from agent_host_bridge import HostInteractionChannel, build_permission_prompt_mcp_config
 
@@ -30,7 +31,7 @@ aliases = next(node for node in tree.body if isinstance(node, ast.Assign) and an
 
 endpoint = 'https://api.deepseek.com/anthropic'
 pro = 'deepseek-v4-pro[1m]'
-flash = 'deepseek-v4-flash'
+flash = 'deepseek-flash'
 default_keys = (
     'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL',
     'ANTHROPIC_DEFAULT_HAIKU_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL',
@@ -62,6 +63,7 @@ def forbidden(*args, **kwargs):
     raise AssertionError('fixture must not request a provider or start a process')
 
 ns = {
+    'PROVIDER_MODEL_ALIASES': PROVIDER_MODEL_ALIASES,
     'Any': Any, 'Mapping': Mapping, 'MODE_CLAUDE': 'claude', 'MODE_VINIPER': 'viniper',
     'normalize_provider_mode': lambda mode: mode,
     'provider_config': forbidden,
@@ -83,14 +85,14 @@ def build(model, base_url=endpoint, mode='claude'):
     }, session, mode=mode, effective_context_window=1048576, auto_compact_supported=False)
 
 positives = []
-for selected_model in (pro, 'deepseek-v4-pro', flash):
+for selected_model in (pro, 'deepseek-v4-pro', flash, 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-flash[1m]'):
     for suffix in ('', '/'):
         result = build(selected_model, endpoint + suffix)
-        main = flash if selected_model == flash else pro
+        main = pro if selected_model in (pro, 'deepseek-v4-pro') else flash + '[1m]'
         assert result['ANTHROPIC_MODEL'] == main, (selected_model, result['ANTHROPIC_MODEL'])
         assert result[provider_names['model']] == main
-        assert result['ANTHROPIC_DEFAULT_SONNET_MODEL'] == pro
-        assert result['ANTHROPIC_DEFAULT_OPUS_MODEL'] == pro
+        assert result['ANTHROPIC_DEFAULT_SONNET_MODEL'] == flash + '[1m]'
+        assert result['ANTHROPIC_DEFAULT_OPUS_MODEL'] == flash + '[1m]'
         assert result['ANTHROPIC_DEFAULT_HAIKU_MODEL'] == flash
         assert result['CLAUDE_CODE_SUBAGENT_MODEL'] == flash
         assert result['CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST'] == 'legacy-fixture'
@@ -102,8 +104,8 @@ for selected_model in (pro, 'deepseek-v4-pro', flash):
         assert ns['claude_native_model_id'](selected_model, cfg, mode='claude') == main
         assert ns['official_deepseek_claude_models'](cfg, mode='claude') == {
             'ANTHROPIC_MODEL': main,
-            'ANTHROPIC_DEFAULT_SONNET_MODEL': pro,
-            'ANTHROPIC_DEFAULT_OPUS_MODEL': pro,
+            'ANTHROPIC_DEFAULT_SONNET_MODEL': flash + '[1m]',
+            'ANTHROPIC_DEFAULT_OPUS_MODEL': flash + '[1m]',
             'ANTHROPIC_DEFAULT_HAIKU_MODEL': flash,
             'CLAUDE_CODE_SUBAGENT_MODEL': flash,
         }
@@ -248,7 +250,7 @@ print(json.dumps({'positiveCases': len(positives), 'unchangedCases': len(negativ
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.deepEqual(JSON.parse(result.stdout.trim()), {
-    positiveCases: 6, unchangedCases: 8, wslBridgeCases: 6,
+    positiveCases: 12, unchangedCases: 8, wslBridgeCases: 12,
     runLocalSettingsCases: 10, providerCalls: 0, nativeProcesses: 0,
     realSettingsReads: 0, globalEnvironmentMutations: 0,
   });
