@@ -1,12 +1,12 @@
-export const PRODUCT_VERSION = "1.8.2" as const;
+export const PRODUCT_VERSION = "1.8.3" as const;
 /** Stable is the published channel.  Preview builds set VINIPER_UI_RELEASE_STAGE=preview
  * in their isolated launcher and retain their already-built rollback artifact. */
 const isPreviewBuild = typeof process !== "undefined"
   && process.env?.VINIPER_UI_RELEASE_STAGE === "preview";
 export const RELEASE_STAGE = (isPreviewBuild ? "Preview" : "Stable") as "Preview" | "Stable";
 export const PRODUCT_NAME = "Viniper workstation" as const;
-export const PRODUCT_BADGE = (isPreviewBuild ? "v1.8.2 · Preview（预览版）" : "v1.8.2 · Stable（稳定版）") as
-  "v1.8.2 · Preview（预览版）" | "v1.8.2 · Stable（稳定版）";
+export const PRODUCT_BADGE = (isPreviewBuild ? "v1.8.3 · Preview（预览版）" : "v1.8.3 · Stable（稳定版）") as
+  "v1.8.3 · Preview（预览版）" | "v1.8.3 · Stable（稳定版）";
 export const PRODUCT_TITLE = `${PRODUCT_NAME} · ${PRODUCT_BADGE}` as const;
 
 import { CoordinationSnapshot, CoordinationWait } from "./coordination-contracts";

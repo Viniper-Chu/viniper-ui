@@ -2862,10 +2862,8 @@ async function loadStatus(mode = state.viewMode, token = modeProjectionToken(mod
     updateRuntimeProfileChrome();
     applySettingsFromServer(state.status.settings);
     const rememberedModel = readRememberedModel(requestedMode);
-    const available = (state.status.models || []).map((model) => model.id);
-    state.selectedModel = available.includes(rememberedModel)
-      ? rememberedModel
-      : (state.status.model || "deepseek-flash");
+    state.selectedModel = resolvePickerModel(state.status.models || [], rememberedModel, state.status.model);
+    rememberModel(state.selectedModel, requestedMode);
     state.permissionMode = sanitizePermissionMode(state.status.permission_mode || "default");
     renderModelSelect();
     renderPermissionSelect();
@@ -3864,6 +3862,13 @@ async function createDesktopShortcut() {
     button.disabled = false;
     panel.innerHTML = `<div class="diagnostic-row fail"><strong>失败</strong><span>${escapeHtml(error.message)}</span></div>`;
   }
+}
+
+function resolvePickerModel(models, remembered, configured) {
+  const ids = models.map((model) => model.id);
+  if (ids.includes(remembered)) return remembered;
+  if (ids.includes(configured)) return configured;
+  return ids[0] || configured || "deepseek-flash";
 }
 
 function renderModelSelect() {

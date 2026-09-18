@@ -18,7 +18,8 @@ def capacity_provider_id(provider):
 
 
 def deepseek_model_options():
-    entries = [item for item in CATALOG["entries"] if item["provider"] == "deepseek"]
+    picker_ids = set(CATALOG["deepseek_picker_models"])
+    entries = [item for item in CATALOG["entries"] if item["provider"] == "deepseek" and item["model"] in picker_ids]
     entries.sort(key=lambda item: item["model"] != DEFAULT_DEEPSEEK_MODEL)
     return [{"id": item["model"], "label": item["label"], "description": "",
              "context": item["context_window"]} for item in entries]
@@ -46,4 +47,10 @@ def migrate_official_deepseek_provider(provider):
                 item["label"] = options[item["id"]]["label"]
             models.append(item)
         result["models"] = models
+        # Retire the old bundled Pro/Flash picker, not the Provider's actual
+        # Pro API or a user-authored custom list. Historical messages stay intact.
+        if seen == {"deepseek-v4-pro", DEFAULT_DEEPSEEK_MODEL}:
+            result["models"] = deepseek_model_options()
+            if result.get("model") in seen:
+                result["model"] = DEFAULT_DEEPSEEK_MODEL
     return result

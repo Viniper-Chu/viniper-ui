@@ -1,6 +1,7 @@
 {
   "version": 2,
   "default_deepseek_model": "deepseek-flash",
+  "deepseek_picker_models": ["deepseek-flash"],
   "provider_model_aliases": {
     "deepseek-v4-pro[1m]": "deepseek-v4-pro",
     "deepseek-flash[1m]": "deepseek-flash",

@@ -1,4 +1,4 @@
-# Agent 边界与本轮优化（1.8.2）
+# Agent 边界与本轮优化（1.8.2–1.8.3）
 
 桌面宿主管理凭据、进程和安装器；HTTP Application Port 管理会话与协议投影；Viniper Harness 和 Claude Code Adapter 分别拥有各自执行生命周期。前端消费状态与事件，不执行 Provider 请求、不写 SQLite，也不读取明文 Key。
 
@@ -17,7 +17,7 @@
 3. 回放超出缓存窗口时重新读取持久会话，不能把残缺文本误当完整文本。
 4. 所有事件仍逐项应用；合并的是 DOM 重绘，不是正文、工具调用或审批事件。
 5. 模型切换后的旧用量响应以及过期模式 generation 不覆盖新状态。
-6. UI/API 显示 `deepseek-flash`；原生 Claude 主模型的 `[1m]` 只存在于 CLI 边界。Pro 仍受官方支持，不强制改掉显式 Pro 选择。
+6. 内置右下角预设统一显示 `DeepSeek V4.1 Flash`，实际 ID 为 `deepseek-flash`；官方地址上的旧 Pro/Flash 双选预设归并为 Flash。自定义网关、自定义列表和历史记录不改写，Pro API 兼容仍保留。原生 Claude 主模型的 `[1m]` 只存在于 CLI 边界。
 
 ## 检查边界
 

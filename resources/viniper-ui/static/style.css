@@ -1694,7 +1694,7 @@ body.sidebar-collapsed #main { grid-column: 1 / -1; }
   #topbar { padding-inline: 12px; gap: 6px; }
   .topbar-actions { gap: 4px; }
   .anchored-control { gap: 3px; padding-inline: 6px; }
-  .anchored-control span { display: none; }
+  .anchored-control > span { display: none; }
   .anchored-control select { max-width: 92px; }
   #change-workdir-btn { display: none; }
   .window-pin-button { max-width: 34px; padding-inline: 4px; overflow: hidden; white-space: nowrap; font-size: 0; }
@@ -1739,7 +1739,7 @@ body.sidebar-collapsed #main { grid-column: 1 / -1; }
   #sidebar { width: 198px !important; max-width: calc(100vw - 48px); }
   body:not(.sidebar-collapsed) #main { padding-left: 198px; }
   body.sidebar-collapsed #main { padding-left: 0; }
-  .composer-controls .anchored-control span { display: none; }
+  .composer-controls .anchored-control > span { display: none; }
   .composer-controls .anchored-control select { max-width: 90px; }
 }
 
@@ -1757,7 +1757,7 @@ body.sidebar-collapsed #main { grid-column: 1 / -1; }
   .platform-win32 #topbar { padding-right: 112px; }
   .topbar-actions { gap: 4px; }
   .anchored-control { gap: 3px; padding-inline: 6px; }
-  .anchored-control span { display: none; }
+  .anchored-control > span { display: none; }
   .anchored-control select { max-width: 92px; }
   #change-workdir-btn { display: none; }
   .window-pin-button { max-width: 32px; padding-inline: 4px; overflow: hidden; white-space: nowrap; font-size: 0; }

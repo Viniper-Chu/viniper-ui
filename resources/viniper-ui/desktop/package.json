@@ -1,6 +1,6 @@
 {
   "name": "viniper-workstation-desktop",
-  "version": "1.8.2",
+  "version": "1.8.3",
   "private": true,
   "description": "Isolated Viniper workstation desktop shell.",
   "main": "main.js",

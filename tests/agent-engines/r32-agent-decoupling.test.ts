@@ -148,6 +148,45 @@ assert migrate_official_deepseek_provider({'model':'deepseek-v4-pro','base_url':
   for (const alias of ["deepseek-v4-flash", "deepseek-flash[1m]", "deepseek-v4-flash-vision-exp"]) assert.equal(boundary.normalizeProviderModel(alias), "deepseek-flash");
 });
 
+test("R33 narrow composer never hides descendant model menu or picker labels", () => {
+  const css = readFileSync(join(ui,"static/style.css"),"utf8");
+  assert.doesNotMatch(css,/\.anchored-control\s+span\s*\{\s*display:\s*none/u);
+  assert.match(css,/\.anchored-control\s*>\s*span\s*\{\s*display:\s*none/u);
+});
+
+test("R33 bottom-right picker replaces unavailable remembered IDs with an actual current option", () => {
+  const sandbox: any = {};
+  vm.createContext(sandbox); vm.runInContext(functionSource("resolvePickerModel"), sandbox);
+  const models = [{id:"deepseek-flash",label:"DeepSeek V4.1 Flash"}];
+  for (const remembered of ["deepseek-v4-pro","deepseek-v4-flash","deepseek-v4-flash[1m]","deepseek-flash",null]) {
+    assert.equal(sandbox.resolvePickerModel(models,remembered,"deepseek-v4-pro"),"deepseek-flash");
+  }
+  assert.equal(sandbox.resolvePickerModel([{id:"custom"},{id:"other"}],"custom","other"),"custom");
+});
+
+test("R33 bottom-right preset migrates old Pro/Flash lists without rewriting custom deployments", () => {
+  python(String.raw`
+import copy
+from model_catalog import *
+assert [item['id'] for item in deepseek_model_options()] == ['deepseek-flash']
+for endpoint in OFFICIAL_DEEPSEEK_ENDPOINTS:
+    for flash in ('deepseek-v4-flash', 'deepseek-v4-flash[1m]', 'deepseek-flash'):
+        for selected in ('deepseek-v4-pro', flash):
+            original={'base_url':endpoint,'model':selected,'secret_ref':'preserve','models':[{'id':'deepseek-v4-pro','label':'Old Pro'},{'id':flash,'label':'Old Flash'}]}
+            before=copy.deepcopy(original)
+            migrated=migrate_official_deepseek_provider(original)
+            assert original == before
+            assert migrated['model']=='deepseek-flash' and migrated['secret_ref']=='preserve'
+            assert [(i['id'],i['label']) for i in migrated['models']]==[('deepseek-flash','DeepSeek V4.1 Flash')]
+            assert migrate_official_deepseek_provider(migrated)==migrated
+            original['base_url']='https://custom.example/anthropic'
+            assert migrate_official_deepseek_provider(original)==original
+custom={'base_url':'https://api.deepseek.com','model':'deepseek-v4-pro','models':[{'id':'deepseek-v4-pro'},{'id':'deepseek-flash'},{'id':'custom','label':'Keep'}]}
+assert len(migrate_official_deepseek_provider(custom)['models'])==3
+assert migrate_official_deepseek_provider(custom)['model']=='deepseek-v4-pro'
+`);
+});
+
 test("R32 bounded backend replay reports a gap, preserves order, and survives subscriber disconnect", () => {
   python(String.raw`
 import asyncio

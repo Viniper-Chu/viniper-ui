@@ -1,8 +1,8 @@
-# Viniper workstation 1.8.2 Stable
+# Viniper workstation 1.8.3 Stable
 
-## 1.8.2 的主要改进
+## 1.8.3 的主要改进
 
-- DeepSeek 默认模型更新为 V4.1 Flash（API 名称 `deepseek-flash`）；官方部署的旧 Flash 别名自动兼容，Key 和自定义 Provider 保留。V4 Pro 仍为可选模型。
+- DeepSeek 内置模型选择器统一为 V4.1 Flash（API 名称 `deepseek-flash`）：设置页与右下角同步，旧 Pro/Flash 预设和浏览器旧选择自动归并。Key、自定义网关与自定义模型列表保留；历史 Pro API 仍兼容。
 - 模型目录与迁移从 HTTP 服务拆出；上下文容量以服务端目录为准，前端不再重复维护容量表。
 - 发送、重试、恢复共用流式传输模块；连接结束后核实后台运行状态，断线只恢复订阅，不重复发送任务。
 - 输出重绘按会话合并；模型切换的过期用量响应不再覆盖当前模型。
