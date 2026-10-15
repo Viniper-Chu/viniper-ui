@@ -1,12 +1,12 @@
-export const PRODUCT_VERSION = "1.8.3" as const;
+export const PRODUCT_VERSION = "2.0.0" as const;
 /** Stable is the published channel.  Preview builds set VINIPER_UI_RELEASE_STAGE=preview
  * in their isolated launcher and retain their already-built rollback artifact. */
 const isPreviewBuild = typeof process !== "undefined"
   && process.env?.VINIPER_UI_RELEASE_STAGE === "preview";
 export const RELEASE_STAGE = (isPreviewBuild ? "Preview" : "Stable") as "Preview" | "Stable";
-export const PRODUCT_NAME = "Viniper workstation" as const;
-export const PRODUCT_BADGE = (isPreviewBuild ? "v1.8.3 · Preview（预览版）" : "v1.8.3 · Stable（稳定版）") as
-  "v1.8.3 · Preview（预览版）" | "v1.8.3 · Stable（稳定版）";
+export const PRODUCT_NAME = "Viniper" as const;
+export const PRODUCT_BADGE = (isPreviewBuild ? "v2.0.0 · Preview（预览版）" : "v2.0.0 · Stable（稳定版）") as
+  "v2.0.0 · Preview（预览版）" | "v2.0.0 · Stable（稳定版）";
 export const PRODUCT_TITLE = `${PRODUCT_NAME} · ${PRODUCT_BADGE}` as const;
 
 import { CoordinationSnapshot, CoordinationWait } from "./coordination-contracts";
@@ -69,6 +69,8 @@ export interface AgentIntent {
   engineId?: AgentEngineId;
   sessionId: string;
   text: string;
+  /** Original user text before host instructions or skill expansion. */
+  userText?: string;
   attachments: string[];
   selectedModel: string;
   permissionMode: PermissionMode;
@@ -79,6 +81,8 @@ export interface AgentIntent {
   routing?: AgentRoutingRequest;
   /** Host-owned per-run memory gate. The renderer never supplies memory bodies. */
   memoryEnabled?: boolean;
+  /** Host-selected planning mode only exposes read-only tools for this run. */
+  planning?: boolean;
 }
 
 export type AgentRoutingRequest =
@@ -102,12 +106,14 @@ export interface QueuedIntent {
   engineId?: AgentEngineId;
   sessionId?: string;
   text: string;
+  userText?: string;
   createdAt: number;
   origin?: IntentOrigin;
   workspaceMode?: WorkspaceMode;
   reviewPolicy?: ReviewPolicy;
   commitRequested?: boolean;
   memoryEnabled?: boolean;
+  planning?: boolean;
 }
 
 export interface ActivityRecord {
@@ -123,6 +129,7 @@ export interface ActivityRecord {
   callId?: string;
   parentCallId?: string;
   toolName?: string;
+  input?: Record<string, unknown>;
   presentation?: ToolPresentation;
   runId?: string;
   createdAt: number;
@@ -201,7 +208,16 @@ export interface TerminalToolPresentation {
   outputText?: string;
 }
 
-export type ToolPresentation = ProjectToolPresentation | TerminalToolPresentation;
+export interface DocumentToolPresentation {
+  kind: "document-results";
+  files: string[];
+  sourceDirectory?: string;
+  sourceDependencies?: string[];
+  intermediateDirectories: string[];
+  intermediateFiles: string[];
+}
+
+export type ToolPresentation = ProjectToolPresentation | TerminalToolPresentation | DocumentToolPresentation;
 
 export interface CacheSegment {
   name: "tool-schemas" | "system" | "project" | "skills" | "stable-history";
@@ -257,6 +273,10 @@ export interface RuntimeItemSnapshot {
 }
 
 export type RuntimeEventType =
+  | "provider.activity"
+  | "provider.request.started"
+  | "context.budget"
+  | "context.compacted"
   | "session.updated"
   | "message.user"
   | "message.delta"

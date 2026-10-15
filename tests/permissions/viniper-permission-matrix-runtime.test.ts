@@ -17,7 +17,7 @@ class ManualTerminalProvider implements ModelProvider {
     const results = request.history.flatMap((entry) => entry.items).filter((item) => item.type === "tool-result");
     if (!results.some((item) => item.callId === "manual-terminal-allow")) {
       yield { kind: "tool-call.completed", call: toolCall("manual-terminal-allow", "terminal.run", {
-        command: "[Console]::Out.Write('R11C_MANUAL_ALLOW_OK')",
+        command: process.platform === "win32" ? "[Console]::Out.Write('R11C_MANUAL_ALLOW_OK')" : "printf R11C_MANUAL_ALLOW_OK",
         purpose: "test",
         timeoutMs: 8_000,
       }) };
@@ -25,7 +25,7 @@ class ManualTerminalProvider implements ModelProvider {
     }
     if (!results.some((item) => item.callId === "manual-terminal-reject")) {
       yield { kind: "tool-call.completed", call: toolCall("manual-terminal-reject", "terminal.run", {
-        command: "Set-Content -LiteralPath 'must-not-run.txt' -Value 'MUST_NOT_RUN'",
+        command: process.platform === "win32" ? "Set-Content -LiteralPath 'must-not-run.txt' -Value 'MUST_NOT_RUN'" : "printf MUST_NOT_RUN > must-not-run.txt",
         purpose: "test",
         timeoutMs: 8_000,
       }) };
@@ -56,7 +56,7 @@ class FullAccessMatrixProvider implements ModelProvider {
       toolCall("full-project-write", "project.write", { path: "created.txt", content: "R11C_CREATE\n", mode: "create" }),
       toolCall("full-project-edit", "project.edit", { path: "created.txt", edits: [{ oldText: "CREATE", newText: "EDIT", expectedMatches: 1 }] }),
       toolCall("full-terminal", "terminal.run", {
-        command: `[Console]::Out.Write("R11C_PS7_OK|$($PSVersionTable.PSEdition)|$($PSVersionTable.PSVersion.Major)")`,
+        command: process.platform === "win32" ? `[Console]::Out.Write("R11C_PS7_OK|$($PSVersionTable.PSEdition)|$($PSVersionTable.PSVersion.Major)")` : `printf 'R11C_POSIX_OK|%s' "\${ZSH_VERSION:-sh}"`,
         purpose: "test",
         timeoutMs: 8_000,
       }),
@@ -155,10 +155,15 @@ test("full access completes the enabled local file/project/terminal matrix witho
     if (terminal?.presentation?.kind === "terminal-run") {
       assert.equal(terminal.presentation.status, "completed");
       assert.equal(terminal.presentation.exitCode, 0);
-      assert.match(terminal.presentation.stdout?.preview ?? "", /R11C_PS7_OK\|Core\|7/u);
-      assert.equal(terminal.presentation.processIdentity?.edition, "Core");
-      assert.equal((terminal.presentation.processIdentity?.major ?? 0) >= 7, true);
-      assert.match(terminal.presentation.processIdentity?.executable ?? "", /pwsh(?:\.exe)?$/iu);
+      if (process.platform === "win32") {
+        assert.match(terminal.presentation.stdout?.preview ?? "", /R11C_PS7_OK\|Core\|7/u);
+        assert.equal(terminal.presentation.processIdentity?.edition, "Core");
+        assert.equal((terminal.presentation.processIdentity?.major ?? 0) >= 7, true);
+        assert.match(terminal.presentation.processIdentity?.executable ?? "", /pwsh(?:\.exe)?$/iu);
+      } else {
+        assert.match(terminal.presentation.stdout?.preview ?? "", /R11C_POSIX_OK\|\S+/u);
+        assert.equal(terminal.presentation.processIdentity, undefined);
+      }
     }
     const deletions = toolActivities.filter((item) => ["full-delete-one", "full-delete-two"].includes(item.callId || ""));
     assert.equal(deletions.every((item) => item.presentation?.kind === "project-change" && Boolean(item.presentation.recoveryReceiptId)), true);

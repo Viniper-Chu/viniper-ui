@@ -214,7 +214,7 @@ def _decode_wsl_output(raw: bytes | str | None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _completed(command: Sequence[str], timeout: int = 30, env: Mapping[str, str] | None = None) -> subprocess.CompletedProcess:
+def _completed(command: Sequence[str], timeout: int = 30, env: Mapping[str, str] | None = None, cwd: str | None = None) -> subprocess.CompletedProcess:
     result = subprocess.run(
         [str(item) for item in command],
         stdout=subprocess.PIPE,
@@ -222,6 +222,7 @@ def _completed(command: Sequence[str], timeout: int = 30, env: Mapping[str, str]
         timeout=timeout,
         check=False,
         env=dict(env) if env is not None else None,
+        cwd=cwd,
     )
     return subprocess.CompletedProcess(
         list(command),
@@ -229,6 +230,32 @@ def _completed(command: Sequence[str], timeout: int = 30, env: Mapping[str, str]
         stdout=_decode_wsl_output(result.stdout),
         stderr=_decode_wsl_output(result.stderr),
     )
+
+
+def native_auth_projection(raw: Any) -> dict[str, Any]:
+    raw = raw if isinstance(raw, dict) else {}
+    configured = raw.get("loggedIn") is True
+    method = str(raw.get("authMethod") or "")
+    return {"source": "cli", "configured": configured,
+            "status": "authenticated" if configured else "login_required",
+            "method": method if method in {"oauth", "api_key", "claude.ai", "console"} else "cli"}
+
+
+def native_plugins_projection(raw: Any) -> dict[str, Any]:
+    rows = raw if isinstance(raw, list) else raw.get("plugins", []) if isinstance(raw, dict) else []
+    plugins = []
+    for item in rows[:200]:
+        if not isinstance(item, dict):
+            continue
+        identity = str(item.get("id") or item.get("name") or "")[:200]
+        if identity:
+            errors = item.get("errors") if isinstance(item.get("errors"), list) else []
+            plugins.append({"id": identity, "name": str(item.get("name") or identity)[:200],
+                            "version": str(item.get("version") or "")[:120], "scope": str(item.get("scope") or "")[:120],
+                            "status": "error" if errors else "disabled" if item.get("enabled") is False else "available",
+                            "error_count": len(errors),
+                            "reason": "插件加载失败，请在原生控制台查看诊断" if errors else ""})
+    return {"status": "available", "plugins": plugins}
 
 
 def _permission_modes_from_help(help_text: str) -> tuple[str, ...]:
@@ -632,6 +659,26 @@ class WslAgentRuntime(AgentRuntime):
             and str(item.get("kind") or "")
             and (str(item.get("id") or "") or str(item.get("sessionId") or ""))
         ]
+
+    def auth_status(self) -> dict[str, Any]:
+        try:
+            result = self._run([*self._base(), "sh", "-lc",
+                'unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL; export PATH="$HOME/.local/bin:$PATH"; claude auth status --json'])
+            if result.returncode not in {0, 1}:
+                raise ValueError("authentication status unavailable")
+            return native_auth_projection(json.loads(str(result.stdout or "")))
+        except (ValueError, OSError, subprocess.SubprocessError):
+            return {"source": "cli", "configured": False, "status": "unavailable", "method": "cli"}
+
+    def plugin_status(self, workdir: str = "") -> dict[str, Any]:
+        try:
+            # CLI's installed registry only; --available would fetch a catalogue.
+            result = self._run([*self._base(), "sh", "-lc", 'export PATH="$HOME/.local/bin:$PATH"; claude plugin list --json'])
+            if result.returncode != 0:
+                raise ValueError("plugin registry unavailable")
+            return native_plugins_projection(json.loads(str(result.stdout or "")))
+        except (ValueError, OSError, subprocess.SubprocessError):
+            return {"status": "unavailable", "plugins": [], "reason": "CLI 未能返回本地插件注册表"}
 
     def runtime_version(self) -> str:
         probe = self._last_probe or self.probe()

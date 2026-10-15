@@ -5,6 +5,7 @@ import { test } from "node:test";
 import { ProviderRegistry } from "../../src/features/providers/provider-registry";
 import { ModelProvider } from "../../src/features/providers/model-provider";
 import { ProviderEvent, ProviderRequest } from "../../src/core/provider-contracts";
+import { ProjectIndexRecord } from "../../src/core/project-index-contracts";
 import { querySessions } from "../../src/features/sessions/session-query";
 import { MemoryService } from "../../src/features/memory/memory-service";
 import { SmartRoutingService } from "../../src/features/providers/model-routing-service";
@@ -121,17 +122,35 @@ test("project index is explicit-only, excludes secret/noise paths, supports symb
   }
 });
 
-test("project index pauses under resource pressure and resumes from its persisted checkpoint", async () => {
+test("project index pauses under resource pressure and resumes from its persisted checkpoint", async (context) => {
   const root = await mkdtemp(join(process.cwd(), "codex", "运行残留", "cp3-index-pause-"));
   try {
     await Promise.all(Array.from({ length: 120 }, (_, index) => writeFile(join(root, `file-${index}.ts`), `export const item${index} = ${index};\n`, "utf8")));
     const service = new ProjectIndexService();
+    // A small index can finish between the 10 ms polling ticks. Hold its
+    // first file read so pause is tested during work regardless of disk speed.
+    const reader = service as unknown as { readRecord(root: string, path: string): Promise<ProjectIndexRecord | undefined> };
+    const readRecord = reader.readRecord.bind(service);
+    let signalReading!: () => void;
+    let releaseRead!: () => void;
+    const reading = new Promise<void>((resolve) => { signalReading = resolve; });
+    const released = new Promise<void>((resolve) => { releaseRead = resolve; });
+    context.mock.method(reader, "readRecord", async (projectRoot: string, path: string) => {
+      signalReading();
+      await released;
+      return readRecord(projectRoot, path);
+    });
     const building = service.build(root, true);
-    await waitFor(() => service.snapshot().status === "indexing");
-    const paused = await service.pause();
-    await building;
-    assert.equal(paused.status, "paused");
-    assert.ok((paused.checkpoint.processed ?? 0) < paused.checkpoint.total);
+    try {
+      await Promise.race([reading, building.then(() => { throw new Error("Index completed without entering a file read"); })]);
+      assert.equal(service.snapshot().status, "indexing");
+      const paused = await service.pause();
+      assert.equal(paused.status, "paused");
+      assert.ok((paused.checkpoint.processed ?? 0) < paused.checkpoint.total);
+    } finally {
+      releaseRead();
+      await building;
+    }
     const resumed = await service.resume();
     assert.equal(resumed.status, "ready");
     assert.equal(resumed.checkpoint.processed, resumed.checkpoint.total);

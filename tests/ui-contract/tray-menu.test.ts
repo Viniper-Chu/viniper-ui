@@ -39,7 +39,7 @@ test("native tray template has fixed groups, bounded entries and overflow submen
   const labels = template.map((item) => item.label).filter((label): label is string => typeof label === "string");
   assert.deepEqual(labels.slice(0, 4), ["正在运行", "任务 4 — 项目 4 · Agent", "任务 3 — 项目 3 · Agent", "任务 2 — 项目 2 · Agent"]);
   assert.equal(labels.filter((label) => label === "更多").length, 2);
-  assert.deepEqual(labels.slice(-3), ["新建 Agent", "隐藏 Viniper workstation", "完全退出 Viniper workstation"]);
+  assert.deepEqual(labels.slice(-3), ["新建 Agent", "隐藏 Viniper", "完全退出 Viniper"]);
   assert.equal(template.filter((item) => item.type === "separator").length, 4);
   const more = template.find((item) => item.label === "更多");
   assert.ok(more && Array.isArray(more.submenu));
@@ -56,7 +56,7 @@ test("empty tray groups are disabled and summary never exposes absolute paths", 
     onQuit: () => undefined,
   });
   const text = JSON.stringify(template, (_key, value) => typeof value === "function" ? "callback" : value);
-  assert.match(text, /打开 Viniper workstation/u);
+  assert.match(text, /打开 Viniper/u);
   assert.match(text, /暂无/u);
   assert.doesNotMatch(text, /C:\\\\Users/u);
   assert.doesNotMatch(text, /New Chat|Chats|消息正文|API Key|powershell|git\.commit/u);
@@ -79,8 +79,8 @@ test("tray actions select, create, toggle and quit through injected callbacks", 
   assert.ok(item && typeof item.click === "function");
   item.click?.({} as never, {} as never, {} as never);
   template.find((candidate) => candidate.label === "新建 Agent")?.click?.({} as never, {} as never, {} as never);
-  template.find((candidate) => candidate.label === "隐藏 Viniper workstation")?.click?.({} as never, {} as never, {} as never);
-  template.find((candidate) => candidate.label === "完全退出 Viniper workstation")?.click?.({} as never, {} as never, {} as never);
+  template.find((candidate) => candidate.label === "隐藏 Viniper")?.click?.({} as never, {} as never, {} as never);
+  template.find((candidate) => candidate.label === "完全退出 Viniper")?.click?.({} as never, {} as never, {} as never);
   assert.deepEqual(calls, ["select:session-1", "new", "toggle", "quit"]);
 });
 

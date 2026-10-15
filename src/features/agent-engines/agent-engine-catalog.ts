@@ -21,7 +21,7 @@ export class AgentEngineCatalog {
   snapshot(): AgentEngineSnapshot[] {
     const claudeProvider = this.providers.list().find((provider) => provider.id === "claude-code");
     const claudeReady = this.claudeCode.available && claudeProvider?.available === true;
-    return [
+    const engines: AgentEngineSnapshot[] = [
       {
         id: "viniper",
         name: "Viniper",
@@ -38,7 +38,7 @@ export class AgentEngineCatalog {
           capability("queue", "队列", "supported", "会话内排队与多运行调度"),
           capability("cancel", "取消", "supported", "按 run 取消"),
           capability("steering", "运行中引导", "supported", "steer / inject"),
-          capability("attachments", "附件", "unproven", "当前桌面输入区尚未开放附件选择"),
+          capability("attachments", "附件", "supported", "桌面原生选择附件；按模型与工具能力读取文件"),
         ],
       },
       {
@@ -64,6 +64,7 @@ export class AgentEngineCatalog {
         ],
       },
     ];
+    return this.claudeCode.available ? engines : engines.filter(engine => engine.id === "viniper");
   }
 }
 

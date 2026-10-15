@@ -18,6 +18,33 @@ import { UnavailableSecretVault } from "../../src/platform/security/unavailable-
 
 const outputRoot = join(process.cwd(), "codex", "运行残留");
 
+test("deleted schedule history and a missing target do not block application restart", async () => {
+  const root = await freshRoot("sqlite-schedule-target-");
+  const options = { dataRoot: root, workingDirectory: root, assetsRoot: process.cwd(), secretVault: new UnavailableSecretVault(), externalScheduleDispatch: true };
+  let bundle = await createHarnessApplication(options);
+  try {
+    const session = await bundle.runtime.createSession(root);
+    const draft = { name: "restart", prompt: "do not run", schedule: { kind: "interval" as const, everyMs: 60_000 }, target: { kind: "existing-session" as const, sessionId: session.id } };
+    const deleted = await bundle.application.createSchedule(draft) as ScheduleDefinition;
+    const active = await bundle.application.createSchedule(draft) as ScheduleDefinition;
+    await bundle.application.deleteSchedule(deleted.id);
+    assert.equal(await bundle.runtime.deleteSession(session.id), true);
+    await bundle.application.dispose();
+    bundle = await createHarnessApplication(options);
+    const definitions = (await bundle.storage.loadSchedules()).definitions;
+    assert.equal(definitions.find(d => d.id === deleted.id)?.status, "deleted");
+    const stopped = definitions.find(d => d.id === active.id)!;
+    assert.equal(stopped.status, "project-invalid");
+    assert.equal(stopped.enabled, false);
+    assert.equal(await bundle.application.restoreSchedule(deleted.id), false);
+    assert.equal(await bundle.application.setScheduleEnabled(active.id, true), false);
+    assert.ok(bundle.runtime.listSessions().length);
+  } finally {
+    await bundle.application.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("fresh SQLite store creates structured tables and rolls back an orphan event", async () => {
   const root = await freshRoot("sqlite-fresh-");
   try {

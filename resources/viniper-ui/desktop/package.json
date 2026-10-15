@@ -1,24 +1,25 @@
 {
-  "name": "viniper-workstation-desktop",
-  "version": "1.8.3",
+  "name": "viniper-desktop",
+  "version": "2.0.0",
   "private": true,
-  "description": "Isolated Viniper workstation desktop shell.",
+  "description": "Viniper — focused local Agent workspace",
   "main": "main.js",
   "viniperProfile": "preview",
   "author": "Viniper",
   "license": "MIT",
   "scripts": {
-    "check": "node --check main.js && node --check profile-owner.js && node --check preload.js",
+    "check": "node --check main.js && node --check profile-owner.js && node --check preload.js && node --check platform-runtime.js",
+    "test:platform": "node --test platform-runtime.test.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder"
   },
   "devDependencies": {
-    "electron": "42.3.3",
-    "electron-builder": "26.0.12"
+    "electron": "42.11.8",
+    "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "com.viniper.workstation.preview",
-    "productName": "Viniper workstation",
+    "productName": "Viniper",
     "asar": true,
     "directories": {
       "output": "release"
@@ -26,6 +27,7 @@
     "files": [
       "main.js",
       "profile-owner.js",
+      "platform-runtime.js",
       "preload.js",
       "package.json",
       "build/**/*"
@@ -43,22 +45,21 @@
           "harness_runtime_bridge.js",
           "harness_usage_projection.js",
           "harness_provider_boundary.js",
-          "agent_host_bridge.py",
           "agent_instructions.py",
+          "goal_service.py",
+          "schedule_host.py",
           "agent_queue.py",
           "agent_run_coordinator.py",
-          "agent_runtime.py",
           "context_lifecycle.py",
           "context_usage.py",
           "model-capabilities.json",
+          "model_catalog.py",
+          "local_agent_contract.py",
+          "local_request_guard.py",
           "daily_usage.py",
-          "native_peer.py",
-          "native_commands.py",
-          "native_stream_protocol.py",
           "native_project_browser.py",
           "update_manager.py",
           "skill_sync.py",
-          "wsl_runtime.py",
           "profiles.json",
           "requirements.txt",
           "VERSION",
@@ -81,6 +82,19 @@
       "icon": "../static/assets/viniper-harness-circuit-node.ico",
       "artifactName": "Viniper-workstation.${version}.${ext}",
       "signAndEditExecutable": true
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "identity": null,
+      "artifactName": "Viniper-${version}-mac-${arch}.${ext}"
     },
     "nsis": {
       "include": "build/installer.nsh",

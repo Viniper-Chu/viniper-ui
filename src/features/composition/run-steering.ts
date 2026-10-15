@@ -46,6 +46,10 @@ export class RunSteeringService {
     });
   }
 
+  hasPending(runId: string): boolean {
+    return Boolean(this.pendingByRun.get(runId)?.length);
+  }
+
   clear(runId: string): SteeringReceipt[] {
     const ids = this.pendingByRun.get(runId) ?? [];
     this.pendingByRun.delete(runId);

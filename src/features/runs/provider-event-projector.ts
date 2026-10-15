@@ -22,6 +22,18 @@ export async function projectProviderEvent(
   context: ProviderProjectionContext,
 ): Promise<void> {
   switch (providerEvent.kind) {
+    case "provider.request.started":
+      await context.emit("provider.request.started", providerEvent);
+      break;
+    case "provider.activity":
+      await context.emit("provider.activity", { phase: providerEvent.phase, receivedCharacters: providerEvent.receivedCharacters });
+      break;
+    case "context.budget":
+      await context.emit("context.budget", providerEvent);
+      break;
+    case "context.compacted":
+      await context.emit("context.compacted", providerEvent);
+      break;
     case "thinking.started":
       if (context.session.activities.some((activity) => activity.id === context.thinkingActivityId)) break;
       await context.emit("thinking.started", {

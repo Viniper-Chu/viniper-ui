@@ -1,12 +1,12 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { AgentRuntime } from "../../src/features/runs/agent-runtime";
+import { AgentRuntime, AgentRuntimeOptions } from "../../src/features/runs/agent-runtime";
 import { ProviderRegistry } from "../../src/features/providers/provider-registry";
 import { FileStore } from "../../src/platform/persistence/file-store";
 import { TokenLedger } from "../../src/features/telemetry/token-ledger";
 import { ToolRegistry } from "../../src/features/tools/tool-registry";
 
-export async function createRuntimeFixture(): Promise<{
+export async function createRuntimeFixture(overrides: Partial<AgentRuntimeOptions> = {}): Promise<{
   runtime: AgentRuntime;
   telemetry: TokenLedger;
   store: FileStore;
@@ -21,10 +21,11 @@ export async function createRuntimeFixture(): Promise<{
   await tokenLedger.initialize();
   const runtime = new AgentRuntime({
     persistence: store,
-    defaultWorkingDirectory: "D:\\Agent",
+    defaultWorkingDirectory: root,
     registry: new ProviderRegistry(20),
     toolRegistry: new ToolRegistry(),
     tokenLedger,
+    ...overrides,
   });
   await runtime.initialize();
   return {

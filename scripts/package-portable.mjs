@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { stageLegacyUi } from "./stage-legacy-ui.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const codexRoot = resolve(repositoryRoot, "..", "..", "codex");
+const codexRoot = resolve(repositoryRoot, "codex");
 const outputRoot = join(codexRoot, "工作输出", "viniper-workstation-implementation-20260817", "packages", "portable");
 const residueRoot = join(codexRoot, "运行残留");
 const stageRoot = join(residueRoot, "viniper-workstation-portable-stage");

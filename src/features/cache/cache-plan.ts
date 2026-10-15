@@ -2,6 +2,7 @@ import { CachePlan, CacheSegment, ContextProfile } from "../../core/contracts";
 import { LoadedSkill } from "../../core/extension-contracts";
 import { ProviderHistoryEntry, ProviderToolDefinition } from "../../core/provider-contracts";
 import { IDENTITY_SYSTEM_DIRECTIVE } from "../instructions/identity-contract";
+import { TASK_WORKFLOW_DIRECTIVE } from "../instructions/task-workflow";
 
 export interface ContextProfileInput {
   generation?: number;
@@ -11,6 +12,7 @@ export interface ContextProfileInput {
   enabledSkills?: LoadedSkill[];
   history?: ProviderHistoryEntry[];
   projectInstructions?: string;
+  taskWorkflow?: boolean;
 }
 
 export function buildContextProfile(input: ContextProfileInput = {}): ContextProfile {
@@ -27,6 +29,7 @@ export function buildContextProfile(input: ContextProfileInput = {}): ContextPro
       text: [
         "Viniper workstation：清楚回复，并以 canonical 会话状态作为唯一真源。",
         IDENTITY_SYSTEM_DIRECTIVE,
+        ...(input.taskWorkflow === false ? [] : [TASK_WORKFLOW_DIRECTIVE]),
       ].join("\n"),
     },
     {

@@ -78,6 +78,7 @@ import type { FrozenRunContext } from "../../core/composition-contracts";
 import { engineScopedId, engineScopeOf } from "../../core/engine-identity";
 import { runtimeErrorEnvelope } from "../../core/runtime-error-contracts";
 import { ClaudeCodeEngineAdapter, ViniperEngineAdapter } from "../agent-engines/engine-adapters";
+import { relevantFileTools, toolsForCurrentTurn } from "./current-turn-tools";
 
 export interface SendResult {
   accepted: boolean;
@@ -93,6 +94,7 @@ interface RunControl {
   controller: AbortController;
   origin: IntentOrigin;
   text: string;
+  userText?: string;
   status: RunStatus;
   createdAt: number;
   recovery?: boolean;
@@ -106,6 +108,7 @@ interface RunControl {
   providerAttempt?: import("../../core/provider-runtime-contracts").ProviderAttemptSnapshot;
   frozenContext?: FrozenRunContext;
   memoryEnabled?: boolean;
+  planning?: boolean;
 }
 
 export interface RunSkillLoader {
@@ -556,6 +559,14 @@ export class AgentRuntime {
     return true;
   }
 
+  async setReasoning(sessionId: string, reasoning = "medium"): Promise<boolean> {
+    const session = this.catalog.get(sessionId);
+    if (!session || this.hasSessionRuns(sessionId) || sessionAgentEngine(session.engineId) !== "viniper") return false;
+    if (reasoning !== undefined && !["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(reasoning)) return false;
+    await this.record(session, "session.updated", { reasoning });
+    return true;
+  }
+
   async setProviderModel(sessionId: string, providerId: string, selectedModel: string): Promise<boolean> {
     const session = this.catalog.get(sessionId);
     if (!session || this.hasSessionRuns(sessionId)) return false;
@@ -687,6 +698,8 @@ export class AgentRuntime {
         reviewPolicy: intent.reviewPolicy,
         commitRequested: intent.commitRequested,
         memoryEnabled: intent.memoryEnabled,
+        planning: intent.planning,
+        userText: intent.userText,
       });
       await this.record(session, "queue.updated", { queue });
       return { accepted: true, queued: true };
@@ -708,6 +721,8 @@ export class AgentRuntime {
       commitRequested: intent.commitRequested,
       routingRequest: intent.routing,
       memoryEnabled: intent.memoryEnabled,
+      planning: intent.planning,
+      userText: intent.userText,
     };
     this.registerRun(session, control);
     const queued = await this.startOrQueueRun(session, control);
@@ -736,6 +751,19 @@ export class AgentRuntime {
     }
     await this.persistChain;
     if (firstFailure !== undefined) throw firstFailure;
+  }
+
+  async flushRunPersistence(runId: string): Promise<void> {
+    // A completed native conversation must not wait for another session's
+    // permission card or provider. Global flush remains the shutdown barrier.
+    const task = this.runTasks.get(runId);
+    if (!task && !this.runSnapshots.has(runId)) throw new Error("Unknown Harness run persistence barrier");
+    try {
+      if (task) await task;
+      await this.persistChain;
+    } finally {
+      if (task && this.runTasks.get(runId) === task) this.runTasks.delete(runId);
+    }
   }
 
   private launchRun(
@@ -857,6 +885,9 @@ export class AgentRuntime {
         if (preparation.status === "blocked") throw new Error(preparation.reason ?? "工作区准备失败。");
       }
       const projectInstructions = await this.loadProjectInstructions(session, workspaceRoot);
+      const localPolicy = engineId === "viniper"
+        ? this.registry.get(control.providerSnapshot!.providerId).runtimePolicyFor?.(control.providerSnapshot!.modelId)
+        : undefined;
       if (projectInstructions.status.status === "error") {
         throw new Error(projectInstructions.status.message);
       }
@@ -865,7 +896,7 @@ export class AgentRuntime {
         sessionScope: session.projectAccess?.enabled === true ? "project" : "all",
       });
       // Generic Viniper requests receive absolute-path file tools and the
-      // unscoped PowerShell terminal. Project/git/workspace/review tools remain
+      // native platform terminal. Project/git/workspace/review tools remain
       // project-owned and are advertised only after a project is selected.
       const registeredToolDefinitions = engineId === "viniper"
         ? stableContextTools(
@@ -875,13 +906,20 @@ export class AgentRuntime {
             || tool.name.startsWith("terminal.")),
         )
         : [];
-      const toolDefinitions = compositionPlan.enabled.some((item) => item.id === "code-mode.worker")
+      const availableTools = compositionPlan.enabled.some((item) => item.id === "code-mode.worker")
         ? registeredToolDefinitions
         : registeredToolDefinitions.filter((tool) => tool.name !== "run_code");
+      // A follow-up can refer to an earlier document without repeating its
+      // filename. Keep its specialized tools for the retained conversation;
+      // explicit restrictions still come only from the current user turn.
+      const fileContext = session.providerHistory.filter((entry) => entry.role === "user")
+        .flatMap((entry) => entry.items.filter((item) => item.type === "text").map((item) => item.text)).join("\n");
+      const turnTools = control.planning ? availableTools.filter((tool) => tool.readOnly) : availableTools;
+      const toolDefinitions = engineId === "viniper" ? toolsForCurrentTurn(control.userText ?? text, relevantFileTools(`${text}\n${fileContext}`, turnTools, localPolicy?.visionEnabled)) : [];
       const enabledSkills = engineId === "viniper"
         ? stableContextSkills(await (this.options.skillLoader?.loadForRun(session.id) ?? Promise.resolve([])))
         : [];
-      await this.options.compactionService?.maybeCompact({
+      if (!localPolicy) await this.options.compactionService?.maybeCompact({
         sessionId: session.id,
         providerId: control.providerSnapshot!.providerId,
         modelId: control.providerSnapshot!.modelId,
@@ -908,7 +946,8 @@ export class AgentRuntime {
         tools: toolDefinitions,
         enabledSkills,
         history: contextHistory,
-        projectInstructions: `${projectInstructions.text ?? ""}${memoryText}`,
+        projectInstructions: `${projectInstructions.text ?? ""}${memoryText}${control.planning ? "\n\n本轮为规划模式：只读调研，给出可执行的方案、取舍和验证方法。不得修改文件、运行有副作用命令或启动其他执行任务。完成方案后等待用户选择开始实施。" : ""}`,
+        taskWorkflow: engineId === "viniper",
       });
       const cachePlan = buildCachePlan(text, contextProfile);
       control.providerSnapshot = {
@@ -942,7 +981,10 @@ export class AgentRuntime {
             ? "loaded"
             : "not-configured",
           text: projectInstructions.text,
-          source: projectInstructions.status.canonicalPath,
+          // Canonical provenance stays in the local instruction status. This
+          // frozen context also reaches Provider/review adapters and should
+          // identify the instruction file without exporting a host path.
+          source: projectInstructions.status.canonicalPath ? "AGENTS.md" : undefined,
         },
         permission: { mode: session.permissionMode },
         review: { policy: controls.reviewPolicy ?? "off" },
@@ -978,7 +1020,7 @@ export class AgentRuntime {
         await this.record(session, "provider.history.appended", { entries: [userHistoryEntry], runId: effectiveRunId });
       }
 
-      const thinkingActivityId = engineScopedId(engineId, "item", newId("thinking"));
+      let thinkingActivityId = engineScopedId(engineId, "item", newId("thinking"));
       const provider = engineId === "claude-code"
         ? this.claudeCodeEngineAdapter
         : this.registry.get(control.providerSnapshot!.providerId);
@@ -987,12 +1029,15 @@ export class AgentRuntime {
       providerRequest = {
         engineId,
         sessionId: session.id,
-        workingDirectory: workspaceRoot ?? session.workingDirectory,
+        // The native Claude adapter needs a local cwd; cloud Providers do
+        // not. Project tools retain their separately authorized root.
+        ...(engineId === "claude-code" ? { workingDirectory: workspaceRoot ?? session.workingDirectory } : {}),
         runId: effectiveRunId,
         profileId: control.providerSnapshot!.profileId,
         selectedModel: control.providerSnapshot!.modelId,
         permissionMode: session.permissionMode,
         reasoning: control.providerSnapshot!.reasoning,
+        currentUserText: control.userText ?? text,
         history: this.options.compactionService?.projectHistory(session.id, session.providerHistory, control.providerSnapshot!.providerId, control.providerSnapshot!.modelId) ?? session.providerHistory,
         tools: engineId === "viniper" ? toolDefinitions : [],
         cachePlan,
@@ -1052,6 +1097,7 @@ export class AgentRuntime {
         request: providerRequest,
         toolRegistry: this.toolRegistry,
         projectRoot: workspaceRoot,
+        taskDirectory: workspaceRoot ?? session.workingDirectory,
         authorizationProjectRoot: session.projectAccess?.enabled ? session.workingDirectory : undefined,
         workspaceId,
         commitRequested: controls.commitRequested,
@@ -1071,12 +1117,12 @@ export class AgentRuntime {
         resourceCoordinator: this.resourceCoordinator,
         artifactService: this.options.artifactService,
         runId: effectiveRunId,
-        // The budget is created per run and reserved by the tool loop before
-        // provider.stream starts. Hosts may narrow an isolated acceptance run
-        // without weakening the production review default of six.
+        // Local deployment limits come from its host-owned contract. Explicit
+        // acceptance overrides still take precedence; cloud defaults stay bounded.
+        ...(localPolicy ? { maxRounds: localPolicy.maxIterations, noProgressLimit: 3, trackReads: true } : {}),
         maxProviderRequests: resolveProviderRequestLimit(
           session.permissionMode,
-          this.options.providerRequestLimits,
+          { ...(localPolicy ? { review: localPolicy.maxIterations, fullAccess: localPolicy.maxIterations } : {}), ...this.options.providerRequestLimits },
         ),
         ...(session.permissionMode === "review" ? {
           reviewPlan: buildReviewExecutionPlan(effectiveRunId),
@@ -1084,6 +1130,9 @@ export class AgentRuntime {
         signal: control.controller.signal,
         now: this.now,
         onProviderAttempt: async (attempt, budget) => {
+          // A tool continuation is a new reasoning phase. Reusing a completed
+          // activity makes the desktop's replay filter discard genuine deltas.
+          thinkingActivityId = engineScopedId(engineId, "item", newId("thinking"));
           control.providerAttempt = { attempt, maxAttempts: 5, status: "running" };
           this.updateRunSnapshot(control, "running");
           this.publish();
@@ -1202,17 +1251,35 @@ export class AgentRuntime {
         text: assistantText,
         createdAt: this.now(),
       }, effectiveRunId);
-      await this.recordRun(session, "run.completed", { runId: effectiveRunId }, effectiveRunId);
       if (this.catalog.getActiveSessionId() !== session.id) {
         await this.record(session, "session.updated", { unread: true });
       }
       if (engineId === "viniper" && this.options.memoryService && control.memoryEnabled !== false && assistantText.trim()) {
-        await this.options.memoryService.captureSession(
-          session.id,
-          session.projectAccess?.enabled ? session.workingDirectory : undefined,
-          assistantText.slice(0, 1_000),
-        );
+        try {
+          await this.options.memoryService.captureSession(
+            session.id,
+            session.projectAccess?.enabled ? session.workingDirectory : undefined,
+            assistantText.slice(0, 1_000),
+          );
+        } catch (error) {
+          // Automatic capture is a post-run convenience. Its storage failure
+          // must remain visible without stranding the completed run's slot or
+          // preventing already accepted user intents from leaving the queue.
+          await this.recordRun(session, "run.listener-failed", {
+            stage: "automatic-memory",
+            activity: {
+              id: engineScopedId(engineId, "item", newId("memory-error")),
+              engineId, sessionId: session.id, runId: effectiveRunId,
+              kind: "error", title: "自动记忆保存失败",
+              detail: error instanceof Error ? error.message : String(error),
+              status: "failed", createdAt: this.now(),
+            },
+          }, effectiveRunId);
+        }
       }
+      // Emit terminal completion only after automatic capture has reported
+      // success or its nonfatal warning to this run's existing subscribers.
+      await this.recordRun(session, "run.completed", { runId: effectiveRunId }, effectiveRunId);
     }
     await this.dispatchLifecycle(session, effectiveRunId, "run/completed", {
       status: cancelled ? "cancelled" : failed ? "failed" : "completed",
@@ -1261,10 +1328,12 @@ export class AgentRuntime {
         controller: new AbortController(),
         origin: next.origin ?? { kind: "user" },
         text: next.text,
+        userText: next.userText,
         status: "queued",
         createdAt: this.now(),
         workspaceMode: next.workspaceMode,
         memoryEnabled: next.memoryEnabled,
+        planning: next.planning,
         reviewPolicy: next.reviewPolicy,
         commitRequested: next.commitRequested,
       };

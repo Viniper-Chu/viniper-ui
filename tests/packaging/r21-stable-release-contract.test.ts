@@ -12,11 +12,11 @@ test("R21 Stable release has an explicit identity and preserves Preview rollback
   };
   const profiles = JSON.parse(await readFile(join(root, "resources", "viniper-ui", "profiles.json"), "utf8")) as Record<string, any>;
   const stable = profiles.stable;
-  assert.equal(packageJson.version, "1.8.3");
-  assert.match(packageJson.description, /Stable/u);
+  assert.equal(packageJson.version, "2.0.0");
+  assert.match(packageJson.description, /Viniper/u);
   assert.match(packageJson.scripts["package:windows-stable"], /package-windows-stable\.mjs/u);
   assert.equal(stable.app_id, "com.viniper.workstation");
-  assert.equal(stable.product_name, "Viniper workstation");
+  assert.equal(stable.product_name, "Viniper");
   assert.equal(stable.port, 17947);
   assert.equal(stable.data_dir_name, "Viniper workstation Preview");
   assert.match(stable.compatibility_read_boundary, /no copy, migration, clear, or overwrite/u);
@@ -47,14 +47,14 @@ test("R21 Stable packaging is a fresh native NSIS lane with a stable app marker"
   assert.match(desktop, /activeProfile: ACTIVE_PROFILE_NAME/u);
 });
 
-test("R21 public documents describe the dual-agent Stable boundary without user data", async () => {
+test("2.0 public documents describe the single-agent upgrade without user data", async () => {
   const root = process.cwd();
   const readme = await readFile(join(root, "README.md"), "utf8");
   const changelog = await readFile(join(root, "CHANGELOG.md"), "utf8");
   for (const document of [readme, changelog]) {
-    assert.match(document, /Viniper Harness/u);
-    assert.match(document, /Claude Code CLI/u);
-    assert.match(document, /Stable/u);
+    assert.match(document, /Harness Runtime|Harness/u);
+    assert.match(document, /Claude Code/u);
+
     assert.doesNotMatch(document, /(?:sk-|gh[pousr]_|Bearer\s+[A-Za-z0-9._-]{12,})/iu);
     assert.doesNotMatch(document, /sessions\.json|harness\.sqlite|secrets\.enc/u);
   }

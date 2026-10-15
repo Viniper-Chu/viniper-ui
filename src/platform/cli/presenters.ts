@@ -35,7 +35,7 @@ export class ChineseTtyPresenter implements CliPresenter {
     }
       switch (event.type) {
       case "ready":
-        this.line(`${this.paint("cyan", "Viniper workstation CLI 已就绪")}。输入 /help 查看命令。`);
+        this.line(`${this.paint("cyan", "Viniper CLI 已就绪")}。输入 /help 查看命令。`);
         break;
       case "help":
         this.help(data);
@@ -286,7 +286,7 @@ export class ChineseTtyPresenter implements CliPresenter {
   }
 
   private help(data: Readonly<Record<string, unknown>>): void {
-    this.line(this.paint("cyan", "Viniper workstation CLI"));
+    this.line(this.paint("cyan", "Viniper CLI"));
     this.line("  人类模式：npm run cli --");
     this.line("  纯文本模式：npm run --silent cli -- run --prompt \"整理当前任务\" --plain");
     this.line("  机器 JSONL：npm run --silent cli -- run --prompt \"整理当前任务\" --jsonl（兼容 --json）");

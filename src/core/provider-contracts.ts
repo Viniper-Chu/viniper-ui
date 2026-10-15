@@ -139,6 +139,7 @@ export interface ProviderToolCallItem {
   name: string;
   arguments: Record<string, unknown>;
   argumentsText: string;
+  argumentsError?: "output-limit" | "invalid-json";
   protocolItemId?: string;
 }
 
@@ -148,6 +149,7 @@ export interface ProviderToolResultItem {
   name: string;
   content: string;
   isError: boolean;
+  providerUsage?: TokenUsage;
 }
 
 export interface ProviderContinuationItem {
@@ -202,6 +204,7 @@ export interface ProviderRequest {
   selectedModel: string;
   permissionMode: PermissionMode;
   history: ProviderHistoryEntry[];
+  currentUserText?: string;
   tools: ProviderToolDefinition[];
   cachePlan: CachePlan;
   contextProfile: ContextProfile;
@@ -210,7 +213,21 @@ export interface ProviderRequest {
   frozenRunContext?: FrozenRunContext;
 }
 
+export interface LocalContextReduction {
+  inputBefore: number;
+  inputAfter: number;
+  outputReserved: number;
+  historyTurns: number;
+  toolResults: number;
+}
+
+export type ProviderActivityEvent = Extract<ProviderEvent, { kind: "provider.request.started" | "provider.activity" }>;
+
 export type ProviderEvent =
+  | { kind: "provider.request.started"; phase: "local-prefill" | "local-image"; timeoutSeconds: number; inputCount: number }
+  | { kind: "provider.activity"; phase: "tool-input" | "image-output"; receivedCharacters: number }
+  | { kind: "context.budget"; inputCount: number; windowSize: number; outputReserved: number }
+  | ({ kind: "context.compacted" } & LocalContextReduction)
   | { kind: "thinking.started" }
   | { kind: "thinking.completed" }
   | { kind: "text.delta"; text: string }

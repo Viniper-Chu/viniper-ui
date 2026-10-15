@@ -12,7 +12,7 @@
   },
   "preview": {
     "app_id": "com.viniper.workstation.preview",
-    "product_name": "Viniper workstation",
+    "product_name": "Viniper",
     "port": 17947,
     "data_dir_name": "Viniper workstation Preview",
     "install_dir": "D:\\Viniper workstation\\codex\\工作输出\\viniper-native-workstation-rebase-20260817\\candidate\\Viniper workstation Preview",
@@ -23,7 +23,7 @@
   },
   "stable": {
     "app_id": "com.viniper.workstation",
-    "product_name": "Viniper workstation",
+    "product_name": "Viniper",
     "port": 17947,
     "data_dir_name": "Viniper workstation Preview",
     "install_dir": "%LOCALAPPDATA%\\Programs\\Viniper workstation",

@@ -37,7 +37,7 @@ test("v13 low-risk actions are icon-first while risky actions keep visible label
   assert.match(provider, /actionButton\([\s\S]*"test-connection"[\s\S]*icon: "refresh"[\s\S]*iconOnly: true/u);
   assert.match(extensions, /setActionButtonPresentation\(toggle,[\s\S]*icon: "power"[\s\S]*iconOnly: true/u);
   assert.match(scheduler, /actionButton\("立即运行"[\s\S]*icon: "play"[\s\S]*iconOnly: true/u);
-  assert.match(externalCli, /title Viniper workstation CLI/u);
+  assert.match(externalCli, /title Viniper CLI/u);
   assert.match(app, /runtimeArchivePreviewButton[\s\S]*setActionButtonPresentation[\s\S]*iconOnly: true/u);
   assert.match(app, /data-memory-toggle[\s\S]*setActionButtonPresentation[\s\S]*icon: "power"/u);
   assert.match(styles, /\.icon-action\s*\{[\s\S]*min-height: 36px[\s\S]*border-radius: 9px/u);

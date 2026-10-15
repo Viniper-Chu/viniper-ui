@@ -7,6 +7,14 @@ const net = require("net");
 const os = require("os");
 const path = require("path");
 const { selectPreviewProfile, statusMatchesProfile } = require("./profile-owner");
+const { desktopEnvironment, resolvePython, isLocalNavigation, isExternalNavigation, isTrustedRenderer, stopOwnedProcess } = require("./platform-runtime");
+const { createMacKeychainVault } = require("./mac-keychain-vault");
+const nativeCredentialVault = process.platform === "darwin" && app.isPackaged
+  && fs.existsSync(path.join(process.resourcesPath, "runtime", "bin", "viniper-keychain"))
+  ? createMacKeychainVault({ helperPath: path.join(process.resourcesPath, "runtime", "bin", "viniper-keychain"), applicationPath: process.execPath })
+  : null;
+
+Object.assign(process.env, desktopEnvironment({ resourcesPath: app.isPackaged ? process.resourcesPath : "" }));
 
 const APP_ROOT = app.isPackaged
   ? path.join(process.resourcesPath, "viniper-ui")
@@ -22,13 +30,13 @@ function readProfileConfig() {
 const PROFILE_CONFIG = readProfileConfig();
 const PREVIEW_PROFILE = PROFILE_CONFIG.preview || {
   app_id: "com.viniper.workstation.preview",
-  product_name: "Viniper workstation",
+  product_name: "Viniper",
   port: 17947,
   data_dir_name: "Viniper workstation Preview"
 };
 const STABLE_PROFILE = PROFILE_CONFIG.stable || {
   app_id: "com.viniper.workstation",
-  product_name: "Viniper workstation",
+  product_name: "Viniper",
   port: 17947,
   data_dir_name: "Viniper workstation Preview"
 };
@@ -68,12 +76,12 @@ let mainWindow = null;
 let splashWindow = null;
 let tray = null;
 let serverProcess = null;
+let serverStopPromise = null;
 let isQuitting = false;
 let isStarting = false;
 let stdioBroken = false;
 let alwaysOnTop = false;
 let trayBadgeCount = 0;
-let wslEnablePromise = null;
 let secretBroker = null;
 let secretBrokerToken = "";
 let hostMigrationToken = "";
@@ -82,6 +90,8 @@ let updateApplyPromise = null;
 let updateQuitRequested = false;
 let updateQuitReady = false;
 let updateQuitPromise = null;
+let quitReady = false;
+let quitPromise = null;
 
 const SECRET_REFS_BY_MODE = Object.freeze({
   viniper: "provider.deepseek",
@@ -253,7 +263,7 @@ async function createSplashWindow() {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: true
     }
   });
   splashWindow.setMenuBarVisibility(false);
@@ -341,7 +351,9 @@ function logServerChunk(level, chunk) {
 function workstationDataDir() {
   const configured = String(process.env.VINIPER_UI_DATA_DIR || "").trim();
   if (configured) return path.resolve(configured);
-  const dataDirName = ACTIVE_PROFILE.data_dir_name || "Viniper workstation Preview";
+  const dataDirName = process.platform === "darwin" && IS_STABLE
+    ? "Viniper workstation"
+    : ACTIVE_PROFILE.data_dir_name || "Viniper workstation Preview";
   if (process.platform === "win32") {
     return path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), dataDirName);
   }
@@ -369,40 +381,55 @@ function readEncryptedRecords(filePath) {
   }
 }
 
-async function decryptSafeValue(encoded) {
-  const encrypted = Buffer.from(encoded, "base64");
-  let decrypted;
-  if (typeof safeStorage.decryptStringAsync === "function") {
-    try {
-      decrypted = await safeStorage.decryptStringAsync(encrypted);
-    } catch {
-      decrypted = safeStorage.decryptString(encrypted);
+async function secureStorageAvailable() {
+  try {
+    if (nativeCredentialVault) return await nativeCredentialVault.available();
+    // On macOS the synchronous probe itself may wait for Keychain consent.
+    // A rejected async probe is a denial/unavailable store, not an invitation
+    // to prompt again on the main thread. Only older Electron lacks this API.
+    if (typeof safeStorage.isAsyncEncryptionAvailable === "function") {
+      return await safeStorage.isAsyncEncryptionAvailable();
     }
-  } else {
-    decrypted = safeStorage.decryptString(encrypted);
+    return safeStorage.isEncryptionAvailable();
+  } catch {
+    return false;
   }
-  return typeof decrypted === "string" ? decrypted : decrypted?.result;
+}
+
+async function decryptSafeValue(encoded) {
+  if (encoded.startsWith("vpk1:")) {
+    if (!nativeCredentialVault) throw new Error("native credential storage unavailable");
+    return nativeCredentialVault.decrypt(encoded);
+  }
+  const encrypted = Buffer.from(encoded, "base64");
+  if (typeof safeStorage.decryptStringAsync === "function") {
+    const decrypted = await safeStorage.decryptStringAsync(encrypted);
+    if (typeof decrypted?.result !== "string") throw new Error("secure storage decryption unavailable");
+    return decrypted.result;
+  }
+  return safeStorage.decryptString(encrypted);
 }
 
 async function encryptSafeValue(value) {
-  let encrypted;
-  if (typeof safeStorage.encryptStringAsync === "function") {
-    try {
-      encrypted = await safeStorage.encryptStringAsync(String(value));
-    } catch {
-      encrypted = safeStorage.encryptString(String(value));
-    }
-  } else {
-    encrypted = safeStorage.encryptString(String(value));
-  }
-  return Buffer.from(encrypted).toString("base64");
+  if (nativeCredentialVault) return nativeCredentialVault.encrypt(value);
+  const encrypted = typeof safeStorage.encryptStringAsync === "function"
+    ? await safeStorage.encryptStringAsync(String(value))
+    : safeStorage.encryptString(String(value));
+  if (!Buffer.isBuffer(encrypted) || !encrypted.length) throw new Error("secure storage encryption unavailable");
+  return encrypted.toString("base64");
 }
 
-async function migrateSecureVault() {
+async function migrateSecureVault(requestedRef) {
   const target = secureVaultPath();
   const source = legacySecureVaultPath();
   if (!fs.existsSync(source) || path.resolve(source) === path.resolve(target)) return;
-  if (!safeStorage.isEncryptionAvailable()) return;
+
+  const refs = requestedRef ? [requestedRef] : Object.values(SECRET_REFS_BY_MODE);
+  const targetRecords = readEncryptedRecords(target);
+  const sourceRecords = readEncryptedRecords(source);
+  const missingRefs = refs.filter((ref) => !targetRecords[ref] && typeof sourceRecords[ref] === "string" && sourceRecords[ref]);
+  if (!missingRefs.length) return;
+  if (!await secureStorageAvailable()) return;
 
   // Preserve a narrow encrypted source copy before inspecting target records;
   // an undecryptable target record must not suppress the recovery backup.
@@ -410,13 +437,8 @@ async function migrateSecureVault() {
   fs.mkdirSync(path.dirname(backup), { recursive: true });
   if (!fs.existsSync(backup)) fs.copyFileSync(source, backup);
 
-  const targetRecords = readEncryptedRecords(target);
-  const targetHasModeSecret = Object.values(SECRET_REFS_BY_MODE).some((ref) => Boolean(targetRecords[ref]));
-  if (targetHasModeSecret) return;
-
-  const sourceRecords = readEncryptedRecords(source);
   const selected = {};
-  for (const ref of Object.values(SECRET_REFS_BY_MODE)) {
+  for (const ref of missingRefs) {
     const encoded = sourceRecords[ref];
     if (typeof encoded !== "string" || !encoded) continue;
     try {
@@ -433,15 +455,32 @@ async function migrateSecureVault() {
   // Only create the workstation-owned vault after at least one record was
   // successfully decrypted and re-encrypted by this host.
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, JSON.stringify({ ...targetRecords, ...selected }, null, 2), "utf8");
+  // A provider save can finish while legacy decryption waits for consent.
+  // Preserve those newer records instead of replacing them with the migration.
+  fs.writeFileSync(target, JSON.stringify({ ...selected, ...readEncryptedRecords(target) }, null, 2), "utf8");
 }
 
 async function readSecureSecret(ref) {
-  if (!safeStorage.isEncryptionAvailable()) return null;
+  await migrateSecureVault(ref);
   const encoded = readEncryptedRecords(secureVaultPath())[ref];
   if (typeof encoded !== "string" || !encoded) return null;
+  // Querying macOS Keychain can display an authorization prompt after a
+  // local ad-hoc app update. An empty vault needs no Keychain access at all.
+  if (!await secureStorageAvailable()) return null;
   try {
     const value = await decryptSafeValue(encoded);
+    if (value && nativeCredentialVault && !encoded.startsWith("vpk1:")) {
+      // Migrate only a successfully decrypted record, without replacing a
+      // newer concurrent save or any other Agent's encrypted credentials.
+      try {
+        const migrated = await encryptSafeValue(value);
+        const records = readEncryptedRecords(secureVaultPath());
+        if (records[ref] === encoded) {
+          records[ref] = migrated;
+          fs.writeFileSync(secureVaultPath(), JSON.stringify(records, null, 2), { mode: 0o600 });
+        }
+      } catch { /* Keep the original encrypted record if migration fails. */ }
+    }
     return String(value || "") || null;
   } catch {
     return null;
@@ -457,16 +496,24 @@ async function writeSecureSecretRef(ref, value) {
   if (!Object.values(SECRET_REFS_BY_MODE).includes(ref)) {
     return { ok: false, configured: false, length: 0, reason: "unsupported secret ref" };
   }
-  if (!safeStorage.isEncryptionAvailable()) {
+  if (!await secureStorageAvailable()) {
     return { ok: false, configured: false, length: 0, reason: "secure storage unavailable" };
   }
   const target = secureVaultPath();
-  const records = readEncryptedRecords(target);
   const secret = String(value || "");
+  let encoded;
+  try {
+    if (secret) encoded = await encryptSafeValue(secret);
+  } catch {
+    return { ok: false, configured: false, length: 0, reason: "secure storage encryption unavailable" };
+  }
+  // Read after encryption: concurrent saves may update another Agent's
+  // record while this operation awaits Keychain authorization.
+  const records = readEncryptedRecords(target);
   if (!secret) {
     delete records[ref];
   } else {
-    records[ref] = await encryptSafeValue(secret);
+    records[ref] = encoded;
   }
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.writeFileSync(target, JSON.stringify(records, null, 2), "utf8");
@@ -474,18 +521,26 @@ async function writeSecureSecretRef(ref, value) {
 }
 
 async function writeSecureSecret(mode, value) {
-  if (!safeStorage.isEncryptionAvailable()) return { ok: false, configured: false, reason: "secure storage unavailable" };
-  await migrateSecureVault();
-  return writeSecureSecretRef(secretRefForMode(mode), value);
+  const ref = secretRefForMode(mode);
+  await migrateSecureVault(ref);
+  return writeSecureSecretRef(ref, value);
 }
 
 async function clearSecureSecret(mode) {
   return writeSecureSecret(mode, "");
 }
 
+function secureSecretMetadata(ref) {
+  const current = readEncryptedRecords(secureVaultPath())[ref];
+  const legacy = current ? null : readEncryptedRecords(legacySecureVaultPath())[ref];
+  const configured = typeof (current || legacy) === "string" && Boolean(current || legacy);
+  return { configured, access: configured ? (current ? "not-checked" : "migration-required") : "not-configured" };
+}
+
 async function startSecretBroker() {
   if (secretBroker) return secretBroker;
-  await migrateSecureVault();
+  // Starting the UI and reading configuration must not unlock any Provider's
+  // credentials. Only an explicit read/save accesses the operating-system vault.
   secretBrokerToken = crypto.randomBytes(32).toString("hex");
   hostMigrationToken = String(process.env.VINIPER_HOST_MIGRATION_TOKEN || "");
   hostMigrationConsumed = false;
@@ -506,12 +561,17 @@ async function startSecretBroker() {
     request.on("error", reject);
   });
   secretBroker = http.createServer(async (request, response) => {
+    try {
+    response.setHeader("Cache-Control", "no-store");
     const remote = String(request.socket.remoteAddress || "");
     const authorized = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
-    const requestUrl = new URL(request.url || "/", "http://127.0.0.1");
+    let requestUrl;
+    try { requestUrl = new URL(request.url || "/", "http://127.0.0.1"); }
+    catch { response.writeHead(400); response.end(); return; }
     const migrationHeader = String(request.headers["x-viniper-migration-token"] || "");
     const migrationRequest = requestUrl.pathname === "/secret/migrate" && migrationEnabled && migrationHeader === hostMigrationToken;
-    if (!authorized || (request.headers.authorization !== `Bearer ${secretBrokerToken}` && !migrationRequest)) {
+    if (!authorized || request.headers.origin || request.headers["sec-fetch-site"]
+      || (request.headers.authorization !== `Bearer ${secretBrokerToken}` && !migrationRequest)) {
       response.writeHead(404);
       response.end();
       return;
@@ -549,13 +609,12 @@ async function startSecretBroker() {
       response.end(JSON.stringify({ ok: Object.values(migrated).every((item) => item.transferred && item.configured), refs: migrated }));
       return;
     }
-    if (url.pathname === "/secret/status") {
-      const secret = await readSecureSecret(ref);
+    if (url.pathname === "/secret/status" && request.method === "GET") {
       response.setHeader("Content-Type", "application/json");
-      response.end(JSON.stringify({ ok: true, mode, ref, configured: Boolean(secret) }));
+      response.end(JSON.stringify({ ok: true, mode, ref, ...secureSecretMetadata(ref) }));
       return;
     }
-    if (url.pathname === "/secret/read") {
+    if (url.pathname === "/secret/read" && request.method === "GET") {
       const secret = await readSecureSecret(ref);
       response.setHeader("Content-Type", "application/json");
       response.end(JSON.stringify({ ok: true, configured: Boolean(secret), secret: secret || "" }));
@@ -563,9 +622,22 @@ async function startSecretBroker() {
     }
     response.writeHead(404);
     response.end();
+    } catch {
+      if (response.destroyed) return;
+      if (!response.headersSent) response.writeHead(500, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ ok: false, reason: "secure-storage-unavailable" }));
+    }
   });
   const listenPort = migrationEnabled ? Number(process.env.VINIPER_HOST_MIGRATION_PORT || 0) : 0;
-  await new Promise((resolve) => secretBroker.listen(listenPort, "127.0.0.1", resolve));
+  secretBroker.requestTimeout = 10000;
+  secretBroker.headersTimeout = 10000;
+  await new Promise((resolve, reject) => {
+    secretBroker.once("error", reject);
+    secretBroker.listen(listenPort, "127.0.0.1", () => {
+      secretBroker.removeListener("error", reject);
+      resolve();
+    });
+  });
   return secretBroker;
 }
 
@@ -576,6 +648,7 @@ async function closeSecretBroker() {
   hostMigrationToken = "";
   hostMigrationConsumed = false;
   if (!server) return;
+  server.closeAllConnections?.();
   await new Promise((resolve) => server.close(() => resolve()));
 }
 
@@ -658,14 +731,7 @@ function requestJson(urlPath, timeoutMs = SERVER_STATUS_PROBE_TIMEOUT_MS) {
 }
 
 function isTrustedUpdateSender(event) {
-  if (!mainWindow || mainWindow.isDestroyed() || event?.sender !== mainWindow.webContents) return false;
-  if (!event.senderFrame || event.senderFrame !== mainWindow.webContents.mainFrame) return false;
-  try {
-    const sender = new URL(event.senderFrame.url);
-    return !sender.username && !sender.password && sender.origin === new URL(localUrl()).origin;
-  } catch {
-    return false;
-  }
+  return isTrustedRenderer(event, mainWindow, localUrl());
 }
 
 function requestAppUpdateInstall() {
@@ -820,39 +886,22 @@ function findOpenPort(startPort) {
 }
 
 function findPython() {
-  const candidates = process.platform === "win32"
-    ? [
-        { command: "py", args: ["-3"] },
-        { command: "python", args: [] },
-        { command: "python3", args: [] }
-      ]
-    : [
-        { command: "python3", args: [] },
-        { command: "python", args: [] }
-      ];
-
-  for (const candidate of candidates) {
-    const probe = spawnSync(candidate.command, [...candidate.args, "-E", "-c", "import json, sys; print(json.dumps(sys.executable))"], {
-      windowsHide: true,
-      encoding: "utf8",
-      timeout: 10000,
-    });
-    if (probe.status !== 0) continue;
-    try {
-      const executable = JSON.parse(String(probe.stdout || "").trim());
-      if (typeof executable === "string" && path.isAbsolute(executable) && fs.statSync(executable).isFile()) {
-        // py.exe is a launcher, not the listening Python process. Owning the
-        // actual interpreter makes normal and update shutdown target one PID.
-        return { command: path.resolve(executable), args: [] };
-      }
-    } catch { /* Try the next configured interpreter without logging stdout. */ }
-  }
-  return null;
+  return resolvePython({ userData: app.getPath("userData"), environment: process.env, packaged: app.isPackaged });
 }
 
 function ensurePythonDependencies(python) {
   const requirements = path.join(APP_ROOT, "requirements.txt");
   if (!fs.existsSync(requirements)) return;
+
+  if (process.platform === "darwin") {
+    const check = spawnSync(python.command, ["-c", "import fastapi, uvicorn, httpx"], {
+      env: process.env, encoding: "utf8", timeout: 15000,
+    });
+    if (check.status !== 0) {
+      throw new Error("工作台的 Python 运行环境未安装完整。请在项目中运行 npm run install:macos，完成后重新打开应用。");
+    }
+    return;
+  }
 
   const marker = path.join(app.getPath("userData"), `deps-${BUNDLED_VERSION || "dev"}.ok`);
   if (fs.existsSync(marker)) return;
@@ -870,12 +919,16 @@ function ensurePythonDependencies(python) {
 }
 
 async function startServerProcess() {
+  if (isQuitting) return;
   const python = findPython();
   if (!python) {
-    throw new Error("Python 3 was not found. Install Python 3.10+ and try again.");
+    throw new Error(process.platform === "darwin"
+      ? "未找到工作台专属 Python 环境。请在项目中运行 npm run install:macos，再重新打开应用。"
+      : "Python 3 was not found. Install Python 3.10+ and try again.");
   }
   ensurePythonDependencies(python);
   const broker = await startSecretBroker();
+  if (isQuitting) return;
   const brokerAddress = broker.address();
 
   const script = path.join(APP_ROOT, "server.py");
@@ -902,12 +955,16 @@ async function startServerProcess() {
     cwd: APP_ROOT,
     env,
     windowsHide: true,
+    detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"]
   });
 
-  serverProcess.stdout.on("data", (chunk) => logServerChunk("log", chunk));
-  serverProcess.stderr.on("data", (chunk) => logServerChunk("error", chunk));
-  serverProcess.on("exit", (code) => {
+  const owned = serverProcess;
+  owned.stdout.on("data", (chunk) => logServerChunk("log", chunk));
+  owned.stderr.on("data", (chunk) => logServerChunk("error", chunk));
+  owned.on("error", (error) => safeMainLog("error", `[${DISPLAY_NAME}] ${error.message}`));
+  owned.on("exit", (code) => {
+    if (serverProcess !== owned) return;
     serverProcess = null;
     if (isQuitting) return;
     safeMainLog("log", `[${DISPLAY_NAME}] Server exited (code=${code}), restarting in 2s...`);
@@ -929,10 +986,11 @@ async function ensureServer() {
   const existingOwned = serverStatusIsOwned(existing);
   if (existingOwned && (!BUNDLED_VERSION || existing.version === BUNDLED_VERSION)) return true;
   if (existing) {
-    if (serverProcess) { serverProcess.kill(); serverProcess = null; }
+    await stopServerProcess();
     port = await findOpenPort(port + 1);
   }
-  if (serverProcess) { serverProcess.kill(); serverProcess = null; }
+  await stopServerProcess();
+  port = await findOpenPort(port);
   await startServerProcess();
   const started = await waitForOwnedServer(30000);
   return Boolean(started && (!BUNDLED_VERSION || started.version === BUNDLED_VERSION));
@@ -971,6 +1029,7 @@ async function createMainWindow() {
     show: false,
     autoHideMenuBar: true,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
+    trafficLightPosition: process.platform === "darwin" ? { x: 14, y: 17 } : undefined,
     titleBarOverlay: process.platform === "win32"
       ? { color: "#f5f3ee", symbolColor: "#302f2b", height: TITLEBAR_HEIGHT }
       : undefined,
@@ -978,20 +1037,20 @@ async function createMainWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: true
     }
   });
   applyWindowsTaskbarIdentity(mainWindow);
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith(localUrl())) return { action: "allow" };
-    shell.openExternal(url);
+    if (isLocalNavigation(url, localUrl())) return { action: "allow" };
+    if (isExternalNavigation(url)) void shell.openExternal(url);
     return { action: "deny" };
   });
   mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (!url.startsWith(localUrl())) {
+    if (!isLocalNavigation(url, localUrl())) {
       event.preventDefault();
-      shell.openExternal(url);
+      if (isExternalNavigation(url)) void shell.openExternal(url);
     }
   });
 
@@ -1023,6 +1082,7 @@ async function createMainWindow() {
       updateTrayMenu();
     }
   });
+  mainWindow.on("closed", () => { mainWindow = null; });
   mainWindow.on("focus", clearTrayBadge);
   mainWindow.on("show", clearTrayBadge);
 }
@@ -1041,21 +1101,37 @@ function showMainWindow() {
 }
 
 async function restartServer() {
-  if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
-  }
-  if (await waitForServer(1200)) {
+  if (isQuitting) return;
+  await stopServerProcess();
+  if (isQuitting) return;
+  const ready = await waitForServer(1200);
+  if (isQuitting) return;
+  if (ready) {
     if (mainWindow) mainWindow.reload();
     return;
   }
   try {
     await startServerProcess();
+    if (isQuitting) return;
     await waitForServer(30000);
-    if (mainWindow) mainWindow.loadURL(localUrl());
+    if (!isQuitting && mainWindow) mainWindow.loadURL(localUrl());
   } catch (error) {
     dialog.showErrorBox(`${DISPLAY_NAME} 重启失败`, error.message);
   }
+}
+
+function stopServerProcess() {
+  if (serverStopPromise) return serverStopPromise;
+  const owned = serverProcess;
+  if (!owned) return Promise.resolve();
+  serverProcess = null;
+  // Restart and quit can arrive together. Retain one completion barrier even
+  // after clearing the restartable process reference, until cleanup finishes.
+  serverStopPromise = Promise.resolve().then(() => stopOwnedProcess(owned)).catch((error) => {
+    if (!serverProcess) serverProcess = owned;
+    throw error;
+  }).finally(() => { serverStopPromise = null; });
+  return serverStopPromise;
 }
 
 async function runDiagnosticsDialog() {
@@ -1082,38 +1158,6 @@ function createTray() {
   tray.on("click", showMainWindow);
 }
 
-function enableWslPlatform() {
-  if (process.platform !== "win32") {
-    return Promise.resolve({ ok: false, status: "unsupported", message: "仅 Windows 需要启用 WSL2。" });
-  }
-  if (wslEnablePromise) return wslEnablePromise;
-
-  const command = [
-    "$ErrorActionPreference='Stop'",
-    "$wsl=Join-Path $env:SystemRoot 'System32\\wsl.exe'",
-    "$process=Start-Process -FilePath $wsl -ArgumentList @('--install','--no-distribution') -Verb RunAs -Wait -PassThru",
-    "exit [int]$process.ExitCode"
-  ].join("; ");
-  wslEnablePromise = new Promise((resolve) => {
-    const child = spawn(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
-      { stdio: "ignore", windowsHide: true }
-    );
-    child.once("error", () => resolve({
-      ok: false,
-      status: "failed",
-      message: "未能启动 Windows WSL 安装；可以稍后重试或打开诊断。"
-    }));
-    child.once("close", (code) => resolve(code === 0
-      ? { ok: true, status: "requested", message: "Windows 已接收 WSL 安装请求。" }
-      : { ok: false, status: "cancelled_or_failed", message: "WSL 安装未完成；可以稍后重试。" }));
-  }).finally(() => {
-    wslEnablePromise = null;
-  });
-  return wslEnablePromise;
-}
-
 function updateTrayMenu() {
   if (!tray) return;
   tray.setToolTip(trayBadgeCount > 0 ? `${DISPLAY_NAME} - ${trayBadgeCount} 条新回复` : DISPLAY_NAME);
@@ -1127,11 +1171,10 @@ function updateTrayMenu() {
         updateTrayMenu();
       }
     },
-    { label: "置顶工作台窗口", type: "checkbox", checked: alwaysOnTop, click: toggleAlwaysOnTop },
+    { label: "窗口置顶", type: "checkbox", checked: alwaysOnTop, click: toggleAlwaysOnTop },
     { label: "切换边栏", click: () => sendRendererCommand("toggle-sidebar") },
     { type: "separator" },
     { label: "设置", click: openSettingsWindow },
-    { label: "在浏览器打开", click: () => shell.openExternal(localUrl()) },
     { type: "separator" },
     { label: "运行自检", click: runDiagnosticsDialog },
     { label: "打开数据目录", click: () => shell.openPath(app.getPath("userData")) },
@@ -1149,6 +1192,22 @@ function updateTrayMenu() {
 
 function createApplicationMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
+    ...(process.platform === "darwin" ? [{
+      label: DISPLAY_NAME,
+      submenu: [
+        { role: "about", label: `关于 ${DISPLAY_NAME}` },
+        { type: "separator" },
+        { label: "设置…", accelerator: "Cmd+,", click: openSettingsWindow },
+        { type: "separator" },
+        { role: "services", label: "服务" },
+        { type: "separator" },
+        { role: "hide", label: `隐藏 ${DISPLAY_NAME}` },
+        { role: "hideOthers", label: "隐藏其他" },
+        { role: "unhide", label: "显示全部" },
+        { type: "separator" },
+        { role: "quit", label: `退出 ${DISPLAY_NAME}` },
+      ],
+    }] : []),
     {
       label: "文件",
       submenu: [
@@ -1156,9 +1215,8 @@ function createApplicationMenu() {
         { label: "添加附件", accelerator: "CmdOrCtrl+O", click: () => sendRendererCommand("attach-file") },
         { label: "选择目录", accelerator: "CmdOrCtrl+Shift+O", click: () => sendRendererCommand("change-workdir") },
         { type: "separator" },
-        { label: `在浏览器打开 ${DISPLAY_NAME}`, click: () => shell.openExternal(localUrl()) },
         { type: "separator" },
-        { role: "quit", label: "退出" }
+        ...(process.platform === "darwin" ? [{ role: "close", label: "关闭窗口" }] : [{ role: "quit", label: "退出" }])
       ]
     },
     {
@@ -1177,7 +1235,7 @@ function createApplicationMenu() {
       label: "查看",
       submenu: [
         { label: "显示/隐藏边栏", accelerator: "CmdOrCtrl+B", click: () => sendRendererCommand("toggle-sidebar") },
-        { label: "设置", accelerator: "CmdOrCtrl+,", click: openSettingsWindow },
+        ...(process.platform === "darwin" ? [] : [{ label: "设置", accelerator: "CmdOrCtrl+,", click: openSettingsWindow }]),
         { type: "separator" },
         { role: "reload", label: "刷新" },
         { role: "forceReload", label: "强制刷新" },
@@ -1193,26 +1251,42 @@ function createApplicationMenu() {
       submenu: [
         { role: "minimize", label: "最小化" },
         { role: "togglefullscreen", label: "全屏" },
-        { label: "置顶工作台窗口", type: "checkbox", checked: alwaysOnTop, click: toggleAlwaysOnTop },
+        { label: "窗口置顶", type: "checkbox", checked: alwaysOnTop, click: toggleAlwaysOnTop },
         { type: "separator" },
         { label: "显示主窗口", click: showMainWindow },
-        { label: "打开 settings", click: openSettingsWindow },
+        { label: "打开设置", click: openSettingsWindow },
       ]
     }
   ]));
 }
 
-ipcMain.handle("viniper:get-window-state", () => ({ alwaysOnTop }));
-ipcMain.handle("viniper:set-always-on-top", (_event, enabled) => setAlwaysOnTop(Boolean(enabled)));
-ipcMain.handle("viniper:toggle-always-on-top", () => toggleAlwaysOnTop());
-ipcMain.handle("viniper:set-titlebar-theme", (_event, theme) => setTitlebarTheme(theme));
-ipcMain.handle("viniper:enable-wsl-platform", () => enableWslPlatform());
+function trustedDesktopHandler(handler) {
+  return (event, ...args) => {
+    if (!isTrustedUpdateSender(event)) throw new Error("操作必须来自工作台主窗口。");
+    return handler(...args);
+  };
+}
+
+ipcMain.handle("viniper:choose-project", trustedDesktopHandler(async () => {
+  const result = await dialog.showOpenDialog(mainWindow, { title: "选择工作目录", properties: ["openDirectory", "createDirectory"] });
+  return result.canceled ? null : result.filePaths[0];
+}));
+ipcMain.handle("viniper:open-external", trustedDesktopHandler(async (url) => {
+  const parsed = new URL(String(url));
+  if (!["https:", "http:", "mailto:"].includes(parsed.protocol)) throw new Error("不支持的链接类型");
+  await shell.openExternal(parsed.toString());
+}));
+
+ipcMain.handle("viniper:get-window-state", trustedDesktopHandler(() => ({ alwaysOnTop })));
+ipcMain.handle("viniper:set-always-on-top", trustedDesktopHandler((enabled) => setAlwaysOnTop(Boolean(enabled))));
+ipcMain.handle("viniper:toggle-always-on-top", trustedDesktopHandler(() => toggleAlwaysOnTop()));
+ipcMain.handle("viniper:set-titlebar-theme", trustedDesktopHandler((theme) => setTitlebarTheme(theme)));
 ipcMain.handle("viniper:install-app-update", (event) => installAppUpdate(event));
-ipcMain.handle("viniper:save-provider-secret", (_event, payload = {}) =>
-  writeSecureSecret(payload.mode, payload.value));
-ipcMain.handle("viniper:clear-provider-secret", (_event, payload = {}) =>
-  clearSecureSecret(payload.mode));
-ipcMain.on("viniper:conversation-completed", markConversationCompleted);
+ipcMain.handle("viniper:save-provider-secret", trustedDesktopHandler((payload = {}) =>
+  writeSecureSecret(payload.mode, payload.value)));
+ipcMain.handle("viniper:clear-provider-secret", trustedDesktopHandler((payload = {}) =>
+  clearSecureSecret(payload.mode)));
+ipcMain.on("viniper:conversation-completed", (event) => { if (isTrustedUpdateSender(event)) markConversationCompleted(); });
 
 if (IS_WORKSTATION) {
   app.setPath("userData", workstationDataDir());
@@ -1227,9 +1301,20 @@ if (!app.requestSingleInstanceLock()) {
   app.setAppUserModelId(APP_USER_MODEL_ID);
   app.on("second-instance", showMainWindow);
   app.whenReady().then(async () => {
+    if (process.platform === "darwin") {
+      app.setAboutPanelOptions({ applicationName: DISPLAY_NAME, applicationVersion: BUNDLED_VERSION, copyright: "Viniper" });
+      // Use the bundle's macOS icon canvas. Replacing it with the edge-to-edge
+      // brand PNG makes the Dock icon visibly larger than neighbouring apps.
+      if (app.isPackaged) app.dock?.setIcon(path.join(process.resourcesPath, "Viniper-dock.png"));
+    }
     createApplicationMenu();
     createTray();
     await createMainWindow();
+  }).catch((error) => {
+    isStarting = false;
+    closeSplashWindow();
+    dialog.showErrorBox(`${DISPLAY_NAME} 启动失败`, error.message || String(error));
+    app.quit();
   });
 }
 
@@ -1242,9 +1327,21 @@ app.on("before-quit", (event) => {
     if (!updateQuitPromise) updateQuitPromise = finishUpdateQuit();
     return;
   }
-  if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
-  }
-  void closeSecretBroker();
+  if (quitReady) return;
+  event.preventDefault();
+  if (quitPromise) return;
+  quitPromise = (async () => {
+    try {
+      await stopServerProcess();
+      await closeSecretBroker();
+      tray?.destroy();
+      tray = null;
+      quitReady = true;
+      app.quit();
+    } catch (error) {
+      isQuitting = false;
+      quitPromise = null;
+      dialog.showErrorBox("暂时无法退出工作台", error.message || String(error));
+    }
+  })();
 });

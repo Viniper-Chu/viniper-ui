@@ -9,6 +9,7 @@ import {
   TerminalExecutionContext,
   TerminalExecutionStatus,
   TerminalOutputInput,
+  TerminalOutputHistory,
   TerminalOutputPreview,
   TerminalOutputResult,
   TerminalProcessHost,
@@ -20,6 +21,7 @@ import {
   TerminalInteractiveStartResult,
 } from "../../features/terminal/contracts";
 import { ArtifactFileRegistrar } from "../../core/ports";
+import { nativeShellArguments, nativeShellPath, terminatePosixProcessGroup } from "./process-shell";
 
 const DEFAULT_PREVIEW_BYTES = 4_096;
 const DEFAULT_OUTPUT_BYTES = 8_192;
@@ -80,7 +82,7 @@ export class WindowsProcessHost implements TerminalProcessHost {
   constructor(options: WindowsProcessHostOptions) {
     this.managedRoot = resolve(options.managedRoot);
     this.now = options.now ?? Date.now;
-    this.shellPath = options.shellPath ?? defaultPowerShellPath();
+    this.shellPath = options.shellPath ?? (process.platform === "win32" ? defaultPowerShellPath() : nativeShellPath());
     this.allowUnscoped = options.allowUnscoped === true;
     this.previewBytes = options.previewBytes ?? DEFAULT_PREVIEW_BYTES;
     this.artifactService = options.artifactService;
@@ -90,9 +92,6 @@ export class WindowsProcessHost implements TerminalProcessHost {
     const startedAt = this.now();
     const input = request.input;
     const fallbackCwd = input.cwd?.trim() || ".";
-    if (process.platform !== "win32") {
-      return failure(request, fallbackCwd, startedAt, "PROCESS_START_FAILED", "P3 当前仅在 Windows 原生进程主平台实现；macOS 仍为 UNPROVEN。");
-    }
     if (!context.projectRoot && !this.allowUnscoped) {
       return failure(request, fallbackCwd, startedAt, "PROJECT_NOT_ENABLED", "本次运行没有显式打开项目；terminal.run 未执行。");
     }
@@ -138,16 +137,17 @@ export class WindowsProcessHost implements TerminalProcessHost {
       return resultFromRecord(request, workingDirectory.relativePath, startedAt, record, stdoutCapture, stderrCapture, null);
     }
 
-    const child = spawn(this.shellPath, [
+    const child = spawn(this.shellPath, process.platform === "win32" ? [
       "-NoLogo",
       "-NoProfile",
       "-NonInteractive",
       "-Command",
       powerShellScript(input.command, statusPath, processIdentityPath),
-    ], {
+    ] : nativeShellArguments(input.command), {
       cwd: workingDirectory.absolutePath,
       env: safeProcessEnvironment(),
       windowsHide: true,
+      detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -223,7 +223,7 @@ export class WindowsProcessHost implements TerminalProcessHost {
     }
 
     const statusMarker = await readOptionalText(statusPath);
-    record.status = statusMarker === "command-not-found"
+    record.status = statusMarker === "command-not-found" || (process.platform !== "win32" && close.code === 127)
       ? "not-found"
       : close.code === 0
         ? "completed"
@@ -235,13 +235,28 @@ export class WindowsProcessHost implements TerminalProcessHost {
     return this.readOutput(input, (record) => record.sessionId === context.sessionId && record.runId === context.runId);
   }
 
-  async outputForSession(input: TerminalOutputInput, sessionId: string): Promise<TerminalOutputResult> {
+  async outputForSession(input: TerminalOutputInput, sessionId: string, history?: TerminalOutputHistory): Promise<TerminalOutputResult> {
+    // The application supplies ownership from its canonical session history.
+    // Recover only that exact managed execution after the process has restarted.
+    if (!this.records.has(input.executionId) && history) {
+      assertInternalId(history.runId, "runId");
+      assertInternalId(input.executionId, "executionId");
+      const directory = join(this.managedRoot, history.runId, input.executionId);
+      const stdoutPath = join(directory, "stdout.log"), stderrPath = join(directory, "stderr.log");
+      try {
+        const [stdout, stderr] = await Promise.all([stat(stdoutPath), stat(stderrPath)]);
+        this.records.set(input.executionId, { executionId: input.executionId, sessionId, runId: history.runId,
+          stdoutPath, stderrPath, stdoutBytes: stdout.size, stderrBytes: stderr.size,
+          processIdentityPath: join(directory, "process-identity.json"), status: history.status === "running" ? "failed" : history.status });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
     return this.readOutput(input, (record) => record.sessionId === sessionId);
   }
 
   async startInteractive(request: TerminalProcessRequest, context: TerminalExecutionContext): Promise<TerminalInteractiveStartResult> {
     const startedAt = this.now();
-    if (process.platform !== "win32") throw new Error("PROCESS_START_FAILED: interactive PowerShell is Windows-only");
     if (this.interactive.has(request.executionId) || this.active.has(request.executionId)) throw new Error("PROCESS_ALREADY_RUNNING");
     if (!context.projectRoot && !this.allowUnscoped) throw new Error("PROJECT_NOT_ENABLED");
     assertInternalId(context.runId, "runId");
@@ -272,13 +287,14 @@ export class WindowsProcessHost implements TerminalProcessHost {
       status: "running",
     };
     this.records.set(request.executionId, record);
-    const child = spawn(this.shellPath, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"], {
+    const child = spawn(this.shellPath, process.platform === "win32" ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"] : nativeShellArguments(), {
       cwd: workingDirectory.absolutePath,
       env: {
         ...safeProcessEnvironment(),
         VINIPER_PROCESS_IDENTITY_PATH: processIdentityPath,
       },
       windowsHide: true,
+      detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -335,7 +351,7 @@ export class WindowsProcessHost implements TerminalProcessHost {
       return resultFromRecord(request, workingDirectory.relativePath, startedAt, record, stdoutCapture, stderrCapture, close.code);
     })();
     this.interactive.set(request.executionId, state);
-    child.stdin.write(interactiveIdentityPrelude());
+    if (process.platform === "win32") child.stdin.write(interactiveIdentityPrelude());
     return { executionId: request.executionId, status: "running", transport: "pipes" };
   }
 
@@ -424,6 +440,7 @@ export class WindowsProcessHost implements TerminalProcessHost {
   }
 
   private async terminateOwnedProcessTree(rootProcessId: number): Promise<void> {
+    if (process.platform !== "win32") return terminatePosixProcessGroup(rootProcessId);
     // Use the native bounded tree terminator first. Starting a fresh
     // PowerShell host for every timeout can take several seconds while the
     // Windows Apps shim initialises, turning a short run timeout into a
@@ -654,6 +671,7 @@ function interactiveIdentityPrelude(): string {
 
 function safeProcessEnvironment(): NodeJS.ProcessEnv {
   const allowed = new Set([
+    "HOME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME",
     "ALLUSERSPROFILE",
     "APPDATA",
     "COMSPEC",

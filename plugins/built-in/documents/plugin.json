@@ -1,0 +1,20 @@
+{
+  "manifestVersion": 1,
+  "id": "built-in.documents",
+  "name": "文档与数据",
+  "version": "2.0.0",
+  "capabilities": [
+    "documents",
+    "data"
+  ],
+  "skills": [],
+  "tools": [
+    "file.docx.inspect",
+    "file.docx.replace",
+    "file.docx.edit",
+    "file.sqlite.inspect",
+    "file.sqlite.query",
+    "file.sqlite.apply"
+  ],
+  "providers": []
+}

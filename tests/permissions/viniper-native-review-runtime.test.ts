@@ -27,6 +27,7 @@ class ReviewProjectProvider implements ModelProvider {
     this.requests.push(structuredClone(request));
     const hasToolResult = request.history.some((entry) => entry.items.some((item) => item.type === "tool-result"));
     if (!hasToolResult) {
+      const printCommand = process.platform === "win32" ? "Write-Output 'VINIPER_REVIEW_SAFE_TERMINAL_OK'" : "printf VINIPER_REVIEW_SAFE_TERMINAL_OK";
       yield {
         kind: "tool-call.completed",
         call: {
@@ -43,8 +44,8 @@ class ReviewProjectProvider implements ModelProvider {
           type: "tool-call",
           callId: "review-safe-terminal",
           name: "terminal.run",
-          arguments: { command: "Write-Output 'VINIPER_REVIEW_SAFE_TERMINAL_OK'", purpose: "test", timeoutMs: 8_000 },
-          argumentsText: JSON.stringify({ command: "Write-Output 'VINIPER_REVIEW_SAFE_TERMINAL_OK'", purpose: "test", timeoutMs: 8_000 }),
+          arguments: { command: printCommand, purpose: "test", timeoutMs: 8_000 },
+          argumentsText: JSON.stringify({ command: printCommand, purpose: "test", timeoutMs: 8_000 }),
         },
       };
       yield {
@@ -54,7 +55,7 @@ class ReviewProjectProvider implements ModelProvider {
           callId: "review-risky-terminal",
           name: "terminal.run",
           arguments: {
-            command: `Set-Content -LiteralPath '${this.blockedComputerPath.replace(/'/gu, "''")}' -Value 'MUST_NOT_EXIST'`,
+            command: process.platform === "win32" ? `Set-Content -LiteralPath '${this.blockedComputerPath.replace(/'/gu, "''")}' -Value 'MUST_NOT_EXIST'` : `printf MUST_NOT_EXIST > '${this.blockedComputerPath.replaceAll("'", "'\\''")}'`,
             purpose: "command",
             timeoutMs: 8_000,
           },

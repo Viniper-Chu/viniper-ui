@@ -8,7 +8,7 @@ import concurrent.futures, json, os, sys, tempfile, threading, uuid
 from pathlib import Path
 
 root = Path(sys.argv[1])
-task = root.parents[1] / 'codex' / '工作输出' / 'viniper-agent-usability-r28-20260905'
+task = root / 'codex' / '工作输出' / 'viniper-agent-usability-r28-20260905'
 task.mkdir(parents=True, exist_ok=True)
 data_root = Path(tempfile.mkdtemp(prefix='host-long-', dir=task))
 sys.dont_write_bytecode = True

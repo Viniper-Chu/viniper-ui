@@ -14,7 +14,7 @@ export interface ExternalCliWindowResult {
 
 export function buildExternalCliCommand(input: ExternalCliWindowInput): string {
   return [
-    "title Viniper workstation CLI",
+    "title Viniper CLI",
     "color 0B",
     'set "ELECTRON_RUN_AS_NODE=1"',
     `${quote(input.executable)} ${quote(input.cliEntry)} --data-root ${quote(input.dataRoot)} --project ${quote(input.projectRoot)}`,
@@ -33,7 +33,7 @@ export function openExternalCliWindow(input: ExternalCliWindowInput): ExternalCl
       windowsHide: false,
     });
     child.unref();
-    return { status: "opened", message: "Viniper workstation CLI 已在独立命令行窗口打开。" };
+    return { status: "opened", message: "Viniper CLI 已在独立命令行窗口打开。" };
   } catch (error) {
     return { status: "failed", message: `独立 CLI 未能启动：${error instanceof Error ? error.message : String(error)}` };
   }

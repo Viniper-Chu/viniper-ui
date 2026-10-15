@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, extname, isAbsolute, resolve } from "node:path";
 import { ToolRequest } from "../../core/contracts";
 import { ToolExecutionContext, ToolExecutor, ToolResult } from "../tools/tool-registry";
 import { FileOpener } from "./contracts";
@@ -74,11 +74,17 @@ abstract class GenericFileToolBase {
 
 class GenericFileReadTool extends GenericFileToolBase implements ToolExecutor {
   readonly name = "file.read";
-  readonly description = "读取指定绝对路径的 UTF-8 文本文件。";
+  readonly description = "读取绝对路径的 UTF-8 文本。局部修改用 startLine/lineCount 只读相关行；截断时用 nextOffset 作为 offset 续读。SQLite 数据库用 file.sqlite.inspect/query，DOCX 用 file.docx.inspect；本工具不能解析二进制文档。";
   readonly readOnly = true;
   readonly inputSchema = {
     type: "object" as const,
-    properties: { path: { type: "string" as const }, maxChars: { type: "number" as const } },
+    properties: {
+      path: { type: "string" as const },
+      startLine: { type: "number" as const, minimum: 1, description: "从第几行开始，正整数，默认 1。" },
+      lineCount: { type: "number" as const, minimum: 1, description: "本次需要的行数，正整数，例如 80。" },
+      offset: { type: "number" as const, minimum: 0, description: "使用上次回执的 nextOffset 续读，优先于 startLine。" },
+      maxChars: { type: "number" as const, minimum: 1 },
+    },
     required: ["path"],
     additionalProperties: false,
   };
@@ -86,9 +92,28 @@ class GenericFileReadTool extends GenericFileToolBase implements ToolExecutor {
   async execute(request: ToolRequest, _context: ToolExecutionContext): Promise<ToolResult> {
     try {
       const path = this.path(request.input);
-      const maxChars = Math.max(1, Math.min(200_000, Number((request.input as Record<string, unknown>)?.maxChars ?? 40_000)));
-      const content = (await readFile(path, "utf8")).slice(0, maxChars);
-      return this.result(request, { ok: true, path, content, truncated: content.length >= maxChars }, `已读取 ${path}。`);
+      const input = request.input as Record<string, unknown>;
+      const buffer = await readFile(path);
+      if (/^\.(pdf|docx?|xlsx?|pptx?|png|jpe?g|gif|webp|zip)$/iu.test(extname(path)) || buffer.includes(0)) {
+        return this.result(request, { ok: false, path, error: "TEXT_FILE_REQUIRED" }, "此文件不是纯文本，请使用对应文档、图片工具或本机解析程序。", true);
+      }
+      const source = buffer.toString("utf8");
+      const lineStarts = [0, ...Array.from(source.matchAll(/\n/gu), (match) => match.index! + 1)];
+      const totalLines = source.length ? lineStarts.length - (source.endsWith("\n") ? 1 : 0) : 0;
+      const requestedLine = integer(input.startLine, 1, 1);
+      const offset = input.offset === undefined ? lineStarts[requestedLine - 1] ?? source.length : Math.min(source.length, integer(input.offset, 0, 0));
+      const startLine = lineStarts.filter((start) => start <= offset).length;
+      const end = input.lineCount === undefined ? source.length : lineStarts[startLine - 1 + integer(input.lineCount, 1, 1)] ?? source.length;
+      const maxChars = Math.min(200_000, integer(input.maxChars, 40_000, 1));
+      let nextOffset = Math.min(end, offset + maxChars);
+      // Keep a UTF-16 surrogate pair together at the chunk boundary.
+      if (nextOffset < end && /[\uD800-\uDBFF]/u.test(source[nextOffset - 1] ?? "")) nextOffset += 1;
+      const content = source.slice(offset, nextOffset);
+      const truncated = nextOffset < source.length;
+      return this.result(request, {
+        ok: true, path, content, startLine, totalLines, offset, truncated,
+        ...(truncated ? { nextOffset } : {}),
+      }, `已读取 ${path}（从第 ${startLine} 行，${content.length} 字符${truncated ? "，后续可续读" : ""}）。`);
     } catch (error) {
       return this.result(request, { ok: false, error: errorMessage(error) }, errorMessage(error), true);
     }
@@ -143,6 +168,7 @@ class GenericFileWriteTool extends GenericFileToolBase implements ToolExecutor {
     try {
       const input = request.input as Record<string, unknown>;
       const path = this.path(input);
+      if (needsStructuredTool(path)) return this.result(request, { ok: false, path, error: "STRUCTURED_FILE_REQUIRED" }, "此文件需要文档、图片或数据库工具，不能用纯文本覆盖。", true);
       const content = typeof input.content === "string" ? input.content : "";
       const mode = input.mode === "replace" ? "replace" : "create";
       if (mode === "create") {
@@ -172,6 +198,7 @@ class GenericFileEditTool extends GenericFileToolBase implements ToolExecutor {
     try {
       const input = request.input as Record<string, unknown>;
       const path = this.path(input);
+      if (needsStructuredTool(path)) return this.result(request, { ok: false, path, error: "STRUCTURED_FILE_REQUIRED" }, "此文件需要专用工具，不能按纯文本替换。", true);
       const oldText = String(input.oldText ?? "");
       const newText = String(input.newText ?? "");
       const source = await readFile(path, "utf8");
@@ -241,4 +268,12 @@ class GenericFileDeleteTool extends GenericFileToolBase implements ToolExecutor 
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function integer(value: unknown, fallback: number, minimum: number): number {
+  return Number.isInteger(value) && Number(value) >= minimum ? Number(value) : fallback;
+}
+
+function needsStructuredTool(path: string): boolean {
+  return /^\.(docx?|xlsx?|pptx?|pdf|sqlite3?|db|png|jpe?g|webp|gif|zip)$/iu.test(extname(path));
 }

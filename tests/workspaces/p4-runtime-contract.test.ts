@@ -37,7 +37,7 @@ class P4LocalProvider implements ModelProvider {
     }
     const results = request.history.flatMap((entry) => entry.items).filter((item) => item.type === "tool-result");
     if (results.some((item) => item.name === "project.write") && !results.some((item) => item.name === "terminal.run")) {
-      yield { kind: "tool-call.completed", call: toolCall("p4-test", "terminal.run", { command: "[Console]::Out.Write('P4_TEST_OK')", purpose: "test", timeoutMs: 8_000 }) };
+      yield { kind: "tool-call.completed", call: toolCall("p4-test", "terminal.run", { command: process.platform === "win32" ? "[Console]::Out.Write('P4_TEST_OK')" : "printf P4_TEST_OK", purpose: "test", timeoutMs: 8_000 }) };
       return;
     }
     if (request.tools.some((tool) => tool.name === "project.write") && results.some((item) => item.name === "terminal.run")) {

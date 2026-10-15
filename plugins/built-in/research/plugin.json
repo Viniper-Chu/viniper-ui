@@ -1,0 +1,15 @@
+{
+  "manifestVersion": 1,
+  "id": "built-in.research",
+  "name": "网络与资料",
+  "version": "2.0.0",
+  "capabilities": [
+    "research"
+  ],
+  "skills": [],
+  "tools": [
+    "web.fetch",
+    "github.repository.read"
+  ],
+  "providers": []
+}

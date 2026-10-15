@@ -207,7 +207,7 @@ test("version and Stable stage are consistent in package, title and settings/abo
   const packageJson = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as { version: string };
   const core = await readFile(join(process.cwd(), "src", "core", "contracts.ts"), "utf8");
   const html = await readFile(join(process.cwd(), "src", "renderer", "shell", "index.html"), "utf8");
-  assert.equal(packageJson.version, "1.8.3");
+  assert.equal(packageJson.version, "2.0.0");
   assert.match(core, /Stable（稳定版）/u);
   assert.equal(html.includes(`v${packageJson.version} · Stable（稳定版）`), true);
   assert.doesNotMatch(html, /Beta|公测|\bRC\b|正式版|首次公测更新/u);
@@ -249,7 +249,7 @@ test("visible branding uses the same three-dimensional Viniper source as native 
 
   assert.match(visibleBranding, /Viniper workstation/u);
   assert.doesNotMatch(visibleBranding, /平静指挥台/u);
-  assert.equal(manifest.brand, "Viniper workstation");
+  assert.equal(manifest.brand, "Viniper");
   assert.equal(manifest.status, "UNIFIED_3D_NATIVE_SOURCE");
   assert.equal(manifest.nativeFallback, "viniper-harness-circuit-node.png");
   assert.equal(manifest.nativeSmall, "viniper-harness-circuit-node-32.png");

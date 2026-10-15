@@ -11,5 +11,5 @@ test("Demo is the only initially callable Provider while all 28 profiles remain 
   assert.equal(descriptors.filter((provider) => provider.configuration === "not-connected").length, 28);
   assert.equal(descriptors.some((provider) => provider.id === "xiaomi-mimo"), true);
   assert.equal(descriptors.some((provider) => provider.id === "ctyun-telechat"), true);
-  assert.throws(() => registry.get("openai"), /仅提供配置占位/u);
+  assert.throws(() => registry.get("openai"), /尚未连接/u);
 });

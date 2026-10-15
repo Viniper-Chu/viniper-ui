@@ -6,7 +6,7 @@ from collections import deque
 import os
 from pathlib import Path, PureWindowsPath
 import stat
-from typing import Any
+from typing import Any, Iterable
 
 
 ENGINE = "desktop-file-browser"
@@ -93,6 +93,10 @@ def _contained_file(root: Path, relative_path: str) -> Path:
     return resolved
 
 
+def _is_excluded_path(path: Path, excluded_roots: tuple[Path, ...]) -> bool:
+    return any(path.is_relative_to(root) for root in excluded_roots)
+
+
 def browse_project_files(
     root: str | Path,
     query: str = "",
@@ -100,9 +104,11 @@ def browse_project_files(
     limit: int = 120,
     max_scan_entries: int = 5000,
     max_depth: int = 12,
+    excluded_roots: Iterable[str | Path] = (),
 ) -> dict[str, Any]:
     """Return the existing project-index shape, with explicit desktop ownership."""
     project = _root_path(root)
+    excluded = tuple(Path(path).expanduser().resolve() for path in excluded_roots)
     limit = max(1, min(int(limit), 500))
     scan_limit = max(1, min(int(max_scan_entries), 20000))
     depth_limit = max(1, min(int(max_depth), 32))
@@ -116,7 +122,8 @@ def browse_project_files(
         # Revalidate each queued directory: never follow a link introduced
         # between discovering the directory and walking it.
         try:
-            if _is_link(directory.lstat()) or not directory.resolve(strict=True).is_relative_to(project):
+            resolved_directory = directory.resolve(strict=True)
+            if _is_excluded_path(resolved_directory, excluded) or _is_link(directory.lstat()) or not resolved_directory.is_relative_to(project):
                 continue
             with os.scandir(directory) as children:
                 batch = []
@@ -132,7 +139,8 @@ def browse_project_files(
                     if _is_link(info):
                         continue
                     candidate = Path(child.path)
-                    if not candidate.resolve(strict=True).is_relative_to(project):
+                    resolved_candidate = candidate.resolve(strict=True)
+                    if _is_excluded_path(resolved_candidate, excluded) or not resolved_candidate.is_relative_to(project):
                         continue
                     if stat.S_ISDIR(info.st_mode):
                         if child.name.casefold() in _EXCLUDED_DIRS:
@@ -187,16 +195,22 @@ def _opened_path(fd: int, fallback: Path) -> Path:
     return fd_path.resolve(strict=True) if fd_path.exists() else fallback.resolve(strict=True)
 
 
-def preview_project_file(root: str | Path, relative_path: str, *, max_bytes: int = 262144) -> dict[str, Any]:
+def preview_project_file(root: str | Path, relative_path: str, *, max_bytes: int = 262144,
+                         excluded_roots: Iterable[str | Path] = ()) -> dict[str, Any]:
     """Read a bounded text file under the selected root; never write or execute."""
     project = _root_path(root)
     path = _contained_file(project, relative_path)
+    excluded = tuple(Path(value).expanduser().resolve() for value in excluded_roots)
+    if _is_excluded_path(path, excluded):
+        raise ProjectBrowserError("工作台运行数据不属于项目文件预览范围")
     maximum = max(1024, min(int(max_bytes), 1048576))
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
         with os.fdopen(fd, "rb") as stream:
             opened = _opened_path(stream.fileno(), path)
+            if _is_excluded_path(opened, excluded):
+                raise ProjectBrowserError("工作台运行数据不属于项目文件预览范围")
             info = os.fstat(stream.fileno())
             if not opened.is_relative_to(project) or not stat.S_ISREG(info.st_mode):
                 raise ProjectBrowserError("文件必须是所选项目内的普通文件")

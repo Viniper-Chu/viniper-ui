@@ -1,5 +1,5 @@
 import { ToolAuthorizationScope, ToolPresentation, ToolRequest } from "../../core/contracts";
-import { JsonSchema, ProviderToolDefinition } from "../../core/provider-contracts";
+import { JsonSchema, ProviderActivityEvent, ProviderToolDefinition } from "../../core/provider-contracts";
 import { ToolResourceClaim } from "./resource-lock";
 import { FrozenProviderSnapshot } from "../../core/programming-contracts";
 import type { FrozenRunContext } from "../../core/composition-contracts";
@@ -14,18 +14,21 @@ export interface ToolResult {
   presentation?: ToolPresentation;
   isError?: boolean;
   cancelled?: boolean;
+  providerUsage?: import("../../core/telemetry-contracts").TokenUsage;
 }
 
 export interface ToolExecutionContext {
   sessionId: string;
   runId: string;
   projectRoot?: string;
+  taskDirectory?: string;
   workspaceId?: string;
   commitRequested?: boolean;
   providerSnapshot?: FrozenProviderSnapshot;
   extensionSnapshot?: ExtensionRunSnapshot;
   frozenRunContext?: FrozenRunContext;
   codeSubcallInvoker?: (input: CodeSubcallInput) => Promise<CodeSubcallResult>;
+  onProviderActivity?: (event: ProviderActivityEvent) => Promise<void>;
   signal: AbortSignal;
 }
 

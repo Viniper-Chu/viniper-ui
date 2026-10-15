@@ -75,7 +75,7 @@ export class CliController {
   async executeInvocation(invocation: CliInvocation): Promise<CliCommandOutcome> {
     await this.ensureInitialized();
     if (invocation.kind === "interactive") {
-      this.emit("ready", { productBadge: this.snapshot?.productBadge ?? "v1.8.3 · Stable（稳定版）" });
+      this.emit("ready", { productBadge: this.snapshot?.productBadge ?? "v1.9.1 · Stable（稳定版）" });
       return { exitRequested: false };
     }
     if (invocation.kind === "help") {

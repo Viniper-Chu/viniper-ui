@@ -260,16 +260,24 @@ test("WSL invocation keeps secrets out of args and prompt JSON while transport m
   assert.equal(invocation.env?.ANTHROPIC_API_KEY, undefined);
 });
 
-test("native transport does not add WSLENV entries", async () => {
+test("native transport delivers bridged-equivalent configuration to a real child without adding WSLENV entries", async () => {
   const host = new NodeClaudeCodeProcessHost();
   const lines: string[] = [];
   for await (const line of host.lines({
     executable: process.execPath,
-    args: ["-e", "process.stdout.write(`${process.env.WSLENV}|${process.env.ANTHROPIC_BASE_URL}`)"],
-    env: { WSLENV: "PREEXISTING/u", ANTHROPIC_BASE_URL: "https://fixture.example" },
+    args: ["-e", "process.stdout.write(JSON.stringify({ bridge: process.env.WSLENV, probe: process.env.VINIPER_NATIVE_ENV_PROBE, url: process.env.ANTHROPIC_BASE_URL, model: process.env.ANTHROPIC_MODEL, cwd: process.cwd() }))"],
+    cwd: process.cwd(),
+    env: {
+      WSLENV: "PREEXISTING/u", VINIPER_NATIVE_ENV_PROBE: "visible-in-native-child",
+      ANTHROPIC_BASE_URL: "https://fixture.example", ANTHROPIC_MODEL: "model-fixture",
+    },
     transport: "native-cli",
   }, new AbortController().signal)) lines.push(line);
-  assert.deepEqual(lines, ["PREEXISTING/u|https://fixture.example"]);
+  assert.equal(lines.length, 1);
+  assert.deepEqual(JSON.parse(lines[0]), {
+    bridge: "PREEXISTING/u", probe: "visible-in-native-child", url: "https://fixture.example",
+    model: "model-fixture", cwd: process.cwd(),
+  });
 });
 
 test("wsl.exe printenv fixture sees non-secret bridged variables when WSL is available", async (t) => {

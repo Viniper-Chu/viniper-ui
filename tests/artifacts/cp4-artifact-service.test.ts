@@ -14,7 +14,7 @@ class MemoryArtifacts implements ArtifactPersistence {
 }
 
 test("CP4 artifact service stores complete tool output and returns bounded continuation", async () => {
-  const tempRoot = "D:\\Viniper workstation\\codex\\运行残留";
+  const tempRoot = join(process.cwd(), "codex", "运行残留");
   await mkdir(tempRoot, { recursive: true });
   const root = await mkdtemp(join(tempRoot, "cp4-artifacts-"));
   try {
@@ -40,7 +40,7 @@ test("CP4 artifact service stores complete tool output and returns bounded conti
 });
 
 test("CP4 artifact write failure is explicit and never silently projects the full result", async () => {
-  const tempRoot = "D:\\Viniper workstation\\codex\\运行残留";
+  const tempRoot = join(process.cwd(), "codex", "运行残留");
   await mkdir(tempRoot, { recursive: true });
   const root = await mkdtemp(join(tempRoot, "cp4-artifact-failure-"));
   try {

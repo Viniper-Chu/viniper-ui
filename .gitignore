@@ -1,3 +1,4 @@
+.DS_Store
 node_modules/
 dist/
 codex/运行残留/
@@ -8,4 +9,4 @@ codex/审查报告/
 __pycache__/
 *.pyc
 resources/viniper-ui/desktop/release/
-resources/viniper-ui/harness-runtime/dist/
+resources/viniper-ui/harness-runtime/

@@ -244,7 +244,7 @@ test("R15 S3 atomic persistence assigns a replay cursor and idempotently ignores
   try {
     const session = createSessionSnapshot("D:\\r15", 200);
     const { events: _events, ...persisted } = session;
-    const application = { schemaVersion: 3 as const, productVersion: "1.8.3" as const, activeSessionId: session.id, sessions: [persisted] };
+    const application = { schemaVersion: 3 as const, productVersion: "2.0.0" as const, activeSessionId: session.id, sessions: [persisted] };
     await store.saveSnapshot(application);
     const draft: RuntimeEvent = {
       id: engineScopedId("viniper", "event", "atomic"), engineId: "viniper",
@@ -315,8 +315,7 @@ test("R15 S5 approval lifecycle carries stable owner, target item and resolution
   assert.ok(completed.completedAt >= completed.startedAt);
 });
 
-test("R15 S6 ProcessHost exposes a bounded interactive PowerShell 7 stream with stdin and cancellation", async (t) => {
-  if (process.platform !== "win32") return t.skip("Windows-only ProcessHost contract");
+test(`R15 S6 ProcessHost exposes a bounded interactive ${process.platform === "win32" ? "PowerShell 7" : "native POSIX shell"} stream with stdin and cancellation`, async () => {
   const root = await freshRoot("r15-interactive-");
   const host = new WindowsProcessHost({ managedRoot: root, allowUnscoped: true });
   const controller = new AbortController();
@@ -326,12 +325,30 @@ test("R15 S6 ProcessHost exposes a bounded interactive PowerShell 7 stream with 
       executionId: "r15-interactive", input: { command: "", purpose: "command", timeoutMs: 10_000 },
     }, { sessionId: "viniper__session-interactive", runId: "viniper__run-interactive", signal: controller.signal });
     const unsubscribe = host.subscribeInteractive(started.executionId, (chunk) => chunks.push(chunk.text));
-    await host.writeInteractive(started.executionId, "Write-Output R15_PWSH7_INTERACTIVE_OK\nexit\n");
+    assert.equal(await host.writeInteractive(started.executionId, process.platform === "win32"
+      ? "Write-Output R15_INTERACTIVE_OK\nexit\n"
+      : "printf 'R15_INTERACTIVE_OK\\n'\nexit\n"), true);
     const completed = await host.waitInteractive(started.executionId);
     unsubscribe();
-    assert.equal(completed.processIdentity?.edition, "Core");
-    assert.equal(completed.processIdentity?.major, 7);
-    assert.match(chunks.join(""), /R15_PWSH7_INTERACTIVE_OK/u);
+    assert.equal(completed.status, "completed");
+    if (process.platform === "win32") {
+      assert.equal(completed.processIdentity?.edition, "Core");
+      assert.equal(completed.processIdentity?.major, 7);
+    }
+    assert.match(chunks.join(""), /R15_INTERACTIVE_OK/u);
+    assert.equal(await host.writeInteractive(started.executionId, "MUST_NOT_RUN\n"), false);
+
+    const cancelled = await host.startInteractive({
+      executionId: "r15-cancelled", input: { command: "", purpose: "command", timeoutMs: 10_000 },
+    }, { sessionId: "viniper__session-interactive", runId: "viniper__run-cancelled", signal: controller.signal });
+    await host.writeInteractive(cancelled.executionId, process.platform === "win32"
+      ? "Start-Sleep -Seconds 8; Write-Output MUST_NOT_FINISH\n"
+      : "sleep 8; printf MUST_NOT_FINISH\n");
+    controller.abort();
+    const interrupted = await host.waitInteractive(cancelled.executionId);
+    assert.equal(interrupted.status, "cancelled");
+    assert.doesNotMatch(interrupted.stdout.preview, /MUST_NOT_FINISH/u);
+    assert.ok(interrupted.durationMs < 5_000);
   } finally {
     await host.dispose();
     await rm(root, { recursive: true, force: true });

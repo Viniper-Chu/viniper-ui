@@ -30,6 +30,11 @@ import { DesktopApplication } from "../desktop/desktop-application";
 import { NodeProjectFilesystem } from "../filesystem/node-project-filesystem";
 import { WindowsFileOpener } from "../process/windows-file-opener";
 import { createFileTools } from "../../features/files/file-tools";
+import { createStructuredFileTools } from "../../features/files/structured-file-tools";
+import { createLocalImageTool } from "../../features/files/local-image-tool";
+import { createDocumentWorkflowTools } from "../../features/files/document-workflow-tools";
+import { discoverDocumentWorkflowHost } from "../process/local-document-workflow-host";
+import { LocalFileHelperHost } from "../process/local-file-helper-host";
 import { WindowsProcessHost } from "../process/windows-process-host";
 import { FilePluginSource } from "../persistence/file-plugin-source";
 import { FileProjectInstructionSource } from "../persistence/file-project-instruction-source";
@@ -68,6 +73,7 @@ import { providerSecretId } from "../../features/providers/provider-profile-cata
 import { NodeClaudeCodeProcessHost, probeClaudeCode, readClaudeCodeNonSecretSettings } from "../process/claude-code-process-host";
 
 export interface HarnessApplicationFactoryOptions {
+  externalScheduleDispatch?: boolean;
   dataRoot: string;
   workingDirectory: string;
   assetsRoot: string;
@@ -181,17 +187,6 @@ export async function createHarnessApplication(
     });
     registry.registerDescriptor(claudeCodeProvider.descriptor);
     claudeCodeEngineAdapter = new ClaudeCodeEngineAdapter(claudeCodeProvider);
-  } else {
-    registry.registerDescriptor({
-      id: "claude-code",
-      name: "Claude code",
-      label: "Claude code · CLI 未探测",
-      configuration: "not-connected",
-      available: false,
-      realCallsEnabled: false,
-      capabilities: [],
-      models: [{ id: "claude-code-default", label: "Claude Code 默认模型" }],
-    });
   }
   const agentEngines = new AgentEngineCatalog(registry, claudeCodeProbe);
   const compositionService = new CompositionService(undefined, {
@@ -200,6 +195,10 @@ export async function createHarnessApplication(
   });
   const toolRegistry = new ToolRegistry();
   for (const tool of createFileTools(new WindowsFileOpener(), { recoveryRoot: join(options.dataRoot, "file-recovery") })) toolRegistry.register(tool);
+  for (const tool of createStructuredFileTools(new LocalFileHelperHost(join(options.assetsRoot, "agent-helpers")))) toolRegistry.register(tool);
+  toolRegistry.register(createLocalImageTool(registry));
+  const documentWorkflowHost = discoverDocumentWorkflowHost();
+  if (documentWorkflowHost) for (const tool of createDocumentWorkflowTools(documentWorkflowHost)) toolRegistry.register(tool);
   for (const tool of createProgrammingTools(projectFilesystem)) toolRegistry.register(tool);
   const terminalService = new TerminalService(new WindowsProcessHost({
     managedRoot: join(options.dataRoot, "terminal-output"),
@@ -370,7 +369,7 @@ export async function createHarnessApplication(
     toolRegistry,
     { "built-in.coordination": () => createCoordinationTools(coordination) },
   );
-  const scheduler = new SchedulerService(store, runtime, workingDirectory);
+  const scheduler = new SchedulerService(store, runtime, workingDirectory, undefined, options.externalScheduleDispatch);
   application = new DesktopApplication({
     runtime,
     coordination,

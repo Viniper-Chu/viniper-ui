@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 1,
+  "id": "built-in.math-documents",
+  "name": "数学与 PDF",
+  "version": "2.0.0",
+  "capabilities": ["documents", "math"],
+  "skills": [],
+  "tools": ["file.math.handout", "file.pdf.inspect", "file.pdf.render"],
+  "providers": []
+}

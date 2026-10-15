@@ -28,6 +28,7 @@ export interface AgentToolLoopOptions {
   request: ProviderRequest;
   toolRegistry: ToolRegistry;
   projectRoot?: string;
+  taskDirectory?: string;
   authorizationProjectRoot?: string;
   workspaceId?: string;
   commitRequested?: boolean;
@@ -40,6 +41,8 @@ export interface AgentToolLoopOptions {
   now: () => number;
   maxRounds?: number;
   maxProviderRequests?: number;
+  noProgressLimit?: number;
+  trackReads?: boolean;
   reviewPlan?: ReviewExecutionPlan;
   onProviderEvent(event: ProviderEvent): Promise<void>;
   appendHistory(entries: ProviderHistoryEntry[]): Promise<void>;
@@ -76,6 +79,7 @@ export type ToolDispatchOptions = Pick<AgentToolLoopOptions,
   | "request"
   | "toolRegistry"
   | "projectRoot"
+  | "taskDirectory"
   | "authorizationProjectRoot"
   | "workspaceId"
   | "commitRequested"
@@ -143,6 +147,10 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
   const history = clone(options.request.history);
   const completedToolResults = new Map<string, ProviderToolResultItem>();
   const reviewFingerprints = new Set<string>();
+  const repeatedReads = new Map<string, number>();
+  let stagnant: string | undefined;
+  let successfulReadCalls = 0;
+  const readPaths = new Set<string>();
   let reviewNoProgress: { checkpointId: string; fingerprint: string } | undefined;
   let completeText = "";
 
@@ -157,6 +165,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
 
   for (let round = 1; round <= maxRounds; round += 1) {
     throwIfCancelled(options.signal);
+    if (stagnant) throw new Error(`工具 ${stagnant} 连续返回相同结果且没有进展，已停止续轮。请依据现有结果调整操作。`);
     if (reviewNoProgress) {
       await options.emit("interaction.requested", {
         ...activity({
@@ -296,6 +305,9 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
     }
 
     if (toolCalls.length === 0) {
+      // A steer may arrive while the final answer is streaming. Deliver it
+      // in the next request instead of silently completing with it queued.
+      if (options.runId && options.steering?.hasPending(options.runId) && round < maxRounds) continue;
       if (!roundText.trim()) throw new ProviderFinalAnswerMissingError(round);
       if (options.reviewPlan) {
         completeReviewPlan(options.reviewPlan);
@@ -317,6 +329,29 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
     for (const call of toolCalls) {
       const previous = completedToolResults.get(call.callId);
       const result = previous ? clone(previous) : await dispatchToolCall(call, options, frozenTools);
+      if (!previous && result.providerUsage) await options.onProviderEvent({ kind: "usage.completed", usage: result.providerUsage });
+      if (options.noProgressLimit && options.toolRegistry.has(call.name)) {
+        const tool = options.toolRegistry.get(call.name);
+        if (tool.readOnly || result.isError) {
+          const fingerprint = reviewToolFingerprint(call, result);
+          const count = (repeatedReads.get(fingerprint) ?? 0) + 1;
+          repeatedReads.set(fingerprint, count);
+          if (count >= options.noProgressLimit) stagnant = call.name;
+        } else {
+          repeatedReads.clear();
+          stagnant = undefined;
+        }
+      }
+      if (options.trackReads && !previous && !result.isError && call.name === "file.read") {
+        successfulReadCalls += 1;
+        readPaths.add(String(call.arguments.path));
+        const progress = { successful_read_calls: successfulReadCalls, distinct_read_paths: readPaths.size,
+          scope: "本轮实际成功读取的累计值，不是目录文件总数。" };
+        try {
+          const value = JSON.parse(result.content);
+          result.content = JSON.stringify({ ...value, read_progress: progress });
+        } catch { result.content += `\n本轮读取进度：${JSON.stringify(progress)}`; }
+      }
       completedToolResults.set(call.callId, clone(result));
       await options.onToolResult?.(call, clone(result));
       const toolEntry: ProviderHistoryEntry = {
@@ -400,7 +435,17 @@ function completeReviewPlan(plan: ReviewExecutionPlan): void {
 }
 
 function reviewToolFingerprint(call: ProviderToolCallItem, result: ProviderToolResultItem): string {
-  return `${call.name}:${stableJson(call.arguments)}:${result.content}`;
+  let content = result.content.replace(/中间内容已存入受管产物 [^，]+，可按范围续读/gu, "中间内容已存入受管产物，可按范围续读");
+  try {
+    const value = JSON.parse(content);
+    if (call.name === "terminal.run") {
+      content = stableJson({ ok: value.ok, status: value.status, exitCode: value.exitCode,
+        stdout: value.stdout?.preview, stderr: value.stderr?.preview, error: value.error });
+    } else if (call.name === "file.image.analyze") {
+      content = stableJson({ ok: value.ok, path: value.path, text: value.text, error: value.error });
+    }
+  } catch { /* Plain text and spilled receipts retain their actual content. */ }
+  return `${call.name}:${stableJson(call.arguments)}:${content}`;
 }
 
 function stableJson(value: unknown): string {
@@ -468,6 +513,14 @@ export async function dispatchToolCall(
   }
 
   const owner = options.toolRegistry.managedOwner(call.name);
+  if (call.argumentsError) {
+    const reason = call.argumentsError === "output-limit" ? "模型达到单次输出上限，工具参数被截断" : "模型生成的工具参数不是完整的 JSON 对象";
+    const message = `${reason}；本次操作未执行。缩小单次操作内容并重新提供完整参数。长文件分段创建或追加，每次只写一个短小片段，避免再次生成整个文件。`;
+    await options.emit("tool.requested", activity({ id: activityId, kind: "tool", title: "操作内容未生成完整", detail: message,
+      status: "failed", callId: call.callId, toolName: call.name, now: options.now }));
+    await options.emit("tool.failed", { activityId, result: message });
+    return toolResult(call, message, true);
+  }
   if (owner) {
     const frozenExtension = options.extensionSnapshot?.[owner]
       ?? options.frozenRunContext?.extensions[owner];
@@ -533,6 +586,7 @@ export async function dispatchToolCall(
     id: activityId,
     kind: "tool",
     title: tool.description,
+    input: clone(call.arguments),
     detail: immediateResolution && options.request.permissionMode === "review"
       ? `${request.summary}\n${permissionDecisionDetail(immediateResolution)}`
       : request.summary,
@@ -609,11 +663,13 @@ export async function dispatchToolCall(
       sessionId: options.request.sessionId,
       runId: options.runId ?? `standalone-${options.request.sessionId}`,
       projectRoot: options.projectRoot,
+      taskDirectory: options.taskDirectory,
       workspaceId: options.workspaceId,
       commitRequested: options.commitRequested,
       extensionSnapshot: options.extensionSnapshot,
       frozenRunContext: options.frozenRunContext,
       codeSubcallInvoker: options.codeSubcallInvoker,
+      onProviderActivity: (event: import("../../../core/provider-contracts").ProviderActivityEvent) => options.emit(event.kind, event),
       providerSnapshot: {
         providerId: options.request.profileId,
         profileId: options.request.profileId,
@@ -701,6 +757,7 @@ export async function dispatchToolCall(
       ...(result.presentation ? { presentation: clone(result.presentation) } : {}),
     });
     const finalResult = toolResult(call, modelText, result.isError === true || result.cancelled === true);
+    if (result.providerUsage) finalResult.providerUsage = clone(result.providerUsage);
     const resultDecision = await options.lifecycle?.dispatch("tool/result", {
       runId: executionContext.runId,
       sessionId: executionContext.sessionId,
@@ -793,6 +850,7 @@ function activity(input: {
   callId?: string;
   parentCallId?: string;
   toolName?: string;
+  input?: Record<string, unknown>;
   now: () => number;
 }): ActivityRecord {
   return {
@@ -805,6 +863,7 @@ function activity(input: {
     callId: input.callId,
     parentCallId: input.parentCallId,
     toolName: input.toolName,
+    ...(input.input ? { input: input.input } : {}),
     createdAt: input.now(),
   };
 }

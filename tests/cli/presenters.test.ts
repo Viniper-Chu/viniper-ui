@@ -108,9 +108,9 @@ test("Viniper workstation is the default TTY brand and its primary ANSI accent i
   presenter.present({ schemaVersion: 1, type: "ready", timestamp: 1, data: {} });
   presenter.present({ schemaVersion: 1, type: "help", timestamp: 2, data: { commands: CLI_HELP_COMMANDS } });
 
-  assert.match(output.text, /Viniper workstation CLI/u);
+  assert.match(output.text, /Viniper CLI/u);
   assert.doesNotMatch(output.text, /平静指挥台/u);
-  assert.match(output.text, /\u001B\[36mViniper workstation CLI/u);
+  assert.match(output.text, /\u001B\[36mViniper CLI/u);
 });
 
 test("P2 TTY/plain and JSONL consume the same bounded project presentation", () => {

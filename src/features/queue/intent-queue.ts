@@ -14,6 +14,8 @@ export function enqueueIntent(
     reviewPolicy?: ReviewPolicy;
     commitRequested?: boolean;
     memoryEnabled?: boolean;
+    planning?: boolean;
+    userText?: string;
   },
 ): QueuedIntent[] {
   const engineId = sessionAgentEngine(session.engineId);
@@ -23,6 +25,8 @@ export function enqueueIntent(
     ...(controls?.reviewPolicy ? { reviewPolicy: controls.reviewPolicy } : {}),
     ...(controls?.commitRequested !== undefined ? { commitRequested: controls.commitRequested } : {}),
     ...(controls?.memoryEnabled !== undefined ? { memoryEnabled: controls.memoryEnabled } : {}),
+    ...(controls?.planning !== undefined ? { planning: controls.planning } : {}),
+    ...(controls?.userText !== undefined ? { userText: controls.userText } : {}),
   }];
 }
 

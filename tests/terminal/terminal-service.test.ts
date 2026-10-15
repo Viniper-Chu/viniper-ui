@@ -5,11 +5,13 @@ import { test } from "node:test";
 import { TerminalService } from "../../src/features/terminal/terminal-service";
 import { WindowsProcessHost } from "../../src/platform/process/windows-process-host";
 
+const shellCommand = (windows: string, posix: string): string => process.platform === "win32" ? windows : posix;
+
 test("P3-01 distinguishes success, nonzero and command-not-found while separating stdout/stderr", async () => {
   const scene = await terminalFixture();
   try {
     const completed = await scene.service.run({
-      command: "[Console]::Out.Write('OUT_MARKER'); [Console]::Error.Write('ERR_MARKER')",
+      command: shellCommand("[Console]::Out.Write('OUT_MARKER'); [Console]::Error.Write('ERR_MARKER')", "printf OUT_MARKER; printf ERR_MARKER >&2"),
       purpose: "test",
     }, scene.context("session-success", "run-success"));
     assert.equal(completed.status, "completed");
@@ -20,7 +22,7 @@ test("P3-01 distinguishes success, nonzero and command-not-found while separatin
     assert.doesNotMatch(completed.stderr.preview, /OUT_MARKER/u);
 
     const nonzero = await scene.service.run({
-      command: "[Console]::Error.Write('EXPECTED_NONZERO'); exit 7",
+      command: shellCommand("[Console]::Error.Write('EXPECTED_NONZERO'); exit 7", "printf EXPECTED_NONZERO >&2; exit 7"),
       purpose: "test",
     }, scene.context("session-nonzero", "run-nonzero"));
     assert.equal(nonzero.status, "nonzero");
@@ -39,18 +41,30 @@ test("P3-01 distinguishes success, nonzero and command-not-found while separatin
   }
 });
 
-test("terminal.run persists the PowerShell identity from the same spawned shell", async () => {
+test(`terminal.run persists ${process.platform === "win32" ? "PowerShell identity metadata" : "native shell identity output"} from the same spawned shell`, async () => {
   const scene = await terminalFixture();
   try {
     const result = await scene.service.run({
-      command: "[Console]::Out.Write('PS7_IDENTITY_CHECK')",
+      command: shellCommand("[Console]::Out.Write('PS7_IDENTITY_CHECK')",
+        "printf 'NATIVE_SHELL_IDENTITY_CHECK:%s:%s:%s\\n' \"$0\" \"$$\" \"${ZSH_VERSION:-${BASH_VERSION:-sh}}\"; /bin/ps -p $$ -o comm=; :"),
       purpose: "test",
     }, scene.context("session-identity", "run-identity"));
     assert.equal(result.status, "completed");
-    assert.match(result.stdout.preview, /PS7_IDENTITY_CHECK/u);
-    assert.equal(result.processIdentity?.edition, "Core");
-    assert.equal((result.processIdentity?.major ?? 0) >= 7, true);
-    assert.match(result.processIdentity?.executable ?? "", /pwsh(?:\.exe)?$/iu);
+    if (process.platform === "win32") {
+      assert.match(result.stdout.preview, /PS7_IDENTITY_CHECK/u);
+      assert.equal(result.processIdentity?.edition, "Core");
+      assert.equal((result.processIdentity?.major ?? 0) >= 7, true);
+      assert.match(result.processIdentity?.executable ?? "", /pwsh(?:\.exe)?$/iu);
+    } else {
+      assert.match(result.stdout.preview, /NATIVE_SHELL_IDENTITY_CHECK:\/bin\/(?:zsh|bash|sh):\d+:/u);
+      if (process.platform === "darwin") {
+        assert.match(result.stdout.preview, /NATIVE_SHELL_IDENTITY_CHECK:\/bin\/zsh:\d+:\d+\.\d+/u);
+        assert.match(result.stdout.preview.split("\n")[1], /(?:^|\/)zsh(?:\s|$)/u);
+      }
+      assert.equal(result.processIdentity, undefined, "POSIX identity must not be mislabeled as PowerShell metadata");
+    }
+    const stored = await readFile(join(scene.managedRoot, "run-identity", result.executionId, "stdout.log"), "utf8");
+    assert.equal(stored, result.stdout.preview, "the exact identity observed in the owning shell is persisted");
   } finally {
     await scene.dispose();
   }
@@ -60,7 +74,7 @@ test("P3-02 streams full output to managed storage and only continues output own
   const scene = await terminalFixture();
   try {
     const result = await scene.service.run({
-      command: "$text = 'x' * 70000; [Console]::Out.Write($text)",
+      command: shellCommand("$text = 'x' * 70000; [Console]::Out.Write($text)", "node -e 'process.stdout.write(\"x\".repeat(70000))'"),
       purpose: "build",
     }, scene.context("session-large", "run-large"));
     assert.equal(result.status, "completed");
@@ -102,7 +116,7 @@ test("P3-01 validates project cwd and does not inherit arbitrary secret-like env
   try {
     await mkdir(join(scene.projectRoot, "nested"));
     const result = await scene.service.run({
-      command: "[Console]::Out.Write([string]$env:PHASE7_FAKE_PROVIDER_SECRET)",
+      command: shellCommand("[Console]::Out.Write([string]$env:PHASE7_FAKE_PROVIDER_SECRET)", "printf '%s' \"$PHASE7_FAKE_PROVIDER_SECRET\""),
       cwd: "nested",
       purpose: "command",
     }, scene.context("session-cwd", "run-cwd"));
@@ -111,7 +125,7 @@ test("P3-01 validates project cwd and does not inherit arbitrary secret-like env
     assert.equal(result.stdout.preview, "");
 
     const outside = await scene.service.run({
-      command: "[Console]::Out.Write('MUST_NOT_RUN')",
+      command: shellCommand("[Console]::Out.Write('MUST_NOT_RUN')", "printf MUST_NOT_RUN"),
       cwd: "..",
       purpose: "command",
     }, scene.context("session-outside", "run-outside"));
@@ -129,7 +143,7 @@ test("P3-01 timeout is distinct and terminates the owned process", async () => {
   const scene = await terminalFixture();
   try {
     const result = await scene.service.run({
-      command: "Start-Sleep -Seconds 5; [Console]::Out.Write('TOO_LATE')",
+      command: shellCommand("Start-Sleep -Seconds 5; [Console]::Out.Write('TOO_LATE')", "sleep 5; printf TOO_LATE"),
       timeoutMs: 180,
       purpose: "test",
     }, scene.context("session-timeout", "run-timeout"));
@@ -163,9 +177,10 @@ test("P3-03 cancelling one run terminates its child tree without stopping anothe
       purpose: "test",
     }, scene.context("session-cancelled", "run-cancelled", firstController.signal));
     await waitForFile(join(scene.projectRoot, "child.pid"));
+    await waitForFile(join(scene.projectRoot, "heartbeat.txt"));
 
     const secondRun = scene.service.run({
-      command: "Start-Sleep -Milliseconds 450; [Console]::Out.Write('SECOND_SESSION_OK')",
+      command: shellCommand("Start-Sleep -Milliseconds 450; [Console]::Out.Write('SECOND_SESSION_OK')", "sleep 0.45; printf SECOND_SESSION_OK"),
       timeoutMs: 3_000,
       purpose: "test",
     }, {

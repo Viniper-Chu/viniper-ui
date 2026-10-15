@@ -24,6 +24,7 @@ function projectLatestRunUsage(snapshot, sessionId, runId) {
   const raw = latest.usage && typeof latest.usage === "object" ? latest.usage : {};
   const usage = {};
   for (const [providerName, ledgerName] of USAGE_FIELDS) usage[providerName] = nonNegativeNumber(raw[ledgerName]);
+  usage.input_tokens = Math.max(0, usage.input_tokens - usage.cache_read_input_tokens - usage.cache_creation_input_tokens);
   usage.total_tokens = nonNegativeNumber(raw.total) || Object.values(usage).reduce((sum, value) => sum + value, 0);
   const source = latest.status === "reconciled" && raw.source === "provider" ? "provider" : "estimated";
   usage.source = source;

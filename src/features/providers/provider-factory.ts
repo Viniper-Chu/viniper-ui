@@ -34,6 +34,12 @@ class NoToolProvider implements ModelProvider {
     this.descriptor = inner.descriptor;
   }
 
+  runtimePolicyFor(model: string) { return this.inner.runtimePolicyFor?.(model); }
+  analyzeImage(input: Parameters<NonNullable<ModelProvider["analyzeImage"]>>[0], signal: AbortSignal, onActivity?: Parameters<NonNullable<ModelProvider["analyzeImage"]>>[2]) {
+    if (!this.inner.analyzeImage) return Promise.reject(new Error("当前 Provider 不支持图像解析。"));
+    return this.inner.analyzeImage(input, signal, onActivity);
+  }
+
   async *stream(request: Parameters<ModelProvider["stream"]>[0], signal: AbortSignal) {
     for await (const event of this.inner.stream({ ...request, tools: [] }, signal)) {
       if (event.kind === "tool-call.completed") {

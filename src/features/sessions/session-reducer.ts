@@ -28,6 +28,7 @@ export function applyRuntimeEvent<TPayload>(session: SessionSnapshot, event: Run
   switch (event.type) {
     case "session.updated": {
       const patch = event.payload as Partial<SessionSnapshot>;
+      if (typeof patch.reasoning === "string") session.reasoning = patch.reasoning;
       if (typeof patch.title === "string") session.title = patch.title;
       if (typeof patch.workingDirectory === "string") session.workingDirectory = patch.workingDirectory;
       if (patch.projectAccess?.enabled === true) session.projectAccess = { ...patch.projectAccess };

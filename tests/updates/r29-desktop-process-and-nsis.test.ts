@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import fs from "node:fs";
 import http from "node:http";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { test } from "node:test";
 import vm from "node:vm";
@@ -11,6 +12,7 @@ import ts from "typescript";
 const root = process.cwd();
 const desktopMain = path.join(root, "resources/viniper-ui/desktop/main.js");
 const mainSource = readFileSync(desktopMain, "utf8");
+const { resolvePython } = createRequire(desktopMain)("./platform-runtime.js");
 
 test("desktop directly owns the real Python listener and update shutdown closes its readiness port", { timeout: 20000 }, async () => {
   const parsed = ts.createSourceFile(desktopMain, mainSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
@@ -19,7 +21,8 @@ test("desktop directly owns the real Python listener and update shutdown closes 
   assert.equal(selected.length, names.size);
   const sandbox: any = {
     spawnSync, fs, path, http, URL, Promise, Date, setTimeout, clearTimeout,
-    process: { platform: process.platform }, SERVER_STATUS_PROBE_TIMEOUT_MS: 500,
+    process: { platform: process.platform, env: process.env }, SERVER_STATUS_PROBE_TIMEOUT_MS: 500,
+    resolvePython, app: { isPackaged: false, getPath: () => root },
     localUrl: () => `http://127.0.0.1:${sandbox.port}`, port: 0,
   };
   vm.runInNewContext(selected.map((node) => node.getText(parsed)).join("\n"), sandbox, { filename: desktopMain });

@@ -42,6 +42,7 @@ export class SchedulerService {
     private readonly runtime: SchedulerRuntimePort,
     private readonly defaultWorkingDirectory: string,
     private readonly clock: SchedulerClock = SYSTEM_CLOCK,
+    private readonly externalDispatch = false,
   ) {}
 
   async initialize(): Promise<void> {
@@ -49,6 +50,7 @@ export class SchedulerService {
     this.history = saved.history;
     for (const definition of saved.definitions) {
       const normalized = clone(definition);
+      this.pauseMissingTarget(normalized);
       if ((normalized.schedule.kind === "daily" || normalized.schedule.kind === "weekly")
         && !normalized.schedule.timeZone) {
         normalized.schedule.timeZone = systemTimeZone();
@@ -62,6 +64,16 @@ export class SchedulerService {
       if (!definition.enabled) continue;
       if (definition.nextRunAt === undefined) definition.nextRunAt = nextOccurrence(definition.schedule, now, definition);
       if (definition.nextRunAt !== undefined && definition.nextRunAt <= now) {
+        if (this.externalDispatch) {
+          definition.overlapPending = false;
+          if (definition.schedule.kind === "once") { definition.enabled = false; definition.nextRunAt = undefined; definition.status = "paused"; }
+          else definition.nextRunAt = nextOccurrence(definition.schedule, now, definition);
+          const skipped: ScheduleHistoryRecord = { id: newId("schedule-history"), scheduleId: definition.id,
+            triggeredAt: now, source: "recovery", status: "pending", detail: "应用离线期间错过的执行时刻已跳过，后续按计划运行。" };
+          this.history.push(skipped);
+          await this.persistence.appendScheduleHistory(skipped);
+          continue;
+        }
         const missedCount = missedOccurrences(definition.schedule, definition.nextRunAt, now);
         await this.trigger(definition, "recovery", missedCount);
         definition.nextRunAt = definition.overlapPending
@@ -79,6 +91,60 @@ export class SchedulerService {
     this.timer = undefined;
   }
 
+  /** Desktop host claims due work and starts it through its normal chat coordinator. */
+  async claimDue(): Promise<ScheduleDefinition[]> {
+    if (!this.externalDispatch) throw new Error("此调度器由 Runtime 自动执行");
+    let changed = false;
+    for (const definition of this.definitions.values()) changed = this.pauseMissingTarget(definition) || changed;
+    if (changed) await this.persistDefinitions();
+    const now = this.clock.now();
+    const due = [...this.definitions.values()].filter(d => d.enabled && d.status !== "deleted" && d.nextRunAt !== undefined && d.nextRunAt <= now);
+    for (const d of due) {
+      d.lastRunAt = now;
+      d.nextRunAt = nextOccurrence(d.schedule, now, d);
+      if (d.schedule.kind === "once") d.enabled = false;
+    }
+    if (due.length) await this.persistDefinitions();
+    return due.map(clone);
+  }
+
+  async recordExternal(id: string, accepted: boolean, detail: string): Promise<void> {
+    const definition = this.definitions.get(id);
+    if (definition) { definition.overlapPending = false; definition.status = "active"; }
+    const record: ScheduleHistoryRecord = { id: newId("schedule-history"), scheduleId: id,
+      triggeredAt: this.clock.now(), source: "timer", status: accepted ? "accepted" : "failed", detail };
+    this.history.push(record);
+    await this.persistence.appendScheduleHistory(record);
+    await this.persistDefinitions();
+  }
+
+  async deferExternal(id: string): Promise<void> {
+    const definition = this.definitions.get(id);
+    if (!definition || !definition.enabled) return;
+    if (!definition.overlapPending) {
+      const record: ScheduleHistoryRecord = { id: newId("schedule-history"), scheduleId: id,
+        triggeredAt: this.clock.now(), source: "timer", status: "pending", detail: "会话忙碌，本次任务等待空闲后执行一次。" };
+      this.history.push(record);
+      await this.persistence.appendScheduleHistory(record);
+    }
+    definition.overlapPending = true;
+    definition.status = "overlap-pending";
+    definition.nextRunAt = this.clock.now() + 10_000;
+    await this.persistDefinitions();
+  }
+
+  async update(id: string, changes: Pick<ScheduleDraft, "name" | "prompt" | "schedule">): Promise<boolean> {
+    const definition = this.definitions.get(id);
+    if (!definition || definition.status === "deleted") return false;
+    if (!changes.name.trim() || !changes.prompt.trim()) throw new Error("名称和任务内容不能为空。");
+    validatePattern(changes.schedule);
+    Object.assign(definition, clone(changes), { updatedAt: this.clock.now(), overlapPending: false });
+    definition.nextRunAt = definition.enabled ? nextOccurrence(changes.schedule, this.clock.now()) : undefined;
+    await this.persistDefinitions();
+    this.armTimer();
+    return true;
+  }
+
   subscribe(listener: SchedulerListener): () => void {
     this.listeners.add(listener);
     listener(this.snapshot());
@@ -87,6 +153,7 @@ export class SchedulerService {
 
   async create(draft: ScheduleDraft): Promise<ScheduleDefinition> {
     if (!draft.name.trim() || !draft.prompt.trim()) throw new Error("自动任务名称和内容不能为空。 ");
+    if (draft.target.kind === "existing-session" && !this.runtime.getSession(draft.target.sessionId)) throw new Error("目标会话已不存在，请选择现有会话。");
     validatePattern(draft.schedule);
     const now = this.clock.now();
     const definition: ScheduleDefinition = {
@@ -112,6 +179,7 @@ export class SchedulerService {
   async setEnabled(id: string, enabled: boolean): Promise<boolean> {
     const definition = this.definitions.get(id);
     if (!definition || definition.status === "deleted") return false;
+    if (enabled && definition.target.kind === "existing-session" && !this.runtime.getSession(definition.target.sessionId)) return false;
     definition.enabled = enabled;
     definition.status = enabled ? "active" : "paused";
     definition.updatedAt = this.clock.now();
@@ -153,6 +221,7 @@ export class SchedulerService {
   async restore(id: string): Promise<boolean> {
     const definition = this.definitions.get(id);
     if (!definition || definition.status !== "deleted") return false;
+    if (definition.target.kind === "existing-session" && !this.runtime.getSession(definition.target.sessionId)) return false;
     definition.enabled = true;
     definition.status = "active";
     delete definition.deletedAt;
@@ -180,6 +249,7 @@ export class SchedulerService {
   }
 
   private armTimer(): void {
+    if (this.externalDispatch) return;
     if (this.timer !== undefined) this.clock.clearTimeout(this.timer);
     this.timer = undefined;
     const next = [...this.definitions.values()]
@@ -282,7 +352,18 @@ export class SchedulerService {
     await this.persistence.appendScheduleHistory(history);
   }
 
+  private pauseMissingTarget(definition: ScheduleDefinition): boolean {
+    if (definition.status === "deleted" || definition.target.kind !== "existing-session" || this.runtime.getSession(definition.target.sessionId)) return false;
+    if (!definition.enabled && definition.status === "project-invalid") return false;
+    definition.enabled = false;
+    definition.status = "project-invalid";
+    definition.nextRunAt = undefined;
+    definition.overlapPending = false;
+    return true;
+  }
+
   private persistDefinitions(): Promise<void> {
+    for (const definition of this.definitions.values()) this.pauseMissingTarget(definition);
     return this.persistence.saveSchedules([...this.definitions.values()].map(clone));
   }
 
@@ -293,6 +374,7 @@ export class SchedulerService {
 }
 
 export function nextOccurrence(pattern: SchedulePattern, from: number, definition?: ScheduleDefinition): number | undefined {
+  if (pattern.kind === "cron") return nextCron(pattern.expression, pattern.timeZone, from);
   if (pattern.kind === "once") return definition?.lastRunAt ? undefined : pattern.runAt;
   if (pattern.kind === "interval") return from + pattern.everyMs;
   if (pattern.timeZone) return nextZonedOccurrence(pattern, from);
@@ -329,6 +411,7 @@ export function previewScheduleOccurrences(
 }
 
 function validatePattern(pattern: SchedulePattern): void {
+  if (pattern.kind === "cron") { parseCron(pattern.expression); assertTimeZone(pattern.timeZone); }
   if (pattern.kind === "once" && !Number.isFinite(pattern.runAt)) throw new Error("单次执行时间无效。 ");
   if (pattern.kind === "interval" && pattern.everyMs < 1_000) throw new Error("间隔至少为 1 秒。 ");
   if ((pattern.kind === "daily" || pattern.kind === "weekly")
@@ -446,4 +529,42 @@ function missedOccurrences(pattern: SchedulePattern, next: number, now: number):
 
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function parseCron(expression: string): number[][] {
+  const fields = expression.trim().split(/\s+/);
+  if (fields.length !== 5) throw new Error("Cron 需要 5 个字段：分 时 日 月 星期。");
+  return fields.map((field, index) => {
+    const [min, max] = [[0,59],[0,23],[1,31],[1,12],[0,7]][index];
+    const values = new Set<number>();
+    for (const part of field.split(',')) {
+      const match = /^(\*|\d+(?:-\d+)?)(?:\/(\d+))?$/.exec(part);
+      if (!match) throw new Error("Cron 字段无效。");
+      const step = Number(match[2] || 1);
+      const range = match[1] === '*' ? [min,max] : match[1].split('-').map(Number);
+      const start = range[0], end = range[1] ?? (match[2] ? max : start);
+      if (step < 1 || start < min || end > max || start > end) throw new Error("Cron 数值超出范围。");
+      for (let n = start; n <= end; n += step) values.add(index === 4 && n === 7 ? 0 : n);
+    }
+    return [...values].sort((a,b)=>a-b);
+  });
+}
+
+function nextCron(expression: string, zone: string, from: number): number | undefined {
+  const [minutes,hours,days,months,weekdays] = parseCron(expression);
+  const raw = expression.trim().split(/\s+/);
+  const today = localParts(from, zone);
+  for (let offset=0; offset<366*5; offset++) {
+    const date = addDays({...today,hour:0,minute:0}, offset);
+    if (!months.includes(date.month)) continue;
+    const day = days.includes(date.day), week = weekdays.includes(weekdayFor(date));
+    if (!(raw[2] === '*' ? week : raw[4] === '*' ? day : day || week)) continue;
+    for (const hour of hours) for (const minute of minutes) {
+      if (!offset && (hour < today.hour || hour === today.hour && minute <= today.minute)) continue;
+      const local = {...date,hour,minute};
+      const at = resolveLocal(local, zone);
+      if (at > from && sameLocal(at, local, zone)) return at;
+    }
+  }
+  throw new Error("未来五年内没有符合该 Cron 的执行时间。");
 }

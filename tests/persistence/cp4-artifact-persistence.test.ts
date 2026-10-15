@@ -6,7 +6,7 @@ import { ManagedArtifactService } from "../../src/features/tool-output/managed-a
 import { SQLiteStore } from "../../src/platform/persistence/sqlite-store";
 
 test("CP4 artifact references survive SQLite restart without storing output in the snapshot", async () => {
-  const tempRoot = "D:\\Viniper workstation\\codex\\运行残留";
+  const tempRoot = join(process.cwd(), "codex", "运行残留");
   await mkdir(tempRoot, { recursive: true });
   const root = await mkdtemp(join(tempRoot, "cp4-sqlite-artifacts-"));
   const first = new SQLiteStore(root);

@@ -1,7 +1,7 @@
 import { PermissionMode, ToolRequest } from "../../core/contracts";
 import { newId } from "../../core/ids";
 import { PermissionAccessPersistence } from "../../core/ports";
-import { win32 } from "node:path";
+import { posix, win32 } from "node:path";
 import {
   ApprovalHostMode,
   FullAccessLevel,
@@ -68,12 +68,15 @@ function isReviewProjectActionAllowed(tool: ToolRequest, projectRoot?: string): 
   if (tool.name !== "terminal.run") return true;
   if (!projectRoot) return false;
   const command = typeof tool.input?.command === "string" ? tool.input.command.trim() : "";
-  if (!command || /[\r\n;|&<>]/u.test(command) || /(^|[\s'"`])\.\.([\\/]|$)/u.test(command)) return false;
+  if (!command || /[\r\n;|&<>`]/u.test(command) || /\$[({]/u.test(command) || /(^|[\s'"`])\.\.([\\/]|$)/u.test(command)) return false;
   const cwd = typeof tool.input?.cwd === "string" ? tool.input.cwd.trim() : "";
   if (cwd && !isProjectContainedPath(cwd, projectRoot)) return false;
   if (absoluteWindowsPaths(command).some((path) => !isProjectContainedPath(path, projectRoot))) return false;
+  if (projectRoot.startsWith("/") && [...command.matchAll(/(?:^|[\s'"=])(\/[^\s'"`;|&<>]*)/gu)]
+    .some((match) => !isProjectContainedPath(match[1], projectRoot))) return false;
 
   if (/^Write-Output(?:\s|$)/iu.test(command)) return true;
+  if (projectRoot.startsWith("/") && /^(?:printf|pwd)(?:\s|$)/u.test(command)) return true;
   if (/^\[Console\]::Out\.Write(?:Line)?\([^\r\n]*\)$/iu.test(command)) return true;
   if (/^(?:Get-ChildItem|Get-Content|Test-Path|Select-String)(?:\s|$)/iu.test(command)) return true;
   if (/^git\s+(?:status|diff|log)(?:\s|$)/iu.test(command)) return true;
@@ -88,12 +91,13 @@ function absoluteWindowsPaths(command: string): string[] {
 }
 
 function isProjectContainedPath(candidate: string, projectRoot: string): boolean {
-  const normalizedRoot = win32.resolve(projectRoot);
-  const normalizedCandidate = win32.isAbsolute(candidate)
-    ? win32.resolve(candidate)
-    : win32.resolve(normalizedRoot, candidate);
-  const relative = win32.relative(normalizedRoot, normalizedCandidate);
-  return relative === "" || (!relative.startsWith("..") && !win32.isAbsolute(relative));
+  const paths = projectRoot.startsWith("/") ? posix : win32;
+  const normalizedRoot = paths.resolve(projectRoot);
+  const normalizedCandidate = paths.isAbsolute(candidate)
+    ? paths.resolve(candidate)
+    : paths.resolve(normalizedRoot, candidate);
+  const relative = paths.relative(normalizedRoot, normalizedCandidate);
+  return relative === "" || (!relative.startsWith("..") && !paths.isAbsolute(relative));
 }
 
 interface PendingAuthorization {

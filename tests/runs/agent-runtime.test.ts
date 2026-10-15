@@ -6,6 +6,7 @@ import { FileStore } from "../../src/platform/persistence/file-store";
 import { createRuntimeFixture, waitFor } from "./runtime-fixture";
 import { TokenLedger } from "../../src/features/telemetry/token-ledger";
 import { ToolRegistry } from "../../src/features/tools/tool-registry";
+import { MemoryService } from "../../src/features/memory/memory-service";
 
 test("Provider request limits keep production defaults and allow an isolated review override", () => {
   assert.equal(resolveProviderRequestLimit("review"), 6);
@@ -56,6 +57,18 @@ test("auto permission completes the read-only Demo tool", async () => {
     const after = activeSession(fixture.runtime);
     assert.equal(after.events.some((event) => event.type === "tool.requested"), true);
     assert.equal(after.events.some((event) => event.type === "tool.completed"), true);
+    const thinkingStarts = after.events.filter((event) => event.type === "thinking.started");
+    const thinkingIds = thinkingStarts.map((event) => (event.payload as { id: string }).id);
+    // The desktop suppresses deltas for completed activity IDs. A second
+    // Provider request after a tool must therefore start a new activity.
+    assert.equal(thinkingIds.length, 2);
+    assert.equal(new Set(thinkingIds).size, 2);
+    for (const id of thinkingIds) {
+      assert.ok(after.events.some((event) => event.type === "thinking.delta"
+        && (event.payload as { activityId: string }).activityId === id));
+      assert.ok(after.events.some((event) => event.type === "thinking.completed"
+        && (event.payload as { activityId: string }).activityId === id));
+    }
     assert.match(after.messages.at(-1)?.text ?? "", /^\[Demo Provider\] Agent 回复：/u);
     assert.equal(latestStatus, "idle");
     unsubscribe();
@@ -172,6 +185,64 @@ test("a failing completion listener stays visible and cannot block the same-sess
     assert.equal(after.events.filter((event) => event.type === "run.listener-failed").length, 2);
     assert.match(after.activities.find((activity) => activity.title === "运行后续处理失败")?.detail ?? "", /fixture failed/u);
   } finally {
+    await fixture.dispose();
+  }
+});
+
+test("an automatic memory persistence failure preserves completion and releases queued work", async () => {
+  class FailingCaptureMemory extends MemoryService {
+    override async captureSession(): Promise<never> {
+      throw new Error("fixture memory persistence failed");
+    }
+  }
+  const fixture = await createRuntimeFixture({ memoryService: new FailingCaptureMemory(), maxConcurrentRuns: 1 });
+  try {
+    const session = activeSession(fixture.runtime);
+    await fixture.runtime.send({ sessionId: session.id, text: "记忆故障前一项", attachments: [], selectedModel: session.selectedModel, permissionMode: session.permissionMode });
+    assert.deepEqual(await fixture.runtime.send({ sessionId: session.id, text: "记忆故障后一项", attachments: [], selectedModel: session.selectedModel, permissionMode: session.permissionMode }), { accepted: true, queued: true });
+    const other = await fixture.runtime.createSession();
+    assert.deepEqual(await fixture.runtime.send({ sessionId: other.id, text: "其他会话排队", attachments: [], selectedModel: other.selectedModel, permissionMode: other.permissionMode }), { accepted: true, queued: true });
+    await fixture.runtime.flushPersistence();
+    const snapshot = fixture.runtime.snapshot();
+    assert.equal(snapshot.sessions.every((item) => item.status === "idle" && item.queue.length === 0), true);
+    assert.equal(fixture.runtime.listRuns().every((run) => run.status === "completed"), true);
+    assert.equal(snapshot.sessions.flatMap((item) => item.events).filter((event) => event.type === "run.completed").length, 3);
+    assert.equal(snapshot.sessions.flatMap((item) => item.activities).filter((item) => item.title === "自动记忆保存失败").length, 3);
+    assert.deepEqual(snapshot.sessions.find((item) => item.id === session.id)!.messages.filter((message) => message.role === "user").map((message) => message.text), ["记忆故障前一项", "记忆故障后一项"]);
+    const persisted = await fixture.store.load();
+    assert.equal(persisted!.application.sessions.every((item) => item.status === "idle"), true);
+  } finally {
+    await fixture.dispose();
+  }
+});
+
+test("a run persistence barrier releases a completed session while global flush still waits for approval", async () => {
+  const fixture = await createRuntimeFixture();
+  try {
+    const waiting = activeSession(fixture.runtime);
+    await fixture.runtime.setPermissionMode(waiting.id, "ask");
+    await fixture.runtime.send({ sessionId: waiting.id, text: "等待权限", attachments: [], selectedModel: waiting.selectedModel, permissionMode: "ask" });
+    await waitFor(() => fixture.runtime.pendingToolApprovals().length === 1);
+    const completed = await fixture.runtime.createSession();
+    await fixture.runtime.send({ sessionId: completed.id, text: "你是谁", attachments: [], selectedModel: completed.selectedModel, permissionMode: completed.permissionMode });
+    await waitFor(() => fixture.runtime.listRuns(completed.id).some((run) => run.status === "completed"));
+    const runId = fixture.runtime.listRuns(completed.id)[0].runId;
+    await fixture.runtime.flushRunPersistence(runId);
+    assert.equal(fixture.runtime.isRunning(waiting.id), true);
+    let globallyFlushed = false;
+    const globalFlush = fixture.runtime.flushPersistence().then(() => { globallyFlushed = true; });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(globallyFlushed, false);
+    assert.equal(await fixture.runtime.cancel(waiting.id), true);
+    await globalFlush;
+    assert.equal(globallyFlushed, true);
+    const persisted = await fixture.store.load();
+    assert.equal(persisted!.application.sessions.find((item) => item.id === completed.id)!.status, "idle");
+    assert.equal(fixture.runtime.pendingToolApprovals().length, 0);
+  } finally {
+    for (const run of fixture.runtime.listRuns()) {
+      if (run.status === "running") await fixture.runtime.cancelRun(run.runId);
+    }
     await fixture.dispose();
   }
 });

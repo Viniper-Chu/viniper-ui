@@ -61,10 +61,10 @@ export function buildTrayMenuTemplate(input: TrayMenuInput): MenuItemConstructor
   template.push({ type: "separator" });
   template.push({ label: "新建 Agent", click: () => input.onNewAgent() });
   template.push({
-    label: input.windowVisible ? "隐藏 Viniper workstation" : "打开 Viniper workstation",
+    label: input.windowVisible ? "隐藏 Viniper" : "打开 Viniper",
     click: () => input.onToggleWindow(),
   });
-  template.push({ label: "完全退出 Viniper workstation", click: () => input.onQuit() });
+  template.push({ label: "完全退出 Viniper", click: () => input.onQuit() });
   return template;
 }
 

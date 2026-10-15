@@ -45,7 +45,7 @@ test("standalone CLI command binds the packaged CLI to the same data root and pr
     dataRoot: "C:\\Users\\fixture\\Viniper Data",
     projectRoot: "D:\\Agent",
   });
-  assert.match(command, /title Viniper workstation CLI/u);
+  assert.match(command, /title Viniper CLI/u);
   assert.match(command, /color 0B/u);
   assert.match(command, /ELECTRON_RUN_AS_NODE=1/u);
   assert.match(command, /--data-root "C:\\Users\\fixture\\Viniper Data" --project "D:\\Agent"/u);

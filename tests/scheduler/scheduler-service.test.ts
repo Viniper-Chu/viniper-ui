@@ -150,3 +150,32 @@ async function waitFor(predicate: () => boolean): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
+
+test("desktop cron persists, defers one busy occurrence, edits, pauses, and skips offline misfires", async()=>{
+  const store=new MemorySchedulerStore(),runtime=new FakeRuntime(),clock=new FakeClock(Date.parse('2026-10-15T00:59:00Z'));
+  const service=new SchedulerService(store,runtime,'/tmp',clock,true);await service.initialize();
+  const target={kind:'existing-session' as const,sessionId:[...runtime.sessions.keys()][0]};
+  const job=await service.create({name:'每日任务',prompt:'写一次结果',schedule:{kind:'cron',expression:'0 9 * * *',timeZone:'Asia/Shanghai'},target});
+  assert.equal(job.nextRunAt,Date.parse('2026-10-15T01:00:00Z'));
+  await clock.advance(60_000);assert.equal(runtime.intents.length,0);
+  assert.equal((await service.claimDue()).length,1);assert.equal((await service.claimDue()).length,0);
+  await service.deferExternal(job.id);await clock.advance(10_000);assert.equal((await service.claimDue()).length,1);
+  await service.deferExternal(job.id);assert.equal(store.history.filter(h=>h.status==='pending').length,1);
+  await clock.advance(10_000);assert.equal((await service.claimDue()).length,1);
+  await service.recordExternal(job.id,true,'已开始');assert.equal((await service.claimDue()).length,0);
+  assert.equal(await service.update(job.id,{name:'新的任务',prompt:'新的内容',schedule:{kind:'cron',expression:'*/5 * * * *',timeZone:'Asia/Shanghai'}}),true);
+  await service.setEnabled(job.id,false);await clock.advance(600_000);assert.equal((await service.claimDue()).length,0);
+  await service.setEnabled(job.id,true);service.dispose();await clock.advance(86_400_000);
+  const reopened=new SchedulerService(store,runtime,'/tmp',clock,true);await reopened.initialize();
+  assert.equal((await reopened.claimDue()).length,0);assert.equal(runtime.intents.length,0);
+  assert.equal(reopened.snapshot().definitions[0].name,'新的任务');
+  assert.ok(reopened.snapshot().history.some(h=>h.detail.includes('离线')));
+  await reopened.delete(job.id);assert.equal(reopened.snapshot().definitions[0].enabled,false);reopened.dispose();
+});
+
+test("cron uses timezone, field ranges and standard day-of-month/day-of-week union",()=>{
+  const from=Date.parse('2026-10-15T01:01:00Z');
+  assert.equal(nextOccurrence({kind:'cron',expression:'*/15 9-17 * * 1-5',timeZone:'Asia/Shanghai'},from),Date.parse('2026-10-15T01:15:00Z'));
+  assert.equal(nextOccurrence({kind:'cron',expression:'0 9 1 * 1',timeZone:'Asia/Shanghai'},from),Date.parse('2026-10-19T01:00:00Z'));
+  assert.throws(()=>nextOccurrence({kind:'cron',expression:'61 * * * *',timeZone:'Asia/Shanghai'},from));
+});

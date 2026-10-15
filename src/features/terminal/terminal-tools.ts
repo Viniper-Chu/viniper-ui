@@ -11,16 +11,18 @@ export function createTerminalTools(service: TerminalService): ToolExecutor[] {
 
 class TerminalRunTool implements ToolExecutor {
   readonly name = "terminal.run";
-  readonly description = "在当前项目中运行 PowerShell 7 脚本，保留可续读的输出。";
+  readonly description = process.platform === "win32"
+    ? "在当前项目中运行 PowerShell 7 脚本，保留可续读的输出。"
+    : `在当前项目中运行 ${process.platform === "darwin" ? "zsh" : "POSIX shell"} 脚本，保留可续读的输出。`;
   readonly readOnly = false;
   readonly authorizationScope = "project" as const;
   readonly inputSchema = {
     type: "object" as const,
     properties: {
-      command: { type: "string" as const, description: "直接提供 PowerShell 7 脚本；宿主已是 pwsh，不要再包一层 pwsh / powershell -Command，以免变量提前展开。The host is already PowerShell 7; pass the script directly." },
+      command: { type: "string" as const, description: process.platform === "win32" ? "直接提供 PowerShell 7 脚本；宿主已是 pwsh，不要再包一层 pwsh / powershell -Command，以免变量提前展开。The host is already PowerShell 7; pass the script directly." : "直接提供当前系统 shell 脚本（macOS 为 zsh）；使用 POSIX 路径和命令。无需再次包装 shell -c；不会加载用户启动脚本。" },
       cwd: { type: "string" as const, description: "可选的项目内相对工作目录；默认项目根。" },
       timeoutMs: { type: "number" as const, description: "可解释超时，默认 120000 毫秒，范围 100–1800000。" },
-      purpose: { type: "string" as const, description: "command/dependency/build/test/lint/typecheck 之一。" },
+      purpose: { type: "string" as const, enum: ["command", "dependency", "build", "test", "lint", "typecheck"], description: "command/dependency/build/test/lint/typecheck 之一。" },
     },
     required: ["command"],
     additionalProperties: false,
@@ -34,11 +36,15 @@ class TerminalRunTool implements ToolExecutor {
 
   async execute(request: ToolRequest, context: ToolExecutionContext): Promise<ToolResult> {
     const result = await this.service.run(request.input as unknown as TerminalRunInput, context);
-    const displayText = terminalRunSummary(result);
+    const captureFailure = result.status === "nonzero"
+      && /(?:^|[\s/;|&])screencapture(?:\s|$)/u.test(String(request.input?.command ?? ""))
+      && /could not create image from display/iu.test(`${result.stdout.preview}\n${result.stderr.preview}`);
+    const hint = captureFailure ? "macOS 未生成截图。可能是屏幕录制权限或当前显示会话不可捕获；该错误不能确定具体原因。条件未改变时不要反复换路径、安装组件或重复截图，不可声称已截图或发送。" : undefined;
+    const displayText = hint ?? terminalRunSummary(result);
     return {
       toolId: request.id,
-      text: JSON.stringify(result),
-      data: result,
+      text: JSON.stringify({ ...result, ...(hint ? { hint } : {}) }),
+      data: { ...result, ...(hint ? { hint } : {}) },
       displayText,
       presentation: terminalRunPresentation(result, displayText),
       isError: !result.ok,

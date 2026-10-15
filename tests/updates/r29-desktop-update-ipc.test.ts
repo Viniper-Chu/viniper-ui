@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { createRequire } from "node:module";
 import { test } from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 
 const mainPath = join(process.cwd(), "resources", "viniper-ui", "desktop", "main.js");
 const source = readFileSync(mainPath, "utf8");
+const { isTrustedRenderer } = createRequire(mainPath)("./platform-runtime.js");
 const parsed = ts.createSourceFile(mainPath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
 const functions = new Set(["isTrustedUpdateSender", "requestAppUpdateInstall", "installAppUpdate", "stopOwnedUpdateServer", "finishUpdateQuit"]);
 const declarations = parsed.statements.filter((node): node is ts.FunctionDeclaration => ts.isFunctionDeclaration(node) && Boolean(node.name && functions.has(node.name.text))).map((node) => node.getText(parsed)).join("\n");
@@ -36,7 +38,7 @@ function fixture(payload: unknown = { ok: true, status: "installer_opened", upda
   const sender = { mainFrame: frame };
   const owned = new OwnedProcess();
   const sandbox: any = {
-    URL, Promise, setTimeout, clearTimeout,
+    URL, Promise, setTimeout, clearTimeout, isTrustedRenderer,
     setImmediate: (callback: () => void) => { scheduled.push(callback); },
     mainWindow: { isDestroyed: () => false, webContents: sender },
     localUrl: () => "http://127.0.0.1:17947", port: 17947,

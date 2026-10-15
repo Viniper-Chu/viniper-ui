@@ -15,6 +15,78 @@ import {
   withProtocolFake,
 } from "../protocol-test-kit";
 
+test("long streamed tool arguments report bounded real progress before completing JSON", async () => {
+  const profile = testProfile("openai-chat", "http://127.0.0.1/v1/chat/completions");
+  const source = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (delta: unknown) => controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\n`));
+      send({ tool_calls: [{ index: 0, id: "long-call", function: { name: "demo.inspect", arguments: '{"topic":"' } }] });
+      await new Promise((resolve) => setTimeout(resolve, 1050));
+      send({ tool_calls: [{ index: 0, function: { arguments: '正文'.repeat(2000) } }] });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      send({ tool_calls: [{ index: 0, function: { arguments: '"}' } }] });
+      controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+      controller.close();
+    },
+  });
+  const provider = new OpenAIChatProvider({ ...providerOptions(profile), fetchImpl: async () => new Response(source) });
+  const events = [];
+  for await (const event of provider.stream(protocolRequest(profile), new AbortController().signal)) events.push(event);
+  const progress = events.filter((e) => e.kind === "provider.activity");
+  assert.equal(progress.length, 2);
+  assert.equal(progress[1].receivedCharacters, 4010);
+  assert.doesNotMatch(JSON.stringify(progress), /正文|argumentsText/u);
+  assert.equal(events.at(-1)?.kind, "tool-call.completed");
+  const call = events.at(-1);
+  if (call?.kind === "tool-call.completed") assert.equal(call.call.arguments.topic, '正文'.repeat(2000));
+});
+
+test("a no-tool OpenAI request omits schemas and explicitly disables tool choice", () => {
+  const profile = testProfile("openai-chat", "http://127.0.0.1/v1/chat/completions");
+  const request = protocolRequest(profile);
+  request.tools = [];
+  const body = serializeOpenAIChat(request, profile);
+  assert.equal("tools" in body, false);
+  assert.equal(body.tool_choice, "none");
+});
+
+test("truncated tool JSON cannot execute or poison the next request, and the model can recover", async () => {
+  await withProtocolFake((request, index) => {
+    if (index === 0) return [
+      { data: { choices: [{ delta: { tool_calls: [{ index: 0, id: "truncated", function: { name: "demo.inspect", arguments: '{"topic":"unfinished' } }] }, finish_reason: "length" }] } },
+      { data: "[DONE]" },
+    ];
+    const messages = request.body.messages as Array<any>;
+    const prior = messages.find((m) => m.tool_calls?.some((c: any) => c.id === "truncated"));
+    assert.deepEqual(JSON.parse(prior.tool_calls[0].function.arguments), {});
+    assert.match(messages.find((m) => m.tool_call_id === "truncated").content, /输出上限.*未执行.*分段/u);
+    return index === 1 ? [
+      { data: { choices: [{ delta: { tool_calls: [{ index: 0, id: "recovered", function: { name: "demo.inspect", arguments: '{"topic":"short part"}' } }] } }] } },
+      { data: "[DONE]" },
+    ] : [{ data: { choices: [{ delta: { content: "分段完成" } }] } }, { data: "[DONE]" }];
+  }, async (endpoint) => {
+    const profile = testProfile("openai-chat", endpoint);
+    const outcome = await runProtocolToolLoop(new OpenAIChatProvider(providerOptions(profile)), protocolRequest(profile));
+    assert.equal(outcome.result.assistantText, "分段完成");
+    assert.deepEqual(outcome.executedCallIds, ["recovered"]);
+    const invalid = outcome.projected.find((e) => e.kind === "tool-call.completed" && e.call.callId === "truncated");
+    if (invalid?.kind === "tool-call.completed") assert.equal(invalid.call.argumentsError, "output-limit");
+    else assert.fail("missing invalid-call evidence");
+  });
+});
+
+test("saved malformed calls are repaired only in the outgoing replay copy", () => {
+  const profile = testProfile("openai-chat", "http://127.0.0.1/v1/chat/completions");
+  const request = protocolRequest(profile);
+  const raw = '{"path":"/example.tex","content":"unfinished';
+  request.history.push({ id: "old", role: "assistant", items: [{ type: "tool-call", callId: "old-call", name: "demo.inspect", argumentsText: raw, arguments: {} }] });
+  const original = JSON.stringify(request.history);
+  const body = serializeOpenAIChat(request, profile);
+  const messages = body.messages as Array<any>;
+  assert.equal(messages.at(-1).tool_calls[0].function.arguments, "{}");
+  assert.equal(JSON.stringify(request.history), original);
+});
+
 test("OpenAI Chat fake handles DeepSeek reasoning, fragmented tool calls and tool_call_id continuation", async () => {
   await withProtocolFake((_request, index) => index === 0 ? [
     { data: { choices: [{ delta: { reasoning_content: "先检查" } }] } },

@@ -46,6 +46,20 @@ const unknownProjectTerminal = {
   input: { command: "Invoke-Expression 'Write-Output unknown'", purpose: "command" },
 } as const;
 
+test("review terminal containment follows POSIX case and absolute path semantics", () => {
+  const root = "/Users/fixture/Project";
+  const allow = (command: string, cwd = "") => decideToolPermission("review", {
+    ...safeProjectTerminal, input: { command, cwd, purpose: "test" },
+  }, { level: "project-full", projectRoot: root }, root).allowed;
+  assert.equal(allow("git status", "src"), true);
+  assert.equal(allow("git diff /Users/fixture/Project/src"), true);
+  assert.equal(allow("git diff /Users/fixture/private.txt"), false);
+  assert.equal(allow("git status", "/Users/fixture/project"), false);
+  assert.equal(allow("git status", "../Other"), false);
+  assert.equal(allow("git diff $(touch unexpected)"), false);
+  assert.equal(allow("git diff `touch unexpected`"), false);
+});
+
 test("Viniper review mode auto-runs read-only and approved project actions, rejects risk without a prompt", async () => {
   assert.deepEqual(decideToolPermission("review", readOnly), { allowed: true, reason: "review-read-only" });
   assert.deepEqual(decideToolPermission("review", projectWrite, { level: "project-full", projectRoot: "C:/project" }, "C:/project"), {

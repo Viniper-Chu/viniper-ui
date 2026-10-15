@@ -10,9 +10,14 @@ test("WindowsProcessHost resolves the explicit PowerShell 7 entrypoint", () => {
   assert.doesNotMatch(value, /windowspowershell[\\/]v1\.0[\\/]powershell/u);
 });
 
-test("terminal schema tells the model to send PowerShell directly without nested shell expansion", () => {
+test("terminal schema describes the native platform shell", () => {
   const tool = createTerminalTools({} as TerminalService)[0];
   const schema = JSON.stringify(tool.inputSchema);
-  assert.match(schema, /already PowerShell 7/);
-  assert.match(schema, /pass the script directly/);
+  if (process.platform === "win32") {
+    assert.match(schema, /already PowerShell 7/);
+    assert.match(schema, /pass the script directly/);
+  } else {
+    assert.match(schema, /POSIX/);
+    assert.doesNotMatch(schema, /PowerShell/);
+  }
 });

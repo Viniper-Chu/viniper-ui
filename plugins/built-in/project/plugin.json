@@ -1,0 +1,19 @@
+{
+  "manifestVersion": 1,
+  "id": "built-in.project",
+  "name": "项目与代码",
+  "version": "2.0.0",
+  "capabilities": [
+    "coding"
+  ],
+  "skills": [],
+  "tools": [
+    "project.list",
+    "project.search",
+    "project.read",
+    "project.edit",
+    "project.diff",
+    "terminal.run"
+  ],
+  "providers": []
+}

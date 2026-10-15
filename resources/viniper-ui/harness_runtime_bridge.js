@@ -9,6 +9,7 @@ const readline = require("node:readline");
 
 const { createHarnessApplication } = require("./harness-runtime/dist/src/platform/bootstrap/create-harness-application.js");
 const { DOMESTIC_MODEL_PROFILES } = require("./harness-runtime/dist/src/features/providers/profiles/domestic-models.js");
+const { loadLocalAgentPolicy } = require("./harness-runtime/dist/src/features/local-models/local-agent-policy.js");
 const {
   normalizeRawAnthropicEndpoint,
   normalizeProviderModel,
@@ -56,9 +57,12 @@ let runtime;
 let services;
 let application;
 const activeRuns = new Map();
-let hostMcpReady = false;
 let sessionMap = { version: 1, sessions: {} };
 let sessionMapWriteBarrier = Promise.resolve();
+
+function nativeIdForHarness(id) {
+  return Object.entries(sessionMap.sessions).find(([,v]) => v.harnessSessionId === id)?.[0] || "";
+}
 
 function knownSecrets(value) {
   const normalized = String(value || "");
@@ -134,19 +138,23 @@ async function configureProviderMetadata(request) {
 
   const settings = application.services.providerSettings;
   const baseUrl = String(request.base_url || "").trim();
+  const localPolicy = loadLocalAgentPolicy(baseUrl);
   const requestedProfile = profileFor(requestedProvider);
   // The existing DeepSeek gateway is Anthropic-compatible when its configured
   // endpoint is /anthropic; use the matching real profile instead of sending
   // an OpenAI payload to that endpoint.
-  const profileId = requestedProvider === "deepseek" && /\/anthropic(?:\/|$)/iu.test(baseUrl)
+  const profileId = localPolicy ? "openai-compatible" : requestedProvider === "deepseek" && /\/anthropic(?:\/|$)/iu.test(baseUrl)
     ? "anthropic"
     : (requestedProfile ? requestedProfile.id : "openai-compatible");
-  const endpoint = profileId === "anthropic"
+  const endpoint = localPolicy ? `${localPolicy.endpoint}/chat/completions` : profileId === "anthropic"
     ? normalizeRawAnthropicEndpoint(baseUrl)
     : baseUrl;
   if (endpoint) await settings.setEndpoint(profileId, endpoint);
   const model = requestedModel(request, profileId);
   await settings.setManualModel(profileId, model);
+  if (localPolicy?.model === model) {
+    await settings.setEnabledCapabilities(profileId, { stream: true, tools: true, reasoning: true, usage: true, cache: false });
+  }
   return { providerId: profileId, model, endpoint };
 }
 
@@ -208,6 +216,9 @@ async function ensureSession(request, provider, { setActive = true } = {}) {
     throw new Error(`Harness provider/model unavailable: ${provider.providerId}/${provider.model}`);
   }
   await runtime.setPermissionMode(session.id, permissionMode);
+  if (request.reasoning != null && !await runtime.setReasoning(session.id, String(request.reasoning))) {
+    throw new Error("Harness reasoning selection unavailable");
+  }
   const accessSelection = permissionMode === "review" && session.projectAccess?.enabled === true
     ? "project-run"
     : "standard";
@@ -299,14 +310,16 @@ async function run(request) {
     const result = await runtime.send({
       sessionId: session.id,
       text: String(request.prompt || ""),
+      userText: request.user_text == null ? undefined : String(request.user_text),
       selectedModel: session.selectedModel,
       permissionMode: session.permissionMode,
       origin: { kind: "user" },
       memoryEnabled: request.memory_enabled !== false,
+      planning: request.planning === true,
     });
     if (!result.accepted) throw new Error(`Harness run rejected: ${result.reason || "unknown"}`);
     const terminalEvent = await terminal;
-    await runtime.flushPersistence();
+    await runtime.flushRunPersistence(String(terminalEvent?.runId || terminalEvent?.payload?.runId || ""));
     writeLine({
       type: "runtime.completed",
       engine: "harness-runtime",
@@ -537,6 +550,17 @@ async function handleHarnessOperation(command) {
   const workflows = services?.workflowService;
   const subagents = services?.subagentService;
   const providerSettings = services?.providerSettings || application?.services?.providerSettings;
+  if (target === "terminal.output") {
+    const session = mappedHarnessSession(String(args.native_session_id || ""));
+    if (!session) throw new Error("输出需要所属的 Viniper 会话");
+    const executionId = String(args.execution_id || "");
+    const owner = session.activities.find(item => item.presentation?.kind === "terminal-run" && item.presentation.executionId === executionId);
+    if (!owner?.runId) throw new Error("此输出不属于当前会话");
+    const result = await services.terminalService.outputForSession({
+      executionId, stream: String(args.stream || "stdout"), offset: Number(args.offset || 0), maxBytes: 65536,
+    }, session.id, { runId: owner.runId, status: owner.presentation.status });
+    return sanitize(result, [String(args.host_secret_value || "")]);
+  }
   if (target === "tools.snapshot") {
     const registry = application?.services?.toolRegistry || services?.toolRegistry;
     return { names: (registry?.descriptors?.() || []).map((item) => String(item.name || "")).filter(Boolean) };
@@ -562,19 +586,19 @@ async function handleHarnessOperation(command) {
       host_secret_value: String(args.host_secret_value || ""),
     });
     const mcpEndpoint = String(args.mcp_endpoint || "");
-    if (mcpEndpoint && !hostMcpReady) {
+    if (mcpEndpoint) {
       const id = "workstation-loopback";
       const existing = (extensions?.snapshot?.().mcpConnections || []).find((item) => item?.id === id);
       if (!existing || String(existing.endpoint || "") !== mcpEndpoint) {
         await extensions.configureMcp({ id, endpoint: mcpEndpoint });
       }
       await extensions.connectMcp(id);
-      hostMcpReady = true;
     }
+    const mcpState = (extensions?.snapshot?.().mcpConnections || []).find((item) => item?.id === "workstation-loopback" && item?.endpoint === mcpEndpoint);
     const plugins = application?.services?.plugins?.list?.() || [];
     return {
       provider: { profileId: provider.providerId, model: provider.model, endpoint: provider.endpoint, configured: Boolean(provider.secret) },
-      mcp: { configured: Boolean(mcpEndpoint), connected: hostMcpReady },
+      mcp: { configured: Boolean(mcpEndpoint), connected: Boolean(mcpState?.connected) },
       builtInCoordination: plugins.some((item) => item?.id === "built-in.coordination" && item?.executable === true),
     };
   }
@@ -685,7 +709,33 @@ async function handleControl(command) {
   const requestId = String(command.request_id || "");
   try {
     let data;
-    if (command.op === "collaboration.snapshot") {
+    if (command.op === "run.steer") {
+      const owned = mappedHarnessSession(command.native_session_id);
+      const active = owned && runtime.listRuns(owned.id).find((run) => ["queued", "running", "waiting", "waiting_resource", "recovering", "replaying"].includes(run.status));
+      if (!active) throw new Error("当前会话没有可引导的运行");
+      data = { receipt: await runtime.steer(active.runId, String(command.message || "")) };
+    } else if (command.op.startsWith("scheduler.")) {
+      const scheduler = application.services.scheduler;
+      if (command.op === "scheduler.snapshot") { data = scheduler.snapshot(); data.definitions = data.definitions.map(d => ({...d, native_session_id: nativeIdForHarness(d.target.sessionId)})); }
+      else if (command.op === "scheduler.create") {
+        const target = mappedHarnessSession(command.native_session_id);
+        if (!target) throw new Error("目标会话尚未注册");
+        data = { schedule: await scheduler.create({name:command.title, prompt:command.prompt,
+          schedule:{kind:"cron",expression:command.cron,timeZone:command.time_zone||"Asia/Shanghai"},
+          target:{kind:"existing-session",sessionId:target.id}}) };
+      } else if (command.op === "scheduler.claim") data = { due: (await scheduler.claimDue()).map(d => ({...d, native_session_id: nativeIdForHarness(d.target.sessionId)})) };
+      else if (command.op === "scheduler.defer") { await scheduler.deferExternal(command.id); data = {ok:true}; }
+      else if (command.op === "scheduler.update") data = {changed:await scheduler.update(command.id, {name:command.title,prompt:command.prompt,schedule:{kind:"cron",expression:command.cron,timeZone:command.time_zone||"Asia/Shanghai"}})};
+      else if (command.op === "scheduler.record") { await scheduler.recordExternal(command.id, command.accepted, command.detail); data = {ok:true}; }
+      else if (command.op === "scheduler.delete") data = {changed:await scheduler.delete(command.id)};
+      else if (command.op === "scheduler.toggle") data = {changed:await scheduler.setEnabled(command.id, Boolean(command.enabled))};
+      else throw new Error("Unknown scheduler operation");
+    } else if (command.op === "goals.load") {
+      data = { goals: await application.services.storage.loadSetting("viniper.goals.v2") || null };
+    } else if (command.op === "goals.save") {
+      await application.services.storage.saveSetting("viniper.goals.v2", command.goals || {});
+      data = { saved: true };
+    } else if (command.op === "collaboration.snapshot") {
       data = publicCollaborationSnapshot(command.visible_native_session_ids);
     } else if (command.op === "sessions.ensure") {
       const rows = Array.isArray(command.sessions) ? command.sessions : [];
@@ -743,11 +793,14 @@ async function handleControl(command) {
       const host = application?.services || services || {};
       const plugins = typeof host.plugins?.list === "function" ? host.plugins.list() : [];
       data = {
-        plugins: plugins.map((plugin) => ({
+        plugins: plugins.filter(plugin => plugin.classification === "built-in").map((plugin) => ({
           id: String(plugin.id || plugin.name || ""),
           name: String(plugin.name || plugin.id || ""),
-          status: String(plugin.status || "available"),
-          built_in: Boolean(plugin.builtIn),
+          status: plugin.tools.every(name => services.toolRegistry.has(name)) ? "available" : "unavailable",
+          tools: plugin.tools,
+          icon: ({ "built-in.documents": "files", "built-in.math-documents": "math", "built-in.project": "code", "built-in.research": "search", "built-in.coordination": "chat" })[plugin.id] || "plugin",
+          description: ({"built-in.documents":"读取和精确修改 Word 文档，以事务处理 SQLite 数据。", "built-in.math-documents":"复用本机排版工具制作师生讲义，读取 PDF 并生成检查用页面。", "built-in.project":"检索项目、修改代码、查看差异并运行验证。", "built-in.research":"读取公开网页与 GitHub 仓库资料。", "built-in.coordination":"通过已注册的工具安排会话协作与任务委派。"})[plugin.id] || "已注册的本机工具扩展。",
+          built_in: plugin.classification === "built-in",
         })).filter((plugin) => plugin.id),
       };
     } else if (command.op === "collaboration.delegate") {
@@ -819,6 +872,7 @@ async function bootstrap() {
     secretVault,
     approvalHostMode: "automatic",
     previewFullAccessDefaults: true,
+    externalScheduleDispatch: true,
     maxConcurrentRuns: 3,
     ...(reviewProviderLimit ? { providerRequestLimits: { review: reviewProviderLimit } } : {}),
     claudeCode: { enabled: false },
@@ -856,7 +910,7 @@ async function main() {
       });
       return;
     }
-    if (["capabilities.snapshot", "plugins.snapshot", "subagent.spawn", "sessions.snapshot", "sessions.ensure", "sessions.delete", "harness.snapshot", "harness.operation", "permissions.snapshot", "permission.resolve"].includes(command.op) || String(command.op || "").startsWith("collaboration.")) {
+    if (["capabilities.snapshot", "plugins.snapshot", "subagent.spawn", "sessions.snapshot", "sessions.ensure", "sessions.delete", "harness.snapshot", "harness.operation", "permissions.snapshot", "permission.resolve"].includes(command.op) || /^(collaboration|scheduler|goals)\./.test(String(command.op || "")) || command.op === "run.steer") {
       void handleControl(command);
     }
   });

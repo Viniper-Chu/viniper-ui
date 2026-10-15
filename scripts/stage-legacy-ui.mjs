@@ -2,23 +2,22 @@ import { access, cp, mkdir, readdir, readFile, writeFile } from "node:fs/promise
 import { join } from "node:path";
 
 const LEGACY_RUNTIME_FILES = [
-  "agent_host_bridge.py",
   "agent_instructions.py",
+  "goal_service.py",
+  "schedule_host.py",
   "agent_queue.py",
   "agent_run_coordinator.py",
-  "agent_runtime.py",
   "context_lifecycle.py",
   "context_usage.py",
   "model-capabilities.json",
   "model_catalog.py",
+  "local_request_guard.py",
+  "local_agent_contract.py",
   "daily_usage.py",
   "harness_application_port.py",
   "harness_provider_boundary.js",
   "harness_runtime_bridge.js",
   "harness_usage_projection.js",
-  "native_peer.py",
-  "native_commands.py",
-  "native_stream_protocol.py",
   "native_project_browser.py",
   "profiles.json",
   "requirements.txt",
@@ -29,17 +28,16 @@ const LEGACY_RUNTIME_FILES = [
   "update_manager.py",
   "VERSION",
   "RELEASE_REVISION",
-  "wsl_runtime.py",
 ];
 
 const LEGACY_RUNTIME_DIRS = ["static", "harness-runtime"];
-const DESKTOP_FILES = ["main.js", "preload.js", "profile-owner.js"];
+const DESKTOP_FILES = ["main.js", "preload.js", "profile-owner.js", "platform-runtime.js", "mac-keychain-vault.js"];
 
 /**
- * Stage the verified Aug-24 static renderer and its HTTP/Application Port
+ * Stage the workstation static renderer and its HTTP/Application Port
  * runtime without copying the previous desktop installation or dependency
  * caches. The current TypeScript build is overlaid into harness-runtime so
- * the restored UI keeps the R18 tool-loop and persistence repairs.
+ * the desktop UI uses the current tool-loop and persistence implementation.
  */
 export async function stageLegacyUi({ repositoryRoot, stagePortable, desktopProfile = "preview" }) {
   const sourceRoot = join(repositoryRoot, "resources", "viniper-ui");

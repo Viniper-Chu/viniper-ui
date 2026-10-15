@@ -1,47 +1,40 @@
-# Viniper workstation 1.8.3 Stable
+# Viniper 2.0
 
-## 1.8.3 的主要改进
+Viniper 是一个用于本机文件、代码和资料任务的桌面 Agent。它使用同一个 Harness Runtime 管理会话、模型、工具、访问权限和执行记录，提供原生 macOS `.app` 入口。
 
-- DeepSeek 内置模型选择器统一为 V4.1 Flash（API 名称 `deepseek-flash`）：设置页与右下角同步，旧 Pro/Flash 预设和浏览器旧选择自动归并。Key、自定义网关与自定义模型列表保留；历史 Pro API 仍兼容。
-- 模型目录与迁移从 HTTP 服务拆出；上下文容量以服务端目录为准，前端不再重复维护容量表。
-- 发送、重试、恢复共用流式传输模块；连接结束后核实后台运行状态，断线只恢复订阅，不重复发送任务。
-- 输出重绘按会话合并；模型切换的过期用量响应不再覆盖当前模型。
-- 后端回放使用有界环形缓冲，超出回放窗口时明确重读持久会话，不静默丢失中间输出。
+2.0 重构了整个界面：月白与夜青主题、统一的模型和智能程度菜单、带图标的权限选择、默认折叠的思考与工具过程、可点击的文件和网页链接，以及消息位置导航。输入框的 **+** 菜单提供附件、规划模式、目标模式和技能入口。
 
-Windows 通过完整安装程序升级，沿用已有数据目录。macOS 架构路径同步，但未进行真机验证。
+- **规划**：先用只读工具调研，输出方案；选择开始实施后才进入执行模式。
+- **目标**：围绕明确成果持续推进，轮次、暂停、继续与完成状态可见。没有执行进展时停止自动续轮。
+- **引导**：运行中输入补充方向，点“引导”或按 `⌘Enter`，在当前安全步骤之后送给模型；普通 `Enter` 加入待发送队列。
+- **定时任务**：支持五字段 Cron；使用 Viniper 当前模型与工具权限执行。应用退出期间错过的时刻不补跑；忙会话等待空闲后执行一次。
+- **技能与插件**：包含本机文档、SQLite、项目代码、网络读取和会话协作工具；本机与项目技能按需读取。
 
-Viniper workstation 是面向 Windows 的双 Agent 工作台。它保留熟悉的 Viniper 壳与浅青视觉，同时把两个运行时严格分开：
+配置本机数学组件后，数学与 PDF 插件提供结构化讲义制作、只读页面提取和页面渲染工具。模型直接提交题目与完整原解，不必在终端拼接 JSON；师生 PDF 与 TeX 源文件显示为成果卡片，编译过程留在执行详情。页面渲染和视觉检查分别记录，不能把编译成功当作版式已经检查。
 
-- **Viniper Harness**：自研 Harness Runtime/Application Port，负责 Viniper 会话、工具、权限、计划、目标、协作、跨会话消息与子 Agent。
-- **Claude Code CLI**：只调用本机原生 Claude Code CLI；其会话、权限、任务/计划投影、Skills 与插件数据不复用 Harness。
+Claude Code 已从应用内移除。它可以继续作为独立 CLI 在终端使用；升级不删除其安装、配置或旧会话。
 
-两边使用相同的前端语义和位置（消息框、附件、模型、上下文环、Token、状态、设置层级），但不共享会话、运行时、模型、权限持久化或密钥。Viniper 提供每次询问、规划自动审核、完全访问；Claude Code 提供原生权限档位及完全访问，选择方向的问题仍由用户回答。
+## macOS
 
-## 能力范围
+使用说明见 [Mac 版说明](docs/macOS本机版.md)。Apple Silicon 本机构建：
 
-工作台支持附件、结构化 plan/goal、任务委派与跨会话协作、受控子 Agent、真实工具/文件 diff、项目索引与代码导航、LSP、Skills、插件和 MCP 管理。Token 与缓存指标来自各自运行时的 turn usage/context usage；缺失 Provider 指标时会明确显示不可用，不伪造零值。诊断、产物留存和更新入口位于设置中。
+```sh
+npm ci
+npm run setup:electron
+npm run setup:macos-signing
+npm run package:macos
+npm run install:macos -- --desktop-shortcut
+```
 
-## Windows 安装与数据兼容
+构建内置 Node，安装器为应用准备独立的 Python 环境；本次本机安装使用 Python 3.15.0。首次固定签名设置可能需要本人在系统窗口授权，之后更新复用该身份与凭据组件。显示名和安装入口为 **Viniper.app**；升级沿用旧版的数据目录和固定签名身份，因此不会通过改名重置设置、会话或密钥。源码不包含个人凭据。
 
-稳定安装器为 `Viniper-workstation-Setup.exe`，产品 AppId 为 `com.viniper.workstation`，默认用户级目录为 `%LOCALAPPDATA%\\Programs\\Viniper workstation`。Stable 继续使用 `%APPDATA%\\Viniper workstation Preview` 兼容数据根，保留原有会话、SQLite、设置、记忆和安全存储。
+当前 Mac 包采用本机证书签名，未做 Apple Developer ID 公证。其他电脑需要按上述步骤建立自己的签名及 Python 环境；本机签名连续性不等同于 Apple 公证或所有设备上的免提示安装。
 
-在任一 Agent 的 **设置 → 应用更新 → 检查更新** 中检查 GitHub 正式版。发现新版本后，查看版本说明、下载安装包，再点击“安装更新”。桌面工作台会退出并打开安装器，按提示完成安装；下载失败可以重试，正在执行任务时不会自动退出。更新使用当前安装目录，不重置个人数据。首次安装或旧版本无法检查更新时，从 [GitHub Releases](https://github.com/Viniper-Chu/viniper-ui/releases/latest) 下载完整安装包。
+开发验证：
 
-运行需要本机 Node.js、Python 及 PowerShell 7；Claude Code 还需安装原生 CLI，并在其独立设置中配置可用的兼容 Provider。发行包不包含个人凭据，第三方用户应填写自己的配置。
+```sh
+npm run typecheck
+npm test
+```
 
-## 1.8.1 的主要改进
-
-- 应用内完整安装包更新、真实下载进度、失败重试和活动任务保护。
-- 独立的双 Agent 设置与模型管理，修复切换 Agent 时的迟到响应、草稿与工作区串页。
-- Claude Code 原生初始化、命令发现、权限确认和会话恢复；深层 Windows 路径下权限交互不再误报 CLI 未安装。
-- 原生子 Agent 输出保留在工具记录内，不混入主回答；官方 DeepSeek 主模型和子模型映射独立配置。
-- Viniper 实时输出、取消、审批等待和工具进度反馈；计划不会把尚未验证的步骤标为完成。
-- 浅青色设置排版与正确的 Windows 应用、任务栏及托盘品牌图标。
-
-当前边界：Viniper 运行中续发是排队，不是实时引导；部分 Claude Code 交互式命令打开原生终端。更新失败时保留当前版本，不承诺网络、Provider 或所有长任务均无故障。
-
-## 从旧 Viniper UI 的变化
-
-旧 UI 的单一聊天入口现在明确拆成 Viniper Harness 与 Claude Code 两个 Agent；共享壳位置不改变，但每个 Agent 的状态、工具和权限 owner 可独立验证。新增了持久计划/目标、协作与子 Agent、项目索引/LSP、MCP/插件管理及可解释的 Token/缓存分区。
-
-本次发布已在 Windows x64 上验证。macOS 构建和运行尚未验证（UNPROVEN）。
+macOS 与 Windows 分别验收；本次 2.0 的交付目标是 Apple Silicon macOS，不能据此认定 Windows 安装器已经完成回归。版本与下载见 [GitHub Releases](https://github.com/Viniper-Chu/viniper-ui/releases)。

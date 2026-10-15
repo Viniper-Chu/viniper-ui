@@ -40,7 +40,7 @@ export async function connectLoopbackMcp(endpoint: string): Promise<LoopbackMcpS
   const initialize = await request("initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
-      clientInfo: { name: "Viniper workstation", version: "1.8.3" },
+      clientInfo: { name: "Viniper workstation", version: "1.9.1" },
   });
   const listed = await request("tools/list");
   const tools = Array.isArray(listed.tools)

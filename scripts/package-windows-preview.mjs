@@ -10,7 +10,7 @@ import { stageLegacyUi } from "./stage-legacy-ui.mjs";
 // per-user installer with an uninstall entry point.
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const desktopRoot = join(repositoryRoot, "resources", "viniper-ui", "desktop");
-const codexRoot = resolve(repositoryRoot, "..", "..", "codex");
+const codexRoot = resolve(repositoryRoot, "codex");
 const outputRoot = resolve(process.env.VINIPER_WINDOWS_PREVIEW_OUTPUT_ROOT
   || join(codexRoot, "工作输出", "viniper-workstation-implementation-20260817", "packages", "windows-preview"));
 const residueRoot = resolve(process.env.VINIPER_WINDOWS_PREVIEW_RESIDUE_ROOT || join(codexRoot, "运行残留"));

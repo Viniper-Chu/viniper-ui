@@ -8,6 +8,7 @@ This module never sends a slash command as an LLM prompt or reads credentials.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Iterable, Mapping, Sequence
 from uuid import UUID
@@ -164,6 +165,7 @@ def build_native_command_manifest(
         add(name, title, description, "cli", cli_args=list(args))
     for name, title, description in _TERMINAL_ROUTES:
         add(name, title, description, "native-terminal")
+    add("terminal", "原生交互面板", "在工作台内使用 Claude Code 完整原生界面", "native-terminal", owner=CATALOG_SOURCE)
     known = {item["command"][1:] for item in descriptors}
     for name in sorted(observed - known):
         add(name, f"/{name}", "在 Claude Code 原生界面执行此命令", "native-terminal")
@@ -198,8 +200,8 @@ def resolve_native_command(
         result.update(execution="native-terminal", ui_action="", available=bool(_probe_dict(probe).get("ready", _probe_dict(probe).get("status") == "ready")))
         result.pop("cli_args", None)
     if result["execution"] == "native-terminal":
-        result["command_to_type"] = f"/{name}" + (f" {detail}" if detail else "")
-        result["summary"] = "将在 Claude Code 原生窗口中继续；打开后输入下方命令。"
+        result["command_to_type"] = "" if name == "terminal" else f"/{name}" + (f" {detail}" if detail else "")
+        result["summary"] = "在 Claude Code 原生交互面板中继续；命令需在面板中确认执行。"
     elif result["execution"] == "native-ui":
         result["summary"] = result["description"]
     return result
@@ -251,6 +253,9 @@ def build_native_terminal_argv(
     settings_file: str = "",
     mcp_config_file: str = "",
     add_dirs: Sequence[str] = (),
+    launcher: Sequence[str] | None = None,
+    system_prompt_file: str = "",
+    agents: Mapping[str, Any] | None = None,
     distro: str = "ViniperRuntime",
     user: str = "viniper",
 ) -> list[str]:
@@ -283,6 +288,7 @@ def build_native_terminal_argv(
     for flag, value, label in (
         ("--model", model, "模型"), ("--name", name, "会话名称"),
         ("--settings", settings_file, "设置路径"), ("--mcp-config", mcp_config_file, "MCP 路径"),
+        ("--append-system-prompt-file", system_prompt_file, "项目说明路径"),
     ):
         text = _single_value(value, label)
         if text:
@@ -292,6 +298,14 @@ def build_native_terminal_argv(
     for directory in add_dirs:
         path = _single_value(directory, "附加目录", required=True)
         if not path.startswith("/"):
-            raise ValueError("附加目录必须是已映射的 WSL 绝对路径")
+            raise ValueError("附加目录必须是绝对路径")
         args.extend(("--add-dir", path))
+    if agents:
+        args.extend(("--agents", json.dumps(dict(agents), ensure_ascii=False)))
+    if launcher is not None:
+        if not launcher or not all(_single_value(item, "CLI 路径", required=True) for item in launcher):
+            raise ValueError("原生 CLI 启动程序无效")
+        if not _single_value(workdir, "工作目录", required=True).startswith("/"):
+            raise ValueError("原生工作目录必须是绝对路径")
+        return [*launcher, *args]
     return _wsl_argv(args, workdir=workdir, distro=distro, user=user)

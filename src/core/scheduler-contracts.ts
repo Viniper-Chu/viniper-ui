@@ -1,4 +1,5 @@
 export type SchedulePattern =
+  | { kind: "cron"; expression: string; timeZone: string }
   | { kind: "once"; runAt: number }
   | { kind: "interval"; everyMs: number }
   | { kind: "daily"; hour: number; minute: number; timeZone?: string }

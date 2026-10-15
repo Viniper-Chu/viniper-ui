@@ -157,14 +157,16 @@ with tempfile.TemporaryDirectory() as directory:
     child=types.SimpleNamespace(poll=lambda:None)
     launches=[]
     def launch(*args,**kwargs): launches.append((args,kwargs)); return child
-    ns=dict(globals(),Any=object,Request=Request,HTTPException=HTTPException,_update_state=state,
+    ns=dict(globals(),os=types.SimpleNamespace(name='nt'),Any=object,Request=Request,HTTPException=HTTPException,_update_state=state,
         _update_ready={'manifest':manifest(),'asset':validate_installer_manifest(manifest()),'path':target},
         _update_installer_process=None,_update_other_mutations=0,_active_runs={'viniper':{}},
         _viniper_tasks={},_goal_tasks={},sessions={'viniper':{},'claude':{}},_native_terminal_processes={},
+        _native_terminal_watchers={},_native_terminal_starting=set(),
         coordinated_run_snapshot=lambda sid:None,native_terminal_active=lambda sid:False,
         choose_update_asset=validate_installer_manifest,DATA_DIR=root,APP_DIR=app_dir,
         configured_update_desktop=lambda:exe,subprocess=types.SimpleNamespace(Popen=launch),
         update_error_message=lambda exc,**kw:'could not launch installer',ensure_harness_update_idle=no_background_tasks)
+    ns['agent_run_coordinator']=lambda:types.SimpleNamespace(has_active=lambda sid:sid in ns['_active_runs'])
     exec(code,ns)
     for active in ({'viniper':{}},{'claude':{}}):
         ns['_active_runs']=active
@@ -172,7 +174,8 @@ with tempfile.TemporaryDirectory() as directory:
         except HTTPException as exc: assert exc.status_code==409
         else: raise AssertionError('active engine was interrupted')
         assert not launches and state.snapshot()['status']=='ready'
-    ns['_active_runs']={}; ns['_update_other_mutations']=1
+    ns['_active_runs']={}
+    ns['_update_other_mutations']=1
     try: asyncio.run(ns['apply_update'](Request()))
     except HTTPException as exc: assert exc.status_code==409
     else: raise AssertionError('in-flight settings save was interrupted')
@@ -180,7 +183,7 @@ with tempfile.TemporaryDirectory() as directory:
     result=asyncio.run(ns['apply_update'](Request()))
     assert result['status']=='installer_opened' and result['updated'] is False
     assert launches[0][1]['shell'] is False and launches[0][1]['executable']==str(target.resolve())
-    assert launches[0][0][0].endswith('/D="'+str(exe.parent)+'"')
+    assert launches[0][0][0].endswith('/D="'+str(exe.parent.resolve())+'"')
     try: ns['ensure_update_not_installing']()
     except HTTPException as exc: assert exc.status_code==409
     else: raise AssertionError('new task accepted during install handoff')

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
@@ -8,13 +9,16 @@ import { runInNewContext } from "node:vm";
 const root = process.cwd();
 const desktopRoot = join(root, "resources", "viniper-ui", "desktop");
 const lanes = ["stable", "preview"];
+const peFixtureRoot = join(root, "codex", "运行残留", "windows-resource-fixture");
+const peExecutable = process.env.VINIPER_WINDOWS_EXE_FIXTURE || (process.platform === "win32"
+  ? join(root, "node_modules", "electron", "dist", "electron.exe") : join(peFixtureRoot, "electron.exe"));
 
-async function brandingFunction(lane: string, reader = readFile) {
+async function brandingFunction(lane: string, reader = readFile, requireFactory = createRequire) {
   const source = await readFile(join(root, "scripts", `package-windows-${lane}.mjs`), "utf8");
   const start = source.lastIndexOf("async function brandWindowsExecutable(");
   assert.ok(start > 0, "packaging must explicitly brand a prepackaged executable");
   return runInNewContext(`${source.slice(start)}; brandWindowsExecutable`, {
-    createRequire, readFile: reader, writeFile, Buffer, join, repositoryRoot: root, desktopRoot,
+    createRequire: requireFactory, readFile: reader, writeFile, Buffer, join, repositoryRoot: root, desktopRoot,
   }) as (executable: string, version: string) => Promise<void>;
 }
 
@@ -31,13 +35,18 @@ test("R28 both Windows lanes brand the shared stage before portable and NSIS", a
 
 test("R28 resource-editor errors abort packaging instead of delivering Electron branding", async () => {
   for (const lane of lanes) {
-    const brand = await brandingFunction(lane, (async () => { throw new Error("editor read failed"); }) as typeof readFile);
+    // This test covers failure propagation, independent of a Windows-only
+    // packager being installed on the machine running the test suite.
+    const stubRequire = (() => () => ({ NtExecutable: {}, NtExecutableResource: {}, Resource: {}, Data: {} })) as unknown as typeof createRequire;
+    const brand = await brandingFunction(lane, (async () => { throw new Error("editor read failed"); }) as typeof readFile, stubRequire);
     await assert.rejects(() => brand("candidate.exe", "1.8.0"), /editor read failed/u);
   }
 });
 
-test("R28 Windows native PE metadata and icon bytes match the existing brand", { skip: process.platform !== "win32" }, async () => {
-  const require = createRequire(join(desktopRoot, "package.json"));
+test("R28 real Windows PE file metadata and icon bytes match the existing brand (resource inspection, no EXE execution)", {
+  skip: !existsSync(peExecutable) && "Prepare the official Windows PE fixture with node scripts/prepare-windows-resource-test.mjs",
+}, async (t) => {
+  const require = createRequire(join(process.platform === "win32" ? desktopRoot : peFixtureRoot, "package.json"));
   const { NtExecutable, NtExecutableResource, Resource, Data } = require("resedit");
   const residue = join(root, "codex", "运行残留");
   await mkdir(residue, { recursive: true });
@@ -50,8 +59,8 @@ test("R28 Windows native PE metadata and icon bytes match the existing brand", {
   const evidence: unknown[] = [];
   try {
     for (const lane of lanes) {
-      await copyFile(join(root, "node_modules", "electron", "dist", "electron.exe"), executable);
-      const brand = await brandingFunction(lane);
+      await copyFile(peExecutable, executable);
+      const brand = await brandingFunction(lane, readFile, (() => require) as typeof createRequire);
       await brand(executable, version);
       const entries = NtExecutableResource.from(NtExecutable.from(await readFile(executable))).entries;
       const versions = Resource.VersionInfo.fromEntries(entries);
@@ -71,9 +80,10 @@ test("R28 Windows native PE metadata and icon bytes match the existing brand", {
       }
       evidence.push({ lane, product: strings.ProductName, version: strings.ProductVersion, iconFrames: firstIcon.length, sourceIconBytesEqual: true });
     }
-    const evidenceRoot = join(root, "codex", "工作输出", "viniper-agent-usability-r28-20260905", "evidence");
+    const evidenceRoot = join(root, "codex", "工作输出", "cross-platform-skipped-validation");
     await mkdir(evidenceRoot, { recursive: true });
-    await writeFile(join(evidenceRoot, "windows-native-branding.json"), `${JSON.stringify({ passed: true, evidence }, null, 2)}\n`);
+    await writeFile(join(evidenceRoot, "windows-pe-resource-branding.json"), `${JSON.stringify({ passed: true, hostPlatform: process.platform, executableExecuted: false, fixture: peExecutable, evidence }, null, 2)}\n`);
+    t.diagnostic(`Real Windows PE resources validated on ${process.platform}; Windows startup/Explorer/NSIS were not exercised`);
   } finally {
     assert.equal(resolve(dirname(candidate)), resolve(residue));
     await rm(candidate, { recursive: true, force: true });

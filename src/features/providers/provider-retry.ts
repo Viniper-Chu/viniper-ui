@@ -45,6 +45,14 @@ export async function runProviderWithRetries(options: ProviderRetryOptions): Pro
       throwIfCancelled(options.signal);
       for await (const event of options.stream()) {
         throwIfCancelled(options.signal);
+        if (event.kind === "provider.activity" || event.kind === "provider.request.started" || event.kind === "context.budget") {
+          // Receipt is not committed model output. Forward it immediately so
+          // the host sees real progress even before a complete tool call, but
+          // retain normal retry behavior if the connection subsequently fails.
+          try { await options.onEvent?.(event); }
+          catch (error) { publicationStarted = true; throw error; }
+          continue;
+        }
         events.push(event);
         if (hasSemanticOutput(events)) await publish();
       }

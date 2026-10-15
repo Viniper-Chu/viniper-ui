@@ -18,13 +18,13 @@ test("R26 model capacity registry is provider-owned and model switches cannot ke
   assert.match(kimi.source_url, /kimi\.com\/code\/docs\/en\/kimi-code\/models\.html/u);
 
   const server = await readFile(join(root, "resources", "viniper-ui", "server.py"), "utf8");
-  const app = await readFile(join(root, "resources", "viniper-ui", "static", "app.js"), "utf8");
+  const app = await readFile(join(root, "resources", "viniper-ui", "static", "v2", "app.js"), "utf8");
   assert.match(server, /model-capabilities\.json/u);
   assert.match(server, /context_limit_for_model\(selected_model, mode=mode/u);
   assert.match(server, /async def get_session_usage\(\s*\n\s*session_id: str,\s*\n\s*model: str = Query/u);
   assert.match(server, /Unknown deployments are deliberately unavailable/u);
-  assert.match(app, /function modelCapacityMetadata\(/u);
+
   assert.doesNotMatch(app, /const CONTEXT_LIMITS/u, "renderer does not duplicate deployment capacity facts");
-  assert.match(app, /model\?\.context_status/u);
-  assert.match(app, /模型上下文容量未知/u);
+  assert.match(app, /context_usage/u);
+  assert.match(app, /\/usage\?/u);
 });

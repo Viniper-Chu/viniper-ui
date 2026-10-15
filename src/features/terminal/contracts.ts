@@ -64,6 +64,11 @@ export interface TerminalRunResult {
   error?: TerminalDiagnostic;
 }
 
+export interface TerminalOutputHistory {
+  runId: string;
+  status: TerminalExecutionStatus | "running";
+}
+
 export interface TerminalOutputInput {
   executionId: string;
   stream: "stdout" | "stderr";
@@ -117,7 +122,7 @@ export type TerminalInteractiveListener = (chunk: TerminalInteractiveChunk) => v
 export interface TerminalProcessHost {
   run(request: TerminalProcessRequest, context: TerminalExecutionContext): Promise<TerminalRunResult>;
   output(input: TerminalOutputInput, context: TerminalExecutionContext): Promise<TerminalOutputResult>;
-  outputForSession(input: TerminalOutputInput, sessionId: string): Promise<TerminalOutputResult>;
+  outputForSession(input: TerminalOutputInput, sessionId: string, history?: TerminalOutputHistory): Promise<TerminalOutputResult>;
   startInteractive?(request: TerminalProcessRequest, context: TerminalExecutionContext): Promise<TerminalInteractiveStartResult>;
   writeInteractive?(executionId: string, text: string): Promise<boolean>;
   subscribeInteractive?(executionId: string, listener: TerminalInteractiveListener): () => void;

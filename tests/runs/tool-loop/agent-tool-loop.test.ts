@@ -11,6 +11,48 @@ import {
   ToolLoopLimitError,
 } from "../../../src/features/runs/tool-loop/agent-tool-loop";
 import { ToolRegistry } from "../../../src/features/tools/tool-registry";
+import { emptyUsage } from "../../../src/features/telemetry/token-ledger";
+
+test("auxiliary model activity from an executing tool reaches the owning run", async () => {
+  const provider = new ScriptedProvider([
+    [{ kind: "tool-call.completed", call: toolCall("image-call", "file.image.analyze", "{}") }],
+    [{ kind: "text.delta", text: "已检查页面" }],
+  ]);
+  const registry = new ToolRegistry(), events: Array<{ type: string; payload: any }> = [];
+  registry.register({ name: "file.image.analyze", description: "image", readOnly: true,
+    inputSchema: { type: "object", properties: {} },
+    async execute(request, context) {
+      assert.ok(context.onProviderActivity);
+      await context.onProviderActivity({ kind: "provider.request.started", phase: "local-image", timeoutSeconds: 300, inputCount: 2048 });
+      await context.onProviderActivity({ kind: "provider.activity", phase: "image-output", receivedCharacters: 24 });
+      return { toolId: request.id, text: "页面可读" };
+    },
+  });
+  await runAgentToolLoop({ provider, request: providerRequest(registry, "auto"), toolRegistry: registry,
+    signal: new AbortController().signal, now: () => 1, onProviderEvent: async () => {}, appendHistory: async () => {},
+    emit: async (type, payload) => { events.push({ type, payload }); },
+  });
+  assert.deepEqual(events.filter(e => e.type.startsWith("provider.")).map(e => [e.type, e.payload.phase]),
+    [["provider.request.started", "local-image"], ["provider.activity", "image-output"]]);
+});
+
+test("local no-progress stop ignores execution ids and timing changes on the same terminal failure", async () => {
+  const provider = new ScriptedProvider(Array.from({ length: 4 }, (_, index) => [{
+    kind: "tool-call.completed" as const, call: toolCall(`terminal-${index}`, "terminal.run", '{"command":"unavailable-command"}'),
+  }]));
+  const registry = new ToolRegistry(); let count = 0;
+  registry.register({ name: "terminal.run", description: "terminal", readOnly: false,
+    inputSchema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+    async execute(request) { count += 1; return { toolId: request.id, isError: true,
+      text: JSON.stringify({ ok: false, status: "nonzero", exitCode: 1, executionId: `execution-${count}`, durationMs: count,
+        stdout: { preview: "", ref: `out-${count}` }, stderr: { preview: "same error", ref: `err-${count}` } }) }; },
+  });
+  await assert.rejects(runAgentToolLoop({ provider, request: { ...providerRequest(registry, "auto"), permissionMode: "full" }, toolRegistry: registry,
+    maxRounds: 96, maxProviderRequests: 96, noProgressLimit: 3, signal: new AbortController().signal, now: () => 1,
+    onProviderEvent: async () => undefined, appendHistory: async () => undefined, emit: async () => undefined,
+  }), /相同结果/u);
+  assert.equal(count, 3);
+});
 
 test("tool loop preserves the provider call id and continues with the canonical local result", async () => {
   const provider = new ScriptedProvider([
@@ -228,6 +270,8 @@ test("default tool loop stops only after the twenty-fourth tool round", async ()
 });
 
 test("a repeated provider callId reuses the canonical result without executing the tool twice", async () => {
+  const auxiliaryUsage = { ...emptyUsage("provider"), input: 20, output: 5, total: 25 };
+  const usageEvents: ProviderEvent[] = [];
   const duplicate = toolCall("same-call", "demo.inspect", "{}");
   const provider = new ScriptedProvider([
     [{ kind: "tool-call.completed", call: duplicate }],
@@ -243,7 +287,7 @@ test("a repeated provider callId reuses the canonical result without executing t
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     async execute(request) {
       executions += 1;
-      return { toolId: request.id, text: "唯一结果" };
+      return { toolId: request.id, text: "唯一结果", providerUsage: auxiliaryUsage };
     },
   });
   const result = await runAgentToolLoop({
@@ -253,15 +297,16 @@ test("a repeated provider callId reuses the canonical result without executing t
     projectRoot: process.cwd(),
     signal: new AbortController().signal,
     now: () => 100,
-    onProviderEvent: async () => undefined,
+    onProviderEvent: async (event) => { if (event.kind === "usage.completed") usageEvents.push(event); },
     appendHistory: async () => undefined,
     emit: async () => undefined,
   });
   assert.equal(result.assistantText, "重复调用已收口");
   assert.equal(executions, 1);
+  assert.deepEqual(usageEvents, [{ kind: "usage.completed", usage: auxiliaryUsage }]);
   assert.deepEqual(provider.requests.slice(1).map((request) => request.history.at(-1)?.items[0]), [
-    { type: "tool-result", callId: "same-call", name: "demo.inspect", content: "唯一结果", isError: false },
-    { type: "tool-result", callId: "same-call", name: "demo.inspect", content: "唯一结果", isError: false },
+    { type: "tool-result", callId: "same-call", name: "demo.inspect", content: "唯一结果", isError: false, providerUsage: auxiliaryUsage },
+    { type: "tool-result", callId: "same-call", name: "demo.inspect", content: "唯一结果", isError: false, providerUsage: auxiliaryUsage },
   ]);
 });
 

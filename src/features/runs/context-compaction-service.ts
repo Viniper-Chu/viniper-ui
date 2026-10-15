@@ -31,12 +31,23 @@ export class ContextCompactionService {
     history: ProviderHistoryEntry[];
   }> {
     const threshold = Math.max(100, input.thresholdChars ?? defaultCompactionThresholdChars(input.providerId, input.modelId));
-    const chars = input.history.reduce((total, entry) => total + JSON.stringify(entry).length, 0);
-    if (chars <= threshold || input.history.length < 3) {
+    const projected = this.projectHistory(input.sessionId, input.history, input.providerId, input.modelId);
+    const chars = projected.reduce((total, entry) => total + JSON.stringify(entry).length, 0);
+    const latestTurn = lastUserIndex(projected);
+    if (chars <= threshold || latestTurn <= 0) {
       this.lastStatus = "not-needed";
-      return { status: "not-needed", history: clone(input.history) };
+      return { status: "not-needed", history: projected };
     }
-    const source = input.history.slice(0, Math.max(1, input.history.length - 2));
+    // Retain a whole user turn: cutting the final two entries can leave a tool
+    // result without its assistant call, or discard the user's actual request.
+    const source = projected.slice(0, latestTurn);
+    const retainedIds = new Set(projected.slice(latestTurn).map((entry) => entry.id));
+    const sourceHistoryIds = input.history.filter((entry) => !retainedIds.has(entry.id)).map((entry) => entry.id);
+    // An oversized latest turn must not re-summarize the same prefix each run.
+    if (source.length === 1 && this.generations.some((item) => item.id === source[0].id)) {
+      this.lastStatus = "not-needed";
+      return { status: "not-needed", history: projected };
+    }
     try {
       const text = (await (this.generator?.(source) ?? Promise.resolve(defaultSummary(source)))).trim();
       if (!text) throw new Error("摘要生成结果为空。");
@@ -50,7 +61,7 @@ export class ContextCompactionService {
         providerId: input.providerId,
         modelId: input.modelId,
         generation: this.nextGeneration(input.sessionId),
-        sourceHistoryIds: source.map((entry) => entry.id),
+        sourceHistoryIds,
         text,
         createdAt: this.now(),
         immutable: true,
@@ -61,10 +72,10 @@ export class ContextCompactionService {
       this.generations.push(generation);
       await this.persistence?.saveCompactionGeneration(clone(generation));
       this.lastStatus = "generated";
-      return { status: "generated", generation: clone(generation), history: this.projectHistory(input.sessionId, input.history) };
+      return { status: "generated", generation: clone(generation), history: this.projectHistory(input.sessionId, input.history, input.providerId, input.modelId) };
     } catch {
       this.lastStatus = "fallback";
-      return { status: "fallback", history: clone(input.history) };
+      return { status: "fallback", history: projected };
     }
   }
 
@@ -102,12 +113,25 @@ export function defaultCompactionThresholdChars(providerId: string, modelId: str
 }
 
 function defaultSummary(history: ProviderHistoryEntry[]): string {
-  return history.map((entry) => entry.items.map((item) => {
-    if (item.type === "text" || item.type === "reasoning") return item.text.slice(0, 240);
-    if (item.type === "tool-call") return `工具调用 ${item.name}`;
-    if (item.type === "tool-result") return `工具结果 ${item.name}: ${item.content.slice(0, 120)}`;
-    return item.type;
-  }).join(" ")).join("\n").slice(0, 4_000);
+  const facts = history.flatMap((entry) => entry.items.flatMap((item) => {
+    if (item.type === "text") return [`${entry.role === "user" ? "用户请求" : "助手报告"}：${item.text.slice(0, 600)}`];
+    if (item.type === "tool-call") return [`操作 ${item.name}：${JSON.stringify(item.arguments).slice(0, 350)}`];
+    if (item.type === "tool-result") return [`${item.isError ? "失败" : "工具返回"} ${item.name}：${item.content.slice(0, 500)}`];
+    return []; // Reasoning is not a verified task outcome.
+  }));
+  const selected: string[] = [];
+  let length = 0;
+  for (const fact of facts.reverse()) {
+    if (length + fact.length + 1 > 3_900) break;
+    selected.unshift(fact);
+    length += fact.length + 1;
+  }
+  return `历史摘录，可能省略细节；以最近用户要求及当前文件为准。\n${selected.join("\n")}`;
+}
+
+function lastUserIndex(history: ProviderHistoryEntry[]): number {
+  for (let index = history.length - 1; index >= 0; index -= 1) if (history[index].role === "user") return index;
+  return -1;
 }
 
 function clone<T>(value: T): T {

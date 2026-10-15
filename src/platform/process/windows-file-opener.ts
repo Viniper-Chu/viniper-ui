@@ -17,14 +17,16 @@ export class WindowsFileOpener implements FileOpener {
       return failure(path, "PATH_NOT_FOUND", "没有找到要打开的文件。");
     }
     if (!metadata.isFile()) return failure(path, "PATH_NOT_FILE", "file.open 只打开文件，不打开目录。");
-    if (process.platform !== "win32") {
-      return failure(path, "OPEN_FAILED", "当前 Preview 只在 Windows 真机实现了系统文件打开；macOS 尚未验证。");
-    }
     try {
-      const child = spawn("explorer.exe", [path], {
+      const command = process.platform === "win32" ? "explorer.exe" : process.platform === "darwin" ? "/usr/bin/open" : "xdg-open";
+      const child = spawn(command, [path], {
         detached: true,
         stdio: "ignore",
         windowsHide: false,
+      });
+      await new Promise<void>((resolveSpawn, rejectSpawn) => {
+        child.once("spawn", resolveSpawn);
+        child.once("error", rejectSpawn);
       });
       child.unref();
       return { ok: true, path };

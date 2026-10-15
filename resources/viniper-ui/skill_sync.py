@@ -18,6 +18,9 @@ MANIFEST_VERSION = 1
 SKILL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 SOURCE_DISPLAY_NAMES = {
+    "built-in": "内置技能",
+    "workspace-agents": "项目技能",
+    "workspace-codex": "项目技能",
     "project-claude": "项目 Claude 技能",
     "project-app-claude": "Viniper 内置 Claude 技能",
     "project-app-agents": "Viniper 内置技能",
@@ -29,6 +32,22 @@ SOURCE_DISPLAY_NAMES = {
 }
 
 ZH_CN_SKILL_METADATA = {
+    "local-math-documents": {"name": "高中数学文档", "description": "制作数学讲义、师生版本和 Word/PDF，保留完整原题原解并核对实际页面。"},
+    "karpathy-llm-wiki": {"name": "个人知识库", "description": "按来源组织知识，检索背景并维护可追溯的笔记。"},
+    "macos-upgrade-audit": {"name": "Mac 升级评估", "description": "核对系统版本、兼容性和本机环境，再评估是否适合升级。"},
+
+    "local-speech-to-text": {
+        "name": "本机语音转文字",
+        "description": "复用已有转写，或用已缓存的本机语音模型识别指定音频，再转换为简体中文。",
+    },
+    "local-math-knowledge": {
+        "name": "本机数学题库",
+        "description": "检索现有题库并回到原题与原解，保留出处；使用本机检索工具，不加载另一个模型。",
+    },
+    "local-small-tasks": {
+        "name": "本机小任务",
+        "description": "局部修改文件、处理小段代码和 SQLite 更新；保留指定内容，并核对实际结果。",
+    },
     "hermes-multi-model-setup": {
         "name": "Hermes 多模型路由配置",
         "description": "配置 Hermes Agent 的多模型路由，让简单任务使用轻量模型、复杂任务交由高能力模型，并包含配置与验证步骤。",
@@ -42,6 +61,18 @@ ZH_CN_SKILL_METADATA = {
         "description": "使用 LaTeX 与 ImageMagick 将公式渲染为 PNG 图片，适合需要可视公式输出的场景。",
     },
 }
+
+for _slug, _name in {
+    "approval": "审批", "apps": "妙搭应用", "attendance": "考勤", "base": "多维表格",
+    "calendar": "日历", "contact": "通讯录", "doc": "云文档", "drive": "云空间",
+    "event": "实时事件", "im": "消息", "mail": "邮箱", "markdown": "Markdown 文档",
+    "meeting": "会议记录", "minutes": "会议纪要", "note": "笔记", "okr": "OKR",
+    "openapi-explorer": "开放接口", "shared": "连接与授权", "sheets": "电子表格",
+    "skill-maker": "技能创建", "slides": "演示文稿", "task": "任务", "vc": "视频会议",
+    "vc-agent": "会议智能体", "whiteboard": "画板", "wiki": "知识库",
+    "workflow-meeting-summary": "会议汇总", "workflow-standup-report": "日程与待办摘要",
+}.items():
+    ZH_CN_SKILL_METADATA[f"lark-{_slug}"] = {"name": f"飞书 · {_name}"}
 
 STATUS_DISPLAY = {
     "available": ("Claude Code 可用", "已通过 Claude Code 官方 add-dir 技能路径发现。"),

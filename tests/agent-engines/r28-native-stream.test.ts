@@ -24,7 +24,7 @@ async def main():
     assert events == [event] and metadata['commands'][0]['name'] == 'help'
     assert 'account' not in metadata and len(written) == 1
     assert written[0]['request']['subtype'] == 'initialize'
-    assert not written[0]['request'].get('forwardSubagentText'), 'Child output must remain in its Agent tool result'
+    assert written[0]['request'].get('forwardSubagentText') is True, 'Child output is projected into its own parent tool lane'
     for reader, kwargs, expected in ((Reader([b'']), {}, '退出'), (Reader([]), {'timeout':0.01}, '超时'), (Reader([]), {'cancelled':lambda:True}, '取消')):
         try: await initialize_native_stream(reader, write, 'r28:init', **kwargs)
         except RuntimeError as e: assert expected in str(e)

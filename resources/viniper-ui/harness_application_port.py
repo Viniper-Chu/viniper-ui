@@ -9,9 +9,11 @@ the Python host does not silently create a new conversation.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import shutil
+import sys
 import uuid
 from collections.abc import AsyncIterable
 from pathlib import Path
@@ -21,6 +23,7 @@ from urllib.parse import urlsplit
 
 _PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
 _LOOPBACK_NO_PROXY = ("localhost", "127.0.0.1", "::1")
+_RUN_STOP_TIMEOUT_SECONDS = 5.0
 
 
 def _merge_no_proxy_values(*values: object) -> str:
@@ -123,9 +126,11 @@ class HarnessTerminalTimeoutError(TimeoutError):
 
     code = "terminal-timeout"
 
-    def __init__(self, timeout_seconds: float) -> None:
+    def __init__(self, timeout_seconds: float, *, first_response: bool = False) -> None:
         self.timeout_seconds = max(0.0, float(timeout_seconds))
-        super().__init__(f"Harness run stopped reporting activity ({self.timeout_seconds:g}s idle deadline)")
+        self.first_response = first_response
+        super().__init__(f"本地模型等待首个输出超过 {self.timeout_seconds:g} 秒，本轮已停止。" if first_response
+                         else f"Harness run stopped reporting activity ({self.timeout_seconds:g}s idle deadline)")
 
 
 async def await_run_queue_message(
@@ -204,6 +209,20 @@ def _runtime_event_to_provider_event(event: dict[str, Any]) -> dict[str, Any] | 
     if engine_id and engine_id != "viniper":
         return None
     run_id = str(payload.get("runId") or payload.get("run_id") or "")
+    if event_type == "provider.request.started":
+        return {"type": "working_status", "content": "正在读取图片，等待模型输出…" if payload.get("phase") == "local-image" else "正在处理本轮上下文，等待首个输出…"}
+    if event_type == "steering.updated":
+        return {"type": "steering", "receipt": payload.get("receipt", {})}
+    if event_type == "provider.activity":
+        count = max(0, int(payload.get("receivedCharacters") or 0))
+        label = "正在检查图片 · 已生成" if payload.get("phase") == "image-output" else "正在准备操作内容 · 已接收"
+        return {"type": "working_status", "content": f"{label} {count:,} 字符"}
+    if event_type == "context.budget":
+        return {"type": "context_budget", "input_tokens": payload.get("inputCount", 0),
+                "context_tokens": payload.get("windowSize", 0), "output_reserved": payload.get("outputReserved", 0)}
+    if event_type == "context.compacted":
+        return {"type": "context_compacted", "run_id": run_id,
+                "content": f"上下文已整理：输入 {payload.get('inputBefore', 0)} → {payload.get('inputAfter', 0)} token，预留 {payload.get('outputReserved', 0)} 输出。原始会话保留。"}
     if event_type == "plan.updated":
         plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
         raw_steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
@@ -246,6 +265,11 @@ def _runtime_event_to_provider_event(event: dict[str, Any]) -> dict[str, Any] | 
             "total_tokens": max(0, int(usage.get("total") or usage.get("total_tokens") or 0)),
             "source": "provider" if source == "provider" else "estimated",
         }
+        # Canonical input already includes cached input. The desktop counters
+        # use disjoint input/read/write buckets, so project it only once.
+        if "input" in usage:
+            projected_usage["input_tokens"] = max(0, projected_usage["input_tokens"]
+                - projected_usage["cache_read_input_tokens"] - projected_usage["cache_creation_input_tokens"])
         return {
             "type": "turn_usage",
             "turn_usage": projected_usage,
@@ -339,9 +363,12 @@ def _runtime_event_to_provider_event(event: dict[str, Any]) -> dict[str, Any] | 
             "tool_name": str(payload.get("toolName") or ""),
             "call_id": str(payload.get("callId") or payload.get("activityId") or ""),
             "content": content,
-            "status": "success" if event_type == "tool.completed" else "error",
+            "status": "success" if event_type == "tool.completed" else "cancelled" if event_type == "tool.cancelled" else "error",
             "run_id": run_id,
         }
+        presentation = payload.get("presentation")
+        if isinstance(presentation, dict) and presentation.get("kind") in {"terminal-run", "terminal-output", "document-results"}:
+            projected["presentation"] = copy.deepcopy(presentation)
         if reason:
             projected["reason"] = reason
             projected["detail"] = str(payload.get("detail") or content)
@@ -350,6 +377,13 @@ def _runtime_event_to_provider_event(event: dict[str, Any]) -> dict[str, Any] | 
         return {
             "type": "runtime_error" if event_type == "run.failed" else "runtime_cancelled",
             "content": str(payload.get("activity", {}).get("detail") or payload.get("message") or event_type),
+            "run_id": run_id,
+        }
+    if event_type == "run.listener-failed" and payload.get("stage") == "automatic-memory":
+        return {
+            "type": "runtime_warning",
+            "code": "automatic_memory_failed",
+            "content": "自动记忆保存失败，本次回答和文件结果已保留。",
             "run_id": run_id,
         }
     if event_type == "runtime.error":
@@ -427,8 +461,11 @@ class HarnessApplicationPort:
         self._run_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
         self._bridge_lock = asyncio.Lock()
         self._control_lock = asyncio.Lock()
+        self._control_operation_lock = asyncio.Lock()
         self._control_waiters: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._control_owners: dict[str, asyncio.subprocess.Process] = {}
         self._active_runs: dict[str, asyncio.subprocess.Process] = {}
+        self._run_stopped: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     def active_run(self, session_id: str) -> bool:
         process = self._active_runs.get(str(session_id))
@@ -443,9 +480,12 @@ class HarnessApplicationPort:
     ) -> dict[str, str]:
         allowed = {
             "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
+            "HOME", "SHELL", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME",
             "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA",
             "VINIPER_DEMO_FIXTURE", "VINIPER_HARNESS_ALLOW_EXTERNAL_NETWORK",
             "VINIPER_HARNESS_REVIEW_PROVIDER_LIMIT",
+            "VINIPER_LOCAL_AGENT_PROFILE",
+            "VINIPER_MATH_HANDOUT_HELPER", "VINIPER_PDF_INSPECT_HELPER",
             "NODE_USE_ENV_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
         }
         source = os.environ if environ is None else environ
@@ -481,37 +521,65 @@ class HarnessApplicationPort:
 
     def _environment(self) -> dict[str, str]:
         env = self._child_environment()
+        env["VINIPER_HARNESS_PYTHON"] = sys.executable
         env["VINIPER_HARNESS_DATA_ROOT"] = str(self.runtime_data_root)
         # The copied Harness package owns plugins/ and skills/ below the
         # harness-runtime directory. Pointing at viniper-ui made discovery
         # silently return an empty catalog in packaged/formal launches.
         env["VINIPER_HARNESS_ASSETS_ROOT"] = str(self.runtime_script.parent / "harness-runtime")
-        env["VINIPER_HARNESS_WORKDIR"] = str(self.runtime_script.parent.parent)
+        configured_workdir = os.environ.get("VINIPER_UI_DEFAULT_WORKSPACE_ROOT", "")
+        workdir = Path(configured_workdir).expanduser() if configured_workdir else Path.home()
+        env["VINIPER_HARNESS_WORKDIR"] = str(workdir if workdir.is_dir() else Path.home())
         return env
 
-    async def _read_stdout(self, process: asyncio.subprocess.Process) -> None:
+    async def _read_stdout(self, process: asyncio.subprocess.Process, bridge_queue: asyncio.Queue[dict[str, Any]] | None = None) -> None:
         assert process.stdout is not None
-        async for raw_line in process.stdout:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(message, dict):
-                if message.get("type") == "control.response":
-                    request_id = str(message.get("request_id") or "")
-                    waiter = self._control_waiters.get(request_id)
-                    if waiter is not None and not waiter.done():
-                        waiter.set_result(message)
-                        continue
-                native_session_id = str(message.get("native_session_id") or "")
-                run_queue = self._run_queues.get(native_session_id)
-                if native_session_id and run_queue is not None:
-                    await run_queue.put(message)
+        owned_queue = bridge_queue if bridge_queue is not None else self._bridge_queue
+        try:
+            async for raw_line in process.stdout:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
                     continue
-                await self._bridge_queue.put(message)
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(message, dict):
+                    if message.get("type") == "control.response":
+                        request_id = str(message.get("request_id") or "")
+                        waiter = self._control_waiters.get(request_id)
+                        if waiter is not None and not waiter.done() and self._control_owners.get(request_id) is process:
+                            waiter.set_result(message)
+                        # A late reply to a timed-out request is not a startup
+                        # envelope and must not poison the next bridge launch.
+                        continue
+                    native_session_id = str(message.get("native_session_id") or "")
+                    run_queue = self._run_queues.get(native_session_id)
+                    if native_session_id:
+                        if run_queue is not None and self._active_runs.get(native_session_id) is process:
+                            if message.get("type") in {"runtime.completed", "runtime.failed"}:
+                                stopped = self._run_stopped.get(native_session_id)
+                                if stopped is not None and not stopped.done():
+                                    stopped.set_result(message)
+                            run_queue.put_nowait(message)
+                        continue
+                    owned_queue.put_nowait(message)
+        except (OSError, ValueError):
+            # Transport/framing failure follows the same owner-visible path
+            # as EOF; never leave an unobserved reader task exception.
+            pass
+        finally:
+            failure = {"type": "bridge.failed", "message": "Harness bridge output closed; the owned request stopped."}
+            owned_queue.put_nowait(failure)
+            for request_id, waiter in tuple(self._control_waiters.items()):
+                if self._control_owners.get(request_id) is process and not waiter.done():
+                    waiter.set_exception(RuntimeError(failure["message"]))
+            for session_id, queue in tuple(self._run_queues.items()):
+                if self._active_runs.get(session_id) is process:
+                    stopped = self._run_stopped.get(session_id)
+                    if stopped is not None and not stopped.done():
+                        stopped.set_result(failure)
+                    queue.put_nowait({**failure, "native_session_id": session_id})
 
     async def _drain_stderr(self, process: asyncio.subprocess.Process) -> None:
         if process.stderr is None:
@@ -523,8 +591,9 @@ class HarnessApplicationPort:
 
     async def _ensure_bridge(self) -> None:
         async with self._bridge_lock:
-            if self._bridge_process is not None and self._bridge_process.returncode is None:
+            if self._bridge_process is not None and self._bridge_process.returncode is None and self._bridge_reader_task is not None and not self._bridge_reader_task.done():
                 return
+            await self._terminate_bridge()
             node = shutil.which("node")
             if not node:
                 raise RuntimeError("Harness AgentRuntime requires Node.js")
@@ -546,11 +615,16 @@ class HarnessApplicationPort:
                 limit=8 * 1024 * 1024,
             )
             self._bridge_process = process
-            self._bridge_reader_task = asyncio.create_task(self._read_stdout(process))
+            self._bridge_queue = asyncio.Queue()
+            self._bridge_reader_task = asyncio.create_task(self._read_stdout(process, self._bridge_queue))
             self._bridge_stderr_task = asyncio.create_task(self._drain_stderr(process))
-            ready = await asyncio.wait_for(self._bridge_queue.get(), timeout=30.0)
-            if ready.get("type") != "bridge.ready":
-                raise RuntimeError(str(ready.get("message") or "Harness bridge failed to initialize"))
+            try:
+                ready = await asyncio.wait_for(self._bridge_queue.get(), timeout=30.0)
+                if ready.get("type") != "bridge.ready":
+                    raise RuntimeError(str(ready.get("message") or "Harness bridge failed to initialize"))
+            except BaseException:
+                await self._terminate_bridge()
+                raise
 
     async def _send(self, message: dict[str, Any]) -> None:
         process = self._bridge_process
@@ -561,9 +635,9 @@ class HarnessApplicationPort:
 
     async def _terminate_bridge(self) -> None:
         process = self._bridge_process
-        if process is None or process.returncode is not None:
+        if process is None:
             return
-        if process.stdin is not None:
+        if process.stdin is not None and not process.stdin.is_closing():
             process.stdin.close()
         try:
             await asyncio.wait_for(process.wait(), timeout=4.0)
@@ -574,19 +648,23 @@ class HarnessApplicationPort:
             except asyncio.TimeoutError:
                 process.kill()
                 await process.wait()
-        self._bridge_process = None
+        if self._bridge_process is process:
+            self._bridge_process = None
 
     async def shutdown(self) -> None:
         await self._terminate_bridge()
         for task in (self._bridge_reader_task, self._bridge_stderr_task):
             if task is not None and not task.done():
                 task.cancel()
+        await asyncio.gather(*(task for task in (self._bridge_reader_task, self._bridge_stderr_task) if task is not None), return_exceptions=True)
         self._bridge_reader_task = None
         self._bridge_stderr_task = None
 
     async def control(self, operation: str, **payload: Any) -> dict[str, Any]:
         """Invoke a non-renderer Harness Application Port operation."""
         concurrent_controls = {
+            "run.steer", "goals.load", "goals.save", "plugins.snapshot",
+            "scheduler.defer", "scheduler.update", "scheduler.snapshot", "scheduler.create", "scheduler.claim", "scheduler.record", "scheduler.delete", "scheduler.toggle",
             "permission.resolve", "collaboration.snapshot", "collaboration.send",
             "collaboration.delegate", "collaboration.wait", "collaboration.cancel-wait",
             "collaboration.mark-read", "subagent.spawn", "subagent.cancel",
@@ -594,21 +672,39 @@ class HarnessApplicationPort:
         }
         if operation not in concurrent_controls and any(self.active_run(session_id) for session_id in tuple(self._active_runs)):
             raise RuntimeError("Harness control operations are unavailable while a run owns the Application Port")
+        if operation in concurrent_controls:
+            return await self._request_control(operation, payload)
+        # Configuration and other exclusive management mutations retain their
+        # serial semantics; interactive controls must be able to pass them.
+        async with self._control_operation_lock:
+            return await self._request_control(operation, payload)
+
+    async def _request_control(self, operation: str, payload: dict[str, Any]) -> dict[str, Any]:
         await self._ensure_bridge()
         request_id = str(uuid.uuid4())
-        async with self._control_lock:
-            loop = asyncio.get_running_loop()
-            waiter: asyncio.Future[dict[str, Any]] = loop.create_future()
-            self._control_waiters[request_id] = waiter
-            try:
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._control_waiters[request_id] = waiter
+        self._control_owners[request_id] = self._bridge_process
+        try:
+            # Serialize writes only. Waiting for a collaboration result must
+            # leave the channel free for its matching permission/cancel reply.
+            async with self._control_lock:
+                if self._bridge_process is not self._control_owners[request_id]:
+                    raise RuntimeError("Harness bridge changed before the control request was sent")
                 await self._send({"op": str(operation), "request_id": request_id, **payload})
-                message = await asyncio.wait_for(waiter, timeout=20.0)
-            finally:
-                self._control_waiters.pop(request_id, None)
-            if not message.get("ok"):
-                raise RuntimeError(str(message.get("error") or "Harness control operation failed"))
-            data = message.get("data")
-            return data if isinstance(data, dict) else {}
+            message = await asyncio.wait_for(waiter, timeout=20.0)
+        finally:
+            self._control_waiters.pop(request_id, None)
+            self._control_owners.pop(request_id, None)
+            if not waiter.done():
+                waiter.cancel()
+            elif not waiter.cancelled():
+                waiter.exception()
+        if not message.get("ok"):
+            raise RuntimeError(str(message.get("error") or "Harness control operation failed"))
+        data = message.get("data")
+        return data if isinstance(data, dict) else {}
 
     async def session_snapshot(self) -> dict[str, Any]:
         """Return the redacted session projection owned by Harness Runtime."""
@@ -663,14 +759,22 @@ class HarnessApplicationPort:
         host_secret_value: str = "",
         agent: str = "viniper",
         memory_enabled: bool = True,
+        reasoning: str | None = None,
+        user_text: str | None = None,
+        planning: bool = False,
     ) -> AsyncIterable[dict[str, Any]]:
         sid = str(session_id)
         if self.active_run(sid):
             raise RuntimeError("Harness Application Port already owns this session run")
         await self._ensure_bridge()
+        if self.active_run(sid):
+            raise RuntimeError("Harness Application Port already owns this session run")
+        owned_process = self._bridge_process
         run_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._run_queues[sid] = run_queue
         self._active_runs[sid] = self._bridge_process  # type: ignore[assignment]
+        stopped: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._run_stopped[sid] = stopped
         selected_provider = str(provider_id or ("demo" if str(model).startswith("demo-") else "deepseek"))
         request = {
             "op": "run",
@@ -683,16 +787,51 @@ class HarnessApplicationPort:
             "workdir": str(workdir),
             "permission_mode": str(permission_mode),
             "memory_enabled": bool(memory_enabled),
+            "reasoning": reasoning,
+            "user_text": user_text,
+            "planning": bool(planning),
         }
         # Host-only secret value is sent over stdin and is never emitted back.
         if host_secret_value:
             request["host_secret_value"] = str(host_secret_value)
         loop = asyncio.get_running_loop()
         terminal_timeout_seconds = _terminal_timeout_seconds()
+        current_timeout_seconds = terminal_timeout_seconds
+        waiting_first_response = False
         idle_deadline = loop.time() + terminal_timeout_seconds
         pending_user_inputs: dict[str, dict[str, Any]] = {}
+        completed = False
+        cancel_sent = False
+        stop_waited = False
+        submitted = False
+
+        def release_owned_run(_result: object = None) -> None:
+            if self._active_runs.get(sid) is owned_process and self._run_queues.get(sid) is run_queue:
+                self._active_runs.pop(sid, None)
+                self._run_queues.pop(sid, None)
+            if self._run_stopped.get(sid) is stopped:
+                self._run_stopped.pop(sid, None)
+
+        async def cancel_owned_run() -> None:
+            nonlocal cancel_sent, stop_waited
+            if not cancel_sent and owned_process is not None and self._active_runs.get(sid) is owned_process:
+                cancel_sent = True
+                await self._cancel_owned_process(owned_process, sid)
+            if submitted and not stop_waited and not stopped.done():
+                stop_waited = True
+                try:
+                    # Sending cancel is only a request. The owned bridge's
+                    # terminal envelope follows tool cleanup and its run's
+                    # persistence barrier; unrelated sessions keep running.
+                    await asyncio.wait_for(asyncio.shield(stopped), timeout=_RUN_STOP_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    # Retain ownership until the reader sees a real terminal
+                    # envelope. A retry must not overlap a still-stopping tool.
+                    pass
+
         try:
             await self._send(request)
+            submitted = True
             # Runtime activity ids and provider call ids are not guaranteed to
             # be the same. Keep both aliases mapped to one canonical id so the
             # native renderer can merge each request/result pair.
@@ -726,17 +865,26 @@ class HarnessApplicationPort:
                             continue
                         except (asyncio.TimeoutError, ConnectionError, RuntimeError):
                             pass
-                    if self._bridge_process is not None:
-                        await self._cancel_owned_process(self._bridge_process, sid)
-                    raise HarnessTerminalTimeoutError(terminal_timeout_seconds) from error
+                    await cancel_owned_run()
+                    raise HarnessTerminalTimeoutError(current_timeout_seconds, first_response=waiting_first_response) from error
                 message_type = str(message.get("type") or "")
                 native_message_id = str(message.get("native_session_id") or "")
                 if native_message_id and native_message_id != sid:
                     continue
-                idle_deadline = loop.time() + terminal_timeout_seconds
+                runtime_event = message.get("event") if isinstance(message.get("event"), dict) else {}
+                runtime_type = str(runtime_event.get("type") or "")
+                payload = runtime_event.get("payload") if isinstance(runtime_event.get("payload"), dict) else {}
+                if runtime_type == "provider.request.started" and payload.get("phase") in {"local-prefill", "local-image"}:
+                    # Only a real local request start grants a bounded first-
+                    # response window. Unrelated metadata cannot extend it.
+                    current_timeout_seconds = max(terminal_timeout_seconds, min(float(payload.get("timeoutSeconds") or terminal_timeout_seconds), 300.0))
+                    waiting_first_response = True
+                    idle_deadline = loop.time() + current_timeout_seconds
+                elif not waiting_first_response or runtime_type in {"thinking.delta", "message.delta", "provider.activity", "tool.requested"} or message_type in {"runtime.completed", "runtime.error"}:
+                    waiting_first_response = False
+                    current_timeout_seconds = terminal_timeout_seconds
+                    idle_deadline = loop.time() + terminal_timeout_seconds
                 if message_type == "runtime.event" and isinstance(message.get("event"), dict):
-                    runtime_event = message["event"]
-                    runtime_type = str(runtime_event.get("type") or "")
                     _track_pending_user_input(pending_user_inputs, runtime_event)
                     yield {"type": "runtime.event", "event": runtime_event}
                     projected = _runtime_event_to_provider_event(runtime_event)
@@ -775,8 +923,11 @@ class HarnessApplicationPort:
                     continue
                 if message_type in {"runtime.started", "runtime.completed"}:
                     finalization_deadline = None
+                    completed = message_type == "runtime.completed"
+                    if completed and not stopped.done():
+                        stopped.set_result(message)
                     yield {**message, "contract": self.contract_id}
-                    if message_type == "runtime.completed":
+                    if completed:
                         return
                     continue
                 if message_type == "runtime.usage":
@@ -785,12 +936,12 @@ class HarnessApplicationPort:
                         yield {"type": "provider.event", "event": projected_usage}
                     continue
                 if message_type in {"runtime.failed", "bridge.failed"}:
+                    if not stopped.done():
+                        stopped.set_result(message)
                     yield {**message, "contract": self.contract_id}
                     raise RuntimeError(str(message.get("message") or "Harness AgentRuntime failed"))
         except asyncio.CancelledError:
-            process = self._bridge_process
-            if process is not None:
-                await self._cancel_owned_process(process, sid)
+            await cancel_owned_run()
             yield {
                 "type": "runtime.cancelled",
                 "engine": "harness-runtime",
@@ -799,6 +950,11 @@ class HarnessApplicationPort:
             }
             raise
         finally:
-            if self._active_runs.get(sid) is self._bridge_process:
-                self._active_runs.pop(sid, None)
-            self._run_queues.pop(sid, None)
+            try:
+                if not completed and owned_process is not None and self._active_runs.get(sid) is owned_process:
+                    await cancel_owned_run()
+            finally:
+                if stopped.done() or not submitted or owned_process is None or owned_process.returncode is not None:
+                    release_owned_run()
+                else:
+                    stopped.add_done_callback(release_owned_run)

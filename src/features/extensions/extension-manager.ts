@@ -48,7 +48,9 @@ export class ExtensionManager {
   private readonly records = new Map<string, ExtensionRecord>();
   private readonly staged = new Map<string, StagedExtensionPackage>();
   private readonly mcpConnections = new Map<string, McpConnectionState>();
-  private readonly mcpTools = new Map<string, Map<string, LoopbackMcpSnapshot>>();
+  private readonly mcpTools = new Map<string, Map<string, ConnectedMcpTool>>();
+  private readonly mcpSnapshots = new Map<string, LoopbackMcpSnapshot>();
+  private readonly mcpOperations = new Map<string, Promise<unknown>>();
   private readonly executionCounts = new Map<string, number>();
   private enabledSkillsBySession: Record<string, string[]> = {};
   private initialized = false;
@@ -62,8 +64,9 @@ export class ExtensionManager {
     for (const record of saved.records ?? []) this.records.set(record.id, normalizeRecord(record));
     this.staged.clear();
     for (const packageItem of saved.staged ?? []) this.staged.set(packageItem.stagingId, structuredClone(packageItem));
+    for (const id of this.mcpTools.keys()) this.unregisterMcpTools(id);
     this.mcpConnections.clear();
-    for (const connection of saved.mcpConnections ?? []) this.mcpConnections.set(connection.id, structuredClone(connection));
+    for (const connection of saved.mcpConnections ?? []) this.mcpConnections.set(connection.id, { ...structuredClone(connection), connected: false });
     this.initialized = true;
   }
 
@@ -293,25 +296,34 @@ export class ExtensionManager {
 
   async configureMcp(input: { id: string; endpoint: string }): Promise<McpConnectionState> {
     assertLoopbackEndpoint(input.endpoint);
-    const state: McpConnectionState = {
-      id: input.id,
-      endpoint: input.endpoint,
-      configured: true,
-      connected: false,
-    };
-    this.mcpConnections.set(input.id, state);
-    await this.persist();
-    return structuredClone(state);
+    return this.queueMcpOperation(input.id, async () => {
+      const existing = this.mcpConnections.get(input.id);
+      if (existing?.configured && existing.endpoint === input.endpoint) return structuredClone(existing);
+      this.unregisterMcpTools(input.id);
+      const state: McpConnectionState = {
+        id: input.id, endpoint: input.endpoint, configured: true, connected: false,
+      };
+      this.mcpConnections.set(input.id, state);
+      await this.persist();
+      return structuredClone(state);
+    });
   }
 
   async connectMcp(id: string): Promise<unknown> {
+    return this.queueMcpOperation(id, () => this.connectMcpNow(id));
+  }
+
+  private async connectMcpNow(id: string): Promise<unknown> {
     const state = this.mcpConnections.get(id);
     if (!state?.configured) throw new Error("MCP_NOT_CONFIGURED");
     if (!this.options.mcpConnector) throw new Error("MCP_CONNECTOR_UNAVAILABLE");
+    const connected = this.mcpSnapshots.get(id);
+    if (state.connected && connected) return connected;
     try {
       this.unregisterMcpTools(id);
       const result = await this.options.mcpConnector(state.endpoint) as LoopbackMcpSnapshot;
       this.registerMcpTools(id, result);
+      this.mcpSnapshots.set(id, result);
       state.connected = true;
       state.lastError = undefined;
       await this.persist();
@@ -326,25 +338,44 @@ export class ExtensionManager {
   }
 
   async disconnectMcp(id: string): Promise<boolean> {
-    const state = this.mcpConnections.get(id);
-    if (!state) return false;
-    this.unregisterMcpTools(id);
-    state.connected = false;
-    await this.persist();
-    return true;
+    return this.queueMcpOperation(id, async () => {
+      const state = this.mcpConnections.get(id);
+      if (!state) return false;
+      this.unregisterMcpTools(id);
+      state.connected = false;
+      await this.persist();
+      return true;
+    });
   }
 
   async refreshMcp(id: string): Promise<unknown> {
-    const state = this.mcpConnections.get(id);
-    if (!state?.configured) throw new Error("MCP_NOT_CONFIGURED");
-    this.unregisterMcpTools(id);
-    state.connected = false;
-    await this.persist();
-    return this.connectMcp(id);
+    return this.queueMcpOperation(id, async () => {
+      const state = this.mcpConnections.get(id);
+      if (!state?.configured) throw new Error("MCP_NOT_CONFIGURED");
+      this.unregisterMcpTools(id);
+      state.connected = false;
+      return this.connectMcpNow(id);
+    });
   }
 
   async dispose(): Promise<void> {
+    await Promise.allSettled([...this.mcpOperations.values()]);
+    for (const id of this.mcpTools.keys()) this.unregisterMcpTools(id);
+    this.mcpSnapshots.clear();
     await this.options.processHost.dispose();
+  }
+
+  private queueMcpOperation<T>(id: string, operation: () => Promise<T>): Promise<T> {
+    // Discovery crosses an async HTTP boundary. Serialize each connection's
+    // configure/connect/refresh/disconnect so a later request cannot unregister
+    // tools belonging to an earlier successful connection.
+    const previous = this.mcpOperations.get(id) ?? Promise.resolve();
+    const result = previous.catch(() => undefined).then(operation);
+    this.mcpOperations.set(id, result);
+    void result.finally(() => {
+      if (this.mcpOperations.get(id) === result) this.mcpOperations.delete(id);
+    }).catch(() => undefined);
+    return result;
   }
 
   private requiredRecord(id: string): ExtensionRecord {
@@ -377,14 +408,22 @@ export class ExtensionManager {
     const registry = this.options.toolRegistry;
     const tools = Array.isArray(snapshot?.tools) ? snapshot.tools : [];
     if (!registry || tools.length === 0) return;
-    const bindings = new Map<string, LoopbackMcpSnapshot>();
+    const bindings = new Map<string, ConnectedMcpTool>();
     for (const tool of tools) {
       const rawName = String(tool?.name || "").trim();
       if (!rawName) continue;
       const name = mcpToolName(connectionId, rawName);
-      if (registry.has(name)) throw new Error(`MCP_TOOL_NAME_COLLISION: ${name}`);
-      registry.register(new ConnectedMcpTool(name, rawName, tool, snapshot));
-      bindings.set(name, snapshot);
+      if (registry.has(name) || bindings.has(name)) throw new Error(`MCP_TOOL_NAME_COLLISION: ${name}`);
+      bindings.set(name, new ConnectedMcpTool(name, rawName, tool, snapshot));
+    }
+    // Validate the entire discovered set before publishing any of it. A
+    // duplicate later in tools/list must never leave an untracked partial set.
+    const registered: ConnectedMcpTool[] = [];
+    try {
+      for (const tool of bindings.values()) { registry.register(tool); registered.push(tool); }
+    } catch (error) {
+      for (const tool of registered) if (registry.has(tool.name) && registry.get(tool.name) === tool) registry.unregister(tool.name);
+      throw error;
     }
     this.mcpTools.set(connectionId, bindings);
   }
@@ -393,9 +432,12 @@ export class ExtensionManager {
     const registry = this.options.toolRegistry;
     const bindings = this.mcpTools.get(connectionId);
     if (registry && bindings) {
-      for (const name of bindings.keys()) registry.unregister(name);
+      for (const [name, tool] of bindings) {
+        if (registry.has(name) && registry.get(name) === tool) registry.unregister(name);
+      }
     }
     this.mcpTools.delete(connectionId);
+    this.mcpSnapshots.delete(connectionId);
   }
 }
 

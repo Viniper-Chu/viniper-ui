@@ -7,6 +7,8 @@ import { ModelProvider } from "../../src/features/providers/model-provider";
 import { createHarnessApplication } from "../../src/platform/bootstrap/create-harness-application";
 import { UnavailableSecretVault } from "../../src/platform/security/unavailable-secret-vault";
 
+const printCommand = (text: string): string => process.platform === "win32" ? `[Console]::Out.Write('${text}')` : `printf '%s' '${text}'`;
+
 class P3TerminalProvider implements ModelProvider {
   readonly descriptor = {
     id: "p3-terminal-fake",
@@ -32,7 +34,7 @@ class P3TerminalProvider implements ModelProvider {
     const outputResult = results.find((item) => item.name === "terminal.output");
     if (!runResult) {
       const call = toolCall(`terminal-run-${request.sessionId}`, "terminal.run", {
-        command: this.commands.get(request.sessionId) ?? "[Console]::Out.Write('P3_DEFAULT')",
+        command: this.commands.get(request.sessionId) ?? printCommand("P3_DEFAULT"),
         purpose: "test",
         timeoutMs: 8_000,
       });
@@ -66,7 +68,7 @@ test("P3 formal Runtime advertises terminal for generic and project sessions and
     scene.bundle.runtime.providerRegistry().register(provider);
     const ordinarySessionId = scene.bundle.runtime.snapshot().activeSessionId;
     const session = await scene.bundle.application.createProjectSession(scene.projectRoot);
-    provider.commands.set(session.id, "[Console]::Out.Write('P3_RUNTIME_OUTPUT')");
+    provider.commands.set(session.id, printCommand("P3_RUNTIME_OUTPUT"));
     await scene.bundle.application.setProviderModel(session.id, provider.descriptor.id, "p3-terminal-model");
     await scene.bundle.application.setPermissionMode(session.id, "full");
     await scene.bundle.application.send({
@@ -131,7 +133,7 @@ test("P3 permission freeze covers manual review, auto review and full access wit
         const provider = new P3TerminalProvider();
         scene.bundle.runtime.providerRegistry().register(provider);
         const session = await scene.bundle.application.createProjectSession(scene.projectRoot);
-        provider.commands.set(session.id, `[Console]::Out.Write('${item.name.replace(/[^a-z]/giu, "_")}')`);
+        provider.commands.set(session.id, printCommand(item.name.replace(/[^a-z]/giu, "_")));
         await scene.bundle.application.setProviderModel(session.id, provider.descriptor.id, "p3-terminal-model");
         await scene.bundle.application.setPermissionMode(session.id, item.mode);
         await scene.bundle.application.send({
@@ -177,7 +179,7 @@ test("P3 runtime cancellation terminates only the owning session process tree", 
     const cancelledSession = await scene.bundle.application.createProjectSession(scene.projectRoot);
     const survivingSession = await scene.bundle.application.createProjectSession(secondProject);
     provider.commands.set(cancelledSession.id, "node spawn-child.cjs heartbeat.txt child.pid");
-    provider.commands.set(survivingSession.id, "Start-Sleep -Milliseconds 550; [Console]::Out.Write('SURVIVED')");
+    provider.commands.set(survivingSession.id, process.platform === "win32" ? "Start-Sleep -Milliseconds 550; [Console]::Out.Write('SURVIVED')" : "sleep 0.55; printf SURVIVED");
     for (const session of [cancelledSession, survivingSession]) {
       await scene.bundle.application.setProviderModel(session.id, provider.descriptor.id, "p3-terminal-model");
       await scene.bundle.application.setPermissionMode(session.id, "full");
@@ -190,6 +192,7 @@ test("P3 runtime cancellation terminates only the owning session process tree", 
       });
     }
     await waitForFile(join(scene.projectRoot, "child.pid"));
+    await waitForFile(join(scene.projectRoot, "heartbeat.txt"));
     assert.equal(await scene.bundle.application.cancel(cancelledSession.id), true);
     await waitFor(() => !scene.bundle.runtime.isRunning(cancelledSession.id) && !scene.bundle.runtime.isRunning(survivingSession.id), 8_000);
 

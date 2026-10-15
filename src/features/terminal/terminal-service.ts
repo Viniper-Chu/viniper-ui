@@ -2,6 +2,7 @@ import { newId } from "../../core/ids";
 import {
   TerminalExecutionContext,
   TerminalOutputInput,
+  TerminalOutputHistory,
   TerminalOutputResult,
   TerminalProcessHost,
   TerminalRunInput,
@@ -58,10 +59,10 @@ export class TerminalService {
     return this.host.output(input, context);
   }
 
-  outputForSession(input: TerminalOutputInput, sessionId: string): Promise<TerminalOutputResult> {
+  outputForSession(input: TerminalOutputInput, sessionId: string, history?: TerminalOutputHistory): Promise<TerminalOutputResult> {
     const invalid = invalidOutputStream(input);
     if (invalid) return Promise.resolve(invalid);
-    return this.host.outputForSession(input, sessionId);
+    return this.host.outputForSession(input, sessionId, history);
   }
 
   dispose(): Promise<void> {

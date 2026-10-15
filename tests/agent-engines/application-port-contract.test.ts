@@ -5,7 +5,7 @@ import test from "node:test";
 import { createHarnessApplication } from "../../src/platform/bootstrap/create-harness-application";
 import { UnavailableSecretVault } from "../../src/platform/security/unavailable-secret-vault";
 
-test("Viniper and Claude code sessions share one Application Port while keeping engine state isolated", async () => {
+test("Viniper is the only advertised engine; archived engine-owned records remain distinct", async () => {
   const residueRoot = join(process.cwd(), "codex", "运行残留");
   await mkdir(residueRoot, { recursive: true });
   const root = await mkdtemp(join(residueRoot, "agent-engine-contract-"));
@@ -40,9 +40,9 @@ test("Viniper and Claude code sessions share one Application Port while keeping 
     const snapshot = bundle.application.snapshot();
     assert.equal(snapshot.sessions.find((session) => session.id === claude.id)?.title, "Claude 独立状态");
     assert.notEqual(snapshot.sessions.find((session) => session.id === viniper.id)?.title, "Claude 独立状态");
-    assert.deepEqual(snapshot.agentEngines?.map((engine) => engine.id), ["viniper", "claude-code"]);
+    assert.deepEqual(snapshot.agentEngines?.map((engine) => engine.id), ["viniper"]);
     assert.equal(snapshot.agentEngines?.find((engine) => engine.id === "viniper")?.status, "ready");
-    assert.equal(snapshot.agentEngines?.find((engine) => engine.id === "claude-code")?.status, "unavailable");
+    assert.equal(snapshot.agentEngines?.find((engine) => engine.id === "claude-code"), undefined);
   } finally {
     await bundle.application.dispose();
     await rm(root, { recursive: true, force: true });
@@ -52,9 +52,6 @@ test("Viniper and Claude code sessions share one Application Port while keeping 
 test("native Harness permission control maps stable native sessions before resolving", async () => {
   const bridgePath = resolve(
     process.cwd(),
-    "..",
-    "..",
-    "viniper-native-workstation",
     "resources",
     "viniper-ui",
     "harness_runtime_bridge.js",
@@ -67,9 +64,6 @@ test("native Harness permission control maps stable native sessions before resol
   assert.match(bridge, /providerRequestLimits:\s*\{ review: reviewProviderLimit \}/u);
   const nativePort = await readFile(resolve(
     process.cwd(),
-    "..",
-    "..",
-    "viniper-native-workstation",
     "resources",
     "viniper-ui",
     "harness_application_port.py",

@@ -759,7 +759,8 @@ function insertUsage(database: DatabaseSync, usage: RunUsageSnapshot): void {
 }
 
 function insertSchedule(database: DatabaseSync, definition: ScheduleDefinition): void {
-  if (definition.target.kind === "existing-session" && !sessionExists(database, definition.target.sessionId)) {
+  const inactiveHistory = !definition.enabled && (definition.status === "deleted" || definition.status === "project-invalid");
+  if (!inactiveHistory && definition.target.kind === "existing-session" && !sessionExists(database, definition.target.sessionId)) {
     throw new SQLiteStoreError(`DATA_REFERENCE_MISSING: schedule ${definition.id} references session ${definition.target.sessionId}`);
   }
   database.prepare("INSERT INTO schedules (id, name, enabled, created_at, updated_at, payload_json) VALUES (?, ?, ?, ?, ?, ?)")
