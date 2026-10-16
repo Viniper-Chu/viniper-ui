@@ -7,7 +7,8 @@ import {
   paintRun,
   projectEvent,
   updateRail,
-  trackScroll,
+  setupConversationScroll,
+  jumpToMessage,
   bottom,
   openFile,
   readTerminalOutput,
@@ -28,6 +29,11 @@ let switchVersion = 0;
 let toastTimer;
 let busySending = false;
 let sessionListMarkup = "";
+function setMarkup(element, html) {
+  if (element._markup === html) return;
+  element.innerHTML = html;
+  element._markup = html;
+}
 export function toast(message, error = false) {
   $("#toast").textContent = message;
   $("#toast").classList.toggle("error", error);
@@ -246,8 +252,12 @@ export function applyTheme(appearance) {
 }
 function resizePrompt() {
   const prompt = $("#prompt");
-  prompt.style.height = "auto";
-  prompt.style.height = Math.min(180, prompt.scrollHeight) + "px";
+  const layout = `${prompt.clientWidth}:${$("#chat-view").classList.contains("is-empty")}:${prompt.value}`;
+  if (prompt._layout !== layout) {
+    prompt.style.height = "auto";
+    prompt.style.height = Math.min(180, prompt.scrollHeight) + "px";
+    prompt._layout = layout;
+  }
   $("#send-button").disabled = !prompt.value.trim();
   $("#steer-button").disabled = !prompt.value.trim();
 }
@@ -263,9 +273,7 @@ export function syncComposer() {
     : /review|read/.test(state.permission)
       ? "read"
       : "normal";
-  $("#permission-button").querySelector("[data-icon]").innerHTML = icon(
-    permissionIcon(state.permission),
-  );
+  setMarkup($("#permission-button").querySelector("[data-icon]"), icon(permissionIcon(state.permission)));
   const model = state.status?.models?.find(
     (m) => (m.id || m.value || m.model) === state.model,
   );
@@ -314,21 +322,21 @@ export function syncComposer() {
       const skill = state.skills.find(s => (s.id || s.filename) === id);
       return skill?.display_name || skill?.name || skill?.command || "已选技能";
     })].filter(Boolean).join(" · ");
-  $("#mode-chip").innerHTML =
-    `${icon(state.mode === "plan" ? "plan" : state.mode === "goal" ? "target" : "plugin")}<span>${escape(selectionLabel)}</span><button data-action="clear-mode" aria-label="清除模式与技能">${icon("close")}</button>`;
+  setMarkup($("#mode-chip"),
+    `${icon(state.mode === "plan" ? "plan" : state.mode === "goal" ? "target" : "plugin")}<span>${escape(selectionLabel)}</span><button data-action="clear-mode" aria-label="清除模式与技能">${icon("close")}</button>`);
   $("#attachments").hidden = !state.attachments.length;
-  $("#attachments").innerHTML = state.attachments
+  setMarkup($("#attachments"), state.attachments
     .map(
       (a, i) =>
         `<div class="attachment-chip">${icon("file")}<span>${escape(a.name)}</span><button data-remove-attachment="${i}" aria-label="移除附件 ${escape(a.name)}">${icon("close")}</button></div>`,
     )
-    .join("");
+    .join(""));
   resizePrompt();
   const pending = run?.interaction || state.session?.pending_interaction;
   $("#interaction").hidden = !pending;
   if (pending) {
-    $("#interaction").innerHTML =
-      `<h3>需要你的确认</h3><p>${escape(pending.description || pending.summary || pending.tool_name || pending.message || pending.content || "允许执行此操作？")}</p><div class="interaction-actions"><button class="secondary-button" data-permission-answer="reject">拒绝</button><button class="primary-button" data-permission-answer="allow-once">允许这一次</button></div>`;
+    setMarkup($("#interaction"),
+      `<h3>需要你的确认</h3><p>${escape(pending.description || pending.summary || pending.tool_name || pending.message || pending.content || "允许执行此操作？")}</p><div class="interaction-actions"><button class="secondary-button" data-permission-answer="reject">拒绝</button><button class="primary-button" data-permission-answer="allow-once">允许这一次</button></div>`);
   }
 }
 async function send() {
@@ -519,8 +527,7 @@ async function consume(response, run) {
         const updated = await api(`/api/sessions/${run.sessionId}`);
         if (state.session?.session_id === run.sessionId) {
           state.session = updated;
-          renderMessages(updated.messages);
-          bottom(true);
+          renderMessages(updated.messages, { preserveView: true });
           syncComposer();
         }
       } catch {}
@@ -801,9 +808,7 @@ async function click(event) {
       return;
     }
     if (b.dataset.jump) {
-      document
-        .getElementById(b.dataset.jump)
-        ?.scrollIntoView({ block: "start", behavior: "smooth" });
+      jumpToMessage(b.dataset.jump);
       return;
     }
     if (b.dataset.prompt) {
@@ -904,7 +909,7 @@ $("#file-input").addEventListener("change", async () => {
     $("#file-input").value = "";
   }
 });
-$("#conversation").addEventListener("scroll", trackScroll, { passive: true });
+setupConversationScroll();
 window.viniperDesktop?.onCommand((payload) => {
   const cmd = payload.command || payload.action;
   if (["new-session", "new-chat", "new-viniper-session"].includes(cmd))
@@ -932,12 +937,12 @@ setInterval(async () => {
       const queue = await api(`/api/runs/${state.session.session_id}/queue`);
       const items = queue.items || queue.queue || [];
       $("#queue").hidden = !items.length;
-      $("#queue").innerHTML = items
+      setMarkup($("#queue"), items
         .map(
           (item) =>
             `<div class="queued-message"><span>${escape(item.text)}</span><button class="icon-button" data-cancel-queue="${escape(item.id)}" aria-label="移除待发送消息">${icon("close")}</button></div>`,
         )
-        .join("");
+        .join(""));
     }
     if (state.view === "tasks") await loadTasks();
     if (state.session) {

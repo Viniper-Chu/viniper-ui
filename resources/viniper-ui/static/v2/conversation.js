@@ -1,13 +1,82 @@
 import { escape, timeLabel, state, api } from "./api.js";
 import { icon } from "./icons.js";
 const $ = (s) => document.querySelector(s);
+let followingLatest = true;
+let lastScrollTop = 0;
+let holdingPointer = false;
 export const nearBottom = () => {
   const el = $("#conversation");
-  return el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 4;
 };
 export function bottom(force = false) {
-  if (force || nearBottom())
-    $("#conversation").scrollTo({ top: $("#conversation").scrollHeight, behavior: force ? "instant" : "smooth" });
+  if (force) followingLatest = true;
+  const selection = globalThis.getSelection?.();
+  if (followingLatest && (force || (!holdingPointer && (!selection || selection.isCollapsed)))) {
+    const el = $("#conversation");
+    el.scrollTo({ top: el.scrollHeight, behavior: "instant" });
+    lastScrollTop = el.scrollTop;
+  }
+  $("#jump-bottom").hidden = nearBottom();
+}
+export function jumpToMessage(id) {
+  followingLatest = false;
+  document.getElementById(id)?.scrollIntoView({ block: "start", behavior: "smooth" });
+}
+export function setupConversationScroll() {
+  const el = $("#conversation");
+  el.addEventListener("scroll", trackScroll, { passive: true });
+  el.addEventListener("wheel", (event) => {
+    if (event.deltaY < 0) followingLatest = false;
+  }, { passive: true });
+  el.addEventListener("touchstart", () => { holdingPointer = true; followingLatest = false; }, { passive: true });
+  el.addEventListener("touchend", () => { holdingPointer = false; }, { passive: true });
+  el.addEventListener("touchcancel", () => { holdingPointer = false; }, { passive: true });
+  el.addEventListener("pointerdown", () => { holdingPointer = true; });
+  document.addEventListener("pointerup", () => { holdingPointer = false; });
+  document.addEventListener("pointercancel", () => { holdingPointer = false; });
+  el.addEventListener("keydown", (event) => {
+    if (["ArrowUp", "PageUp", "Home"].includes(event.key)) followingLatest = false;
+  });
+}
+
+// Keep existing text, details and scroll containers alive while Markdown grows.
+function patchChildren(parent, next) {
+  const desired = [...next.childNodes];
+  desired.forEach((fresh, index) => {
+    const current = parent.childNodes[index];
+    if (!current) { parent.append(fresh); return; }
+    if (current.nodeType !== fresh.nodeType || current.nodeName !== fresh.nodeName) {
+      current.replaceWith(fresh);
+      return;
+    }
+    if (current.nodeType === 3) {
+      if (fresh.data === current.data) return;
+      if (fresh.data.startsWith(current.data)) current.appendData(fresh.data.slice(current.data.length));
+      else if (current.data !== fresh.data) current.data = fresh.data;
+      return;
+    }
+    if (current.nodeType !== 1) return;
+    for (const attr of [...current.attributes])
+      if (!fresh.hasAttribute(attr.name) && !(current.tagName === "DETAILS" && attr.name === "open")) current.removeAttribute(attr.name);
+    for (const attr of fresh.attributes)
+      if (current.getAttribute(attr.name) !== attr.value) current.setAttribute(attr.name, attr.value);
+    patchChildren(current, fresh);
+  });
+  while (parent.childNodes.length > desired.length) parent.lastChild.remove();
+}
+function updateMarkup(element, html) {
+  if (element._markup === html) return;
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  decorateFiles(template.content, element.matches(".answer"));
+  patchChildren(element, template.content);
+  element._markup = html;
+}
+function updateMarkdown(element, text, streaming) {
+  const key = `${Boolean(streaming)}:${text}`;
+  if (element._markdown === key) return;
+  updateMarkup(element, markdown(text, streaming));
+  element._markdown = key;
 }
 function markdown(text, streaming = false) {
   return globalThis.ViniperMarkdown.render(
@@ -149,7 +218,7 @@ function messageText(message) {
   const progress = segments.slice(0, lastTool).filter(s => s.type === "text" && s.content?.trim()).map(s => s.content);
   return answer.trim() && progress.length ? { answer, progress } : unchanged;
 }
-function activityHtml(message, progress = []) {
+function activityData(message, progress = []) {
   const segments = message.segments || [];
   const thoughts =
     segments
@@ -197,24 +266,77 @@ function activityHtml(message, progress = []) {
     : elapsed
       ? `${outcome}用时 ${timeLabel(elapsed)}`
       : `${outcome}用时不足 1 秒`;
-  return `<details class="activity"><summary>${message.streaming ? '<span class="spinner"></span>' : icon("chevron")}<span>${escape(label)}</span>${!message.streaming && operationCount ? `<small class="activity-count">${operationCount} 次操作${progress.length ? ` · ${progress.length} 条进展` : ""}</small>` : ""}${message.streaming && elapsed ? `<span>· ${timeLabel(elapsed)}</span>` : ""}</summary><div class="activity-body">${thoughts ? `<div class="thinking-content">${markdown(thoughts, message.streaming)}</div>` : ""}${progress.length ? `<div class="thinking-content"><p>执行中的回复</p>${progress.map(text => markdown(text, false)).join("")}</div>` : ""}${tools.map((t) => toolHtml(t, Boolean(message.streaming))).join("")}${!thoughts && !tools.length ? (message.streaming ? "<span>等待模型响应…</span>" : "<span>本轮没有额外的执行记录。</span>") : ""}</div></details>`;
+  return { thoughts, tools, label, count: !message.streaming && operationCount ? `${operationCount} 次操作${progress.length ? ` · ${progress.length} 条进展` : ""}` : "", time: message.streaming && elapsed ? `· ${timeLabel(elapsed)}` : "" };
+}
+function activityBodyHtml(message, progress, data) {
+  return `<div class="thinking-content">${data.thoughts ? markdown(data.thoughts, message.streaming) : ""}</div><div class="progress-content">${progress.length ? `<p>执行中的回复</p>${progress.map(text => markdown(text, false)).join("")}` : ""}</div><div class="activity-tools">${data.tools.map(t => `<div>${toolHtml(t, Boolean(message.streaming))}</div>`).join("")}</div><span class="activity-empty"${data.thoughts || data.tools.length ? " hidden" : ""}>${message.streaming ? "等待模型响应…" : "本轮没有额外的执行记录。"}</span>`;
+}
+function activityHtml(message, progress = []) {
+  const data = activityData(message, progress);
+  return `<details class="activity"><summary><span class="activity-symbol">${message.streaming ? '<span class="spinner"></span>' : icon("chevron")}</span><span class="activity-label">${escape(data.label)}</span><small class="activity-count"${data.count ? "" : " hidden"}>${escape(data.count)}</small><span class="activity-time"${data.time ? "" : " hidden"}>${escape(data.time)}</span></summary><div class="activity-body">${message.streaming ? "" : activityBodyHtml(message, progress, data)}</div></details>`;
+}
+function updateActivityBody(activity, message, progress, data) {
+  const body = activity.querySelector(".activity-body");
+  if (!body.querySelector(".thinking-content")) body.innerHTML = activityBodyHtml({ streaming: true }, [], { thoughts: "", tools: [] });
+  updateMarkdown(body.querySelector(".thinking-content"), data.thoughts, message.streaming);
+  updateMarkup(body.querySelector(".progress-content"), progress.length ? `<p>执行中的回复</p>${progress.map(text => markdown(text, false)).join("")}` : "");
+  const list = body.querySelector(".activity-tools");
+  data.tools.forEach((tool, index) => {
+    let slot = list.children[index];
+    if (!slot) { slot = document.createElement("div"); list.append(slot); }
+    updateMarkup(slot, toolHtml(tool, Boolean(message.streaming)));
+  });
+  while (list.children.length > data.tools.length) list.lastElementChild.remove();
+  const empty = body.querySelector(".activity-empty");
+  empty.hidden = Boolean(data.thoughts || data.tools.length);
+  empty.textContent = message.streaming ? "等待模型响应…" : "本轮没有额外的执行记录。";
 }
 function messageHtml(message) {
   if (message.role === "user")
     return `<div class="user-content">${escape(message.content)}${(message.attachments || []).map((a) => `<div><button class="file-link" data-file="${escape(a.path || "")}">${icon("file")}${escape(a.name || a.path)}</button></div>`).join("")}</div>`;
   const { answer: content, progress } = messageText(message);
-  return `${activityHtml(message, progress)}<div class="answer">${markdown(content, Boolean(message.streaming))}</div>${resultFiles(message)}${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan">按此计划开始实施</button>' : ""}<div class="message-actions"><button class="icon-button" data-copy="${escape(content)}" title="复制回答" aria-label="复制回答">${icon("copy")}</button></div>`;
+  return `${activityHtml(message, progress)}<div class="answer">${markdown(content, Boolean(message.streaming))}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan">按此计划开始实施</button>' : ""}</div><div class="message-actions"><button class="icon-button" data-copy="${escape(content)}" title="复制回答" aria-label="复制回答">${icon("copy")}</button></div>`;
 }
-export function renderMessages(messages) {
+function updateMessage(node, message) {
+  node._message = message;
+  if (message.role === "user") { updateMarkup(node, messageHtml(message)); return; }
+  const { answer, progress } = messageText(message);
+  const activity = node.querySelector(".activity");
+  const data = activityData(message, progress);
+  updateMarkup(activity.querySelector(".activity-symbol"), message.streaming ? '<span class="spinner"></span>' : icon("chevron"));
+  for (const [className, text] of [["activity-label", data.label], ["activity-count", data.count], ["activity-time", data.time]]) {
+    const part = activity.querySelector(`.${className}`);
+    if (part.textContent !== text) part.textContent = text;
+    part.hidden = !text;
+  }
+  // A collapsed trace does no Markdown work on streaming tokens or timer ticks.
+  if (activity.open) updateActivityBody(activity, message, progress, data);
+  updateMarkdown(node.querySelector(".answer"), answer, message.streaming);
+  updateMarkup(node.querySelector(".message-results"), resultFiles(message));
+  updateMarkup(node.querySelector(".message-plan"), message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan">按此计划开始实施</button>' : "");
+  const copy = node.querySelector("[data-copy]");
+  if (copy.dataset.copy !== answer) copy.dataset.copy = answer;
+}
+export function renderMessages(messages, { preserveView = false } = {}) {
   const visible = (messages || []).filter(
     (m) => m.role === "user" || m.role === "assistant",
   );
   $("#welcome").hidden = visible.length > 0;
   $("#chat-view").classList.toggle("is-empty", visible.length === 0);
   $("#starters").hidden = visible.length > 0;
-  $("#messages").innerHTML = "";
-  visible.forEach((message, index) => appendMessage(message, index));
+  const list = $("#messages");
+  if (!preserveView) { list.replaceChildren(); followingLatest = true; lastScrollTop = 0; }
+  visible.forEach((message, index) => {
+    const node = list.children[index];
+    if (node && node._message?.role === message.role) updateMessage(node, message);
+    else {
+      const added = appendMessage(message, index);
+      if (node) list.replaceChild(added, node);
+    }
+  });
+  while (list.children.length > visible.length) list.lastElementChild.remove();
   updateRail();
+  if (preserveView) bottom();
 }
 export function appendMessage(message, index = $("#messages").children.length) {
   $("#welcome").hidden = true;
@@ -226,6 +348,11 @@ export function appendMessage(message, index = $("#messages").children.length) {
   node.dataset.messageIndex = index;
   node._message = message;
   node.innerHTML = messageHtml(message);
+  node.querySelector(".activity")?.addEventListener("toggle", (event) => {
+    if (!event.target.open) return;
+    const { progress } = messageText(node._message);
+    updateActivityBody(event.target, node._message, progress, activityData(node._message, progress));
+  });
   $("#messages").append(node);
   decorateFiles(node);
   updateRail();
@@ -239,21 +366,9 @@ export function paintRun(run) {
     node = appendMessage(run.message);
     run.node = node;
   }
-  const auto = nearBottom();
-  const expanded = node.querySelector(".activity")?.open;
-  const openedTools = new Set([...node.querySelectorAll(".tool-event details[open]")].map(d => d.closest(".tool-event").dataset.callId));
-  const outputs = new Map([...node.querySelectorAll("[data-output-key]")].map(section => [section.dataset.outputKey, section]));
   node.classList.toggle("error", Boolean(run.error));
-  node.innerHTML = messageHtml(run.message);
-  if (expanded) node.querySelector(".activity").open = true;
-  for (const detail of node.querySelectorAll(".tool-event details"))
-    if (openedTools.has(detail.closest(".tool-event").dataset.callId)) detail.open = true;
-  for (const section of node.querySelectorAll("[data-output-key]")) {
-    const previous = outputs.get(section.dataset.outputKey);
-    if (previous) section.replaceWith(previous);
-  }
-  decorateFiles(node);
-  if (auto) bottom(true);
+  updateMessage(node, run.message);
+  bottom();
 }
 export function projectEvent(run, event) {
   if (event.sequence && event.sequence <= run.sequence) return;
@@ -332,6 +447,10 @@ export function updateRail() {
     .join("");
 }
 export function trackScroll() {
+  const top = $("#conversation").scrollTop;
+  if (top < lastScrollTop - 1) followingLatest = false;
+  else if (!holdingPointer && nearBottom()) followingLatest = true;
+  lastScrollTop = top;
   $("#jump-bottom").hidden = nearBottom();
   const area = $("#conversation").getBoundingClientRect();
   let active = "";
@@ -341,7 +460,7 @@ export function trackScroll() {
     .querySelectorAll("button")
     .forEach((b) => b.classList.toggle("active", b.dataset.jump === active));
 }
-export function decorateFiles(root) {
+export function decorateFiles(root, answer = false) {
   root.querySelectorAll("a[href]").forEach((a) => {
     const href = a.getAttribute("href");
     if (
@@ -356,7 +475,7 @@ export function decorateFiles(root) {
       a.removeAttribute("target");
     }
   });
-  root.querySelectorAll(".answer p>code,.answer li>code").forEach((code) => {
+  root.querySelectorAll(answer ? "p>code,li>code" : ".answer p>code,.answer li>code").forEach((code) => {
     const text = code.textContent.trim();
     if (/^(?:\/(?!\/)|~\/|\.\.?\/)[^\n]+/.test(text)) {
       const b = document.createElement("button");

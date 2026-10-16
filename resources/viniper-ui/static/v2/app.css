@@ -361,7 +361,6 @@ kbd {
   overflow: auto;
   overscroll-behavior: contain;
   padding: 18px 50px 30px;
-  scroll-behavior: smooth;
   scrollbar-gutter: stable;
 }
 .messages {
@@ -1398,13 +1397,18 @@ dialog::backdrop {
   grid-column: 1;
 }
 .spinner {
+  display: inline-block;
+  flex: none;
   width: 12px;
   height: 12px;
   border: 1.5px solid var(--line);
   border-top-color: var(--accent);
   border-radius: 50%;
   animation: spin 1s linear infinite;
+  will-change: transform;
 }
+.activity-symbol { display: inline-flex; align-items: center; flex: none; }
+.thinking-content:empty, .progress-content:empty, .message-results:empty, .message-plan:empty { display: none; }
 @keyframes spin {
   to {
     transform: rotate(360deg);

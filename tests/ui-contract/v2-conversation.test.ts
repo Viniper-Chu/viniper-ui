@@ -24,6 +24,15 @@ test('completed output renders math, collapses thinking and tool receipts, and k
  assert.equal((html.match(/class="tool-event/g)||[]).length,1);assert.match(html,/SELECT note FROM notes/);
  assert.match(html,/&lt;literal&gt;/);assert.doesNotMatch(html,/执行中|<literal>/);
 });
+test('closed live activity defers long thinking markdown until opened',()=>{
+ const {ctx}=renderer();
+ const thoughts='THINKING_DETAIL '.repeat(4000);
+ const live=ctx.messageHtml({role:'assistant',content:'当前回答',thinking:thoughts,streaming:true});
+ assert.match(live,/class="spinner"/);assert.match(live,/当前回答/);
+ assert.doesNotMatch(live,/THINKING_DETAIL/);
+ const complete=ctx.messageHtml({role:'assistant',thinking:thoughts,streaming:false});
+ assert.match(complete,/THINKING_DETAIL/);assert.doesNotMatch(complete,/class="spinner"/);
+});
 test('completed turns keep intermediate replies in activity details and copy the final reply',()=>{
  const {ctx}=renderer();
  const message={role:'assistant',content:'先检查文件。\n\n完成，结果已验证。',segments:[

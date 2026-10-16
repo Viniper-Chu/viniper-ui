@@ -244,7 +244,7 @@ test("R15 S3 atomic persistence assigns a replay cursor and idempotently ignores
   try {
     const session = createSessionSnapshot("D:\\r15", 200);
     const { events: _events, ...persisted } = session;
-    const application = { schemaVersion: 3 as const, productVersion: "2.0.0" as const, activeSessionId: session.id, sessions: [persisted] };
+    const application = { schemaVersion: 3 as const, productVersion: "2.0.1" as const, activeSessionId: session.id, sessions: [persisted] };
     await store.saveSnapshot(application);
     const draft: RuntimeEvent = {
       id: engineScopedId("viniper", "event", "atomic"), engineId: "viniper",
