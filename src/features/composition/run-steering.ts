@@ -20,6 +20,7 @@ export class RunSteeringService {
   private readonly statuses = new Map<string, SteeringRunStatus>();
   private readonly receipts = new Map<string, SteeringReceipt>();
   private readonly pendingByRun = new Map<string, string[]>();
+  private readonly interrupts = new Map<string, () => void>();
 
   constructor(private readonly now: () => number = Date.now) {}
 
@@ -33,6 +34,19 @@ export class RunSteeringService {
 
   inject(runId: string, context: Record<string, unknown>): SteeringReceipt {
     return this.enqueue(runId, "inject", context, false);
+  }
+
+  /** Interrupt only the current step, keeping the run and its history alive. */
+  interrupt(runId: string): void {
+    if ((this.pendingByRun.get(runId) ?? []).some(id => this.receipts.get(id)?.kind === "steer")) {
+      this.interrupts.get(runId)?.();
+    }
+  }
+
+  bindInterrupt(runId: string, interrupt: () => void): () => void {
+    this.interrupts.set(runId, interrupt);
+    this.interrupt(runId);
+    return () => { if (this.interrupts.get(runId) === interrupt) this.interrupts.delete(runId); };
   }
 
   claimForPreStep(runId: string): SteeringReceipt[] {

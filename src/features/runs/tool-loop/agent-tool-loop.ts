@@ -187,6 +187,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
     await emitLifecycleOutcome(options, preStep);
     if (preStep?.decision === "reject") throw new Error(preStep.reason ?? "运行前步骤被生命周期拦截器拒绝。");
     const steering = options.runId ? options.steering?.claimForPreStep(options.runId) ?? [] : [];
+    const firstSteer = steering.find(receipt => receipt.kind === "steer");
     for (const receipt of steering) {
       const text = receipt.kind === "steer"
         ? String(receipt.payload)
@@ -198,192 +199,230 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       };
       history.push(entry);
       await options.appendHistory([entry]);
-      await options.emit("steering.updated", { receipt });
+      await options.emit("steering.updated", { receipt, startNewMessage: receipt === firstSteer });
     }
-    const roundItems: ProviderContentItem[] = [];
-    const toolCalls: ProviderToolCallItem[] = [];
-    // Text emitted in a tool-calling round is provisional context for the
-    // follow-up request.  It must not satisfy the final-answer gate on a
-    // later round that produced no new visible answer.
-    let roundText = "";
-    let reasoningText = "";
-    let reasoningItemId: string | undefined;
-
-    const consumeProviderEvent = async (event: ProviderEvent) => {
-      throwIfCancelled(options.signal);
-      await options.onProviderEvent(event);
-      switch (event.kind) {
-        case "text.delta":
-          completeText += event.text;
-          roundText += event.text;
-          appendAdjacentText(roundItems, event.text);
-          break;
-        case "reasoning.delta":
-          reasoningText += event.text;
-          reasoningItemId = event.itemId ?? reasoningItemId;
-          appendAdjacentReasoning(roundItems, event.text, reasoningItemId, options.request.profileId);
-          break;
-        case "reasoning.completed":
-          replaceReasoning(roundItems, event.item);
-          reasoningText = event.item.text;
-          reasoningItemId = event.item.itemId;
-          break;
-        case "tool-call.completed":
-          toolCalls.push(clone(event.call));
-          roundItems.push(clone(event.call));
-          break;
-        case "continuation.updated":
-        case "model-step.completed":
-          roundItems.push(clone(event.item));
-          break;
-        default:
-          break;
-      }
-    };
-
-    const preRequest = await options.lifecycle?.dispatch("provider/pre-request", {
-      runId: options.runId ?? `standalone-${options.request.sessionId}`,
-      sessionId: options.request.sessionId,
-      payload: { round, request: options.request },
-    });
-    await emitLifecycleOutcome(options, preRequest);
-    if (preRequest?.decision === "reject") throw new Error(preRequest.reason ?? "Provider 请求被生命周期拦截器拒绝。");
-    let providerResult;
+    if (firstSteer) {
+      stagnant = undefined;
+      reviewNoProgress = undefined;
+      repeatedReads.clear();
+      reviewFingerprints.clear();
+    }
+    const stepController = new AbortController();
+    const stepSignal = AbortSignal.any([options.signal, stepController.signal]);
+    const unbind = options.runId ? options.steering?.bindInterrupt(options.runId, () => stepController.abort()) : undefined;
     try {
-      providerResult = await runProviderWithRetries({
-        onEvent: consumeProviderEvent,
-        signal: options.signal,
-        stream: () => options.provider.stream({
-          ...options.request,
-          tools: clone(frozenTools),
-          frozenRunContext: options.frozenRunContext,
-          history: clone(history),
-        }, options.signal),
-        onAttempt: async (attempt) => {
-          const ordinal = requestBudget.reserve();
-          await options.onProviderAttempt?.(attempt, {
-            ordinal,
-            limit: requestBudget.limit,
-            remaining: requestBudget.limit - ordinal,
-          });
-        },
-        onRetry: options.onProviderRetry,
-        retryDelayMs: options.providerRetryDelayMs,
-      });
-    } catch (error) {
-      if (!(error instanceof ProviderRequestBudgetExceededError)) throw error;
-      await options.emit("interaction.requested", {
-        ...activity({
-        kind: "error",
-        title: "Provider 请求预算已耗尽",
-        detail: error.message,
-        status: "failed",
-        now: options.now,
-        }),
-        reason: "budget_exhausted",
-      });
-      throw error;
-    }
-    if (!providerResult.ok) throw providerResult.error;
+      const roundItems: ProviderContentItem[] = [];
+      const toolCalls: ProviderToolCallItem[] = [];
+      // Text emitted in a tool-calling round is provisional context for the
+      // follow-up request.  It must not satisfy the final-answer gate on a
+      // later round that produced no new visible answer.
+      let roundText = "";
+      let reasoningText = "";
+      let reasoningItemId: string | undefined;
 
-    if (reasoningText && !roundItems.some((item) => item.type === "reasoning")) {
-      roundItems.unshift({
-        type: "reasoning",
-        text: reasoningText,
-        itemId: reasoningItemId,
-        providerId: options.request.profileId,
-      });
-    }
-    if (roundItems.length) {
-      const assistantEntry: ProviderHistoryEntry = {
-        id: newId("provider-assistant"),
-        role: "assistant",
-        items: clone(roundItems),
-      };
-      history.push(assistantEntry);
-      await options.appendHistory([assistantEntry]);
-    }
-
-    if (toolCalls.length === 0) {
-      // A steer may arrive while the final answer is streaming. Deliver it
-      // in the next request instead of silently completing with it queued.
-      if (options.runId && options.steering?.hasPending(options.runId) && round < maxRounds) continue;
-      if (!roundText.trim()) throw new ProviderFinalAnswerMissingError(round);
-      if (options.reviewPlan) {
-        completeReviewPlan(options.reviewPlan);
-        await options.emit("plan.updated", { plan: projectReviewPlan(options.reviewPlan) });
-      }
-      return { assistantText: completeText, rounds: round };
-    }
-    if (round === maxRounds) {
-      await options.emit("interaction.requested", activity({
-        kind: "error",
-        title: "工具续轮已停止",
-        detail: `已达到 ${maxRounds} 轮上限；未继续请求 Provider。`,
-        status: "failed",
-        now: options.now,
-      }));
-      throw new ToolLoopLimitError(maxRounds);
-    }
-
-    for (const call of toolCalls) {
-      const previous = completedToolResults.get(call.callId);
-      const result = previous ? clone(previous) : await dispatchToolCall(call, options, frozenTools);
-      if (!previous && result.providerUsage) await options.onProviderEvent({ kind: "usage.completed", usage: result.providerUsage });
-      if (options.noProgressLimit && options.toolRegistry.has(call.name)) {
-        const tool = options.toolRegistry.get(call.name);
-        if (tool.readOnly || result.isError) {
-          const fingerprint = reviewToolFingerprint(call, result);
-          const count = (repeatedReads.get(fingerprint) ?? 0) + 1;
-          repeatedReads.set(fingerprint, count);
-          if (count >= options.noProgressLimit) stagnant = call.name;
-        } else {
-          repeatedReads.clear();
-          stagnant = undefined;
+      const consumeProviderEvent = async (event: ProviderEvent) => {
+        throwIfCancelled(stepSignal);
+        await options.onProviderEvent(event);
+        switch (event.kind) {
+          case "text.delta":
+            completeText += event.text;
+            roundText += event.text;
+            appendAdjacentText(roundItems, event.text);
+            break;
+          case "reasoning.delta":
+            reasoningText += event.text;
+            reasoningItemId = event.itemId ?? reasoningItemId;
+            appendAdjacentReasoning(roundItems, event.text, reasoningItemId, options.request.profileId);
+            break;
+          case "reasoning.completed":
+            replaceReasoning(roundItems, event.item);
+            reasoningText = event.item.text;
+            reasoningItemId = event.item.itemId;
+            break;
+          case "tool-call.completed":
+            toolCalls.push(clone(event.call));
+            roundItems.push(clone(event.call));
+            break;
+          case "continuation.updated":
+          case "model-step.completed":
+            roundItems.push(clone(event.item));
+            break;
+          default:
+            break;
         }
-      }
-      if (options.trackReads && !previous && !result.isError && call.name === "file.read") {
-        successfulReadCalls += 1;
-        readPaths.add(String(call.arguments.path));
-        const progress = { successful_read_calls: successfulReadCalls, distinct_read_paths: readPaths.size,
-          scope: "本轮实际成功读取的累计值，不是目录文件总数。" };
-        try {
-          const value = JSON.parse(result.content);
-          result.content = JSON.stringify({ ...value, read_progress: progress });
-        } catch { result.content += `\n本轮读取进度：${JSON.stringify(progress)}`; }
-      }
-      completedToolResults.set(call.callId, clone(result));
-      await options.onToolResult?.(call, clone(result));
-      const toolEntry: ProviderHistoryEntry = {
-        id: newId("provider-tool"),
-        role: "tool",
-        items: [result],
       };
-      history.push(toolEntry);
-      await options.appendHistory([toolEntry]);
-      if (options.reviewPlan) {
-        const tool = options.toolRegistry.has(call.name) ? options.toolRegistry.get(call.name) : undefined;
-        if (tool?.readOnly) {
-          const fingerprint = reviewToolFingerprint(call, result);
-          if (reviewFingerprints.has(fingerprint)) {
-            reviewNoProgress = { checkpointId: options.reviewPlan.checkpointId, fingerprint };
-          } else {
-            reviewFingerprints.add(fingerprint);
+
+      const preRequest = await options.lifecycle?.dispatch("provider/pre-request", {
+        runId: options.runId ?? `standalone-${options.request.sessionId}`,
+        sessionId: options.request.sessionId,
+        payload: { round, request: options.request },
+      });
+      await emitLifecycleOutcome(options, preRequest);
+      if (preRequest?.decision === "reject") throw new Error(preRequest.reason ?? "Provider 请求被生命周期拦截器拒绝。");
+      let providerResult;
+      try {
+        providerResult = await runProviderWithRetries({
+          onEvent: consumeProviderEvent,
+          signal: stepSignal,
+          stream: () => options.provider.stream({
+            ...options.request,
+            tools: clone(frozenTools),
+            frozenRunContext: options.frozenRunContext,
+            history: clone(history),
+          }, stepSignal),
+          onAttempt: async (attempt) => {
+            const ordinal = requestBudget.reserve();
+            await options.onProviderAttempt?.(attempt, {
+              ordinal,
+              limit: requestBudget.limit,
+              remaining: requestBudget.limit - ordinal,
+            });
+          },
+          onRetry: options.onProviderRetry,
+          retryDelayMs: options.providerRetryDelayMs,
+        });
+      } catch (error) {
+        throwIfCancelled(options.signal);
+        if (stepController.signal.aborted) {
+          // An interrupted generation may contain complete-looking tool calls.
+          // They were never dispatched: retain only its visible text/reasoning.
+          const items = roundItems.filter(item => item.type === "text" || item.type === "reasoning");
+          if (items.length) {
+            const partial: ProviderHistoryEntry = { id: newId("provider-assistant"), role: "assistant", items };
+            history.push(partial);
+            await options.appendHistory([partial]);
           }
-        } else if (tool && !result.isError) {
-          reviewFingerprints.clear();
-          reviewNoProgress = undefined;
+          if (round === maxRounds) throw new ToolLoopLimitError(maxRounds);
+          continue;
         }
-        if (tool && advanceReviewPlan(options.reviewPlan, tool.readOnly, result.isError === true)) {
-          await options.emit("plan.updated", { plan: projectReviewPlan(options.reviewPlan) });
-          await options.emit("run.checkpoint", {
-            phase: "review",
-            status: "started",
-            reviewPlan: clone(options.reviewPlan),
-          });
-        }
+        if (!(error instanceof ProviderRequestBudgetExceededError)) throw error;
+        await options.emit("interaction.requested", {
+          ...activity({
+          kind: "error",
+          title: "Provider 请求预算已耗尽",
+          detail: error.message,
+          status: "failed",
+          now: options.now,
+          }),
+          reason: "budget_exhausted",
+        });
+        throw error;
       }
-      if (options.signal.aborted) throw new Error("当前运行已取消。");
+      if (!providerResult.ok) throw providerResult.error;
+
+      if (reasoningText && !roundItems.some((item) => item.type === "reasoning")) {
+        roundItems.unshift({
+          type: "reasoning",
+          text: reasoningText,
+          itemId: reasoningItemId,
+          providerId: options.request.profileId,
+        });
+      }
+      if (roundItems.length) {
+        const assistantEntry: ProviderHistoryEntry = {
+          id: newId("provider-assistant"),
+          role: "assistant",
+          items: clone(roundItems),
+        };
+        history.push(assistantEntry);
+        await options.appendHistory([assistantEntry]);
+      }
+
+      if (toolCalls.length === 0) {
+        // A steer may arrive while the final answer is streaming. Deliver it
+        // in the next request instead of silently completing with it queued.
+        if (options.runId && options.steering?.hasPending(options.runId)) {
+          if (round === maxRounds) throw new ToolLoopLimitError(maxRounds);
+          continue;
+        }
+        if (!roundText.trim()) throw new ProviderFinalAnswerMissingError(round);
+        if (options.reviewPlan) {
+          completeReviewPlan(options.reviewPlan);
+          await options.emit("plan.updated", { plan: projectReviewPlan(options.reviewPlan) });
+        }
+        return { assistantText: completeText, rounds: round };
+      }
+      if (round === maxRounds) {
+        await options.emit("interaction.requested", activity({
+          kind: "error",
+          title: "工具续轮已停止",
+          detail: `已达到 ${maxRounds} 轮上限；未继续请求 Provider。`,
+          status: "failed",
+          now: options.now,
+        }));
+        throw new ToolLoopLimitError(maxRounds);
+      }
+
+      for (const call of toolCalls) {
+        const previous = completedToolResults.get(call.callId);
+        let result: ProviderToolResultItem;
+        try {
+          result = previous ? clone(previous) : stepController.signal.aborted
+            ? toolResult(call, "用户已引导当前任务，此操作未执行。请按最新引导继续。", true)
+            : await dispatchToolCall(call, { ...options, signal: stepSignal }, frozenTools);
+        } catch (error) {
+          throwIfCancelled(options.signal);
+          if (!stepController.signal.aborted) throw error;
+          result = toolResult(call, "用户已引导当前任务，此操作已中断；已完成的更改保留，请核对结果后按最新引导继续。", true);
+        }
+        if (!previous && result.providerUsage) await options.onProviderEvent({ kind: "usage.completed", usage: result.providerUsage });
+        if (!stepController.signal.aborted && options.noProgressLimit && options.toolRegistry.has(call.name)) {
+          const tool = options.toolRegistry.get(call.name);
+          if (tool.readOnly || result.isError) {
+            const fingerprint = reviewToolFingerprint(call, result);
+            const count = (repeatedReads.get(fingerprint) ?? 0) + 1;
+            repeatedReads.set(fingerprint, count);
+            if (count >= options.noProgressLimit) stagnant = call.name;
+          } else {
+            repeatedReads.clear();
+            stagnant = undefined;
+          }
+        }
+        if (options.trackReads && !previous && !result.isError && call.name === "file.read") {
+          successfulReadCalls += 1;
+          readPaths.add(String(call.arguments.path));
+          const progress = { successful_read_calls: successfulReadCalls, distinct_read_paths: readPaths.size,
+            scope: "本轮实际成功读取的累计值，不是目录文件总数。" };
+          try {
+            const value = JSON.parse(result.content);
+            result.content = JSON.stringify({ ...value, read_progress: progress });
+          } catch { result.content += `\n本轮读取进度：${JSON.stringify(progress)}`; }
+        }
+        completedToolResults.set(call.callId, clone(result));
+        await options.onToolResult?.(call, clone(result));
+        const toolEntry: ProviderHistoryEntry = {
+          id: newId("provider-tool"),
+          role: "tool",
+          items: [result],
+        };
+        history.push(toolEntry);
+        await options.appendHistory([toolEntry]);
+        if (options.reviewPlan && !stepController.signal.aborted) {
+          const tool = options.toolRegistry.has(call.name) ? options.toolRegistry.get(call.name) : undefined;
+          if (tool?.readOnly) {
+            const fingerprint = reviewToolFingerprint(call, result);
+            if (reviewFingerprints.has(fingerprint)) {
+              reviewNoProgress = { checkpointId: options.reviewPlan.checkpointId, fingerprint };
+            } else {
+              reviewFingerprints.add(fingerprint);
+            }
+          } else if (tool && !result.isError) {
+            reviewFingerprints.clear();
+            reviewNoProgress = undefined;
+          }
+          if (tool && advanceReviewPlan(options.reviewPlan, tool.readOnly, result.isError === true)) {
+            await options.emit("plan.updated", { plan: projectReviewPlan(options.reviewPlan) });
+            await options.emit("run.checkpoint", {
+              phase: "review",
+              status: "started",
+              reviewPlan: clone(options.reviewPlan),
+            });
+          }
+        }
+        if (options.signal.aborted) throw new Error("当前运行已取消。");
+      }
+    } finally {
+      unbind?.();
     }
   }
 

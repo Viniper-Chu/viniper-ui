@@ -130,12 +130,16 @@ test("document tools remain available on the third follow-up without repeating t
   } finally { await fixture.dispose(); }
 });
 
-test("steering during a final answer reaches the next model request before completion", async () => {
+test("steering aborts a streaming answer immediately and resumes with the correction", async () => {
   const registry=new ProviderRegistry(0,[]), requests: ProviderRequest[]=[];
-  let release!:()=>void;const gate=new Promise<void>(resolve=>release=resolve);let started=false;
-  registry.register({descriptor:{...registry.get('demo').descriptor},async *stream(request):AsyncIterable<ProviderEvent>{
+  let started=false, aborted=false;
+  registry.register({descriptor:{...registry.get('demo').descriptor},async *stream(request,signal):AsyncIterable<ProviderEvent>{
     requests.push(request);
-    if(requests.length===1){started=true;yield {kind:'text.delta',text:'正在整理初步结果。'};await gate;}
+    if(requests.length===1){
+      started=true;yield {kind:'text.delta',text:'正在整理初步结果。'};
+      await new Promise<void>(resolve=>{ const stop=()=>{aborted=true;resolve();}; signal.aborted?stop():signal.addEventListener('abort',stop,{once:true}); });
+      yield {kind:'text.delta',text:'不应出现的旧输出'};
+    }
     else yield {kind:'text.delta',text:'已按补充方向修正。'};
   }});
   const fixture=await createRuntimeFixture({registry});
@@ -146,11 +150,73 @@ test("steering during a final answer reaches the next model request before compl
     const run=fixture.runtime.listRuns(session.id).find(r=>r.status==='running')!;
     assert.ok(run);
     const receipt=await fixture.runtime.steer(run.runId,'优先报告仍未解决的问题');
-    assert.equal(receipt.status,'queued');release();
+    assert.equal(receipt.status,'queued');assert.equal(aborted,true);
     await waitFor(()=>!fixture.runtime.isRunning(session.id));
     assert.equal(requests.length,2);
     const last=requests[1].history.at(-1)!;
     assert.equal(last.role,'user');
     assert.ok(last.items.some(i=>i.type==='text'&&i.text==='优先报告仍未解决的问题'));
-  }finally{release();await fixture.dispose();}
+    assert.ok(requests[1].history.flatMap(e=>e.items).some(i=>i.type==='text'&&i.text==='正在整理初步结果。'));
+    assert.ok(!requests[1].history.flatMap(e=>e.items).some(i=>i.type==='text'&&i.text.includes('不应出现')));
+    assert.equal(fixture.runtime.listRuns(session.id).at(-1)?.status,'completed');
+  }finally{await fixture.dispose();}
+});
+
+test("steering interrupts prefill without output and discards undispatched tool calls", async () => {
+  for (const prefill of [true, false]) {
+    const registry = new ProviderRegistry(0, []), requests: ProviderRequest[] = [];
+    const tools = new ToolRegistry(); let ready = false, writes = 0;
+    tools.register({ ...tool, async execute(request) { writes++; return { toolId: request.id, text: "unexpected" }; } });
+    registry.register({ descriptor: { ...registry.get("demo").descriptor }, async *stream(request, signal): AsyncIterable<ProviderEvent> {
+      requests.push(request);
+      if (requests.length > 1) { yield { kind: "text.delta", text: "新方向" }; return; }
+      if (!prefill) yield { kind: "tool-call.completed", call: { type: "tool-call", name: tool.name, callId: "not-started", arguments: {}, argumentsText: "{}" } };
+      ready = true;
+      await new Promise<void>(resolve => signal.aborted ? resolve() : signal.addEventListener("abort", () => resolve(), { once: true }));
+    } });
+    const fixture = await createRuntimeFixture({ registry, toolRegistry: tools });
+    try {
+      const session = fixture.runtime.snapshot().sessions[0];
+      await fixture.runtime.send({ sessionId: session.id, text: "读取内容", attachments: [], selectedModel: session.selectedModel, permissionMode: "auto" });
+      await waitFor(() => ready);
+      const run = fixture.runtime.listRuns(session.id).find(r => r.status === "running")!;
+      await fixture.runtime.steer(run.runId, "改为只回答状态");
+      await waitFor(() => !fixture.runtime.isRunning(session.id));
+      assert.equal(requests.length, 2); assert.equal(writes, 0);
+      assert.ok(!requests[1].history.flatMap(e => e.items).some(i => i.type === "tool-call"));
+      assert.equal(fixture.runtime.listSteering(run.runId)[0].status, "delivered");
+    } finally { await fixture.dispose(); }
+  }
+});
+
+test("steering cancels an active tool, keeps its result and skips the remaining old batch", async () => {
+  const registry = new ProviderRegistry(0, []), requests: ProviderRequest[] = [], executed: string[] = [];
+  const tools = new ToolRegistry(); let ready = false, stopped = false;
+  tools.register({ ...tool, async execute(request, context) {
+    executed.push(request.id); ready = true;
+    await new Promise<void>(resolve => context.signal.aborted ? resolve() : context.signal.addEventListener("abort", () => resolve(), { once: true }));
+    stopped = true;
+    return { toolId: request.id, text: "已停止，保留已完成部分", cancelled: true };
+  } });
+  registry.register({ descriptor: { ...registry.get("demo").descriptor }, async *stream(request): AsyncIterable<ProviderEvent> {
+    requests.push(request);
+    if (requests.length > 1) { yield { kind: "text.delta", text: "已按引导继续" }; return; }
+    for (const callId of ["active", "not-started"]) yield { kind: "tool-call.completed", call: { type: "tool-call", name: tool.name, callId, arguments: {}, argumentsText: "{}" } };
+  } });
+  const fixture = await createRuntimeFixture({ registry, toolRegistry: tools });
+  try {
+    const session = fixture.runtime.snapshot().sessions[0];
+    await fixture.runtime.send({ sessionId: session.id, text: "读取内容", attachments: [], selectedModel: session.selectedModel, permissionMode: "auto" });
+    await waitFor(() => ready);
+    const run = fixture.runtime.listRuns(session.id).find(r => r.status === "running")!;
+    await fixture.runtime.steer(run.runId, "停止读取，只汇报当前状态");
+    await waitFor(() => !fixture.runtime.isRunning(session.id));
+    assert.ok(stopped); assert.deepEqual(executed, ["active"]);
+    const results = requests[1].history.flatMap(e => e.items).filter(i => i.type === "tool-result");
+    assert.equal(results.length, 2);
+    assert.ok(results.every(i => i.isError));
+    assert.match(results[0].content, /保留已完成部分/);
+    assert.match(results[1].content, /未执行/);
+    assert.equal(fixture.runtime.listRuns(session.id).at(-1)?.status, "completed");
+  } finally { await fixture.dispose(); }
 });

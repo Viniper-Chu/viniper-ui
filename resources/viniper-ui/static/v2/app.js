@@ -28,6 +28,7 @@ const $ = (s) => document.querySelector(s);
 let switchVersion = 0;
 let toastTimer;
 let busySending = false;
+let busySteering = false;
 let sessionListMarkup = "";
 function setMarkup(element, html) {
   if (element._markup === html) return;
@@ -181,7 +182,8 @@ export async function selectSession(id) {
   bottom(true);
   const running = state.runs.get(id);
   if (running?.active) {
-    running.node = null;
+    const pendingIndex = session.messages.findLastIndex(message => message.role === "assistant" && message.pending);
+    running.node = $("#messages").children[pendingIndex] || null;
     paintRun(running);
   } else if (session.active_run?.active)
     resumeRun(session).catch((e) => toast(e.message, true));
@@ -259,7 +261,7 @@ function resizePrompt() {
     prompt._layout = layout;
   }
   $("#send-button").disabled = !prompt.value.trim();
-  $("#steer-button").disabled = !prompt.value.trim();
+  $("#steer-button").disabled = busySteering || !prompt.value.trim();
 }
 export function syncComposer() {
   const run = state.runs.get(state.session?.session_id),
@@ -308,7 +310,7 @@ export function syncComposer() {
     ? "等待确认"
     : active
       ? run?.steering?.status === "queued"
-        ? "引导已排入当前任务"
+        ? "正在中断当前步骤，切换到新方向…"
         : run?.message?.working || "等待模型响应"
       : state.mode === "plan"
         ? "规划模式 · 只读调研"
@@ -467,14 +469,16 @@ async function resumeRun(session) {
   if (state.runs.get(sid)?.active) return;
   const snapshot = session.active_run;
   const run = newRun(sid, snapshot.run_id);
-  const last = session.messages?.at(-1);
+  const pendingIndex = session.messages?.findLastIndex(message => message.role === "assistant" && message.pending) ?? -1;
+  const last = session.messages?.[pendingIndex];
+  run.guidanceIds = new Set((session.messages || []).map(message => message.guidance_id).filter(Boolean));
   if (last?.role === "assistant") {
     run.message = { ...run.message, ...last, streaming: true };
     run.message.elapsed = Number(
       last.elapsed_seconds ?? last.elapsed ?? last.turn_usage?.elapsed_seconds ?? 0,
     );
     run.started -= run.message.elapsed * 1000;
-    run.node = $("#messages").lastElementChild;
+    run.node = $("#messages").children[pendingIndex];
   }
   run.sequence = snapshot.sequence || 0;
   run.interaction = snapshot.pending_interaction;
@@ -537,6 +541,7 @@ async function consume(response, run) {
   }
 }
 async function steer() {
+  if (busySteering) return;
   const text = $("#prompt").value.trim();
   if (!text) {
     $("#prompt").focus();
@@ -546,20 +551,18 @@ async function steer() {
   const sid = state.session?.session_id,
     generation = switchVersion;
   if (!sid) return;
-  const result = await api(`/api/runs/${sid}/guidance`, {
-    method: "POST",
-    body: { message: text },
-  });
-  const run = state.runs.get(sid);
-  if (run) run.steering = result.receipt;
-  if (generation === switchVersion) {
-    appendMessage({ role: "user", content: `引导：${text}` });
-    if (run?.node?.isConnected) $("#messages").append(run.node);
-    updateRail();
-    $("#prompt").value = "";
+  busySteering = true;
+  syncComposer();
+  try {
+    await api(`/api/runs/${sid}/guidance`, {
+      method: "POST", body: { message: text },
+    });
+    if (generation === switchVersion && $("#prompt").value.trim() === text) $("#prompt").value = "";
+    toast("引导已发送，正在按新方向继续");
+  } finally {
+    busySteering = false;
     syncComposer();
   }
-  toast("引导已收到，将在当前安全步骤结束后生效");
 }
 
 async function stop() {

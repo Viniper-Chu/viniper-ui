@@ -2998,6 +2998,7 @@ class HarnessRuntimeTransport:
         turn_usage: dict[str, int | float | str] = {}
         usage_run_id = str(uuid.uuid4())
         started = time.monotonic()
+        message_started = started
         last_save = 0.0
         active_plan_run_id = ""
         plan_touched = False
@@ -3064,7 +3065,7 @@ class HarnessRuntimeTransport:
                 "thinking": thinking_text,
                 "model": selected_model,
                 "segments": copy.deepcopy(segments),
-                "elapsed_seconds": max(0, round(now - started)),
+                "elapsed_seconds": max(0, round(now - message_started)),
                 "planned": session.get("task_mode") == "plan",
                 "pending": True,
                 "created_at": timestamp,
@@ -3089,7 +3090,7 @@ class HarnessRuntimeTransport:
                         "thinking": thinking_text,
                         "model": selected_model,
                         "segments": copy.deepcopy(segments),
-                        "elapsed_seconds": max(0, round(time.monotonic() - started)),
+                        "elapsed_seconds": max(0, round(time.monotonic() - message_started)),
                         "planned": session.get("task_mode") == "plan",
                         "updated_at": now_ts(),
                     })
@@ -3190,7 +3191,35 @@ class HarnessRuntimeTransport:
                 if not isinstance(event, dict):
                     continue
                 event_type = str(event.get("type") or "")
-                if event_type in {"working_status", "steering"}:
+                if event_type == "steering":
+                    receipt = event.get("receipt", {})
+                    if receipt.get("kind") == "steer" and receipt.get("status") == "queued":
+                        update_pending(force=True)
+                        guidance = {"role": "user", "content": str(receipt.get("payload") or ""),
+                                    "guidance": True, "guidance_id": receipt["id"], "created_at": now_ts()}
+                        session["messages"].append(guidance)
+                        save_sessions_to_disk()
+                        event = {**event, "user_message": copy.deepcopy(guidance)}
+                    elif receipt.get("status") == "delivered" and event.get("start_new_message"):
+                        finish_thinking()
+                        update_pending(force=True)
+                        previous = next(item for item in reversed(session["messages"])
+                                        if item.get("role") == "assistant" and item.get("pending"))
+                        previous.pop("pending", None)
+                        previous.pop("planned", None)
+                        previous["steered"] = True
+                        previous["segments"] = finalize_transcript_segments(previous.get("segments"))
+                        assistant_text = ""
+                        thinking_text = ""
+                        segments = []
+                        thinking_elapsed_total = 0.0
+                        message_started = time.monotonic()
+                        save_progress(force=True)
+                        event = {**event, "previous_message": copy.deepcopy(previous),
+                                 "message": copy.deepcopy(session["messages"][-1])}
+                    yield event
+                    continue
+                if event_type == "working_status":
                     yield event
                     continue
                 if event_type == "context_budget":
@@ -4956,12 +4985,8 @@ async def guide_active_agent(session_id: str, request: Request):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if result.get("receipt", {}).get("status") == "rejected":
         raise HTTPException(status_code=409, detail="本轮已结束，请直接发送新消息")
-    messages = session.setdefault("messages", [])
-    pending = next((item for item in reversed(messages) if item.get("role") == "assistant" and item.get("pending")), None)
-    if pending is not None: messages.remove(pending)
-    messages.append({"role": "user", "content": message, "guidance": True, "created_at": now_ts()})
-    if pending is not None: messages.append(pending)
-    save_sessions_to_disk()
+    # The ordered run event stream persists the guidance and its answer boundary.
+    # Mutating messages here would race ahead of the tokens already in flight.
     return {"ok": True, **result}
 
 

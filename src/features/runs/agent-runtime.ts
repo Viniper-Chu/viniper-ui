@@ -289,6 +289,7 @@ export class AgentRuntime {
   async steer(runId: string, message: string): Promise<SteeringReceipt> {
     const receipt = this.steering.steer(runId, message);
     await this.recordSteeringReceipt(receipt);
+    if (receipt.status === "queued") this.steering.interrupt(runId);
     this.publish();
     return clone(receipt);
   }

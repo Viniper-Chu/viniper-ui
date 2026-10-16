@@ -17,7 +17,7 @@ if (chat.setupConversationScroll) chat.setupConversationScroll();
 else document.querySelector('#conversation').addEventListener('scroll', chat.trackScroll, { passive: true });
 chat.bottom(true);
 document.querySelector('#session-title').textContent = '流式交互回归 · 独立测试';
-document.querySelector('.topbar-actions').innerHTML = '<button id="check" class="primary-button">运行交互验收</button><output id="result">就绪</output>';
+document.querySelector('.topbar-actions').innerHTML = '<button id="check" class="primary-button">运行交互验收</button><output id="result" style="max-width:160px;max-height:32px;overflow:hidden;font-size:10px">就绪</output>';
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const results = {};
 let ticks = 0;

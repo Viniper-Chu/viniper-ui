@@ -8,6 +8,7 @@ import json
 p = argparse.ArgumentParser()
 p.add_argument('--port', type=int, required=True)
 p.add_argument('--revision')
+p.add_argument('--fixture', choices=['streaming-ui-check.js', 'steering-ui-check.js'], default='streaming-ui-check.js')
 args = p.parse_args()
 repo = Path(__file__).resolve().parents[2]
 
@@ -25,7 +26,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path == '/':
             relative = 'resources/viniper-ui/static/index.html'
         elif path == '/fixture.js':
-            relative = 'tests/fixtures/streaming-ui-check.js'
+            relative = 'tests/fixtures/' + args.fixture
         elif path.startswith('/static/'):
             relative = 'resources/viniper-ui' + path
         else:

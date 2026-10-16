@@ -12,7 +12,7 @@ test("R21 Stable release has an explicit identity and preserves Preview rollback
   };
   const profiles = JSON.parse(await readFile(join(root, "resources", "viniper-ui", "profiles.json"), "utf8")) as Record<string, any>;
   const stable = profiles.stable;
-  assert.equal(packageJson.version, "2.0.1");
+  assert.equal(packageJson.version, "2.0.2");
   assert.match(packageJson.description, /Viniper/u);
   assert.match(packageJson.scripts["package:windows-stable"], /package-windows-stable\.mjs/u);
   assert.equal(stable.app_id, "com.viniper.workstation");

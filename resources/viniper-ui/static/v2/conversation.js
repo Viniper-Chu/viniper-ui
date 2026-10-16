@@ -211,7 +211,7 @@ function messageText(message) {
   const segments = message.segments || [];
   const all = message.content || segments.filter(s => s.type === "text").map(s => s.content || "").join("");
   const unchanged = { answer: all, progress: [] };
-  if (message.streaming || message.cancelled || message.error) return unchanged;
+  if (message.streaming || message.cancelled || message.steered || message.error) return unchanged;
   const lastTool = segments.findLastIndex(s => ["tool_start", "tool_result", "tool"].includes(s.type));
   if (lastTool < 0) return unchanged;
   const answer = segments.slice(lastTool + 1).filter(s => s.type === "text").map(s => s.content || "").join("");
@@ -258,6 +258,8 @@ function activityData(message, progress = []) {
     0;
   const outcome = message.cancelled
     ? "已停止 · "
+    : message.steered
+      ? "已按引导中断 · "
     : message.error
       ? "未完成 · "
       : "";
@@ -293,7 +295,7 @@ function updateActivityBody(activity, message, progress, data) {
 }
 function messageHtml(message) {
   if (message.role === "user")
-    return `<div class="user-content">${escape(message.content)}${(message.attachments || []).map((a) => `<div><button class="file-link" data-file="${escape(a.path || "")}">${icon("file")}${escape(a.name || a.path)}</button></div>`).join("")}</div>`;
+    return `<div class="user-content">${message.guidance ? `<span class="guidance-label">${icon("steer")}引导</span>` : ""}${escape(message.content)}${(message.attachments || []).map((a) => `<div><button class="file-link" data-file="${escape(a.path || "")}">${icon("file")}${escape(a.name || a.path)}</button></div>`).join("")}</div>`;
   const { answer: content, progress } = messageText(message);
   return `${activityHtml(message, progress)}<div class="answer">${markdown(content, Boolean(message.streaming))}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan">按此计划开始实施</button>' : ""}</div><div class="message-actions"><button class="icon-button" data-copy="${escape(content)}" title="复制回答" aria-label="复制回答">${icon("copy")}</button></div>`;
 }
@@ -416,10 +418,9 @@ export function projectEvent(run, event) {
   } else if (["artifact", "plan", "turn_diff", "context_compacted"].includes(type))
     m.segments.push({ ...event });
   else if (type === "working_status") m.working = event.content || "正在处理";
-  else if (type === "heartbeat") m.elapsed = event.elapsed;
+  else if (type === "heartbeat") m.elapsed = Math.round((Date.now() - run.started) / 1000);
   else if (type === "turn_usage") {
     m.turn_usage = event.turn_usage;
-    m.elapsed = event.turn_usage?.elapsed_seconds ?? m.elapsed;
   } else if (type === "usage") run.usage = event.usage;
   else if (["permission_request", "interaction_request"].includes(type))
     run.interaction = event;
@@ -435,6 +436,23 @@ export function projectEvent(run, event) {
     run.interaction = null;
   } else if (type === "steering") {
     run.steering = event.receipt;
+    const visible = state.session?.session_id === run.sessionId && state.view === "chat";
+    if (event.user_message) {
+      run.guidanceIds ??= new Set();
+      if (!run.guidanceIds.has(event.user_message.guidance_id)) {
+        run.guidanceIds.add(event.user_message.guidance_id);
+        if (visible) appendMessage(event.user_message);
+      }
+    }
+    if (event.previous_message && event.message) {
+      // End the old response in place. Guidance and the next response are
+      // new timeline entries; never move or concatenate the previous answer.
+      if (visible && run.node?.isConnected) updateMessage(run.node, { ...event.previous_message, streaming: false });
+      run.message = { ...event.message, streaming: true, elapsed: 0, working: "正在按引导继续" };
+      run.started = Date.now();
+      run.interaction = null;
+      run.node = visible ? appendMessage(run.message) : null;
+    }
   }
 }
 export function updateRail() {

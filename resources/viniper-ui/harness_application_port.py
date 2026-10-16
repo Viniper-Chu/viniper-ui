@@ -212,7 +212,8 @@ def _runtime_event_to_provider_event(event: dict[str, Any]) -> dict[str, Any] | 
     if event_type == "provider.request.started":
         return {"type": "working_status", "content": "正在读取图片，等待模型输出…" if payload.get("phase") == "local-image" else "正在处理本轮上下文，等待首个输出…"}
     if event_type == "steering.updated":
-        return {"type": "steering", "receipt": payload.get("receipt", {})}
+        return {"type": "steering", "receipt": payload.get("receipt", {}),
+                "start_new_message": bool(payload.get("startNewMessage"))}
     if event_type == "provider.activity":
         count = max(0, int(payload.get("receivedCharacters") or 0))
         label = "正在检查图片 · 已生成" if payload.get("phase") == "image-output" else "正在准备操作内容 · 已接收"

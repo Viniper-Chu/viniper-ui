@@ -53,6 +53,18 @@ test("CP2：steer 可唤醒下一步，inject 只在活动运行的 pre-step 消
   const claimed = service.claimForPreStep("run-1");
   assert.deepEqual(claimed.map((item) => item.status), ["delivered", "delivered"]);
   assert.deepEqual(service.claimForPreStep("run-1"), []);
+  let interrupted = 0;
+  const unbind = service.bindInterrupt("run-1", () => { interrupted++; });
+  service.interrupt("run-1");
+  assert.equal(interrupted, 0, "a delayed wake must not abort the request already handling delivered guidance");
+  service.inject("run-1", { note: "context only" });
+  service.interrupt("run-1");
+  assert.equal(interrupted, 0, "inject must not interrupt");
+  service.steer("run-1", "新的纠正方向");
+  service.interrupt("run-1");
+  assert.equal(interrupted, 1);
+  service.claimForPreStep("run-1");
+  unbind();
   service.markRun("run-2", "idle");
   const rejected = service.inject("run-2", { note: "不能唤醒" });
   assert.equal(rejected.status, "rejected");

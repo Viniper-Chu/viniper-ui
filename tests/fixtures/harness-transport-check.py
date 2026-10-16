@@ -128,6 +128,47 @@ async def main():
         assert "result.txt" in json.dumps(restored)
         assert port.calls[0]["provider_id"] == "fixture"
 
+    class SteeringPort:
+        async def control(self, _operation, **payload):
+            return {"receipt": {"id": payload["message"], "kind": "steer", "status": "queued", "payload": payload["message"]}}
+
+        async def stream(self, **kwargs):
+            def envelope(event):
+                return {"type": "provider.event", "event": event}
+            yield envelope({"type": "text", "content": "原回答，保留在引导之前。"})
+            for text in ["改为简短回答", "保留关键结论"]:
+                class Request:
+                    async def json(self): return {"message": text}
+                result = await server.guide_active_agent(kwargs["session_id"], Request())
+                assert not any(m.get("content") == text for m in server.sessions[kwargs["session_id"]]["messages"]), "HTTP must not race ahead of the ordered event stream"
+                yield envelope({"type": "steering", "receipt": result["receipt"]})
+            for index, text in enumerate(["改为简短回答", "保留关键结论"]):
+                yield envelope({"type": "steering", "start_new_message": index == 0,
+                                "receipt": {"id": text, "kind": "steer", "status": "delivered", "payload": text}})
+            yield envelope({"type": "text", "content": "新回答，只保留结论。"})
+
+    steering_workdir = root / "steering"
+    steering_workdir.mkdir()
+    server.sessions["steering"] = {"id": "steering", "mode": "viniper", "workdir": str(steering_workdir), "messages": []}
+    steering_port = SteeringPort()
+    transport = server.HarnessRuntimeTransport(steering_port)
+    previous_transport, previous_coordinator = server.VINIPER_TRANSPORT, server.agent_run_coordinator
+    server.VINIPER_TRANSPORT = transport
+    server.agent_run_coordinator = lambda: type("Active", (), {"has_active": lambda self, sid: True})()
+    try:
+        events = [event async for event in transport.stream("steering", "原始请求")]
+        messages = server.sessions["steering"]["messages"]
+        assert [m["role"] for m in messages] == ["user", "assistant", "user", "user", "assistant"]
+        assert [m["content"] for m in messages] == ["原始请求", "原回答，保留在引导之前。", "改为简短回答", "保留关键结论", "新回答，只保留结论。"]
+        assert messages[1]["steered"] and not messages[1].get("pending")
+        assert all(m["guidance"] and m["guidance_id"] for m in messages[2:4])
+        assert not messages[-1].get("pending") and not messages[-1].get("steered")
+        assert sum("previous_message" in event for event in events) == 1
+        restored = json.loads(server.SESSIONS_FILE.read_text())
+        assert restored["steering"]["messages"] == messages
+    finally:
+        server.VINIPER_TRANSPORT, server.agent_run_coordinator = previous_transport, previous_coordinator
+
     server.provider_config = lambda *_args: {"api_key": "", "model": "fixture-model", "provider": "fixture", "base_url": ""}
     sid = "harness-unconfigured"
     workdir = root / "unconfigured"
