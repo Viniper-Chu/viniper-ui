@@ -59,7 +59,7 @@ test("truncated tool JSON cannot execute or poison the next request, and the mod
     const messages = request.body.messages as Array<any>;
     const prior = messages.find((m) => m.tool_calls?.some((c: any) => c.id === "truncated"));
     assert.deepEqual(JSON.parse(prior.tool_calls[0].function.arguments), {});
-    assert.match(messages.find((m) => m.tool_call_id === "truncated").content, /输出上限.*未执行.*分段/u);
+    assert.match(messages.find((m) => m.tool_call_id === "truncated").content, /输出上限.*未执行.*分批/u);
     return index === 1 ? [
       { data: { choices: [{ delta: { tool_calls: [{ index: 0, id: "recovered", function: { name: "demo.inspect", arguments: '{"topic":"short part"}' } }] } }] } },
       { data: "[DONE]" },
@@ -228,4 +228,24 @@ test("DeepSeek keeps tool-call reasoning only and serializes text-less assistant
   assert.equal(assistants[0].reasoning_content, undefined);
   assert.equal(assistants[1].content, "");
   assert.equal(assistants[1].reasoning_content, "required-passback");
+});
+
+test("a truncated final reply stays incomplete and never passes the final-answer gate", async () => {
+  await withProtocolFake(() => [
+    { data: { choices: [{ delta: { content: "This is only the first half" }, finish_reason: "length" }] } },
+    { data: "[DONE]" },
+  ], async endpoint => {
+    const profile = testProfile("openai-chat", endpoint);
+    const provider = new OpenAIChatProvider(providerOptions(profile));
+    await assert.rejects(runProtocolToolLoop(provider, protocolRequest(profile)), /回复尚不完整/);
+  });
+});
+
+test("length termination rejects even a syntactically closed tool payload", async () => {
+  const profile = testProfile("openai-chat", "http://127.0.0.1/v1/chat/completions");
+  const payload = { choices: [{ delta: { tool_calls: [{ index: 0, id: "cut", function: { name: "demo.inspect", arguments: '{"topic":"partial"}' } }] }, finish_reason: "length" }] };
+  const provider = new OpenAIChatProvider({ ...providerOptions(profile), fetchImpl: async () => new Response(`data: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`) });
+  const events = []; for await (const event of provider.stream(protocolRequest(profile), new AbortController().signal)) events.push(event);
+  const call = events.find(e => e.kind === "tool-call.completed");
+  assert.equal(call?.kind === "tool-call.completed" && call.call.argumentsError, "output-limit");
 });

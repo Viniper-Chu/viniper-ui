@@ -63,9 +63,7 @@ const icon = join(repositoryRoot, "resources", "viniper-ui", "static", "assets",
 const iconLayout = run("/usr/bin/swift", [join(repositoryRoot, "scripts", "build-macos-icon.swift"), icon, iconset]);
 await writeFile(join(residue, "macos-icon-layout.json"), `${iconLayout}\n`);
 run("/usr/bin/iconutil", ["-c", "icns", iconset, "-o", join(resources, "Viniper.icns")]);
-// Finder consumes ICNS; Electron's nativeImage/Dock API requires a PNG.
-// Both representations must retain the same transparent outer margin.
-await cp(join(iconset, "icon_512x512@2x.png"), join(resources, "Viniper-dock.png"));
+// Finder and the running Dock tile share CFBundleIconFile; no runtime override.
 const plist = join(contents, "Info.plist");
 for (const [key, value] of Object.entries({
   CFBundleIdentifier: appId, CFBundleName: product, CFBundleDisplayName: product,

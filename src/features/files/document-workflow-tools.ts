@@ -27,20 +27,33 @@ export function createDocumentWorkflowTools(host: DocumentWorkflowHost): ToolExe
   const tools: ToolExecutor[] = [];
   if (host.available("handout")) tools.push({
     name: "file.math.handout", readOnly: false, authorizationScope: "computer",
-    description: "制作独立短师生数学讲义，直接传结构化题目，勿再把 JSON 拼进终端命令。先读完整原稿及实际规范；使用已安装模板完成 A4/20mm/12pt18pt、三字体、学生留白、教师黑题红解、真实页码映射、编译与每页 PNG。保留完整原解，不替模型解题。成功仅代表编译和渲染；须用 file.image.analyze 逐页检查后才报告页面通过。现有项目的专用模板继续用其编译入口。",
+    description: "生成师生数学文档。长文档先逐题写入JSON/JSONL文件，再传questions_file与原计划expected_question_count；不要把整份长题解塞进一次调用，不得减题或删原解。章节用sections，题干不重复写题号。先读实际规范、完整题源并独立验算；编译成功不是内容验收，须核对范围、题量、完整解析和每页图。现有项目继续用其编译入口。",
     inputSchema: { type: "object", properties: {
       directory: { type: "string", description: "已存在且位于当前工作目录内的输出目录；省略使用当前工作目录。" },
       title_tex: { type: "string", description: "讲义标题，不含文档模板。" },
       student_name: { type: "string", description: "学生版文件名，不带目录和.pdf。" },
       teacher_name: { type: "string", description: "教师版文件名，不带目录和.pdf。" },
       answer_space_cm: { type: "number", description: "每题连续作答空间厘米数，按用户要求提供，默认6。" },
-      questions: { type: "array", description: "按原稿顺序的全部题目，每项 {question_tex:完整题干,answer_tex:答案,solution_tex:完整原解的段落字符串数组}。也支持solution_tex为字符串。TeX反斜杠按JSON转义；不传documentclass或宏模板。" },
-    }, required: ["title_tex", "student_name", "teacher_name", "questions"], additionalProperties: false } satisfies JsonSchema,
-    resourceClaims(request, context) { return [{ key: resolve(context.taskDirectory ?? context.projectRoot ?? ".", String(request.input?.directory ?? ".")), access: "write" }]; },
+      questions: { type: "array", description: "按原稿顺序的全部题目，每项 {question_tex:完整题干,answer_tex:答案,solution_tex:完整原解的段落字符串数组}。也支持solution_tex字符串；可选figure_tex为两版共用的完整TeX题图，solution_figure_tex仅在教师版解析后出现。可用完整tikzpicture环境，不传文档模板。" },
+      questions_file: { type: "string", description: "完整绝对路径，UTF-8 .json题目数组或.jsonl逐行题目，字段与questions相同；先分批写完，与questions二选一。" },
+      expected_question_count: { type: "number", description: "原组卷计划的正整数题数。文件模式必填；不得在截断后降低预期题数。" },
+      sections: { type: "array", description: "独立分节数组：{before_question:实际题号从1起,title_tex:章节标题}。标题不放入questions，不算题目。" },
+    }, required: ["title_tex", "student_name", "teacher_name"], additionalProperties: false } satisfies JsonSchema,
+    resourceClaims(request, context) {
+      return [{ key: resolve(context.taskDirectory ?? context.projectRoot ?? ".", String(request.input?.directory ?? ".")), access: "write" as const },
+        ...(typeof request.input?.questions_file === "string" ? [{ key: resolve(request.input.questions_file), access: "read" as const }] : [])];
+    },
     async execute(request, context) {
       try {
         const directory = await taskDirectory(context, request.input?.directory);
-        const data = await host.execute("handout", { ...request.input, directory }, context.signal);
+        const input: Record<string, unknown> = { ...request.input, directory };
+        if (Object.hasOwn(input, "questions") === Object.hasOwn(input, "questions_file")) throw new Error("questions与questions_file必须且只能提供一种；不要省略题目。");
+        if (input.questions_file !== undefined) {
+          if (typeof input.questions_file !== "string" || !isAbsolute(input.questions_file)) throw new Error("questions_file需要已保存的完整绝对路径。");
+          if (!Number.isInteger(input.expected_question_count) || Number(input.expected_question_count) <= 0) throw new Error("文件模式必须提供原计划的expected_question_count正整数；不能自动按现有内容降低题数。");
+          input.questions_file = await realpath(input.questions_file);
+        }
+        const data = await host.execute("handout", input, context.signal);
         const result = receipt(request.id, data);
         if (data.success && data.student?.path && data.teacher?.path && Array.isArray(data.sources)) result.presentation = {
           kind: "document-results",

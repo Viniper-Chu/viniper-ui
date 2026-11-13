@@ -1,12 +1,22 @@
 const paths = {
-  brand: "M4 5h4l4 13L20 5h-4l-4 7",
-  compose: "M20 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5m4-1 7 7m-4-9 6 6-11 11-6 1 1-6Z",
-  grid: "M3 3h7v7H3ZM14 3h7v7h-7ZM3 14h7v7H3ZM14 14h7v7h-7Z",
-  tasks: "M4 4h9M4 9h7M4 14h3m9-3a5 5 0 1 0 0 10 5 5 0 0 0 0-10Zm0 3v3h2",
-  document: "M6 3h8l4 4v14H6ZM14 3v5h4M9 12h6M9 16h4",
-  database: "M20 6c0 2-3.5 3-8 3S4 8 4 6s3.5-3 8-3 8 1 8 3ZM4 6v12c0 2 3.5 3 8 3s8-1 8-3V6M4 12c0 2 3.5 3 8 3s8-1 8-3",
-  codeWindow: "M3 3h18v18H3ZM3 8h18M6 5.5h.1m3 0h.1m1 6-3 3 3 3m4-6 3 3-3 3",
-  math: "M4 15h3l3 6 4-18h7M16 15h5m-2.5-2.5v5",
+  back: "m14 5-7 7 7 7",
+  appearance: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 0v18",
+  outline: "M4 5h16M4 12h3m4 0h9M4 19h3m4 0h7",
+  proof: "M4 5h12M4 10h8M4 15h5m3 1 3 3 6-8",
+  geometry: "M3 19 10 4l11 15H3Zm4-1 1-3 3 1",
+  thought: "M4 12c2.5-6 4.5-6 7 0s4.5 6 9-2m-13 5c1 1.4 2 1.9 3 1.5",
+  send: "M4.1 10.6 19.4 4.2c.6-.3 1.1.2.9.9l-5.1 15c-.2.7-1.1.8-1.4.2l-3.1-6 5.4-6.1-6.7 4.6-5.3-.9c-.7-.2-.7-1 0-1.3Z",
+  enqueue: "M3.5 7h10m-10 5h7m-7 5H8m8.5-8 4.3 4.3-4.3 4.3m-4.2-4.3h8.1",
+  activityTool: "M14 5a5 5 0 0 0-6.3 6.3l-4 4a2.3 2.3 0 0 0 3.3 3.3l4-4A5 5 0 0 0 18 8l-3.2 3.2-2.7-2.7L15.4 5Z",
+  activityOutput: "M4 6h16M4 12h12M4 18h7m4-2v4",
+  compose: "M13 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7M10 14l1-4 7-7a1.6 1.6 0 0 1 2.3 2.3l-7 7Z",
+  model: "M8 3v3m8-3v3M8 18v3m8-3v3M3 8h3m-3 8h3m12-8h3m-3 8h3M6 6h12v12H6ZM10 10h4v4h-4Z",
+  grid: "M4 4h6v6H4ZM15.5 3.5l4 4-4 4-4-4ZM4 14h6v6H4ZM14 14h6v6h-6Z",
+  tasks: "M5 21V4m.3 1c4-4 8.5 3.5 14-.1v9c-5.5 3.6-10-3.9-14 .1",
+  document: "M6 3h8l4.5 4.5v12A1.5 1.5 0 0 1 17 21H7.5A1.5 1.5 0 0 1 6 19.5ZM14 3v5h4.5M9.5 12h5.5m-5.5 3.5H14",
+  database: "M5 6.5a7 3 0 1 0 14 0 7 3 0 1 0-14 0Zm0 0v11c0 1.7 3.1 3 7 3s7-1.3 7-3v-11M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3",
+  codeWindow: "M8 6 2.5 12 8 18m8-12 5.5 6-5.5 6m-3-14-2 16",
+  math: "M19 5H6.5l6.5 7-6.5 7H19m0-14v2.5M19 19v-2.5",
   arrowRight: "M4 12h16m-5-5 5 5-5 5",
   book: "M12 5v16M3 3h5a4 4 0 0 1 4 2 4 4 0 0 1 4-2h5v16h-5a4 4 0 0 0-4 2 4 4 0 0 0-4-2H3Z",
   mic: "M9 5a3 3 0 0 1 6 0v7a3 3 0 0 1-6 0ZM5 10v2a7 7 0 0 0 14 0v-2M12 19v3m-4 0h8",
@@ -17,14 +27,13 @@ const paths = {
   down: "M12 5v14m-6-6 6 6 6-6",
   up: "M12 19V5m-6 6 6-6 6 6",
   stop: "M7 7h10v10H7z",
-  sidebar: "M4 4h16v16H4zM9 4v16",
-  chat: "M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 3V6a2 2 0 0 1 1-2Z",
+  sidebar: "M5.5 4.5h13A1.5 1.5 0 0 1 20 6v12a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18V6a1.5 1.5 0 0 1 1.5-1.5ZM9.5 4.5v15",
+  chat: "M7 4.5h10a4 4 0 0 1 4 4v6a4 4 0 0 1-4 4H9l-5.5 3v-13A4 4 0 0 1 7 4.5Z",
   sparkles: "m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z",
   target: "M21 12a9 9 0 1 1-9-9m0 4a5 5 0 1 0 5 5m-5 0 8-8m-4 0h4v4",
   search: "M10.5 3a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15Zm5.5 13 5 5",
-  settings:
-    "m9 3-1 3-3 1-2 5 2 5 3 1 1 3h6l1-3 3-1 2-5-2-5-3-1-1-3ZM9 12a3 3 0 1 0 6 0 3 3 0 1 0-6 0",
-  folder: "M3 6h7l2 2h9v11H3Z",
+  settings: "M4 7h4m5 0h7M4 17h9m5 0h2M13 7a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0ZM18 17a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0Z",
+  folder: "M3.5 6a1 1 0 0 1 1-1h5l2.5 3h7.5a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1Z",
   files: "M7 3h9l4 4v14H7ZM16 3v5h4M3 6v12",
   file: "M6 3h8l4 4v14H6ZM14 3v5h4M9 12h6M9 16h4",
   code: "m8 7-5 5 5 5m8-10 5 5-5 5m-2-13-4 16",
@@ -32,6 +41,7 @@ const paths = {
   shieldAlert: "m12 3 8 3v6c0 4-4 7-8 9-4-2-8-5-8-9V6ZM12 8v5m0 3v.1",
   eye: "M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Zm7 0a3 3 0 1 0 6 0 3 3 0 1 0-6 0",
   edit: "m4 15 11-11 5 5L9 20H4ZM12 7l5 5",
+  pin: "M16 9V4l1-1H7l1 1v5l-3 3v3h14v-3l-3-3ZM12 15v7",
   more: "M5 12h.01M12 12h.01M19 12h.01",
   refresh: "M20 8a8 8 0 1 0 0 8M20 3v5h-5",
   steer: "M5 20V8a4 4 0 0 1 4-4h10m-5-1 5 1-1 5M5 13h8a4 4 0 0 1 4 4v3",
@@ -47,8 +57,9 @@ const paths = {
   plugin: "M8 3v5m8-5v5M5 8h14v5a7 7 0 0 1-14 0ZM12 20v3",
   copy: "M8 8h12v13H8ZM4 16H2V2h12v3",
 };
-export const icon = (name) =>
-  `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${name === "more" ? '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>' : `<path d="${paths[name] || paths.sparkles}"/>`}</svg>`;
+export const icon = (name) => name === "brand"
+  ? '<span class="icon brand-symbol" aria-hidden="true"></span>'
+  : `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${name === "more" ? '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>' : `<path d="${paths[name] || paths.plugin}"/>`}</svg>`;
 export function hydrateIcons(root = document) {
   root
     .querySelectorAll("[data-icon]")

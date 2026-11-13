@@ -42,7 +42,6 @@ export const state = {
   drafts: new Map(),
   attachments: [],
   mode: "execute",
-  permission: "ask",
   model: "",
   reasoning: "medium",
   workdir: "",

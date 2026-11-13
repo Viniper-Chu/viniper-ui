@@ -11,6 +11,9 @@ run.message.segments.push({ type: 'tool_result', call_id: 'fixture-command', too
   kind: 'terminal-run', executionId: 'fixture-command', purpose: 'command', exitCode: 0,
   stdout: { preview: '输出预览', totalBytes: 10000, truncated: true }, stderr: { preview: '', totalBytes: 0 },
 } });
+run.message.segments.push(...Array.from({ length: 7 }, (_, index) => ({
+  type: 'artifact', path: `/fixture/结果-${index + 1}.pdf`, status: 'success',
+})));
 chat.renderMessages(history);
 run.node = chat.appendMessage(run.message);
 if (chat.setupConversationScroll) chat.setupConversationScroll();
@@ -35,6 +38,11 @@ document.querySelector('#check').onclick = async () => {
   await delay(2200);
   results.spinner_node_survives_stream = spinner === run.node.querySelector('.spinner');
   results.animation_runs_continuously = animation?.currentTime > 1800;
+  const moreFiles = run.node.querySelector('.more-files');
+  results.large_file_list_starts_collapsed = !moreFiles.open && run.node.querySelectorAll('.result-files > .result-file').length === 3;
+  moreFiles.open = true;
+  await delay(200);
+  results.expanded_file_list_survives_stream = moreFiles.open && moreFiles === run.node.querySelector('.more-files') && moreFiles.querySelectorAll('[data-file]').length === 4;
   chat.bottom(true);
   area.dispatchEvent(new WheelEvent('wheel', { deltaY: -35, bubbles: true }));
   area.scrollTo({ top: area.scrollTop - 35, behavior: 'instant' });
@@ -89,6 +97,13 @@ document.querySelector('#check').onclick = async () => {
   run.message.content += '\n\n新增回答内容。'.repeat(20);
   chat.paintRun(run);
   results.explicit_bottom_resumes_following = area.scrollTop > oldBottom && area.scrollHeight - area.scrollTop - area.clientHeight < 2;
+  run.message.streaming = true;
+  chat.projectEvent(run, {type:'run_status', status:'cancelled', sequence:1});
+  chat.paintRun(run);
+  results.cancel_ack_keeps_pending_feedback = run.node.querySelector('.activity-label').textContent.includes('正在停止') && Boolean(run.node.querySelector('.spinner'));
+  chat.projectEvent(run, {type:'done', sequence:2});
+  chat.paintRun(run);
+  results.cancel_terminal_has_stopped_label = run.node.querySelector('.activity-label').textContent.includes('已停止') && !run.node.querySelector('.spinner');
   document.querySelector('#result').textContent = JSON.stringify({ passed: Object.values(results).every(Boolean), results });
   button.textContent = '验收结束';
 };

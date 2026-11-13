@@ -128,11 +128,27 @@ function exchangeSummary(exchange: ToolExchange): string {
     const receipt = exchange.receipts.find((item) => item.tool_call_id === call.id)!;
     const args = JSON.parse(call.function.arguments) as Record<string, unknown>;
     const references = Object.entries(args)
-      .filter(([key]) => /path|source|destination|executionId|offset|line|table|database|cwd|command/iu.test(key))
+      .filter(([key]) => /path|source|destination|directory|questions_file|expected_question_count|executionId|offset|line|table|database|cwd|command/iu.test(key))
       .map(([key, value]) => `${key}=${excerpt(String(value), 240)}`).join("; ");
-    return `${call.function.name} (${call.id})${references ? ` ${references}` : ""}\n工具返回：${excerpt(String(receipt.content ?? ""), 600)}`;
+    const count = Array.isArray(args.questions) ? `; submitted_question_count=${args.questions.length}` : "";
+    return `${call.function.name} (${call.id})${references ? ` ${references}` : ""}${count}\n工具返回：${summarizeToolReceipt(String(receipt.content ?? ""))}`;
   });
   return entries.join("\n");
+}
+
+/** Preserve outcome and completeness facts ahead of large page/font listings. */
+function summarizeToolReceipt(content: string): string {
+  try {
+    const data = JSON.parse(content);
+    if (!data || typeof data !== "object" || Array.isArray(data)) return excerpt(content, 600);
+    const facts: Record<string, unknown> = {};
+    for (const key of ["success", "ok", "status", "mode", "bytes", "executionId", "error", "recovery", "path", "source_directory", "questions_source", "question_count", "expected_question_count", "section_count", "validation", "visually_reviewed", "exitCode"])
+      if (data[key] !== undefined) facts[key] = data[key];
+    for (const key of ["student", "teacher"]) if (data[key]?.path) facts[key] = { path: data[key].path, page_count: data[key].page_count };
+    if (data.stdout?.preview) facts.stdout = excerpt(String(data.stdout.preview), 400);
+    if (data.stderr?.preview) facts.stderr = excerpt(String(data.stderr.preview), 300);
+    return Object.keys(facts).length ? `${JSON.stringify(facts)}\n[回执摘要；正文与页面细节需按原路径回读，生成成功不是内容验收。]` : excerpt(content, 600);
+  } catch { return excerpt(content, 600); }
 }
 
 function excerpt(text: string, length: number): string {

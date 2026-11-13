@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { access, mkdir, readFile, readlink, rename, symlink, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readlink, rename, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -83,6 +83,11 @@ catch (error) {
   throw error;
 }
 await writeFile(lockedRequirements, `${preparedPython.freeze}\n`);
+// Same-version artwork updates otherwise retain the old Finder/Dock icon.
+// Refresh this bundle only; leave the global registration database intact.
+const registeredAt = new Date();
+await utimes(destination, registeredAt, registeredAt);
+run("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister", ["-f", destination], { timeout: 10000 });
 const result = {
   status: "MACOS_INSTALLED", installedAt: new Date().toISOString(), version: metadata.version,
   application: destination, dataDirectory: userData, python: pythonPath,
@@ -93,6 +98,7 @@ const result = {
   previousApplication: backupPath, signing: metadata.signing, signingIdentity: metadata.signingIdentity,
   credentialStorage: metadata.credentialStorage,
   signingRequirement: sourceRequirement, notarized: false,
+  iconRegistration: "refreshed",
 };
 if (process.argv.includes("--desktop-shortcut")) {
   const desktop = join(homedir(), "Desktop");

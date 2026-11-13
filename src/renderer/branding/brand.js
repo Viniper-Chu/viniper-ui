@@ -1,6 +1,6 @@
 export const BRAND_NAME = "Viniper workstation";
 export const BRAND_BADGE = "v1.9.1 · Stable（稳定版）";
-export const BRAND_ASSET_STATUS = "UNIFIED_3D_NATIVE_SOURCE";
+export const BRAND_ASSET_STATUS = "UNIFIED_APPROVED_ARTWORK";
 
 export function initializeBranding(root = document) {
   root.title = `${BRAND_NAME} · ${BRAND_BADGE}`;
@@ -14,5 +14,5 @@ export function initializeBranding(root = document) {
     mark.textContent = "V";
   }
   mark.dataset.assetStatus = BRAND_ASSET_STATUS;
-  mark.title = "Viniper workstation 立体电路节点品牌图标";
+  mark.title = "Viniper 标识";
 }

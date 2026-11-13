@@ -23,7 +23,9 @@ from urllib.parse import urlsplit
 
 _PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
 _LOOPBACK_NO_PROXY = ("localhost", "127.0.0.1", "::1")
-_RUN_STOP_TIMEOUT_SECONDS = 5.0
+# The model is aborted immediately; its terminal acknowledgement also includes
+# tool cleanup and the durable run ledger, which can exceed five seconds.
+_RUN_STOP_TIMEOUT_SECONDS = 30.0
 
 
 def _merge_no_proxy_values(*values: object) -> str:
@@ -210,14 +212,14 @@ def _runtime_event_to_provider_event(event: dict[str, Any]) -> dict[str, Any] | 
         return None
     run_id = str(payload.get("runId") or payload.get("run_id") or "")
     if event_type == "provider.request.started":
-        return {"type": "working_status", "content": "正在读取图片，等待模型输出…" if payload.get("phase") == "local-image" else "正在处理本轮上下文，等待首个输出…"}
+        return {"type": "working_status", "phase": "image" if payload.get("phase") == "local-image" else "context", "content": "正在读取图片，等待模型输出…" if payload.get("phase") == "local-image" else "正在处理本轮上下文，等待首个输出…"}
     if event_type == "steering.updated":
         return {"type": "steering", "receipt": payload.get("receipt", {}),
                 "start_new_message": bool(payload.get("startNewMessage"))}
     if event_type == "provider.activity":
         count = max(0, int(payload.get("receivedCharacters") or 0))
         label = "正在检查图片 · 已生成" if payload.get("phase") == "image-output" else "正在准备操作内容 · 已接收"
-        return {"type": "working_status", "content": f"{label} {count:,} 字符"}
+        return {"type": "working_status", "phase": "image" if payload.get("phase") == "image-output" else "tool-input", "content": f"{label} {count:,} 字符"}
     if event_type == "context.budget":
         return {"type": "context_budget", "input_tokens": payload.get("inputCount", 0),
                 "context_tokens": payload.get("windowSize", 0), "output_reserved": payload.get("outputReserved", 0)}
@@ -300,6 +302,7 @@ def _runtime_event_to_provider_event(event: dict[str, Any]) -> dict[str, Any] | 
     if event_type == "tool.requested":
         return {
             "type": "tool_start",
+            "read_only": payload.get("readOnly") is True,
             "tool_name": str(payload.get("toolName") or ""),
             "call_id": str(payload.get("callId") or payload.get("id") or ""),
             "content": str(payload.get("title") or payload.get("detail") or ""),
@@ -486,6 +489,7 @@ class HarnessApplicationPort:
             "VINIPER_DEMO_FIXTURE", "VINIPER_HARNESS_ALLOW_EXTERNAL_NETWORK",
             "VINIPER_HARNESS_REVIEW_PROVIDER_LIMIT",
             "VINIPER_LOCAL_AGENT_PROFILE",
+            "VINIPER_LOCAL_SSE_CAPTURE_DIRECTORY", "VINIPER_LOCAL_SSE_CAPTURE_PREFIX",
             "VINIPER_MATH_HANDOUT_HELPER", "VINIPER_PDF_INSPECT_HELPER",
             "NODE_USE_ENV_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
         }
@@ -734,7 +738,7 @@ class HarnessApplicationPort:
             session_id=str(session_id),
             run_id=str(run_id),
             call_id=str(call_id),
-            decision="allow-once" if decision == "allow-once" else "reject",
+            decision=decision if decision in {"allow-once", "allow-always"} else "reject",
         )
 
     async def _cancel_owned_process(self, process: asyncio.subprocess.Process, session_id: str = "") -> None:
@@ -762,6 +766,7 @@ class HarnessApplicationPort:
         memory_enabled: bool = True,
         reasoning: str | None = None,
         user_text: str | None = None,
+        document_context: str | None = None,
         planning: bool = False,
     ) -> AsyncIterable[dict[str, Any]]:
         sid = str(session_id)
@@ -790,6 +795,7 @@ class HarnessApplicationPort:
             "memory_enabled": bool(memory_enabled),
             "reasoning": reasoning,
             "user_text": user_text,
+            "document_context": document_context,
             "planning": bool(planning),
         }
         # Host-only secret value is sent over stdin and is never emitted back.

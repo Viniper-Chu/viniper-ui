@@ -18,7 +18,9 @@ test("a real Harness bridge completes and persists one session while another awa
     }
     const bridgePath = join(root, "harness_runtime_bridge.js");
     await writeFile(bridgePath,
-      "require('./harness-runtime/dist/src/features/memory/memory-service.js').MemoryService.prototype.captureSession = async () => { throw new Error('fixture memory storage failure'); };\n"
+      // This fixture models a newly installed capability, outside the user's initial grants.
+      "const PermissionPolicy = require('./harness-runtime/dist/src/features/permissions/permission-policy.js').PermissionPolicy; const authorize = PermissionPolicy.prototype.authorizeInitialTools; PermissionPolicy.prototype.authorizeInitialTools = function(tools) { return authorize.call(this, tools.filter(tool => tool.name !== 'demo.read-only-preview')); };\n"
+      + "require('./harness-runtime/dist/src/features/memory/memory-service.js').MemoryService.prototype.captureSession = async () => { throw new Error('fixture memory storage failure'); };\n"
       + await readFile(bridgePath, "utf8"));
     const script = String.raw`
 import asyncio,json,sys
@@ -63,7 +65,18 @@ async def main():
         restored=await port.control('collaboration.snapshot')
         rows=restored.get('sessions') or []
         assert any(row.get('native_session_id')=='completed-session' and row.get('state')=='idle' for row in rows),restored
-        print('real Harness: memory warning was delivered without failing the run; completed session returned before unrelated permission response; shutdown and persisted restore passed; provider calls=0')
+        remembered=[]
+        async for event in port.stream(session_id='remembered-session',prompt='执行只读演示工具',model='demo-default',provider_id='demo',workdir=str(root),permission_mode='ask'):
+            if event['type']=='provider.event' and event['event']['type']=='permission_request':
+                approval=event['event'];remembered.append(approval)
+                answer=await port.resolve_permission('remembered-session',approval['run_id'],approval['call_id'],'allow-always')
+                assert answer.get('resolved'),answer
+        assert len(remembered)==1,remembered
+        await port.shutdown()
+        again=[event async for event in port.stream(session_id='remembered-session',prompt='再次执行只读演示工具',model='demo-default',provider_id='demo',workdir=str(root),permission_mode='ask')]
+        assert not any(event['type']=='provider.event' and event['event']['type']=='permission_request' for event in again),again
+        assert again[-1]['status']=='run.completed',again[-1]
+        print('real Harness: memory warning, concurrent completion, persistent grant and restart passed; provider calls=0')
     finally:
         if not task.done(): task.cancel()
         await asyncio.gather(task,return_exceptions=True)

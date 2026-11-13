@@ -55,17 +55,45 @@ function sameNames(left: Set<string>, right: Set<string>): boolean {
   return left.size === right.size && [...left].every((name) => right.has(name));
 }
 
-/** Specialized schemas are advertised only when the task uses that document family. */
-export function relevantFileTools(text: string, tools: ProviderToolDefinition[], vision = false): ProviderToolDefinition[] {
-  const docx = /\.docx\b|\bDOCX\b|Word\s*文档/iu.test(text);
-  const sqlite = /\.sqlite(?:3)?\b|\bSQLite\b|\.db\b/iu.test(text);
-  const handout = /file\.math\.handout\b|(?:制作|生成|创建|整理|编写|设计|排版|排成).{0,24}(?:讲义|师生|学生版|教师版)|(?:讲义|师生|学生版|教师版).{0,16}(?:制作|生成|排版)|\b(?:create|generate|format)\b.{0,30}\b(?:handout|worksheet)\b/iu.test(text);
+/** Fully stated exercises can use calculation tools without initiating unrelated workspace actions. */
+export function isInlineMathExercise(request: string): boolean {
+  // Explicitly asking for the built-in root checker still describes an inline calculation.
+  request = request.replace(/math\.quadratic\.check|(?:二次方程|实根|根数)(?:核验|验算|检查)?工具/giu, "根数验算");
+  if (/附件|题图|如图|图中|文件|文档|目录|项目|题库|资料|教材|源码|原卷|原稿|讲义|试卷|排版|编译|绘制|画|作图|作出.{0,8}图|示意图|图形文件|搜索|检索|查找|查询|读取|保存|写入|生成|工具|脚本|计算机|程序|代码|上面|上题|之前|刚才|根据图|阅读|资料库|联网|验证器|实验|导出|绘图|上一|前面|前述|插件|技能|[a-z]+\.[a-z]{2,}\b|\b(?:python|pdf|tex|word|tikz|excel|latex|cas)\b/iu.test(request)) return false;
+  return /求|证明|证出|判定|判断|解答|解下列|解方程|解不等式|讨论|给出|列出|有几个|几条|多少/iu.test(request)
+    && /方程|函数|实根|不等式|三角形|切线|数列|向量|直线|抛物线|椭圆|双曲线|多面体|概率|正实数|导数/iu.test(request)
+    && /[0-9=<>≤≥∈√²³]|\\(?:frac|sqrt|in|le|ge)\b/u.test(request);
+}
+
+/** Compact, provider-independent hints retained for follow-ups such as “把上一份再编一次”. */
+export function documentHints(text: string): string[] {
+  const material = "(?:讲义|试卷|练习册|练习卷|习题单|练习单|学案|师生版?|学生版|教师版)";
+  const operation = "(?:制作|生成|创建|整理|编写|设计|排版|排成|排出|编译|重编|组卷|排一份|出一份|出一套)";
+  const handout = new RegExp(`${operation}.{0,28}${material}|${material}.{0,20}${operation}`, "iu").test(text)
+    || /file\.math\.handout\b|(?:编译|出|做成|排成).{0,8}(?:师生|学生版|教师版)|\b(?:create|generate|format|compile)\b.{0,30}\b(?:handout|worksheet|exam)\b/iu.test(text);
   const pdf = handout || /\.pdf\b|\bPDF\b|排版|版式|页面/iu.test(text);
-  // Page verification starts before the PDF has been rendered into images.
-  const image = vision && /\.(?:png|jpe?g|webp|pdf)\b|图片|图像|截图|页面|版式|排版/iu.test(text);
-  return tools.filter((tool) => (!tool.name.startsWith("file.docx.") || docx)
-    && (!tool.name.startsWith("file.sqlite.") || sqlite)
-    && (!tool.name.startsWith("file.pdf.") || pdf)
-    && (tool.name !== "file.math.handout" || handout)
-    && (tool.name !== "file.image.analyze" || image));
+  const image = handout || /\.(?:png|jpe?g|webp|pdf)\b|图片|图像|截图|页面|版式|排版|读图|看图|题图|如图/iu.test(text);
+  return [
+    ...(/math\.quadratic\.check|二次|方程|实根|根的个数|根数|判别式|抛物线|抛物線|quadratic|real roots/iu.test(text) ? ["quadratic"] : []),
+    ...(/\.docx\b|\bDOCX\b|Word\s*文档/iu.test(text) ? ["docx"] : []),
+    ...(/\.sqlite(?:3)?\b|\bSQLite\b|\.db\b/iu.test(text) ? ["sqlite"] : []),
+    ...(handout ? ["handout"] : []), ...(pdf ? ["pdf"] : []), ...(image ? ["image"] : []),
+  ];
+}
+
+export function legacyDocumentHints(text: string): string[] {
+  // Older desktop history stored the host's instructions together with the visible request.
+  const marker = "\n\n[当前请求]\n";
+  const boundary = text.includes("[Viniper Harness 独立指令]") ? text.indexOf(marker) : -1;
+  return documentHints(boundary < 0 ? text : text.slice(boundary + marker.length));
+}
+
+export function relevantFileTools(text: string, tools: ProviderToolDefinition[], vision = false, previous: string[] = []): ProviderToolDefinition[] {
+  const hints = new Set([...documentHints(text), ...previous]);
+  return tools.filter((tool) => (tool.name !== "math.quadratic.check" || hints.has("quadratic"))
+    && (!tool.name.startsWith("file.docx.") || hints.has("docx"))
+    && (!tool.name.startsWith("file.sqlite.") || hints.has("sqlite"))
+    && (!tool.name.startsWith("file.pdf.") || hints.has("pdf"))
+    && (tool.name !== "file.math.handout" || hints.has("handout"))
+    && (tool.name !== "file.image.analyze" || (vision && hints.has("image"))));
 }

@@ -1,0 +1,37 @@
+/* Viniper workbench. Design review guided by unslop, Damir Sokolovsky
+   (https://github.com/heydamir/unslop, CC BY 4.0). Original implementation.
+   Interface density and user-selected reading size are independent. */
+:root {
+  color-scheme: light;
+  --bg: #FAF9F5; --sidebar: #EEEFE8; --surface: #FFFFFF; --surface-soft: #EDF1EF;
+  --ink: #1E302D; --secondary: #455A53; --muted: #5C6962;
+  --line: #DDDFD6; --line-strong: #A8B4AB;
+  --accent: #245E54; --accent-soft: #DEEBE3; --on-accent: #FFFFFF; --hover: #E5E8DE;
+  --primary: #214F46; --on-primary: #FFFFFF; --primary-hover: #163E37;
+  --waiting: #855518; --danger: #A33531; --danger-soft: #FAE9E6;
+  --scrim: #102C3759; --shadow: 0 8px 28px #102C3714, 0 2px 6px #102C3708;
+  --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", sans-serif;
+  --display-font: "Songti SC", "STSong", "Noto Serif CJK SC", Georgia, serif;
+  --graph-level: #AB6945;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --text-xs: 12px; --text-sm: 13px; --text-ui: 14px; --text-title: 30px; --chat-size: 15px;
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-5: 24px; --space-6: 32px;
+  --radius-sm: 6px; --radius-md: 8px; --radius-lg: 16px;
+  --button-radius: 9px; --button-height: 32px; --button-gap: 6px;
+  --control-fill: color-mix(in srgb, var(--surface) 65%, var(--surface-soft));
+  --control-edge: color-mix(in srgb, var(--ink) 17%, transparent);
+  --control-press: color-mix(in srgb, var(--ink) 11%, var(--surface-soft));
+  --control-sm: 28px; --control-md: 32px; --sidebar-width: 224px; --reading-width: 720px;
+  --ease: cubic-bezier(.22,1,.36,1); --fast: 160ms; --normal: 200ms;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --graph-level: #DEA37B;
+  --bg: #192320; --sidebar: #141D1B; --surface: #202D28; --surface-soft: #283832;
+  --ink: #E9F1EB; --secondary: #BDCECB; --muted: #9CB1B2;
+  --line: #36463E; --line-strong: #546C72;
+  --accent: #A4D3BD; --accent-soft: #2A4036; --on-accent: #102C37; --hover: #2B3931;
+  --primary: #AFD3BD; --on-primary: #102C37; --primary-hover: #D0EBE6;
+  --waiting: #EAC283; --danger: #F3A89B; --danger-soft: #442B2B;
+  --scrim: #08131880; --shadow: 0 8px 28px #040B0F55;
+}

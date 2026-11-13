@@ -1,7 +1,7 @@
 import { PermissionMode, ToolRequest } from "./contracts";
 import { AgentEngineId } from "./agent-engine-contracts";
 
-export type ToolApprovalDecision = "allow-once" | "reject";
+export type ToolApprovalDecision = "allow-once" | "allow-always" | "reject";
 export type ApprovalHostMode = "interactive" | "fail-closed";
 export type PermissionAccessSelection =
   | "standard"
@@ -74,7 +74,7 @@ export interface ToolAuthorizationInput {
 }
 
 export type ToolAuthorizationResolution =
-  | { allowed: true; reason: "auto-read-only" | "auto-approved" | "review-read-only" | "review-project-approved" | "allow-once" | "full-access" | "project-full-access" | "computer-full-access" }
+  | { allowed: true; reason: "auto-read-only" | "auto-approved" | "review-read-only" | "review-project-approved" | "allow-once" | "remembered-access" | "full-access" | "project-full-access" | "computer-full-access" }
   | { allowed: false; reason: "rejected" | "review-risk-rejected" | "host-fail-closed" | "cancelled" | "plan-read-only"; message: string };
 
 export interface ToolAuthorization {

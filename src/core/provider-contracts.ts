@@ -173,6 +173,8 @@ export type ProviderContentItem =
   | ProviderModelStepItem;
 
 export interface ProviderHistoryEntry {
+  /** Local routing metadata, never a model message. */
+  documentHints?: string[];
   id: string;
   role: "user" | "assistant" | "tool";
   items: ProviderContentItem[];
@@ -224,6 +226,7 @@ export interface LocalContextReduction {
 export type ProviderActivityEvent = Extract<ProviderEvent, { kind: "provider.request.started" | "provider.activity" }>;
 
 export type ProviderEvent =
+  | { kind: "response.incomplete"; reason: "output-limit" }
   | { kind: "provider.request.started"; phase: "local-prefill" | "local-image"; timeoutSeconds: number; inputCount: number }
   | { kind: "provider.activity"; phase: "tool-input" | "image-output"; receivedCharacters: number }
   | { kind: "context.budget"; inputCount: number; windowSize: number; outputReserved: number }

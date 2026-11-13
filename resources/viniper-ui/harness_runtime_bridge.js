@@ -261,8 +261,7 @@ function waitForRunTerminal(sessionId, nativeSessionId, seenEvents, secrets) {
     };
     const finish = (event) => {
       if (closed) return;
-      const snapshot = application?.snapshot?.();
-      emitUsage(snapshot, true);
+      emitUsage({ telemetry: application.services.telemetry.snapshot() }, true);
       if (pendingUsage) {
         const signature = usageProjectionSignature(pendingUsage);
         if (signature && signature !== lastUsageSignature) {
@@ -274,17 +273,13 @@ function waitForRunTerminal(sessionId, nativeSessionId, seenEvents, secrets) {
       unsubscribe?.();
       resolve(event);
     };
-    const observe = (snapshot) => {
-      const session = snapshot.sessions.find((item) => item.id === sessionId);
-      const events = session?.events || [];
-      for (const event of events.slice(seenEvents.count)) {
-        seenEvents.count += 1;
-        writeLine({ type: "runtime.event", native_session_id: nativeSessionId, event: sanitize(event, secrets) });
-        if (["run.completed", "run.failed", "run.cancelled"].includes(String(event.type || ""))) finish(event);
-      }
-      if (!closed) emitUsage(snapshot);
-    };
-    unsubscribe = runtime.subscribe(observe);
+    unsubscribe = runtime.subscribeEvents(event => {
+      if (event.sessionId !== sessionId || closed) return;
+      seenEvents.count += 1;
+      writeLine({ type: "runtime.event", native_session_id: nativeSessionId, event: sanitize(event, secrets) });
+      if (["run.completed", "run.failed", "run.cancelled"].includes(String(event.type || ""))) finish(event);
+      else if (event.type === "turn.usage.updated") emitUsage({ telemetry: application.services.telemetry.snapshot() });
+    });
   });
 }
 
@@ -311,6 +306,7 @@ async function run(request) {
       sessionId: session.id,
       text: String(request.prompt || ""),
       userText: request.user_text == null ? undefined : String(request.user_text),
+      documentContext: typeof request.document_context === "string" ? request.document_context : undefined,
       selectedModel: session.selectedModel,
       permissionMode: session.permissionMode,
       origin: { kind: "user" },
@@ -764,7 +760,7 @@ async function handleControl(command) {
       const sessionId = String(command.session_id || "");
       const runId = String(command.run_id || "");
       const callId = String(command.call_id || "");
-      const decision = command.decision === "allow-once" ? "allow-once" : "reject";
+      const decision = ["allow-once", "allow-always"].includes(command.decision) ? command.decision : "reject";
       if (!sessionId || !runId || !callId) throw new Error("permission resolve requires session_id, run_id and call_id");
       // The native server owns the stable/native session id, while the
       // Harness runtime owns a durable session id.  Resolve against the
@@ -799,7 +795,7 @@ async function handleControl(command) {
           status: plugin.tools.every(name => services.toolRegistry.has(name)) ? "available" : "unavailable",
           tools: plugin.tools,
           icon: ({ "built-in.documents": "files", "built-in.math-documents": "math", "built-in.project": "code", "built-in.research": "search", "built-in.coordination": "chat" })[plugin.id] || "plugin",
-          description: ({"built-in.documents":"读取和精确修改 Word 文档，以事务处理 SQLite 数据。", "built-in.math-documents":"复用本机排版工具制作师生讲义，读取 PDF 并生成检查用页面。", "built-in.project":"检索项目、修改代码、查看差异并运行验证。", "built-in.research":"读取公开网页与 GitHub 仓库资料。", "built-in.coordination":"通过已注册的工具安排会话协作与任务委派。"})[plugin.id] || "已注册的本机工具扩展。",
+          description: ({"built-in.documents":"读取和精确修改 Word 文档，以事务处理 SQLite 数据。", "built-in.math-documents":"精确核对区间实根数，编译带题图的师生讲义，查看 PDF 页面。", "built-in.project":"检索项目、修改代码、查看差异并运行验证。", "built-in.research":"读取公开网页与 GitHub 仓库资料。", "built-in.coordination":"通过已注册的工具安排会话协作与任务委派。"})[plugin.id] || "已注册的本机工具扩展。",
           built_in: plugin.classification === "built-in",
         })).filter((plugin) => plugin.id),
       };
@@ -870,7 +866,8 @@ async function bootstrap() {
     assetsRoot,
     workingDirectory: process.env.VINIPER_HARNESS_WORKDIR || process.cwd(),
     secretVault,
-    approvalHostMode: "automatic",
+    approvalHostMode: "interactive",
+    rememberToolApprovals: true,
     previewFullAccessDefaults: true,
     externalScheduleDispatch: true,
     maxConcurrentRuns: 3,

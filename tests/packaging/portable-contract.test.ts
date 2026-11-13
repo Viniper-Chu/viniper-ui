@@ -40,8 +40,8 @@ test("Windows x64 portable packaging carries the Viniper workstation branding co
   assert.equal(brandingManifest.nativeFallback, "viniper-harness-circuit-node.png");
   assert.equal(brandingManifest.nativeSmall, "viniper-harness-circuit-node-32.png");
   assert.equal(brandingManifest.windowsIco, "viniper-harness-circuit-node.ico");
-  assert.equal(brandingManifest.variant, "circuit-node-3d");
-  assert.equal(brandingManifest.frame.radius, 24);
+  assert.equal(brandingManifest.variant, "folded-v");
+  assert.equal(brandingManifest.frame.radius, 14);
   const installScript = await readFile(join(root, "scripts", "install-preview.ps1"), "utf8");
   assert.match(installScript, /brandingManifest\.windowsIco/u);
   assert.doesNotMatch(source, /reg(?:\.exe|istry)|shortcut|Task Scheduler|schtasks|service|startup/iu);

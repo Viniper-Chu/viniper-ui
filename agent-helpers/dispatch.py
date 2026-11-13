@@ -10,10 +10,14 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from docx_local_edit import inspect_docx, edit_docx, replace_docx, _run_mapping
 from sqlite_local_ops import inspect, query, apply
+from quadratic_check import verify_request
 
 
 def dispatch(request):
-    operation, path = request['operation'], request['path']
+    operation = request['operation']
+    if operation == 'math.quadratic.check':
+        return verify_request(request)
+    path = request['path']
     if operation == 'docx.inspect':
         return inspect_docx(path)
     if operation == 'docx.edit':

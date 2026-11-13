@@ -128,7 +128,7 @@
 
   function codeBlock(code, language) {
     const label = language ? `<span class="code-lang">${escape(language)}</span>` : "";
-    return `<pre class="markdown-code">${label}<button type="button" class="copy-btn" data-copy="${escape(code)}">复制</button><code>${escape(code)}</code></pre>\n`;
+    return `<pre class="markdown-code">${label}<button type="button" class="copy-btn" data-hint="复制这段代码" data-copy="${escape(code)}">复制</button><code>${escape(code)}</code></pre>\n`;
   }
   md.renderer.rules.fence = (tokens, index, _options, env) => {
     const token = tokens[index];

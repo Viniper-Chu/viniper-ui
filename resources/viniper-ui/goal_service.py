@@ -69,6 +69,27 @@ class GoalService:
         await self.initialize()
         return sorted((copy.deepcopy(g) for g in self.items.values() if not sid or g["session_id"] == sid), key=lambda g: g["updated"], reverse=True)
 
+    async def edit(self, gid, body):
+        await self.initialize()
+        goal = self.items[gid]
+        if goal["status"] in {"active", "complete"} or self.coordinator.has_active(goal["session_id"]):
+            raise ValueError("请在目标暂停且会话空闲时编辑")
+        title, prompt = body.get("title"), body.get("prompt")
+        if not isinstance(title, str) or not isinstance(prompt, str) or not title.strip() or not prompt.strip():
+            raise ValueError("名称和目标内容不能为空")
+        if body.get("original") != {"title": goal["title"], "prompt": goal["prompt"]}:
+            raise ValueError("目标已更改，请重新打开编辑页核对")
+        previous = dict(goal)
+        goal.update(title=title.strip()[:160], prompt=prompt.strip(), updated=time.time())
+        edited = dict(goal)
+        try:
+            await self.save()
+        except Exception:
+            if self.items.get(gid) is goal and goal == edited:
+                goal.update(previous)
+            raise
+        return copy.deepcopy(goal)
+
     async def control(self, gid, action):
         await self.initialize()
         if gid not in self.items:

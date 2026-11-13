@@ -27,7 +27,7 @@ export class LocalDocumentWorkflowHost implements DocumentWorkflowHost {
         if (child.pid) void terminatePosixProcessGroup(child.pid).catch(() => child.kill("SIGKILL"));
       };
       const abort = () => stop("文档操作已取消。");
-      const timer = setTimeout(() => stop("文档工具超过 60 秒，请缩小单次讲义或查看编译诊断。"), 60_000);
+      const timer = setTimeout(() => stop("文档工具超过 60 秒，请查看编译诊断并分阶段处理，保留原题量与完整解析。"), 60_000);
       const cleanup = () => { clearTimeout(timer); signal.removeEventListener("abort", abort); };
       child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {

@@ -14,17 +14,26 @@ test("local policy stays deployment scoped, honors manual thinking and gates mix
   const root = await mkdtemp(join(maintenance, "local-policy-"));
   try {
     const path = join(root, "profile.json");
-    await writeFile(path, JSON.stringify({ endpoint: "http://127.0.0.1:18080/v1", api_model: "qwen-local", context_tokens: 16384, compaction_trigger_tokens: 12288, output_limit: 4096, max_iterations: 96, thinking_control: { default: "medium", budget_tokens: { low: 256, medium: 512, high_and_above: 1024 } }, auto_thinking: { enabled: true }, secret: "must-not-project" }));
+    await writeFile(path, JSON.stringify({ endpoint: "http://127.0.0.1:18080/v1", api_model: "qwen-local", context_tokens: 16384, compaction_trigger_tokens: 12288, output_limit: 4096, max_iterations: 96, thinking_control: { default: "medium", budget_message: "收束草稿，执行必要工具并核对结果。", budget_tokens: { low: 256, medium: 512, high_and_above: 1024 } }, auto_thinking: { enabled: true }, secret: "must-not-project" }));
     const policy = loadLocalAgentPolicy("http://127.0.0.1:18080/v1/chat/completions", path)!;
     assert.equal(policy.contextTokens, 16384);
     assert.equal(policy.maxIterations, 96);
+    const contract = JSON.parse(await (await import("node:fs/promises")).readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ ...contract, max_iterations: "unlimited" }));
+    assert.equal(loadLocalAgentPolicy("http://127.0.0.1:18080/v1", path)?.maxIterations, "unlimited");
+    for (const invalid of [null, 0, -1, "96"]) {
+      await writeFile(path, JSON.stringify({ ...contract, max_iterations: invalid }));
+      assert.equal(loadLocalAgentPolicy("http://127.0.0.1:18080/v1", path), undefined);
+    }
     assert.equal(JSON.stringify(policy).includes("must-not-project"), false);
     assert.equal(loadLocalAgentPolicy("http://127.0.0.1:19000/v1", path), undefined);
     const request = protocolRequest(testProfile("openai-chat", "http://127.0.0.1:18080/v1"), "qwen-local");
     request.currentUserText = "读取文件，输出严格 JSON 对象。";
     assert.equal(localRequestOverrides(request, policy).reasoning_budget_tokens, 512);
+    assert.equal(localRequestOverrides(request, policy).reasoning_budget_message, "收束草稿，执行必要工具并核对结果。");
     request.reasoning = "off";
     assert.equal(localRequestOverrides(request, policy).reasoning_budget_tokens, 0);
+    assert.equal(localRequestOverrides(request, policy).reasoning_budget_message, undefined);
     request.reasoning = "high";
     assert.equal(localRequestOverrides(request, policy).reasoning_budget_tokens, 1024);
     assert.equal(localRequestOverrides(request, policy).response_format, undefined);

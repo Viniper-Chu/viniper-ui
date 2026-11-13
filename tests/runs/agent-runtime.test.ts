@@ -13,12 +13,54 @@ test("Provider request limits keep production defaults and allow an isolated rev
   assert.equal(resolveProviderRequestLimit("review", { review: 4 }), 4);
   assert.equal(resolveProviderRequestLimit("auto", { review: 4 }), 10);
   assert.equal(resolveProviderRequestLimit("auto", { fullAccess: 8 }), 8);
+  assert.equal(resolveProviderRequestLimit("auto", { fullAccess: "unlimited" }), "unlimited");
+  assert.equal(resolveProviderRequestLimit("review", { review: "unlimited" }), "unlimited");
 });
 
 function activeSession(runtime: AgentRuntime) {
   const snapshot = runtime.snapshot();
   return snapshot.sessions.find((session) => session.id === snapshot.activeSessionId)!;
 }
+
+test("cancellation reaches the Provider while the interrupt audit commit is blocked", async () => {
+  const registry = new ProviderRegistry(0, []);
+  let started = false, aborted = false, release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  registry.register({
+    descriptor: registry.get("demo").descriptor,
+    async *stream(_request, signal) {
+      started = true;
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => {
+        aborted = true; resolve();
+      }, { once: true }));
+    },
+  });
+  const fixture = await createRuntimeFixture({ registry });
+  let cancellation: Promise<boolean> | undefined;
+  try {
+    const session = activeSession(fixture.runtime);
+    await fixture.runtime.send({ sessionId: session.id, text: "连续输出", attachments: [], selectedModel: session.selectedModel, permissionMode: session.permissionMode });
+    await waitFor(() => started);
+    const original = fixture.store.commitEvent.bind(fixture.store);
+    let commitBlocked = false;
+    fixture.store.commitEvent = async (event, application) => {
+      if (event.type === "interrupt.requested") { commitBlocked = true; await blocked; }
+      return original(event, application);
+    };
+    cancellation = fixture.runtime.cancel(session.id);
+    await waitFor(() => commitBlocked);
+    assert.equal(aborted, true, "Provider cancellation must not wait for the audit disk write");
+    release();
+    assert.equal(await cancellation, true);
+    await waitFor(() => !fixture.runtime.isRunning(session.id));
+    const events = activeSession(fixture.runtime).events;
+    assert.ok(events.findIndex(e => e.type === "interrupt.requested") < events.findIndex(e => e.type === "run.cancelled"));
+  } finally {
+    release();
+    await cancellation;
+    await fixture.dispose();
+  }
+});
 
 test("two Agent sessions isolate messages, events and queue state", async () => {
   const fixture = await createRuntimeFixture();
@@ -273,4 +315,27 @@ test("runtime restores sessions and messages from its own Preview data directory
   } finally {
     await fixture.dispose();
   }
+});
+
+test("event subscribers receive ordered deltas without cloning global runtime snapshots", async () => {
+  const registry = new ProviderRegistry(0, []);
+  registry.register({ descriptor: registry.get("demo").descriptor, async *stream() {
+    for (const text of ["第一段\n", "  缩进", "\n末尾"]) yield { kind: "text.delta" as const, text };
+  } });
+  const fixture = await createRuntimeFixture({ registry });
+  try {
+    const session = fixture.runtime.listSessions()[0];
+    let snapshots = 0; const original = fixture.runtime.snapshot.bind(fixture.runtime);
+    fixture.runtime.snapshot = () => { snapshots++; return original(); };
+    const deltas: string[] = [], sequences: number[] = [];
+    const off = fixture.runtime.subscribeEvents(event => {
+      if (event.type === "message.delta") { deltas.push((event.payload as any).text); sequences.push(event.sequence!); }
+    });
+    await fixture.runtime.send({ sessionId: session.id, text: "输出", attachments: [], selectedModel: session.selectedModel, permissionMode: session.permissionMode });
+    await waitFor(() => !fixture.runtime.isRunning(session.id)); await fixture.runtime.flushPersistence(); off();
+    assert.deepEqual(deltas, ["第一段\n", "  缩进", "\n末尾"]);
+    assert.ok(sequences.every((n,i)=>!i||n>sequences[i-1]));
+    assert.equal(snapshots, 0);
+    assert.equal(fixture.runtime.getSession(session.id)!.messages.at(-1)!.text, deltas.join(""));
+  } finally { await fixture.dispose(); }
 });

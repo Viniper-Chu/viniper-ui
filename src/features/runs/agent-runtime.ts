@@ -1,5 +1,6 @@
 import {
   AgentIntent,
+  AgentIterationLimit,
   AgentMessage,
   ActivityRecord,
   IntentOrigin,
@@ -28,7 +29,7 @@ import {
 } from "../../core/permission-contracts";
 import { newId } from "../../core/ids";
 import { RuntimePersistence } from "../../core/ports";
-import { ProviderHistoryEntry, ProviderRequest, ProviderToolCallItem } from "../../core/provider-contracts";
+import { ProviderHistoryEntry, ProviderRequest, ProviderToolCallItem, ProviderToolResultItem } from "../../core/provider-contracts";
 import { AgentEngineId, DEFAULT_AGENT_ENGINE, sessionAgentEngine } from "../../core/agent-engine-contracts";
 import { TokenUsage } from "../../core/telemetry-contracts";
 import {
@@ -78,7 +79,7 @@ import type { FrozenRunContext } from "../../core/composition-contracts";
 import { engineScopedId, engineScopeOf } from "../../core/engine-identity";
 import { runtimeErrorEnvelope } from "../../core/runtime-error-contracts";
 import { ClaudeCodeEngineAdapter, ViniperEngineAdapter } from "../agent-engines/engine-adapters";
-import { relevantFileTools, toolsForCurrentTurn } from "./current-turn-tools";
+import { documentHints, isInlineMathExercise, legacyDocumentHints, relevantFileTools, toolsForCurrentTurn } from "./current-turn-tools";
 
 export interface SendResult {
   accepted: boolean;
@@ -95,6 +96,7 @@ interface RunControl {
   origin: IntentOrigin;
   text: string;
   userText?: string;
+  documentContext?: string;
   status: RunStatus;
   createdAt: number;
   recovery?: boolean;
@@ -116,15 +118,16 @@ export interface RunSkillLoader {
 }
 
 export interface ProviderRequestLimits {
-  review?: number;
-  fullAccess?: number;
+  review?: AgentIterationLimit;
+  fullAccess?: AgentIterationLimit;
 }
 
 export function resolveProviderRequestLimit(
   permissionMode: PermissionMode,
   overrides?: ProviderRequestLimits,
-): number {
+): AgentIterationLimit {
   const configured = permissionMode === "review" ? overrides?.review : overrides?.fullAccess;
+  if (configured === "unlimited") return configured;
   if (Number.isInteger(configured) && Number(configured) > 0) return Number(configured);
   return permissionMode === "review" ? 6 : 10;
 }
@@ -180,6 +183,8 @@ export class AgentRuntime {
   private readonly permissionPolicy: PermissionPolicy;
   private readonly resourceCoordinator = new ToolResourceCoordinator();
   private persistChain: Promise<void> = Promise.resolve();
+  private readonly eventListeners = new Set<(event: RuntimeEvent) => void>();
+  private readonly changeListeners = new Set<() => void>();
   private readonly runTasks = new Map<string, Promise<void>>();
   private readonly turnUsageProjection = new Map<string, { signature: string; projectedAt: number }>();
   private readonly composition: CompositionService;
@@ -275,6 +280,20 @@ export class AgentRuntime {
     this.listeners.add(listener);
     listener(this.snapshot());
     return () => this.listeners.delete(listener);
+  }
+
+  subscribeEvents(listener: (event: RuntimeEvent) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
+  subscribeChanges(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => this.changeListeners.delete(listener);
+  }
+
+  unfinishedRunCount(): number {
+    return [...this.runSnapshots.values()].filter(run => !["completed", "cancelled", "failed"].includes(run.status)).length;
   }
 
   onRunCompleted(listener: RunCompletionListener): () => void {
@@ -389,8 +408,12 @@ export class AgentRuntime {
     if (control?.status === "running") {
       const sessionId = this.runSnapshots.get(runId)?.sessionId;
       const session = sessionId ? this.catalog.get(sessionId) : undefined;
-      if (session) await this.recordRun(session, "interrupt.requested", { runId, requestedAt: this.now() }, runId);
+      // Queue the audit event first, but never make cancellation wait on disk.
+      const requested = session
+        ? this.recordRun(session, "interrupt.requested", { runId, requestedAt: this.now() }, runId)
+        : Promise.resolve();
       control.controller.abort();
+      await requested;
       if (session) await this.recordRun(session, "interrupt.acknowledged", { runId, acknowledgedAt: this.now() }, runId);
       return true;
     }
@@ -432,7 +455,7 @@ export class AgentRuntime {
   ): Promise<boolean> {
     const session = this.catalog.get(sessionId);
     if (!session || sessionAgentEngine(session.engineId) !== "viniper") return false;
-    const resolved = this.permissionPolicy.resolve(sessionId, runId, callId, decision);
+    const resolved = await this.permissionPolicy.resolveRemembered(sessionId, runId, callId, decision);
     if (resolved) this.publish();
     return resolved;
   }
@@ -690,6 +713,8 @@ export class AgentRuntime {
     const origin = intent.origin ?? { kind: "user" as const };
     // Preserve the original implicit same-session queue for ordinary typed input.
     // Explicit origins are scheduler/delegation boundaries and become independent runs.
+    const documentContext = intent.documentContext
+      ?? (intent.attachments?.length ? [intent.userText ?? text, ...intent.attachments].join("\n") : undefined);
     if (intent.origin === undefined && this.hasSessionRuns(session.id)) {
       if (session.queue.length >= this.maxSessionQueue) {
         return { accepted: false, queued: false, reason: "session-queue-saturated" };
@@ -701,6 +726,7 @@ export class AgentRuntime {
         memoryEnabled: intent.memoryEnabled,
         planning: intent.planning,
         userText: intent.userText,
+        documentContext,
       });
       await this.record(session, "queue.updated", { queue });
       return { accepted: true, queued: true };
@@ -724,6 +750,7 @@ export class AgentRuntime {
       memoryEnabled: intent.memoryEnabled,
       planning: intent.planning,
       userText: intent.userText,
+      documentContext,
     };
     this.registerRun(session, control);
     const queued = await this.startOrQueueRun(session, control);
@@ -913,10 +940,17 @@ export class AgentRuntime {
       // A follow-up can refer to an earlier document without repeating its
       // filename. Keep its specialized tools for the retained conversation;
       // explicit restrictions still come only from the current user turn.
-      const fileContext = session.providerHistory.filter((entry) => entry.role === "user")
-        .flatMap((entry) => entry.items.filter((item) => item.type === "text").map((item) => item.text)).join("\n");
+      const previousHints = session.providerHistory.filter(entry => entry.role === "user").flatMap(entry =>
+        entry.documentHints ?? entry.items.flatMap(item => item.type === "text" ? legacyDocumentHints(item.text) : []));
+      const userRequest = control.userText ?? text;
+      const documentContext = control.documentContext ?? userRequest;
       const turnTools = control.planning ? availableTools.filter((tool) => tool.readOnly) : availableTools;
-      const toolDefinitions = engineId === "viniper" ? toolsForCurrentTurn(control.userText ?? text, relevantFileTools(`${text}\n${fileContext}`, turnTools, localPolicy?.visionEnabled)) : [];
+      const inlineExercise = isInlineMathExercise(documentContext);
+      const candidates = inlineExercise
+        ? turnTools.filter(tool => tool.name.startsWith("math."))
+        : turnTools;
+      const toolDefinitions = engineId === "viniper" ? toolsForCurrentTurn(userRequest,
+        relevantFileTools(documentContext, candidates, localPolicy?.visionEnabled, previousHints)) : [];
       const enabledSkills = engineId === "viniper"
         ? stableContextSkills(await (this.options.skillLoader?.loadForRun(session.id) ?? Promise.resolve([])))
         : [];
@@ -947,6 +981,9 @@ export class AgentRuntime {
         tools: toolDefinitions,
         enabledSkills,
         history: contextHistory,
+        // Absolute file tools need the same directory as the native terminal.
+        // Only the matched local deployment receives this host path context.
+        ...(localPolicy ? { taskDirectory: workspaceRoot ?? session.workingDirectory } : {}),
         projectInstructions: `${projectInstructions.text ?? ""}${memoryText}${control.planning ? "\n\n本轮为规划模式：只读调研，给出可执行的方案、取舍和验证方法。不得修改文件、运行有副作用命令或启动其他执行任务。完成方案后等待用户选择开始实施。" : ""}`,
         taskWorkflow: engineId === "viniper",
       });
@@ -1014,6 +1051,7 @@ export class AgentRuntime {
         };
         await this.record(session, "message.user", { message: userMessage, origin, runId: effectiveRunId });
         const userHistoryEntry: ProviderHistoryEntry = {
+          documentHints: documentHints(documentContext),
           id: engineScopedId(engineId, "item", newId("provider-user")),
           role: "user",
           items: [{ type: "text", text }],
@@ -1045,6 +1083,7 @@ export class AgentRuntime {
         contextProfile,
         frozenRunContext: frozenContext,
       };
+      let lastEstimatedUsageAt = 0;
       const onProviderEvent = async (providerEvent: import("../../core/provider-contracts").ProviderEvent): Promise<void> => {
         if (providerEvent.kind === "usage.estimated") {
           this.options.tokenLedger.updateEstimate(engineId, effectiveRunId, providerEvent.usage);
@@ -1067,7 +1106,10 @@ export class AgentRuntime {
           },
           emit: (type, payload) => this.recordRun(session, type, attachRunId(payload, effectiveRunId), effectiveRunId),
         });
-        if (providerEvent.kind === "text.delta") await this.recordTurnUsage(session, effectiveRunId);
+        if (providerEvent.kind === "text.delta" && this.now() - lastEstimatedUsageAt >= 250) {
+          lastEstimatedUsageAt = this.now();
+          await this.recordTurnUsage(session, effectiveRunId);
+        }
       };
       await this.recordRun(session, "run.checkpoint", {
         runId: effectiveRunId,
@@ -1118,6 +1160,10 @@ export class AgentRuntime {
         resourceCoordinator: this.resourceCoordinator,
         artifactService: this.options.artifactService,
         runId: effectiveRunId,
+        // A successful batch closes the calculation phase of a standalone exercise.
+        // An explicit request for tools, an attachment, or a document task retains the ordinary loop.
+        ...(inlineExercise && localPolicy ? { completesVerification: (call: ProviderToolCallItem, result: ProviderToolResultItem) =>
+          call.name === "math.quadratic.check" && !result.isError } : {}),
         // Local deployment limits come from its host-owned contract. Explicit
         // acceptance overrides still take precedence; cloud defaults stay bounded.
         ...(localPolicy ? { maxRounds: localPolicy.maxIterations, noProgressLimit: 3, trackReads: true } : {}),
@@ -1330,6 +1376,7 @@ export class AgentRuntime {
         origin: next.origin ?? { kind: "user" },
         text: next.text,
         userText: next.userText,
+        documentContext: next.documentContext,
         status: "queued",
         createdAt: this.now(),
         workspaceMode: next.workspaceMode,
@@ -1668,10 +1715,19 @@ export class AgentRuntime {
       payload,
     };
     this.persistChain = this.persistChain.then(async () => {
-      const projected = clone(session);
-      applyRuntimeEvent(projected, event);
-      const receipt = await this.options.persistence.commitEvent(event, this.serializeWithSession(projected));
-      if (!receipt.duplicate) applyRuntimeEvent(session, receipt.event);
+      const delta = ["message.delta", "thinking.delta", "provider.activity", "turn.usage.updated"].includes(type);
+      let receipt;
+      if (delta && this.options.persistence.commitDeltaEvent) {
+        receipt = await this.options.persistence.commitDeltaEvent(event);
+      } else {
+        const projected = clone(session);
+        applyRuntimeEvent(projected, event);
+        receipt = await this.options.persistence.commitEvent(event, this.serializeWithSession(projected));
+      }
+      if (!receipt.duplicate) {
+        applyRuntimeEvent(session, receipt.event);
+        for (const listener of this.eventListeners) listener(clone(receipt.event));
+      }
       this.publish();
     }).catch((error) => {
       const envelope = runtimeErrorEnvelope(error, {
@@ -1795,6 +1851,8 @@ export class AgentRuntime {
   }
 
   private publish(): void {
+    for (const listener of this.changeListeners) listener();
+    if (this.listeners.size === 0) return;
     const snapshot = this.snapshot();
     for (const listener of this.listeners) listener(snapshot);
   }

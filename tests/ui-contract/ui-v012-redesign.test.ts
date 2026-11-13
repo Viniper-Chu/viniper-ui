@@ -34,7 +34,7 @@ test("v0.19 Viniper workstation workbench contract", async () => {
   assert.doesNotMatch(`${html}\n${styles}\n${titlebar}\n${conversation}\n${sessions}`, /[⚙⌕♢—□×▱＋↔◷⌘◇⌁↗★☆✎]/u);
   assert.match(titlebar, /<svg[\s\S]*window/u);
   assert.match(html, /viniper-harness-circuit-node\.png/u);
-  assert.match(brand, /UNIFIED_3D_NATIVE_SOURCE/u);
+  assert.match(brand, /UNIFIED_APPROVED_ARTWORK/u);
   assert.match(sessions, /session-status-mark/u);
   assert.match(conversation, /reasoning-block[\s\S]*reasoning-step-mark/u);
   assert.match(styles, /\.usage-cache \.usage-token-row strong[\s\S]*font-size:\s*12px[\s\S]*word-break:\s*keep-all/u);

@@ -10,6 +10,7 @@ import {
 import { ModelProvider } from "../../model-provider";
 import { loadLocalAgentPolicy, localRequestOverrides, LocalAgentPolicy } from "../../../local-models/local-agent-policy";
 import { boundLocalRequest } from "../../../local-models/local-request-budget";
+import { localSseCapture } from "../../../local-models/local-sse-capture";
 import { ToolResourceCoordinator } from "../../../tools/resource-lock";
 import { projectCachePolicy } from "../../cache-policies/provider-cache-policy";
 import { isProviderCapabilityEnabled } from "../../provider-capabilities";
@@ -79,6 +80,7 @@ export class OpenAIChatProvider implements ModelProvider {
       const response = await this.transport.request({ method: "POST", signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (!response.body) throw new Error("本机图像解析未返回流式响应体。");
       let text = "", receivedCharacters = 0, lastActivityAt = 0;
+      let finishReason = "";
       let finalUsage: ChatChunk["usage"];
       for await (const frame of readSseFrames(response.body, signal)) {
         if (!frame.data || frame.data === "[DONE]") continue;
@@ -86,6 +88,7 @@ export class OpenAIChatProvider implements ModelProvider {
         if (value.usage) finalUsage = value.usage;
         let changed = false;
         for (const choice of value.choices ?? []) {
+          if (choice.finish_reason) finishReason = choice.finish_reason;
           const delta = choice.delta ?? {};
           const content = delta.content || "", reasoning = delta.reasoning_content ?? delta.reasoning ?? "";
           text += content;
@@ -97,6 +100,7 @@ export class OpenAIChatProvider implements ModelProvider {
           lastActivityAt = Date.now();
         }
       }
+      if (finishReason === "length") throw new Error("图片检查达到单次输出上限，结果不完整；不能据此声明页面已通过，请缩小本次检查范围后重试。");
       if (!text.trim()) throw new Error("本机图像解析未返回可见结果。");
       return { text: text.trim(), usage: finalUsage ? mapChatUsage(finalUsage) : undefined };
     } finally { lease.release(); }
@@ -122,6 +126,7 @@ export class OpenAIChatProvider implements ModelProvider {
       // delta exists. Announce this actual request once, not a fake heartbeat.
       yield { kind: "provider.request.started", phase: "local-prefill", timeoutSeconds: 300, inputCount: reduction.inputAfter };
     }
+    const capture = localSseCapture(Boolean(local), request.currentUserText);
     const response = await this.transport.request({
       method: "POST",
       signal,
@@ -136,7 +141,9 @@ export class OpenAIChatProvider implements ModelProvider {
     let reasoningStarted = false;
     let reasoningText = "";
     let finishReason = "";
+    try {
     for await (const frame of readSseFrames(response.body, signal)) {
+      capture?.frame(frame.data);
       if (!frame.data || frame.data === "[DONE]") continue;
       const payload = JSON.parse(frame.data) as ChatChunk;
       for (const choice of payload.choices ?? []) {
@@ -166,10 +173,12 @@ export class OpenAIChatProvider implements ModelProvider {
       }
       if (payload.usage) yield { kind: "usage.completed", usage: mapChatUsage(payload.usage) };
     }
+    } finally { await capture?.finish(finishReason); }
     if (reasoningStarted) {
       yield { kind: "reasoning.completed", item: { type: "reasoning", text: reasoningText, providerId: request.profileId } };
       yield { kind: "thinking.completed" };
     }
+    if (finishReason === "length" && calls.size === 0) yield { kind: "response.incomplete", reason: "output-limit" };
     for (const [index, call] of [...calls.entries()].sort(([left], [right]) => left - right)) {
       const callId = call.callId || `chat-call-${index}`;
       let args: Record<string, unknown> = {};
@@ -178,7 +187,7 @@ export class OpenAIChatProvider implements ModelProvider {
         const value = JSON.parse(call.argumentsText || "{}");
         if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected tool object");
         args = value;
-        if (!call.argumentsText && finishReason === "length") argumentsError = "output-limit";
+        if (finishReason === "length") argumentsError = "output-limit";
       } catch { argumentsError = finishReason === "length" ? "output-limit" : "invalid-json"; }
       yield {
         kind: "tool-call.completed",

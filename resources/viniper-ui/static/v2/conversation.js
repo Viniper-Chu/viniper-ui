@@ -20,7 +20,7 @@ export function bottom(force = false) {
 }
 export function jumpToMessage(id) {
   followingLatest = false;
-  document.getElementById(id)?.scrollIntoView({ block: "start", behavior: "smooth" });
+  document.getElementById(id)?.scrollIntoView({ block: "start", behavior: globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth" });
 }
 export function setupConversationScroll() {
   const el = $("#conversation");
@@ -84,25 +84,45 @@ function markdown(text, streaming = false) {
     { streaming },
   );
 }
-function toolTitle(name) {
+export function toolTitle(name) {
   return {
+    "project.list": "查看项目目录", "project.search": "搜索项目", "project.read": "读取项目文件",
+    "project.write": "写入项目文件", "project.edit": "修改项目文件", "project.diff": "查看文件差异",
+    "github.repository.read": "读取 GitHub 仓库",
+    "coordination.send-message": "发送协作消息", "coordination.delegate-task": "分配协作任务",
+    "coordination.wait-for-result": "等待任务结果", "coordination.read-result": "读取任务结果",
     "file.list": "定位文件", "file.search": "查找文件", "file.read": "读取文件",
     "file.edit": "修改文字", "file.write": "写入文件",
     "file.docx.inspect": "读取文档结构", "file.docx.replace": "替换文档文字",
     "file.docx.edit": "调整文档文字与格式", "file.sqlite.inspect": "查看数据库结构",
     "file.sqlite.query": "查询数据", "file.sqlite.apply": "更新并回读数据",
     "file.image.analyze": "检查图片",
-    "file.math.handout": "制作师生讲义", "file.pdf.inspect": "读取 PDF 页面", "file.pdf.render": "渲染 PDF 页面",
+    "math.quadratic.check": "验算实根个数", "file.math.handout": "制作师生讲义", "file.pdf.inspect": "读取 PDF 页面", "file.pdf.render": "渲染 PDF 页面",
     "terminal.run": "运行命令", "terminal.output": "查看命令输出",
     "web.search": "搜索资料", "web.fetch": "阅读网页",
   }[name] || name;
+}
+export function workingLabel(value) {
+  return String(value || "等待模型响应").replace(/正在准备操作内容(?:.*)?$/, "正在准备工具调用");
 }
 function toolReceipt(tool) {
   if (tool.type !== "tool_result" && tool.type !== "tool") return "";
   const name = tool.tool_name || tool.name;
   let data;
   try { data = JSON.parse(tool.content || tool.output || ""); } catch { return ""; }
-  if (name !== "file.sqlite.apply" || !Array.isArray(data.transactions)) return "";
+  if (name === "math.quadratic.check" && data?.ok === true) {
+    const families = Array.isArray(data.families) ? data.families : [data];
+    const pieces = families.flatMap(f => Array.isArray(f?.pieces) ? f.pieces : []);
+    if (pieces.length) return "已核对 " + pieces.length + " 个参数区间或临界值";
+    if (Array.isArray(data.cases)) return "已验算 " + data.cases.length + " 组系数";
+  }
+  if (name === "file.math.handout" && data?.success === true) {
+    const facts = [Number.isInteger(data.question_count) && data.question_count + " 题",
+      Number.isInteger(data.student?.page_count) && "学生版 " + data.student.page_count + " 页",
+      Number.isInteger(data.teacher?.page_count) && "教师版 " + data.teacher.page_count + " 页"];
+    return facts.filter(Boolean).join(" · ");
+  }
+  if (name !== "file.sqlite.apply" || !Array.isArray(data?.transactions)) return "";
   const committed = data.transactions.filter((t) => t.status === "committed").length;
   const rolledBack = data.transactions.filter((t) => t.status === "rolled_back").length;
   const facts = [];
@@ -123,14 +143,20 @@ function resultFiles(message) {
   for (const item of message.segments || []) {
     if (item.type === "artifact" && item.path && item.status !== "failed" && !intermediate(item.path) && !sourceDependency(item.path)) files.set(item.path, item);
   }
+  // Filesystem watchers can report Finder metadata; it is not a deliverable.
+  for (const path of files.keys()) if (/^(?:\.DS_Store|Thumbs\.db|\._.*)$/i.test(path.split(/[\\/]/).at(-1))) files.delete(path);
   if (!files.size) return "";
-  return `<div class="result-files" aria-label="本轮文件">${[...files.values()].map((file) => {
-    const name = file.path.split("/").at(-1);
-    const parent = file.path.slice(0, -name.length).replace(/\/$/, "");
+  const cards = [...files.values()].map((file) => {
+    const name = file.path.split(/[\\/]/).at(-1);
+    const parent = file.path.slice(0, -name.length).replace(/[\\/]$/, "");
     const type = /\.pdf$/i.test(name) ? "PDF" : /\.tex$/i.test(name) ? "TeX" : /\.docx$/i.test(name) ? "Word" : /\.(db|sqlite3?)$/i.test(name) ? "数据" : /\.(py|ts|js|tsx|jsx|rs)$/i.test(name) ? "代码" : "文件";
     const glyph = type === "数据" ? "database" : ["代码", "TeX"].includes(type) ? "codeWindow" : "document";
-    return `<button class="result-file" data-file="${escape(file.path)}" title="${escape(file.path)}"><span class="result-file-icon">${icon(glyph)}</span><span class="result-file-copy"><strong>${escape(name)}</strong><small>${escape(parent)}</small></span><span class="result-file-type">${type}</span>${icon("external")}</button>`;
-  }).join("")}${[...new Set(documents.map(document => document.sourceDirectory).filter(Boolean))].map(path => `<button class="text-button" data-file="${escape(path)}" title="保留此目录中的 TeX 与页码映射文件，便于重新编译">${icon("folder")}完整 TeX 源码${icon("external")}</button>`).join("")}</div>`;
+    return `<button class="result-file" data-file="${escape(file.path)}"><span class="result-file-icon" aria-hidden="true" data-result-type="${type}">${type === "PDF" ? "PDF" : icon(glyph)}</span><span class="result-file-copy"><strong>${escape(name)}</strong><small>${escape(parent)}</small></span><span class="sr-only">${type}</span>${icon("external")}</button>`;
+  });
+  const more = cards.length > 3
+    ? `<details class="more-files"><summary data-hint="其余交付文件">${icon("chevron")}另外 ${cards.length - 3} 个文件</summary><div class="more-files-list">${cards.slice(3).join("")}</div></details>`
+    : "";
+  return `<div class="result-files" aria-label="本轮文件">${cards.slice(0, 3).join("")}${more}${[...new Set(documents.map(document => document.sourceDirectory).filter(Boolean))].map(path => `<button class="text-button" data-file="${escape(path)}">${icon("folder")}完整 TeX 源码${icon("external")}</button>`).join("")}</div>`;
 }
 function terminalHtml(tool) {
   const p = tool.presentation;
@@ -202,121 +228,147 @@ function toolHtml(tool, streaming) {
             null,
             2,
           );
-  const path = tool.input?.path || tool.path;
+  const path = String(tool.input?.path || tool.path || "");
+  const filename = path.split(/[\\/]/).filter(Boolean).at(-1);
   const receipt = toolReceipt(tool);
-  return `<div class="tool-event${error ? " error" : ""}" data-call-id="${escape(tool.call_id || tool.tool_id || tool.path || title)}">${icon(error ? "shieldAlert" : status === "running" ? "clock" : status === "cancelled" ? "pause" : "check")}<details><summary><span>${escape(toolTitle(String(title)))}</span> <small>${escape(label)}</small></summary>${path && !error ? `<button class="file-link tool-path" data-file="${escape(path)}" title="${escape(path)}">${icon("file")}${escape(path.split("/").at(-1))}</button>` : ""}${receipt ? `<p class="tool-receipt">${escape(receipt)}</p>` : ""}${terminalHtml(tool)}<pre>${escape(input + output)}</pre></details></div>`;
+  const glyph = error ? "shieldAlert" : status === "waiting" ? "clock" : ["cancelled", "interrupted"].includes(status) ? "pause" : status === "running" ? "activityTool" : "check";
+  return `<div class="tool-event${error ? " error" : ""}" data-call-id="${escape(tool.call_id || tool.tool_id || tool.path || title)}"><details>
+    <summary data-hint="工具调用详情" class="step-heading"><span class="step-glyph">${icon(glyph)}</span><span class="step-label">${escape(toolTitle(String(title)))}</span>${filename ? `<span class="step-target">${escape(filename)}</span>` : ""}<small${["success", "completed"].includes(status) && !error ? ' class="sr-only"' : ""}>${escape(error && !["failed", "error", "rejected", "denied", "blocked"].includes(status) ? "失败" : label)}</small><span class="step-chevron">${icon("chevron")}</span></summary>
+    <div class="tool-body">${path && !error ? `<button class="file-link tool-path" data-file="${escape(path)}">${icon("file")}${escape(filename || path)}</button>` : ""}${receipt ? `<p class="tool-receipt">${escape(receipt)}</p>` : ""}${terminalHtml(tool)}<pre>${escape(input + output)}</pre></div>
+  </details></div>`;
 
 }
-function messageText(message) {
+// Preserve the order of the canonical event stream. Tool results update their
+// original call row; reasoning never gets concatenated ahead of all replies.
+export function conversationTimeline(message) {
+  const parts = [], tools = new Map();
   const segments = message.segments || [];
-  const all = message.content || segments.filter(s => s.type === "text").map(s => s.content || "").join("");
-  const unchanged = { answer: all, progress: [] };
-  if (message.streaming || message.cancelled || message.steered || message.error) return unchanged;
-  const lastTool = segments.findLastIndex(s => ["tool_start", "tool_result", "tool"].includes(s.type));
-  if (lastTool < 0) return unchanged;
-  const answer = segments.slice(lastTool + 1).filter(s => s.type === "text").map(s => s.content || "").join("");
-  const progress = segments.slice(0, lastTool).filter(s => s.type === "text" && s.content?.trim()).map(s => s.content);
-  return answer.trim() && progress.length ? { answer, progress } : unchanged;
-}
-function activityData(message, progress = []) {
-  const segments = message.segments || [];
-  const thoughts =
-    segments
-      .filter((s) => s.type === "thinking" || s.type === "reasoning")
-      .map((s) => s.content || "")
-      .join("\n\n") ||
-    message.thinking ||
-    "";
-  const tools = [];
-  for (const item of segments.filter((s) =>
-    [
-      "tool_start",
-      "tool_result",
-      "tool",
-      "artifact",
-      "plan",
-      "plan_timeline",
-      "turn_diff",
-      "context_compacted",
-    ].includes(s.type),
-  )) {
-    const id = item.call_id || item.tool_call_id || item.tool_id;
-    const index = id
-      ? tools.findIndex(
-          (t) => (t.call_id || t.tool_call_id || t.tool_id) === id,
-        )
-      : -1;
-    if (item.type === "tool_result" && index >= 0)
-      tools[index] = { ...tools[index], ...item };
-    else tools.push(item);
-  }
-  const operationCount = tools.filter(t => t.type !== "artifact").length;
-  const elapsed =
-    message.elapsed ??
-    message.elapsed_seconds ??
-    message.turn_usage?.elapsed_seconds ??
-    0;
-  const outcome = message.cancelled
-    ? "已停止 · "
-    : message.steered
-      ? "已按引导中断 · "
-    : message.error
-      ? "未完成 · "
-      : "";
-  const label = message.streaming
-    ? message.working || "等待模型响应"
-    : elapsed
-      ? `${outcome}用时 ${timeLabel(elapsed)}`
-      : `${outcome}用时不足 1 秒`;
-  return { thoughts, tools, label, count: !message.streaming && operationCount ? `${operationCount} 次操作${progress.length ? ` · ${progress.length} 条进展` : ""}` : "", time: message.streaming && elapsed ? `· ${timeLabel(elapsed)}` : "" };
-}
-function activityBodyHtml(message, progress, data) {
-  return `<div class="thinking-content">${data.thoughts ? markdown(data.thoughts, message.streaming) : ""}</div><div class="progress-content">${progress.length ? `<p>执行中的回复</p>${progress.map(text => markdown(text, false)).join("")}` : ""}</div><div class="activity-tools">${data.tools.map(t => `<div>${toolHtml(t, Boolean(message.streaming))}</div>`).join("")}</div><span class="activity-empty"${data.thoughts || data.tools.length ? " hidden" : ""}>${message.streaming ? "等待模型响应…" : "本轮没有额外的执行记录。"}</span>`;
-}
-function activityHtml(message, progress = []) {
-  const data = activityData(message, progress);
-  return `<details class="activity"><summary><span class="activity-symbol">${message.streaming ? '<span class="spinner"></span>' : icon("chevron")}</span><span class="activity-label">${escape(data.label)}</span><small class="activity-count"${data.count ? "" : " hidden"}>${escape(data.count)}</small><span class="activity-time"${data.time ? "" : " hidden"}>${escape(data.time)}</span></summary><div class="activity-body">${message.streaming ? "" : activityBodyHtml(message, progress, data)}</div></details>`;
-}
-function updateActivityBody(activity, message, progress, data) {
-  const body = activity.querySelector(".activity-body");
-  if (!body.querySelector(".thinking-content")) body.innerHTML = activityBodyHtml({ streaming: true }, [], { thoughts: "", tools: [] });
-  updateMarkdown(body.querySelector(".thinking-content"), data.thoughts, message.streaming);
-  updateMarkup(body.querySelector(".progress-content"), progress.length ? `<p>执行中的回复</p>${progress.map(text => markdown(text, false)).join("")}` : "");
-  const list = body.querySelector(".activity-tools");
-  data.tools.forEach((tool, index) => {
-    let slot = list.children[index];
-    if (!slot) { slot = document.createElement("div"); list.append(slot); }
-    updateMarkup(slot, toolHtml(tool, Boolean(message.streaming)));
+  const hasThoughts = segments.some(s => ["thinking", "reasoning"].includes(s.type));
+  const hasText = segments.some(s => s.type === "text");
+  const pushText = (kind, content, source) => {
+    if (!content) return;
+    const last = parts.at(-1);
+    if (last?.kind === kind) last.content += content;
+    else parts.push({ kind, content, key: `${kind}-${source}` });
+  };
+  if (!hasThoughts && message.thinking) pushText("thinking", message.thinking, "legacy");
+  segments.forEach((segment, index) => {
+    if (["thinking", "reasoning", "text"].includes(segment.type)) {
+      pushText(segment.type === "text" ? "text" : "thinking", segment.content || "", index);
+      return;
+    }
+    if (["tool_start", "tool_result", "tool"].includes(segment.type)) {
+      const id = segment.call_id || segment.tool_call_id || segment.tool_id;
+      const prior = id && tools.get(id);
+      if (prior) { prior.tool = { ...prior.tool, ...segment }; prior.resultSource = segment; }
+      else {
+        const part = { kind: "tool", key: `tool-${id || index}`, source: segment, tool: { ...segment } };
+        parts.push(part);
+        if (id) tools.set(id, part);
+      }
+    } else if (["plan", "plan_timeline", "turn_diff", "context_compacted"].includes(segment.type)) {
+      parts.push({ kind: "tool", key: `event-${index}`, source: segment, tool: segment });
+    }
   });
-  while (list.children.length > data.tools.length) list.lastElementChild.remove();
-  const empty = body.querySelector(".activity-empty");
-  empty.hidden = Boolean(data.thoughts || data.tools.length);
-  empty.textContent = message.streaming ? "等待模型响应…" : "本轮没有额外的执行记录。";
+  if (!hasText) pushText("text", message.content || "", "legacy");
+  else {
+    const represented = segments.filter(s => s.type === "text").map(s => s.content || "").join("");
+    if (represented && message.content?.startsWith(represented)) pushText("text", message.content.slice(represented.length), "tail");
+  }
+  const lastWork = parts.findLastIndex(p => p.kind !== "text");
+  for (let i = 0; i < parts.length; i++) parts[i].final = parts[i].kind === "text" && i > lastWork;
+  return parts;
+}
+function activityData(message, parts) {
+  const count = parts.filter(p => p.kind === "tool" && ["tool", "tool_start", "tool_result"].includes(p.tool.type)).length;
+  const elapsed = message.elapsed ?? message.elapsed_seconds ?? message.turn_usage?.elapsed_seconds ?? 0;
+  const outcome = message.cancelled ? "已停止 · " : message.steered ? "已按引导中断 · " : message.error ? "未完成 · " : "";
+  return {
+    label: `${outcome}用时 ${elapsed ? timeLabel(elapsed) : "不足 1 秒"}`,
+    count: count ? `${count} 次操作` : "",
+    expandable: parts.some(part => isFoldable(part)),
+    outcome,
+  };
+}
+function isFoldable(part) {
+  if (part.kind !== "tool") return part.kind === "thinking";
+  const tool = part.tool;
+  if (!["tool", "tool_start", "tool_result"].includes(tool.type) || tool.is_error) return false;
+  return ["success", "completed"].includes(tool.status || (tool.type === "tool_start" ? "running" : "success"));
+}
+function timelinePartHtml(part, streaming, live, thinkingActive) {
+  if (part.kind === "text") return `<div class="answer${part.final ? " final-answer" : " progress-answer"}">${markdown(part.content, streaming && live)}</div>`;
+  if (part.kind === "tool") return toolHtml(part.tool, streaming);
+  return `<details class="thought-step"><summary data-hint="思考记录" class="step-heading"><span class="step-glyph">${icon("thought")}</span><span class="step-label">${thinkingActive ? "正在思考" : "思考过程"}</span><span class="step-chevron">${icon("chevron")}</span></summary><div class="thinking-content"></div></details>`;
+}
+function timelineHtml(message, parts) {
+  return parts.map((part, i) => {
+    const last = i === parts.length - 1;
+    const thinking = Boolean(message.streaming && last && part.kind === "thinking" && message.working === "正在思考");
+    return `<div class="timeline-part" data-kind="${part.kind}" data-foldable="${isFoldable(part)}" data-thinking="${thinking}" data-part-key="${escape(part.key)}">${timelinePartHtml(part, Boolean(message.streaming), last, thinking)}</div>`;
+  }).join("");
+}
+function copyAnswer(message) {
+  const parts = conversationTimeline(message).filter(p => p.kind === "text");
+  const final = parts.filter(p => p.final);
+  return (final.length ? final : parts).map(p => p.content).join("\n\n");
 }
 function messageHtml(message) {
   if (message.role === "user")
     return `<div class="user-content">${message.guidance ? `<span class="guidance-label">${icon("steer")}引导</span>` : ""}${escape(message.content)}${(message.attachments || []).map((a) => `<div><button class="file-link" data-file="${escape(a.path || "")}">${icon("file")}${escape(a.name || a.path)}</button></div>`).join("")}</div>`;
-  const { answer: content, progress } = messageText(message);
-  return `${activityHtml(message, progress)}<div class="answer">${markdown(content, Boolean(message.streaming))}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan">按此计划开始实施</button>' : ""}</div><div class="message-actions"><button class="icon-button" data-copy="${escape(content)}" title="复制回答" aria-label="复制回答">${icon("copy")}</button></div>`;
+  const parts = conversationTimeline(message), data = activityData(message, parts), content = copyAnswer(message);
+  return `<button class="turn-summary"${message.streaming || !data.expandable ? " hidden" : ""} data-toggle-thoughts aria-expanded="false"><span class="activity-label">${escape(data.label)}</span><small class="activity-count">${escape(data.count)}</small><span class="step-chevron">${icon("chevron")}</span></button><span class="turn-outcome"${!message.streaming && !data.expandable && data.outcome ? "" : " hidden"}>${escape(data.label)}</span><div class="turn-timeline">${timelineHtml(message, parts)}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : ""}</div><div class="message-actions"${content.trim() ? "" : " hidden"}><button class="icon-button" data-copy="${escape(content)}" aria-label="复制回答">${icon("copy")}</button></div>`;
 }
 function updateMessage(node, message) {
   node._message = message;
   if (message.role === "user") { updateMarkup(node, messageHtml(message)); return; }
-  const { answer, progress } = messageText(message);
-  const activity = node.querySelector(".activity");
-  const data = activityData(message, progress);
-  updateMarkup(activity.querySelector(".activity-symbol"), message.streaming ? '<span class="spinner"></span>' : icon("chevron"));
-  for (const [className, text] of [["activity-label", data.label], ["activity-count", data.count], ["activity-time", data.time]]) {
-    const part = activity.querySelector(`.${className}`);
+  const parts = conversationTimeline(message), data = activityData(message, parts);
+  const summary = node.querySelector(".turn-summary");
+  if (summary.hidden && !message.streaming && node.querySelector("details[open]")) summary.setAttribute("aria-expanded", "true");
+  summary.hidden = Boolean(message.streaming || !data.expandable);
+  const outcome = node.querySelector(".turn-outcome");
+  outcome.hidden = Boolean(message.streaming || data.expandable || !data.outcome);
+  if (!outcome.hidden) outcome.textContent = data.label;
+  for (const [className, text] of [["activity-label", data.label], ["activity-count", data.count]]) {
+    const part = node.querySelector(`.${className}`);
     if (part.textContent !== text) part.textContent = text;
     part.hidden = !text;
   }
-  // A collapsed trace does no Markdown work on streaming tokens or timer ticks.
-  if (activity.open) updateActivityBody(activity, message, progress, data);
-  updateMarkdown(node.querySelector(".answer"), answer, message.streaming);
+  const list = node.querySelector(".turn-timeline");
+  const existing = new Map([...list.children].map(slot => [slot.dataset.partKey, slot]));
+  parts.forEach((part, index) => {
+    let slot = existing.get(part.key);
+    if (!slot) {
+      slot = document.createElement("div"); slot.className = "timeline-part"; slot.dataset.partKey = part.key;
+      slot.innerHTML = timelinePartHtml(part, Boolean(message.streaming), index === parts.length - 1);
+    }
+    slot.dataset.kind = part.kind;
+    slot.dataset.foldable = String(isFoldable(part));
+    const thinking = Boolean(message.streaming && index === parts.length - 1 && part.kind === "thinking" && message.working === "正在思考");
+    slot.dataset.thinking = String(thinking);
+    if (list.children[index] !== slot) list.insertBefore(slot, list.children[index] || null);
+    const previousPart = slot._part, wasStreaming = slot._streaming;
+    slot._part = part; slot._streaming = message.streaming;
+    if (part.kind === "text") {
+      const answer = slot.querySelector(".answer");
+      answer.classList.toggle("final-answer", part.final); answer.classList.toggle("progress-answer", !part.final);
+      updateMarkdown(answer, part.content, Boolean(message.streaming) && index === parts.length - 1);
+    } else if (part.kind === "tool") {
+      if (previousPart?.source !== part.source || previousPart?.resultSource !== part.resultSource || wasStreaming !== message.streaming) updateMarkup(slot, toolHtml(part.tool, Boolean(message.streaming)));
+    }
+    else {
+      const detail = slot.querySelector("details"), label = detail.querySelector(".step-label");
+      const text = thinking ? "正在思考" : "思考过程";
+      if (label.textContent !== text) label.textContent = text;
+      if (detail.open) updateMarkdown(detail.querySelector(".thinking-content"), part.content, Boolean(message.streaming));
+    }
+  });
+  const retained = new Set(parts.map(p => p.key));
+  for (const slot of [...list.children]) if (!retained.has(slot.dataset.partKey)) slot.remove();
   updateMarkup(node.querySelector(".message-results"), resultFiles(message));
-  updateMarkup(node.querySelector(".message-plan"), message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan">按此计划开始实施</button>' : "");
-  const copy = node.querySelector("[data-copy]");
+  updateMarkup(node.querySelector(".message-plan"), message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : "");
+  const answer = copyAnswer(message), copy = node.querySelector("[data-copy]");
+  node.querySelector(".message-actions").hidden = !answer.trim();
   if (copy.dataset.copy !== answer) copy.dataset.copy = answer;
 }
 export function renderMessages(messages, { preserveView = false } = {}) {
@@ -350,10 +402,18 @@ export function appendMessage(message, index = $("#messages").children.length) {
   node.dataset.messageIndex = index;
   node._message = message;
   node.innerHTML = messageHtml(message);
-  node.querySelector(".activity")?.addEventListener("toggle", (event) => {
-    if (!event.target.open) return;
-    const { progress } = messageText(node._message);
-    updateActivityBody(event.target, node._message, progress, activityData(node._message, progress));
+  node.addEventListener("toggle", (event) => {
+    if (!event.target.matches?.(".thought-step") || !event.target.open) return;
+    const slot = event.target.closest(".timeline-part");
+    const part = slot._part || conversationTimeline(node._message).find(p => p.key === slot.dataset.partKey);
+    if (part) updateMarkdown(event.target.querySelector(".thinking-content"), part.content, Boolean(node._message.streaming));
+  }, true);
+  node.addEventListener("click", event => {
+    const summary = event.target.closest("[data-toggle-thoughts]");
+    if (!summary) return;
+    const open = summary.getAttribute("aria-expanded") !== "true";
+    summary.setAttribute("aria-expanded", String(open));
+    for (const thought of node.querySelectorAll(".thought-step")) thought.open = open;
   });
   $("#messages").append(node);
   decorateFiles(node);
@@ -372,8 +432,16 @@ export function paintRun(run) {
   updateMessage(node, run.message);
   bottom();
 }
+function appendLiveSegment(message, type, content) {
+  message.segments ||= [];
+  const last = message.segments.at(-1);
+  if (last?.type === type) last.content = (last.content || "") + content;
+  else message.segments.push({ type, content });
+}
 export function projectEvent(run, event) {
   if (event.sequence && event.sequence <= run.sequence) return;
+  if (event.turn_started_at > 0) run.started = event.turn_started_at * 1000;
+  if (event.activity_phase) run.phase = event.activity_phase;
   if (event.sequence) run.sequence = event.sequence;
   if (event.run_id) run.runId = event.run_id;
   if (event.type === "queue_dispatch") {
@@ -386,7 +454,7 @@ export function projectEvent(run, event) {
       streaming: true,
       elapsed: 0,
     };
-    run.started = Date.now();
+    if (!event.turn_started_at) run.started = Date.now();
     if (state.session?.session_id === run.sessionId) {
       appendMessage({ role: "user", content: event.item?.text || "" });
       run.node = appendMessage(run.message);
@@ -395,11 +463,18 @@ export function projectEvent(run, event) {
   }
   const m = run.message,
     type = event.type;
-  if (type === "text") {
+  if (["text", "thinking", "thinking_delta", "tool_start", "tool_result", "working_status"].includes(type)) run.lastActivityAt = Date.now();
+  if (type === "run_status" && event.status === "cancelled") {
+    run.stopRequested = true;
+    run.cancelAcknowledged = true;
+    m.stopping = true;
+  } else if (type === "text") {
     m.content += event.content || "";
+    appendLiveSegment(m, "text", event.content || "");
     m.working = "正在回答";
   } else if (type === "thinking" || type === "thinking_delta") {
     m.thinking += event.content || "";
+    appendLiveSegment(m, "thinking", event.content || "");
     m.working = "正在思考";
   } else if (type === "tool_start") {
     m.segments.push({ ...event });
@@ -423,16 +498,20 @@ export function projectEvent(run, event) {
     m.turn_usage = event.turn_usage;
   } else if (type === "usage") run.usage = event.usage;
   else if (["permission_request", "interaction_request"].includes(type))
-    run.interaction = event;
+    { run.interaction = event; m.working = "等待确认"; }
   else if (["interaction_resolved", "permission_resolved"].includes(type))
-    run.interaction = null;
+    { run.interaction = null; m.working = "正在继续处理"; }
   else if (type === "error") {
     run.error = true;
     m.error = true;
-    m.content += `\n\n${event.content || "本次任务未完成"}`;
+    const errorText = `\n\n${event.content || "本次任务未完成"}`;
+    m.content += errorText;
+    appendLiveSegment(m, "text", errorText);
   } else if (type === "done") {
     run.done = true;
     m.streaming = false;
+    m.stopping = false;
+    if (run.cancelAcknowledged) m.cancelled = true;
     run.interaction = null;
   } else if (type === "steering") {
     run.steering = event.receipt;
@@ -449,7 +528,7 @@ export function projectEvent(run, event) {
       // new timeline entries; never move or concatenate the previous answer.
       if (visible && run.node?.isConnected) updateMessage(run.node, { ...event.previous_message, streaming: false });
       run.message = { ...event.message, streaming: true, elapsed: 0, working: "正在按引导继续" };
-      run.started = Date.now();
+      if (!event.turn_started_at) run.started = Date.now();
       run.interaction = null;
       run.node = visible ? appendMessage(run.message) : null;
     }
@@ -457,10 +536,11 @@ export function projectEvent(run, event) {
 }
 export function updateRail() {
   const nodes = [...$("#messages").querySelectorAll(".message.user")];
+  $("#turn-index-button").hidden = !$("#messages").children.length;
   $("#message-rail").innerHTML = nodes
     .map(
       (node) =>
-        `<button data-jump="${node.id}" aria-label="跳转到消息：${escape(node._message?.content?.slice(0, 90) || "历史消息")}" title="${escape(node._message?.content?.slice(0, 90) || "历史消息")}"></button>`,
+        `<button data-jump="${node.id}" aria-label="跳转到消息：${escape(node._message?.content?.slice(0, 90) || "历史消息")}"></button>`,
     )
     .join("");
 }

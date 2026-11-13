@@ -54,3 +54,24 @@ test("document helper host transmits literal JSON without shell quoting and canc
     assert.equal((await host.execute("pdf", { path: "file.pdf" }, new AbortController().signal)).success, true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("file-backed math requests keep complete input on disk, require the planned count, and claim the source for reading", async () => {
+  const root = await mkdtemp(join(process.cwd(), "codex", "运行残留", "document-request-"));
+  const source = join(root, "完整题解.jsonl");
+  const calls: Record<string, unknown>[] = [];
+  const tool = createDocumentWorkflowTools({ available: op => op === "handout", execute: async (_, input) => { calls.push(input); return { success: true }; } })[0];
+  const context = { sessionId: "s", runId: "r", taskDirectory: root, signal: new AbortController().signal };
+  const base = { title_tex: "完整题目", student_name: "学生", teacher_name: "教师", questions_file: source, expected_question_count: 19 };
+  const invoke = (input: Record<string, unknown>) => tool.execute({ id: "call", name: tool.name, input, readOnly: false, scope: "computer", summary: "compile" }, context);
+  try {
+    const original = JSON.stringify({ question_tex: "完整题干", answer_tex: "答案", solution_tex: ["完整推导".repeat(3000)] });
+    await writeFile(source, original);
+    assert.equal((await invoke({ ...base, expected_question_count: undefined })).isError, true);
+    assert.equal((await invoke({ ...base, questions: [] })).isError, true);
+    assert.equal(calls.length, 0);
+    assert.equal((await invoke(base)).isError, false);
+    assert.equal(calls[0].questions_file, source); assert.equal(calls[0].expected_question_count, 19);
+    assert.equal("questions" in calls[0], false);
+    assert.deepEqual(tool.resourceClaims!({ id: "c", name: tool.name, input: base, readOnly: false, scope: "computer", summary: "" }, context).at(-1), { key: source, access: "read" });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

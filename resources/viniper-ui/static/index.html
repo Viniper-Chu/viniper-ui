@@ -25,38 +25,33 @@
             class="icon-button"
             data-action="toggle-sidebar"
             aria-label="收起侧栏"
-            title="收起侧栏 ⌘B"
+            data-hint="收起侧栏 ⌘B"
             data-icon="sidebar"
           ></button>
         </div>
-        <button class="new-chat" data-action="new-chat">
+        <button data-hint="开始新会话  ⌘K" class="new-chat" data-action="new-chat">
           <span data-icon="compose"></span><span>新建会话</span><kbd>⌘K</kbd>
         </button>
         <nav class="primary-nav" aria-label="主要页面">
-          <button class="nav-item active" data-view="chat">
+          <button data-hint="返回会话，继续处理当前题目" class="nav-item active" data-view="chat">
             <span data-icon="chat"></span>会话</button
-          ><button class="nav-item" data-view="extensions">
+          ><button data-hint="浏览技能和可调用的工具" class="nav-item" data-view="extensions">
             <span data-icon="grid"></span>技能与插件</button
-          ><button class="nav-item" data-view="tasks">
+          ><button data-hint="查看目标进度和定时任务" class="nav-item" data-view="tasks">
             <span data-icon="tasks"></span>目标与任务
           </button>
         </nav>
-        <label class="history-search"
-          ><span data-icon="search"></span
-          ><input
-            id="session-search"
-            type="search"
-            placeholder="查找会话"
-            aria-label="查找历史会话"
-        /></label>
-        <div class="section-caption">最近会话</div>
+        <button data-hint="查找会话、操作或设置  ⇧⌘K" class="quick-trigger" data-action="quick" aria-label="快速查找会话与操作">
+          <span data-icon="search"></span><span>快速查找</span><kbd>⇧⌘K</kbd>
+        </button>
+        <div id="history-heading" class="history-heading">历史会话</div>
         <nav id="session-list" class="session-list" aria-label="历史会话"></nav>
         <div class="sidebar-footer">
-          <button class="profile-button" data-view="settings">
+          <button data-hint="打开模型和应用设置  ⌘," class="profile-button" data-view="settings">
             <span class="profile-avatar" data-icon="settings"></span
             ><span
               ><strong>设置与模型</strong
-              ><small id="connection-status">正在连接</small></span
+              ><small id="connection-status" hidden></small></span
             ><span data-icon="chevron"></span>
           </button>
         </div>
@@ -69,13 +64,15 @@
             data-action="toggle-sidebar"
             data-icon="sidebar"
             aria-label="展开侧栏"
-            title="展开侧栏 ⌘B"
+            data-hint="展开侧栏 ⌘B"
             hidden
           ></button>
+          <button data-hint="返回会话，继续处理当前题目" id="return-chat" class="text-button back-link" data-view="chat" hidden><span data-icon="back"></span>返回会话</button>
           <div class="page-heading">
-            <span id="session-title" class="title-button">新会话</span
+            <span id="session-title" class="title-button"></span
             ><button
               id="project-button"
+              hidden
               class="project-button"
               data-action="project"
             >
@@ -84,12 +81,14 @@
             </button>
           </div>
           <div class="topbar-actions">
-            <button
+            <button data-hint="跳转到本次提问或打开交付文件" id="turn-index-button" class="text-button index-trigger" data-action="turn-index" aria-label="会话目录与文件" hidden>
+              <span data-icon="outline"></span><span>会话目录</span>
+            </button>
+            <button data-hint="查看会话操作与工作目录"
               id="session-more"
               class="icon-button"
               data-menu="session"
               aria-label="会话选项"
-              title="会话选项"
               data-icon="more"
             ></button>
           </div>
@@ -101,11 +100,23 @@
               class="message-rail"
               aria-label="跳转到历史消息"
             ></nav>
-            <div id="conversation" class="conversation">
+            <div id="conversation" class="conversation" tabindex="0" aria-label="会话内容">
               <section id="welcome" class="welcome">
-                <p class="eyebrow"><span class="welcome-line"></span>你的日常工作台</p>
-                <h1>今天，我们完成什么？</h1>
-                <p class="welcome-copy">带上文件和想法，从这里开始。</p>
+                <div class="welcome-heading">
+                  <span class="welcome-emblem" data-icon="brand" aria-hidden="true"></span>
+                  <h1>今天解哪道题？</h1>
+<button class="welcome-context" data-action="project" data-hint="选择工作目录"><span data-icon="folder"></span><span id="welcome-project">选择工作目录</span></button>
+                </div>
+                <button class="example-graph" data-hint="将这道参数题放入输入框" aria-label="试一道参数题" data-prompt="在 −1 ≤ x &lt; 3 上，水平线 y=t 与抛物线 y=4−(x−1)² 的左右两支各有几个交点？请给出分段证明。">
+                  <svg viewBox="0 0 155 76" aria-hidden="true" fill="none">
+                    <path class="graph-grid" d="M12 22h131M12 44h131M12 66h131M32 9v58M64 9v58M96 9v58M128 9v58"/>
+                    <path class="graph-axis" d="M10 66h134"/>
+                    <path class="graph-level" d="M14 44h124" stroke-dasharray="3 4"/>
+                    <path class="graph-curve" d="M26 66 Q75 -38 124 66"/>
+                    <g class="graph-points"><circle cx="37.8" cy="44" r="2.7"/><circle cx="112.2" cy="44" r="2.7"/></g>
+                  </svg>
+                  <span>试一道参数题<span data-icon="arrowRight"></span></span>
+                </button>
               </section>
               <div id="messages" class="messages"></div>
             </div>
@@ -119,6 +130,7 @@
             ></button>
           </div>
           <div class="composer-area">
+            <div id="model-notice" class="model-notice" role="status" hidden></div>
             <div id="task-banner" class="task-banner" hidden></div>
             <div
               id="interaction"
@@ -127,6 +139,15 @@
               hidden
             ></div>
             <div id="queue" class="queue-list" hidden></div>
+            <div id="work-indicator" class="work-indicator" hidden>
+              <div class="work-status">
+                <span id="work-signal" class="phase-signal" aria-hidden="true"></span>
+                <span id="work-label" role="status"></span>
+                <span id="work-detail" class="work-detail" hidden></span>
+                <span id="work-time"></span>
+                <button class="text-button" data-action="bottom" data-hint="查看最新执行过程">查看进展 <span data-icon="down"></span></button>
+              </div>
+            </div>
             <div class="composer">
               <div id="attachments" class="attachment-list" hidden></div>
               <div id="mode-chip" class="mode-chip" hidden></div>
@@ -134,7 +155,7 @@
                 id="prompt"
                 rows="1"
                 aria-label="消息"
-                placeholder="描述任务，或添加需要处理的文件…"
+                placeholder="输入题目，或添加题图、讲义…" title="Enter 发送 · Shift Enter 换行"
               ></textarea>
               <div class="composer-toolbar">
                 <div class="composer-left">
@@ -144,20 +165,8 @@
                     data-menu="add"
                     data-icon="plus"
                     aria-label="添加附件、模式或插件"
-                    title="添加附件、模式或插件"
-                  ></button
-                  ><button
-                    id="permission-button"
-                    class="text-button permission-button"
-                    data-menu="permission"
-                    aria-label="访问权限"
-                  >
-                    <span data-icon="shield"></span
-                    ><span id="permission-label">每次询问</span
-                    ><span data-icon="chevron"></span>
-                  </button>
-                </div>
-                <div class="composer-right">
+                    data-hint="添加附件、模式或插件"
+                  ></button>
                   <button
                     id="model-button"
                     class="text-button model-button"
@@ -168,7 +177,10 @@
                     ><span class="model-divider">·</span
                     ><span id="reasoning-label">中</span
                     ><span data-icon="chevron"></span></button
-                  ><button
+                  >
+                </div>
+                <div class="composer-right">
+                  <button
                     id="context-button"
                     class="context-button"
                     data-menu="context"
@@ -188,7 +200,7 @@
                     id="steer-button"
                     class="text-button steer-button"
                     data-action="steer"
-                    title="引导当前任务 ⌘Enter"
+                    data-hint="引导当前任务 ⌘Enter"
                     hidden
                   >
                     <span data-icon="steer"></span><span>引导</span></button
@@ -205,30 +217,26 @@
                     class="send-button"
                     data-action="send"
                     aria-label="发送消息"
-                    data-icon="up"
+                    data-icon="send"
                   ></button>
                 </div>
               </div>
             </div>
-            <div class="composer-footnote">
-              <span id="run-status" role="status">准备就绪</span
-              ><span id="input-hint">Enter 发送 · Shift Enter 换行</span>
-            </div>
+            <small id="input-hint" class="composer-hint" hidden></small>
           </div>
           <section id="starters" class="starters" aria-label="常用工作">
-            <div class="starter-heading"><span>从一件具体的事开始</span><span>选择后可修改</span></div>
             <div class="starter-grid">
-              <button data-prompt="帮我修改这份文档。请先确认文件和需要修改的段落，保留原有格式与其他内容，完成后回读核对。">
-                <span class="starter-icon" data-icon="document"></span><strong>文档整理</strong><small>改文字，保留原格式</small><span class="starter-arrow" data-icon="arrowRight"></span>
+              <button data-hint="将解题要求填入输入框" data-prompt="请解答下面的高中数学题，写出关键推导并核对答案。题目：">
+                <span class="starter-icon" data-icon="math"></span><strong>解一道题</strong>
               </button>
-              <button data-prompt="帮我核对并处理这份数据。请先读取实际表结构，说明改动范围，完成后查询核验。">
-                <span class="starter-icon" data-icon="database"></span><strong>数据处理</strong><small>查结构，核对每次修改</small><span class="starter-arrow" data-icon="arrowRight"></span>
+              <button data-hint="将证明检查要求填入输入框" data-prompt="请逐步检查下面的证明，指出第一处有问题的推理和理由，并给出修正。题目与证明：">
+                <span class="starter-icon" data-icon="proof"></span><strong>检查证明</strong>
               </button>
-              <button data-prompt="帮我修复这个项目中的问题。先读相关代码，定位原因，尽量局部修改，并运行相关测试。">
-                <span class="starter-icon" data-icon="codeWindow"></span><strong>代码修复</strong><small>定位原因，运行验证</small><span class="starter-arrow" data-icon="arrowRight"></span>
+              <button data-hint="将读图要求填入输入框" data-prompt="请核对题图上的已知条件、点名和设问，再给出解答；看不清的标记请指出。">
+                <span class="starter-icon" data-icon="geometry"></span><strong>读图解题</strong>
               </button>
-              <button data-prompt="帮我整理这份数学材料。请保留原题与完整原解，核对关键推导和边界；如需讲义，制作便于阅读的师生版本。">
-                <span class="starter-icon" data-icon="math"></span><strong>数学与讲义</strong><small>完整推导，清晰呈现</small><span class="starter-arrow" data-icon="arrowRight"></span>
+              <button data-hint="将师生讲义编译要求填入输入框" data-prompt="请将下面的题目编译成学生版和教师版讲义，保留完整题干、图形和已有原解，并核对最终页面。题源：">
+                <span class="starter-icon" data-icon="book"></span><strong>编译讲义</strong>
               </button>
             </div>
           </section>
@@ -239,17 +247,20 @@
           aria-label="技能与插件"
           hidden
         >
+          <div id="extension-catalog">
           <header class="content-heading">
-            <div>
-              <p class="eyebrow">工具与工作方法</p>
-              <h1>技能与插件</h1>
-              <p>连接实际工具，复用已经熟悉的工作方法。</p>
-            </div>
-            <button class="secondary-button" data-action="refresh-extensions">
+            <h1>技能与插件</h1>
+            <button data-hint="重新读取本机技能和工具插件" class="secondary-button" data-action="refresh-extensions">
               <span data-icon="refresh"></span>刷新
             </button>
           </header>
-          <label class="field search-field"
+          <div class="page-tools">
+            <div class="filter-options" role="group" aria-label="筛选扩展类型">
+              <button data-hint="显示所有技能与插件" data-extension-filter="all" aria-pressed="true">全部</button>
+              <button data-hint="只显示工具插件" data-extension-filter="plugins" aria-pressed="false">工具插件</button>
+              <button data-hint="只显示工作技能" data-extension-filter="skills" aria-pressed="false">工作技能</button>
+            </div>
+            <label class="field search-field"
             ><span data-icon="search"></span
             ><input
               id="extension-search"
@@ -257,10 +268,29 @@
               placeholder="搜索技能与插件"
               aria-label="搜索技能与插件"
           /></label>
-          <h2 class="group-title">工具插件 <small>执行具体操作</small></h2>
-          <div id="plugin-list" class="card-grid"></div>
-          <h2 class="group-title">工作技能 <small>复用方法与约定</small></h2>
-          <div id="skill-list" class="card-grid"></div>
+          </div>
+          <section id="plugins-section" class="catalog-section" aria-labelledby="plugins-heading">
+            <h2 id="plugins-heading" class="group-title">工具插件<span id="plugin-count" class="section-count"></span></h2>
+            <div id="plugin-list" class="card-grid"></div>
+          </section>
+          <section id="skills-section" class="catalog-section" aria-labelledby="skills-heading">
+            <h2 id="skills-heading" class="group-title">工作技能<span id="skill-count" class="section-count"></span></h2>
+            <div id="skill-list" class="card-grid"></div>
+          </section>
+          </div>
+          <article id="extension-detail" hidden>
+            <button data-hint="返回原筛选结果  Esc" class="text-button back-link" data-action="back-extensions"><span data-icon="back"></span>技能与插件</button>
+            <header class="detail-heading"><span class="detail-icon" id="detail-icon"></span><h1 id="detail-title" tabindex="-1"></h1></header>
+            <div id="detail-actions" hidden><button class="primary-button" data-action="use-skill"></button><button class="secondary-button" data-action="edit-skill">编辑说明</button></div>
+            <div id="detail-content"></div>
+          </article>
+          <article class="directory-editor" id="skill-editor" hidden>
+            <button class="text-button back-link" data-action="cancel-skill-edit"><span data-icon="back"></span>技能详情</button>
+            <h1 id="skill-edit-title" tabindex="-1">编辑技能说明</h1>
+            <form id="skill-edit-form"><label class="field"><span id="skill-editor-source"></span><textarea name="content" aria-label="技能说明源码" rows="15" required spellcheck="false"></textarea></label>
+              <footer class="editor-bar"><span role="status"></span><button type="button" class="secondary-button" data-action="cancel-skill-edit">取消</button><button class="primary-button" type="submit">保存修改</button></footer>
+            </form>
+          </article>
         </section>
         <section
           id="tasks-view"
@@ -268,121 +298,129 @@
           aria-label="目标与定时任务"
           hidden
         >
+          <div id="task-catalog">
           <header class="content-heading">
-            <div>
-              <p class="eyebrow">持续推进</p>
-              <h1>目标与任务</h1>
-              <p>查看进度，安排重复工作，随时继续或暂停。</p>
-            </div>
-            <button class="primary-button" data-action="new-schedule">
-              <span data-icon="plus"></span>定时任务
-            </button>
+            <h1>目标与任务</h1>
           </header>
-          <h2 class="group-title">目标</h2>
-          <div id="goal-list" class="task-list"></div>
-          <h2 class="group-title">定时任务 <small>Asia/Shanghai</small></h2>
-          <div id="schedule-list" class="task-list"></div>
-        </section>
-        <section
-          id="settings-view"
-          class="page content-page"
-          aria-label="设置"
-          hidden
-        >
-          <header class="content-heading">
-            <div>
-              <p class="eyebrow">工作偏好</p>
-              <h1>设置</h1>
-              <p>连接模型，选择适合自己的工作方式。</p>
+          <div class="page-tools">
+            <div class="filter-options" role="group" aria-label="筛选任务状态">
+              <button data-hint="显示所有状态的任务" data-task-filter="all" aria-pressed="true">全部</button>
+              <button data-hint="查看进行中的目标和已启用的定时任务" data-task-filter="open" aria-pressed="false">进行中</button>
+              <button data-hint="查看已暂停或需处理的任务" data-task-filter="attention" aria-pressed="false">待处理</button>
+              <button data-hint="查看已经完成的目标" data-task-filter="closed" aria-pressed="false">已完成</button>
             </div>
-            <span class="version-badge"
-              >Viniper <span id="version">2.0.2</span></span
-            >
-          </header>
-          <form id="settings-form">
-            <section class="settings-section">
-              <div class="settings-heading">
-                <h2>连接与模型</h2>
-                <p>密钥由本机钥匙串保护。</p>
-              </div>
-              <div class="form-grid">
-                <label class="field"
-                  >服务名称<input
-                    name="provider-label"
-                    autocomplete="off" /></label
-                ><label class="field"
-                  >协议<select name="provider-id">
-                    <option value="custom">OpenAI 兼容</option>
-                    <option value="deepseek">DeepSeek</option>
-                    <option value="openai">OpenAI</option>
-                  </select></label
-                ><label class="field full"
-                  >服务地址<input
-                    name="base-url"
-                    type="url"
-                    placeholder="http://127.0.0.1:18080/v1" /></label
-                ><label class="field"
-                  >模型 ID<input name="model-id" autocomplete="off" /></label
-                ><label class="field"
-                  >API key<input
-                    name="api-key"
-                    type="password"
-                    autocomplete="new-password"
-                    placeholder="留空保留现有密钥"
-                /></label>
-              </div>
-            </section>
-            <section class="settings-section">
-              <div class="settings-heading">
-                <h2>外观与工作目录</h2>
-                <p>使用清晰、统一的本机字体。</p>
-              </div>
-              <div class="form-grid">
-                <label class="field"
-                  >主题<select name="theme">
-                    <option value="system">跟随系统</option>
-                    <option value="light">月白</option>
-                    <option value="dark">夜青</option>
-                  </select></label
-                ><label class="field"
-                  >文字大小<select name="font-size">
-                    <option value="small">紧凑</option>
-                    <option value="normal">标准</option>
-                    <option value="large">舒适</option>
-                  </select></label
-                ><label class="field full"
-                  >默认工作目录<input name="workdir"
-                /></label>
-              </div>
-            </section>
-            <section class="settings-section">
-              <div class="settings-heading">
-                <h2>长期协作规则</h2>
-                <p>简短的全局约定；项目里的 AGENTS.md 会按实际目录加载。</p>
-              </div>
-              <label class="field">
-                <textarea
-                  name="instructions"
-                  rows="6"
-                  aria-label="长期协作规则"
-                ></textarea>
-              </label>
-            </section>
-            <div class="form-actions">
-              <span id="settings-result" role="status"></span
-              ><button class="primary-button" type="submit">保存设置</button>
-            </div>
-          </form>
+            <label class="field search-field"><span data-icon="search"></span><input type="search" id="task-search" aria-label="搜索目标与任务" placeholder="搜索目标与任务"></label>
+          </div>
+
+          <section class="catalog-section" aria-labelledby="goals-heading">
+            <header class="task-heading">
+              <h2 id="goals-heading" class="group-title">目标<span id="goal-count" class="section-count"></span></h2>
+              <button data-hint="新建会话并进入目标模式" class="text-button" data-action="new-goal"><span data-icon="plus"></span>新建目标</button>
+            </header>
+            <div id="goal-list" class="task-list"></div>
+          </section>
+          <section class="catalog-section" aria-labelledby="schedules-heading">
+            <header class="task-heading">
+              <h2 id="schedules-heading" class="group-title">定时任务<span id="schedule-count" class="section-count"></span></h2>
+              <button data-hint="设置任务内容和执行时间" class="text-button" data-action="new-schedule"><span data-icon="plus"></span>新建定时任务</button>
+            </header>
+            <div id="schedule-list" class="task-list"></div>
+          </section>
+          </div>
+          <article id="task-detail" class="directory-detail" hidden>
+            <button class="text-button back-link" data-action="back-tasks" data-hint="返回原任务列表  Esc"><span data-icon="back"></span>目标与任务</button>
+            <div id="task-record"></div>
+          </article>
+          <article class="directory-editor" id="task-editor" hidden>
+            <button class="text-button back-link" data-action="cancel-task-edit"><span data-icon="back"></span><span id="task-edit-origin"></span></button>
+            <h1 id="task-edit-title" tabindex="-1"></h1>
+            <form id="task-edit-form"></form>
+          </article>
         </section>
       </main>
+      <section id="settings-view" class="preferences" aria-label="设置" hidden>
+        <aside class="preferences-sidebar" aria-label="设置导航">
+          <div class="preferences-nav-head">
+            <button type="button" class="text-button back-link" data-action="leave-settings" data-hint="返回打开设置前的页面"><span data-icon="back"></span>返回应用</button>
+            <h1>设置</h1>
+          </div>
+          <label class="preferences-search">
+            <span data-icon="search"></span><input id="preference-query" type="search" aria-label="搜索设置" placeholder="搜索设置" autocomplete="off" spellcheck="false">
+          </label>
+          <div class="settings-navigation" role="tablist" aria-label="设置章节">
+            <button data-hint="设置模型、服务地址和密钥" id="connection-tab" type="button" role="tab" aria-controls="connection-settings" aria-selected="true" tabindex="0" data-settings-section="connection-settings"><span data-icon="model"></span>模型连接</button>
+            <button data-hint="预览主题和解答字号" id="appearance-tab" type="button" role="tab" aria-controls="appearance-settings" aria-selected="false" tabindex="-1" data-settings-section="appearance-settings"><span data-icon="appearance"></span>外观</button>
+            <button data-hint="设置新会话的默认目录" id="workspace-tab" type="button" role="tab" aria-controls="workspace-settings" aria-selected="false" tabindex="-1" data-settings-section="workspace-settings"><span data-icon="folder"></span>工作目录</button>
+            <button data-hint="编辑适用于所有任务的协作规则" id="instruction-tab" type="button" role="tab" aria-controls="instruction-settings" aria-selected="false" tabindex="-1" data-settings-section="instruction-settings"><span data-icon="book"></span>协作规则</button>
+          </div>
+          <small class="preferences-version">Viniper <span id="version">2.2.2</span></small>
+        </aside>
+        <main class="preferences-content" aria-label="设置内容">
+          <section id="preference-results" aria-label="设置搜索结果" hidden>
+            <h2>搜索结果</h2>
+            <div id="preference-matches"></div>
+          </section>
+          <form id="settings-form">
+            <fieldset id="settings-fields" disabled>
+              <section id="connection-settings" class="settings-section" role="tabpanel" aria-labelledby="connection-tab">
+                <h2>模型连接</h2>
+                <div class="preference-rows">
+                  <label class="field pref-row" data-pref="服务名称"><span>服务名称</span><input name="provider-label" autocomplete="off"></label>
+                  <label class="field pref-row" data-pref="协议"><span>协议</span><select name="provider-id"><option value="custom">OpenAI 兼容</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option></select></label>
+                  <label class="field pref-row" data-pref="服务地址"><span>服务地址</span><input name="base-url" type="url" placeholder="http://127.0.0.1:18080/v1"></label>
+                  <label class="field pref-row" data-pref="模型 ID"><span>模型 ID</span><input name="model-id" autocomplete="off"></label>
+                  <label class="field pref-row" data-pref="API 密钥" data-alias="key 钥匙串"><span>API 密钥</span><input name="api-key" type="password" autocomplete="new-password" placeholder="留空保留现有密钥"></label>
+                </div>
+              </section>
+              <section id="appearance-settings" class="settings-section" role="tabpanel" aria-labelledby="appearance-tab" hidden>
+                <h2>外观</h2>
+                <fieldset class="theme-choices" data-pref="主题" data-alias="配色 明亮 深色 石墨 跟随系统"><legend>主题</legend>
+                  <label class="theme-choice"><input type="radio" name="theme" value="system"><span class="theme-swatch" data-palette="system" aria-hidden="true"><i></i><b></b></span><span class="theme-caption">跟随系统<span class="choice-check" data-icon="check" aria-hidden="true"></span></span></label>
+                  <label class="theme-choice"><input type="radio" name="theme" value="light"><span class="theme-swatch" data-palette="light" aria-hidden="true"><i></i><b></b></span><span class="theme-caption">明亮<span class="choice-check" data-icon="check" aria-hidden="true"></span></span></label>
+                  <label class="theme-choice"><input type="radio" name="theme" value="dark"><span class="theme-swatch" data-palette="dark" aria-hidden="true"><i></i><b></b></span><span class="theme-caption">石墨<span class="choice-check" data-icon="check" aria-hidden="true"></span></span></label>
+                </fieldset>
+                <div class="pref-row type-row" data-control="font-size" data-pref="文字大小" data-alias="字号 字体 阅读大小">
+                  <span id="type-label">文字大小</span>
+                  <div class="size-options" role="radiogroup" aria-labelledby="type-label"></div>
+                </div>
+                <figure id="reading-preview" aria-label="解答阅读预览"><figcaption>解答预览</figcaption><div class="preview-answer"></div></figure>
+              </section>
+              <section id="workspace-settings" class="settings-section" role="tabpanel" aria-labelledby="workspace-tab" hidden>
+                <h2>工作目录</h2>
+                <label class="field pref-row" data-pref="默认工作目录" data-alias="文件夹 路径"><span>默认工作目录</span><input name="workdir"></label>
+                <button data-hint="在系统窗口选择默认目录" type="button" class="secondary-button browse-dir" id="browse-workdir" hidden><span data-icon="folder"></span>选择目录</button>
+              </section>
+              <section id="instruction-settings" class="settings-section" role="tabpanel" aria-labelledby="instruction-tab" hidden>
+                <h2>协作规则</h2><label class="field" data-pref="长期协作规则" data-alias="指令 AGENT.md"><span>适用于所有任务</span><textarea name="instructions" rows="10" aria-label="长期协作规则" placeholder="输入适用于所有任务的协作约定…"></textarea></label>
+              </section>
+            </fieldset>
+            <div class="form-actions" hidden>
+              <span id="settings-result" role="status"></span>
+              <button data-hint="重新读取已保存的设置" class="text-button" type="button" data-action="reload-settings" hidden>重新读取</button>
+              <button data-hint="撤销各分区尚未保存的更改" class="text-button" type="button" data-action="discard-settings" hidden>撤销更改</button>
+              <button class="primary-button" type="submit" disabled>保存设置</button>
+            </div>
+          </form>
+        </main>
+      </section>
     </div>
     <input id="file-input" type="file" multiple hidden />
     <div id="popover" class="popover" hidden></div>
-    <dialog id="dialog">
+    <dialog id="navigator" class="navigator" aria-labelledby="navigator-title">
+      <header class="navigator-head"><h2 id="navigator-title">快速查找</h2>
+        <button class="icon-button" type="button" data-nav-close aria-label="关闭快速查找" data-icon="close"></button>
+      </header>
+      <label class="navigator-search"><span data-icon="search"></span>
+        <input id="navigator-query" role="combobox" aria-expanded="true" aria-controls="navigator-list" aria-autocomplete="list" aria-label="筛选查找结果" autocomplete="off" spellcheck="false">
+        <kbd>esc</kbd>
+      </label>
+      <div id="navigator-list" class="navigator-list" role="listbox" aria-labelledby="navigator-title"></div>
+    </dialog>
+    <dialog id="dialog" aria-labelledby="dialog-title">
       <form method="dialog">
         <div class="dialog-heading">
           <h2 id="dialog-title"></h2>
-          <button
+          <button data-hint="关闭对话框  Esc"
             class="icon-button"
             value="cancel"
             formnovalidate

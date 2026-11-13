@@ -198,7 +198,7 @@ class IdleDeadlineTests(unittest.IsolatedAsyncioTestCase):
                 result = await port.collect("long-tool")
             self.assertEqual(result[-1]["type"], "runtime.completed")
             statuses = [x["event"] for x in result if x["type"] == "provider.event"]
-            self.assertEqual(statuses[-1], {"type": "working_status", "content": "正在准备操作内容 · 已接收 800 字符"})
+            self.assertEqual(statuses[-1], {"type": "working_status", "phase": "tool-input", "content": "正在准备操作内容 · 已接收 800 字符"})
             self.assertEqual(port.cancelled, [])
         finally:
             await port.close_fixture()

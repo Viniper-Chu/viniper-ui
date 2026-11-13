@@ -1,12 +1,13 @@
-export const PRODUCT_VERSION = "2.0.2" as const;
+export const PRODUCT_VERSION = "2.2.2" as const;
+export type AgentIterationLimit = number | "unlimited";
 /** Stable is the published channel.  Preview builds set VINIPER_UI_RELEASE_STAGE=preview
  * in their isolated launcher and retain their already-built rollback artifact. */
 const isPreviewBuild = typeof process !== "undefined"
   && process.env?.VINIPER_UI_RELEASE_STAGE === "preview";
 export const RELEASE_STAGE = (isPreviewBuild ? "Preview" : "Stable") as "Preview" | "Stable";
 export const PRODUCT_NAME = "Viniper" as const;
-export const PRODUCT_BADGE = (isPreviewBuild ? "v2.0.2 · Preview（预览版）" : "v2.0.2 · Stable（稳定版）") as
-  "v2.0.2 · Preview（预览版）" | "v2.0.2 · Stable（稳定版）";
+export const PRODUCT_BADGE = (isPreviewBuild ? "v2.2.2 · Preview（预览版）" : "v2.2.2 · Stable（稳定版）") as
+  "v2.2.2 · Preview（预览版）" | "v2.2.2 · Stable（稳定版）";
 export const PRODUCT_TITLE = `${PRODUCT_NAME} · ${PRODUCT_BADGE}` as const;
 
 import { CoordinationSnapshot, CoordinationWait } from "./coordination-contracts";
@@ -71,6 +72,8 @@ export interface AgentIntent {
   text: string;
   /** Original user text before host instructions or skill expansion. */
   userText?: string;
+  /** Task plus selected attachments/skills, before global host instructions. */
+  documentContext?: string;
   attachments: string[];
   selectedModel: string;
   permissionMode: PermissionMode;
@@ -102,6 +105,7 @@ export interface AgentMessage {
 }
 
 export interface QueuedIntent {
+  documentContext?: string;
   id: string;
   engineId?: AgentEngineId;
   sessionId?: string;
@@ -373,6 +377,8 @@ export interface ToolRequest {
   readOnly: boolean;
   scope: ToolAuthorizationScope;
   input?: Record<string, unknown>;
+  /** Host-owned extension/version identity; never supplied by the model. */
+  authorizationIdentity?: string;
 }
 
 export interface RuntimeSnapshot {

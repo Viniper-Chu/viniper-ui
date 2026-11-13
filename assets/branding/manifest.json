@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
   "brand": "Viniper",
-  "status": "UNIFIED_3D_NATIVE_SOURCE",
-  "variant": "circuit-node-3d",
+  "status": "UNIFIED_APPROVED_ARTWORK",
+  "variant": "folded-v",
   "frame": {
     "kind": "rounded-square",
-    "radius": 24,
-    "preserves": "existing V circuit-node mark"
+    "radius": 14,
+    "preserves": "open folds of the V"
   },
   "asset": "viniper-harness-circuit-node.png",
   "nativeFallback": "viniper-harness-circuit-node.png",
@@ -15,5 +15,7 @@
   "fallback": {
     "kind": "code-native-fallback",
     "text": "V"
-  }
+  },
+  "source": "v-icon-harness.svg",
+  "symbol": "v-icon-harness.svg#viniper-mark"
 }

@@ -390,3 +390,32 @@ async function fileExists(path: string): Promise<boolean> {
     throw error;
   }
 }
+
+test("streaming deltas are durable without rewriting snapshots and recover exactly once", async () => {
+  const root = await freshRoot("sqlite-stream-tail-");
+  const store = new SQLiteStore(root); await store.initialize();
+  const session = createSessionSnapshot(root, 100); session.replayCursor = 0;
+  const { events: _events, ...persisted } = session;
+  let bundle: Awaited<ReturnType<typeof createHarnessApplication>> | undefined;
+  try {
+    await store.saveSnapshot({ schemaVersion: 3, productVersion: PRODUCT_VERSION, activeSessionId: session.id, sessions: [persisted] });
+    const deltas: RuntimeEvent[] = ["第一段\n", "  保留缩进", "\n最后一段"].map((text,index)=>({
+      id: `durable-delta-${index}`, sessionId: session.id, type: "message.delta", timestamp: 101+index,
+      payload: { messageId: "tail-message", text, createdAt: 101 },
+    }));
+    for (const event of deltas) await store.commitDeltaEvent(event);
+    assert.equal((await store.commitDeltaEvent(deltas[0])).duplicate, true);
+    const raw = await store.load();
+    assert.equal(raw!.application.sessions[0].messages.length, 0, "token writes must not rewrite the session snapshot");
+    assert.equal(raw!.application.sessions[0].replayCursor, 0);
+    assert.equal(raw!.events.length, 3);
+    await assert.rejects(store.commitDeltaEvent({ ...deltas[0], id: "orphan-delta", sessionId: "missing" }), /DATA_REFERENCE_MISSING/);
+    assert.equal((await store.load())!.events.length, 3);
+    await store.close();
+    bundle = await createHarnessApplication({ dataRoot: root, workingDirectory: root, assetsRoot: process.cwd(), secretVault: new UnavailableSecretVault(), externalScheduleDispatch: true });
+    assert.equal(bundle.runtime.getSession(session.id)!.messages[0].text, "第一段\n  保留缩进\n最后一段");
+    await bundle.application.dispose(); bundle = undefined;
+    bundle = await createHarnessApplication({ dataRoot: root, workingDirectory: root, assetsRoot: process.cwd(), secretVault: new UnavailableSecretVault(), externalScheduleDispatch: true });
+    assert.equal(bundle.runtime.getSession(session.id)!.messages[0].text, "第一段\n  保留缩进\n最后一段");
+  } finally { await bundle?.application.dispose(); await store.close(); await rm(root,{recursive:true,force:true}); }
+});

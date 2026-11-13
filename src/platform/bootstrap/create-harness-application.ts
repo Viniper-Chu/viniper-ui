@@ -33,6 +33,7 @@ import { createFileTools } from "../../features/files/file-tools";
 import { createStructuredFileTools } from "../../features/files/structured-file-tools";
 import { createLocalImageTool } from "../../features/files/local-image-tool";
 import { createDocumentWorkflowTools } from "../../features/files/document-workflow-tools";
+import { createQuadraticCheckTool } from "../../features/math/quadratic-tool";
 import { discoverDocumentWorkflowHost } from "../process/local-document-workflow-host";
 import { LocalFileHelperHost } from "../process/local-file-helper-host";
 import { WindowsProcessHost } from "../process/windows-process-host";
@@ -91,6 +92,8 @@ export interface HarnessApplicationFactoryOptions {
   systemNotificationAdapter?: SystemNotificationAdapter;
   /** Enables Preview-only defaults without changing the canonical runtime defaults used by tests and other hosts. */
   previewFullAccessDefaults?: boolean;
+  /** User-authorized desktop mode: existing capabilities execute; new ones ask once. */
+  rememberToolApprovals?: boolean;
   /** Desktop-only capability probe. Tests and headless hosts remain deterministic by default. */
   claudeCode?: {
     enabled: boolean;
@@ -195,7 +198,9 @@ export async function createHarnessApplication(
   });
   const toolRegistry = new ToolRegistry();
   for (const tool of createFileTools(new WindowsFileOpener(), { recoveryRoot: join(options.dataRoot, "file-recovery") })) toolRegistry.register(tool);
-  for (const tool of createStructuredFileTools(new LocalFileHelperHost(join(options.assetsRoot, "agent-helpers")))) toolRegistry.register(tool);
+  const helperHost = new LocalFileHelperHost(join(options.assetsRoot, "agent-helpers"));
+  for (const tool of createStructuredFileTools(helperHost)) toolRegistry.register(tool);
+  toolRegistry.register(createQuadraticCheckTool(helperHost));
   toolRegistry.register(createLocalImageTool(registry));
   const documentWorkflowHost = discoverDocumentWorkflowHost();
   if (documentWorkflowHost) for (const tool of createDocumentWorkflowTools(documentWorkflowHost)) toolRegistry.register(tool);
@@ -296,7 +301,11 @@ export async function createHarnessApplication(
     toolRegistry,
   });
   let runtime!: AgentRuntime;
-  const permissionPolicy = new PermissionPolicy(options.approvalHostMode ?? "interactive", Date.now, store);
+  const permissionPolicy = new PermissionPolicy(options.approvalHostMode ?? "interactive", Date.now, store,
+    options.rememberToolApprovals ? {
+      load: () => store.loadSetting<string[]>("permissions.remembered-tools.v1"),
+      save: grants => store.saveSetting("permissions.remembered-tools.v1", grants),
+    } : undefined);
   const skills = new SkillCatalog(
     new ExtensionSkillSource(
       new FileSkillSource([
@@ -408,6 +417,12 @@ export async function createHarnessApplication(
   });
   await workspaceService.initialize();
   await application.initialize();
+  if (options.rememberToolApprovals) {
+    await permissionPolicy.authorizeInitialTools(toolRegistry.descriptors().filter(tool => !toolRegistry.managedOwner(tool.name)).map(tool => ({
+      name: tool.name, readOnly: tool.readOnly, scope: toolRegistry.get(tool.name).authorizationScope ?? "computer",
+      authorizationIdentity: "built-in",
+    })));
+  }
   if (options.previewFullAccessDefaults === true) {
     const permissionMigration = await store.loadSetting<boolean>("preview.v016.full-access-and-skills");
     if (!permissionMigration) {

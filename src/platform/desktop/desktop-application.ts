@@ -1,4 +1,4 @@
-import { AppSnapshot, AgentIntent, PermissionMode, RunSnapshot, SessionSnapshot } from "../../core/contracts";
+import { AppSnapshot, AgentIntent, PermissionMode, RunSnapshot, SessionSnapshot, RuntimeEvent } from "../../core/contracts";
 import { AgentEngineId, DEFAULT_AGENT_ENGINE } from "../../core/agent-engine-contracts";
 import { ArtifactReadInput, ArtifactReadResult } from "../../core/artifact-contracts";
 import { CoordinationEnvelopeType } from "../../core/coordination-contracts";
@@ -92,7 +92,6 @@ export class DesktopApplication {
   private readonly unsubscribers: Array<() => void> = [];
   private publishTimer?: NodeJS.Timeout;
   private disposePromise?: Promise<void>;
-  private readonly seenRuntimeEvents = new Set<string>();
   private readonly seenScheduleHistory = new Set<string>();
   private readonly seenCoordinationEnvelopes = new Set<string>();
 
@@ -129,13 +128,11 @@ export class DesktopApplication {
     await this.services.plugins.initialize();
     this.syncExtensionTools();
     await this.services.scheduler.initialize();
-    for (const session of this.services.runtime.snapshot().sessions) {
-      for (const event of session.events) this.seenRuntimeEvents.add(event.id);
-    }
     for (const record of this.services.scheduler.snapshot().history) this.seenScheduleHistory.add(record.id);
     for (const envelope of this.services.coordination.snapshot().envelopes) this.seenCoordinationEnvelopes.add(envelope.id);
     this.unsubscribers.push(
-      this.services.runtime.subscribe((snapshot) => { void this.observeRuntime(snapshot).then(() => this.requestPublish()); }),
+      this.services.runtime.subscribeEvents((event) => { void this.observeRuntimeEvent(event); }),
+      this.services.runtime.subscribeChanges(() => { this.services.updates?.setActiveRunCount(this.services.runtime.unfinishedRunCount()); this.requestPublish(); }),
       this.services.coordination.subscribe((snapshot) => { void this.observeCoordination(snapshot).then(() => this.requestPublish()); }),
       this.services.telemetry.subscribe(() => this.requestPublish()),
       this.services.scheduler.subscribe((snapshot) => { void this.observeSchedules(snapshot).then(() => this.requestPublish()); }),
@@ -586,6 +583,7 @@ export class DesktopApplication {
   }
 
   private requestPublish(): void {
+    if (this.listeners.size === 0) return;
     if (this.publishTimer) return;
     this.publishTimer = setTimeout(() => {
       this.publishTimer = undefined;
@@ -610,44 +608,35 @@ export class DesktopApplication {
   }
 
   private publishNow(): void {
+    if (this.listeners.size === 0) return;
     const snapshot = this.snapshot();
     for (const listener of this.listeners) listener(snapshot);
   }
 
-  private async observeRuntime(snapshot: ReturnType<AgentRuntime["snapshot"]>): Promise<void> {
-    this.services.updates?.setActiveRunCount(snapshot.runs?.filter((run) => !["completed", "cancelled", "failed"].includes(run.status)).length ?? 0);
-    for (const session of snapshot.sessions) {
-      for (const event of session.events) {
-        if (this.seenRuntimeEvents.has(event.id)) continue;
-        this.seenRuntimeEvents.add(event.id);
-        const payload = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
-        this.services.diagnostics?.record({
-          runId: typeof payload.runId === "string" ? payload.runId : undefined,
-          code: event.type,
-          level: event.type.endsWith("failed") ? "error" : "info",
-          status: event.type.startsWith("run.") ? event.type.slice(4) : undefined,
-        });
-        if (event.type === "run.completed" || event.type === "run.failed" || event.type === "run.cancelled") {
-          if (typeof payload.runId === "string") this.services.diagnostics?.endRun(payload.runId);
-        }
-        if (event.type === "run.completed" || event.type === "run.failed") {
-          await this.services.notifications.notify({
-            kind: event.type === "run.completed" ? "completion" : "failure",
-            title: event.type === "run.completed" ? "Agent 运行完成" : "Agent 运行失败",
-            body: typeof payload.detail === "string" ? payload.detail : undefined,
-            sessionId: session.id,
-            runId: typeof payload.runId === "string" ? payload.runId : undefined,
-          });
-        } else if (event.type === "interaction.requested" && payload.status === "waiting") {
-          await this.services.notifications.notify({
-            kind: "approval-waiting",
-            title: "等待本次批准",
-            body: typeof payload.detail === "string" ? payload.detail : undefined,
-            sessionId: session.id,
-            runId: typeof payload.runId === "string" ? payload.runId : undefined,
-          });
-        }
-      }
+  private async observeRuntimeEvent(event: RuntimeEvent): Promise<void> {
+    // The canonical log already persists every delta. Diagnostics need semantic
+    // actions and outcomes, not another full copy of the token stream.
+    if (["message.delta", "thinking.delta", "provider.activity", "turn.usage.updated"].includes(event.type)) return;
+    const payload = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
+    this.services.diagnostics?.record({
+      runId: typeof payload.runId === "string" ? payload.runId : undefined,
+      code: event.type, level: event.type.endsWith("failed") ? "error" : "info",
+      status: event.type.startsWith("run.") ? event.type.slice(4) : undefined,
+    });
+    if (["run.completed", "run.failed", "run.cancelled"].includes(event.type) && typeof payload.runId === "string") this.services.diagnostics?.endRun(payload.runId);
+    if (event.type === "run.completed" || event.type === "run.failed") {
+      await this.services.notifications.notify({
+        kind: event.type === "run.completed" ? "completion" : "failure",
+        title: event.type === "run.completed" ? "Agent 运行完成" : "Agent 运行失败",
+        body: typeof payload.detail === "string" ? payload.detail : undefined,
+        sessionId: event.sessionId, runId: typeof payload.runId === "string" ? payload.runId : undefined,
+      });
+    } else if (event.type === "interaction.requested" && payload.status === "waiting") {
+      await this.services.notifications.notify({
+        kind: "approval-waiting", title: "等待本次批准",
+        body: typeof payload.detail === "string" ? payload.detail : undefined,
+        sessionId: event.sessionId, runId: typeof payload.runId === "string" ? payload.runId : undefined,
+      });
     }
   }
 

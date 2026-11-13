@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Tray, dialog, nativeImage, shell, ipcMain, safeStorage } = require("electron");
+const { app, BrowserWindow, Menu, Tray, dialog, nativeImage, nativeTheme, shell, ipcMain, safeStorage } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -282,6 +282,14 @@ function closeSplashWindow() {
 }
 
 function trayIcon(size = 0) {
+  if (process.platform === "darwin") {
+    const name = trayBadgeCount > 0 ? "viniper-tray-badgeTemplate.png" : "viniper-trayTemplate.png";
+    const image = nativeImage.createFromPath(path.join(ICON_ASSET_DIR, name));
+    if (!image.isEmpty()) {
+      image.setTemplateImage(true);
+      return image;
+    }
+  }
   const exactSize = [16, 20, 24, 32].includes(Number(size)) ? Number(size) : 32;
   const ordinaryPath = path.join(ICON_ASSET_DIR, `viniper-harness-circuit-node-${exactSize}.png`);
   const badgePath = path.join(ICON_ASSET_DIR, `viniper-harness-circuit-node-badge-${exactSize}.png`);
@@ -690,9 +698,11 @@ function openSettingsWindow() {
 }
 
 function setTitlebarTheme(theme = {}) {
-  if (mainWindow && !mainWindow.isDestroyed() && process.platform === "win32" && typeof mainWindow.setTitleBarOverlay === "function") {
-    const color = String(theme.color || "#f5f3ee");
-    const symbolColor = String(theme.symbolColor || "#302f2b");
+  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
+  const color = theme.color || "#F8F8F4";
+  mainWindow.setBackgroundColor(color);
+  if (process.platform === "win32" && typeof mainWindow.setTitleBarOverlay === "function") {
+    const symbolColor = theme.symbolColor || "#182F37";
     mainWindow.setTitleBarOverlay({ color, symbolColor, height: TITLEBAR_HEIGHT });
   }
   return { ok: true };
@@ -1025,13 +1035,13 @@ async function createMainWindow() {
     minHeight: 680,
     title: DISPLAY_NAME,
     icon: appIcon(),
-    backgroundColor: "#f6fbff",
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#152329" : "#F8F8F4",
     show: false,
     autoHideMenuBar: true,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
     trafficLightPosition: process.platform === "darwin" ? { x: 14, y: 17 } : undefined,
     titleBarOverlay: process.platform === "win32"
-      ? { color: "#f5f3ee", symbolColor: "#302f2b", height: TITLEBAR_HEIGHT }
+      ? { color: nativeTheme.shouldUseDarkColors ? "#152329" : "#F8F8F4", symbolColor: nativeTheme.shouldUseDarkColors ? "#E9F1EB" : "#182F37", height: TITLEBAR_HEIGHT }
       : undefined,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -1212,6 +1222,7 @@ function createApplicationMenu() {
       label: "文件",
       submenu: [
         { label: "新建会话", accelerator: "CmdOrCtrl+N", click: () => sendRendererCommand("new-viniper-session") },
+        { label: "快速查找…", accelerator: "CmdOrCtrl+Shift+K", click: () => sendRendererCommand("quick-navigator") },
         { label: "添加附件", accelerator: "CmdOrCtrl+O", click: () => sendRendererCommand("attach-file") },
         { label: "选择目录", accelerator: "CmdOrCtrl+Shift+O", click: () => sendRendererCommand("change-workdir") },
         { type: "separator" },
@@ -1303,9 +1314,9 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     if (process.platform === "darwin") {
       app.setAboutPanelOptions({ applicationName: DISPLAY_NAME, applicationVersion: BUNDLED_VERSION, copyright: "Viniper" });
-      // Use the bundle's macOS icon canvas. Replacing it with the edge-to-edge
-      // brand PNG makes the Dock icon visibly larger than neighbouring apps.
-      if (app.isPackaged) app.dock?.setIcon(path.join(process.resourcesPath, "Viniper-dock.png"));
+      // Let macOS resolve the bundle icon both before and after launch. A
+      // runtime PNG override bypasses the system's icon treatment and makes
+      // the pinned Dock tile change its appearance when the app opens.
     }
     createApplicationMenu();
     createTray();

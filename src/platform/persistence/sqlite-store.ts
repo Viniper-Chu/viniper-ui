@@ -218,6 +218,17 @@ export class SQLiteStore implements RuntimePersistence, CoordinationPersistence,
     });
   }
 
+  async commitDeltaEvent(event: RuntimeEvent): Promise<RuntimeCommitReceipt> {
+    const database = this.requiredDatabase();
+    return inTransaction(database, () => {
+      const existing = database.prepare("SELECT sequence_no, engine_id, session_id, run_id, item_id, type, timestamp, payload_json FROM events WHERE id = ?").get(event.id) as DatabaseRow | undefined;
+      if (existing) return { event: eventFromRow(event.id, existing), duplicate: true };
+      const committed = insertEvent(database, event);
+      updateRunProjection(database, committed);
+      return { event: committed, duplicate: false };
+    });
+  }
+
   async loadMemoryEntries(): Promise<MemoryEntry[]> {
     return this.rows("SELECT payload_json FROM memory_entries ORDER BY created_at")
       .map((row) => parseJson<MemoryEntry>(row.payload_json, "memory_entries.payload_json"));

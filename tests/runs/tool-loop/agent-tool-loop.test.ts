@@ -13,6 +13,27 @@ import {
 import { ToolRegistry } from "../../../src/features/tools/tool-registry";
 import { emptyUsage } from "../../../src/features/telemetry/token-ledger";
 
+test("host cancellation runs between already-buffered Provider tokens", async () => {
+  const controller = new AbortController();
+  const provider = new ScriptedProvider([Array.from({ length: 500 }, () => ({ kind: "text.delta" as const, text: "x" }))]);
+  const registry = new ToolRegistry();
+  let consumed = 0;
+  let cancelDelivered!: () => void;
+  const delivered = new Promise<void>((resolve) => { cancelDelivered = resolve; });
+  try {
+    await assert.rejects(runAgentToolLoop({
+      provider, request: providerRequest(registry, "auto"), toolRegistry: registry,
+      signal: controller.signal, now: () => 1,
+      onProviderEvent: async () => {
+        consumed += 1;
+        if (consumed === 1) setImmediate(() => { controller.abort(); cancelDelivered(); });
+      },
+      appendHistory: async () => undefined, emit: async () => undefined,
+    }), /cancel|取消|abort/iu);
+    assert.ok(consumed < 500, "The host's stop command must run before the buffered reply is drained");
+  } finally { await delivered; }
+});
+
 test("auxiliary model activity from an executing tool reaches the owning run", async () => {
   const provider = new ScriptedProvider([
     [{ kind: "tool-call.completed", call: toolCall("image-call", "file.image.analyze", "{}") }],
@@ -48,7 +69,7 @@ test("local no-progress stop ignores execution ids and timing changes on the sam
         stdout: { preview: "", ref: `out-${count}` }, stderr: { preview: "same error", ref: `err-${count}` } }) }; },
   });
   await assert.rejects(runAgentToolLoop({ provider, request: { ...providerRequest(registry, "auto"), permissionMode: "full" }, toolRegistry: registry,
-    maxRounds: 96, maxProviderRequests: 96, noProgressLimit: 3, signal: new AbortController().signal, now: () => 1,
+    maxRounds: "unlimited", maxProviderRequests: "unlimited", noProgressLimit: 3, signal: new AbortController().signal, now: () => 1,
     onProviderEvent: async () => undefined, appendHistory: async () => undefined, emit: async () => undefined,
   }), /相同结果/u);
   assert.equal(count, 3);
@@ -363,6 +384,7 @@ test("provider request budget is reserved before every stream and never overshoo
     projectRoot: process.cwd(),
     signal: new AbortController().signal,
     now: () => 100,
+    maxRounds: "unlimited",
     maxProviderRequests: 3,
     onProviderEvent: async () => undefined,
     appendHistory: async () => undefined,
@@ -507,3 +529,56 @@ function toolCall(callId: string, name: string, argumentsText: string) {
 function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
+
+test("a completed verification moves from tool use to a written answer and allows a failed input to be corrected", async () => {
+  const name = "math.quadratic.check";
+  const provider = new ScriptedProvider([
+    [{ kind: "tool-call.completed", call: toolCall("bad",name,"{}") }],
+    [{ kind: "tool-call.completed", call: toolCall("fixed",name,'{"level_family":{}}') }],
+    [{ kind: "text.delta", text: "<tool_" }, { kind: "text.delta", text: "call>bad</tool_call>" }],
+    [{ kind: "text.delta", text: "已按各段给出证明。" }],
+  ]);
+  const registry = new ToolRegistry();
+  registry.register({ name, description: "verify", readOnly: true, inputSchema: { type: "object" },
+    async execute(request) {
+      return { toolId: request.id, text: request.id === "bad" ? "参数错误" : "完整分类", isError: request.id === "bad" };
+    },
+  });
+  const result = await runAgentToolLoop({
+    provider, request: providerRequest(registry,"auto"), toolRegistry: registry,
+    completesVerification: (call, receipt) => call.name === name && !receipt.isError,
+    signal: new AbortController().signal, now: () => 1, onProviderEvent: async () => {},
+    appendHistory: async () => {}, emit: async () => {},
+  });
+  assert.deepEqual(provider.requests.map(r => r.tools.map(t => t.name)), [[name], [name], [], []]);
+  assert.equal(provider.requests[2].reasoning, "none");
+  assert.ok(provider.requests[2].history.every(entry => entry.role !== "tool"));
+  assert.ok(JSON.stringify(provider.requests[2].history).includes("完整分类"));
+  assert.equal(result.assistantText, "已按各段给出证明。");
+});
+
+test("the student sees exact branch counts even if the writer fills the two branches incorrectly", async () => {
+  const name = "math.quadratic.check";
+  const verifiedTable = "| 参数 t | 左支 | 右支 | 共同顶点 | 不同实根数 |\n|---|---:|---:|---:|---:|\n| 0<t<1 | 1 | 1 | 0 | 2 |";
+  const wrong = "先比较两条单调支的值域。\n\n| 参数 | 左支 | 右支 | 总数 |\n|---|---|---|---|\n| 0<t<1 | 2 | 0 | 2 |\n\n顶点重合时去重。";
+  const provider = new ScriptedProvider([
+    [{ kind: "tool-call.completed", call: toolCall("roots", name, '{"level_family":{}}') }],
+    [{ kind: "text.delta", text: wrong.slice(0,17) }, { kind: "text.delta", text: wrong.slice(17) }],
+  ]);
+  const registry = new ToolRegistry();
+  registry.register({ name, description:"verify",readOnly:true,inputSchema:{type:"object"},
+    async execute(req) { return {toolId:req.id, text:JSON.stringify({ok:true,branch_table:verifiedTable})}; } });
+  const displayed: string[] = [], persisted: string[] = [];
+  const result = await runAgentToolLoop({
+    provider, request:providerRequest(registry,"auto"),toolRegistry:registry, completesVerification:() => true,
+    signal:new AbortController().signal,now:()=>1, emit:async()=>{},
+    onProviderEvent:async e=>{ if(e.kind==="text.delta") displayed.push(e.text); },
+    appendHistory:async entries=>{ for(const entry of entries) if(entry.role==="assistant")
+      for(const item of entry.items) if(item.type==="text") persisted.push(item.text); },
+  });
+  assert.equal(displayed.join(""),result.assistantText);
+  assert.equal(persisted.join(""),result.assistantText);
+  assert.ok(result.assistantText.includes(verifiedTable));
+  assert.ok(!result.assistantText.includes("| 2 | 0 |"));
+  assert.ok(result.assistantText.includes("顶点重合时去重。"));
+});

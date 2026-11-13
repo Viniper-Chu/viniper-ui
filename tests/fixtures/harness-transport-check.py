@@ -54,6 +54,12 @@ class LocalEffectsPort:
         sid = kwargs["session_id"]
         def envelope(event):
             return {"type": "provider.event", "event": event}
+        if self.ending == "read_only":
+            yield envelope({"type": "tool_start", "tool_name": "file.read", "call_id": "read", "read_only": True})
+            (Path(kwargs["workdir"]) / "external.txt").write_text("created by another application")
+            yield envelope({"type": "tool_result", "call_id": "read", "tool_name": "file.read", "status": "success"})
+            yield envelope({"type": "text", "content": "Read complete."})
+            return
         yield envelope({"type": "tool_start", "tool_name": "project.write", "call_id": "write-local",
                         "input": {"path": "result.txt", "content": "after"}})
         persisted = json.loads(server.SESSIONS_FILE.read_text())
@@ -77,7 +83,7 @@ class LocalEffectsPort:
             yield envelope({"type": "runtime_cancelled"})
 
 async def main():
-    for ending in ("completed", "failed", "cancelled"):
+    for ending in ("completed", "failed", "cancelled", "read_only"):
         workdir = root / ending
         workdir.mkdir()
         (workdir / "result.txt").write_text("before\n")
@@ -95,12 +101,16 @@ async def main():
         except asyncio.CancelledError:
             assert ending == "cancelled"
         session = server.safe_session(sid)
-        assert session["last_run_status"] == ending
+        assert session["last_run_status"] == ("completed" if ending == "read_only" else ending)
         messages = session["messages"]
         assert [item["role"] for item in messages] == ["user", "assistant"]
         message = messages[-1]
         assert not message.get("pending")
         artifacts = [item for item in message["segments"] if item["type"] == "artifact"]
+        if ending == "read_only":
+            assert not artifacts and not any(event["type"] == "artifact" for event in events)
+            assert (workdir / "external.txt").is_file()
+            continue
         assert len(artifacts) == 1
         change = artifacts[0]["file_change"]
         assert change["operation"] == "modified" and change["available"]

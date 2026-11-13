@@ -24,34 +24,43 @@ test('completed output renders math, collapses thinking and tool receipts, and k
  assert.equal((html.match(/class="tool-event/g)||[]).length,1);assert.match(html,/SELECT note FROM notes/);
  assert.match(html,/&lt;literal&gt;/);assert.doesNotMatch(html,/执行中|<literal>/);
 });
-test('closed live activity defers long thinking markdown until opened',()=>{
+test('thought bodies stay lazy until disclosure and replies retain their own order',()=>{
  const {ctx}=renderer();
  const thoughts='THINKING_DETAIL '.repeat(4000);
- const live=ctx.messageHtml({role:'assistant',content:'当前回答',thinking:thoughts,streaming:true});
- assert.match(live,/class="spinner"/);assert.match(live,/当前回答/);
- assert.doesNotMatch(live,/THINKING_DETAIL/);
- const complete=ctx.messageHtml({role:'assistant',thinking:thoughts,streaming:false});
- assert.match(complete,/THINKING_DETAIL/);assert.doesNotMatch(complete,/class="spinner"/);
-});
-test('completed turns keep intermediate replies in activity details and copy the final reply',()=>{
- const {ctx}=renderer();
- const message={role:'assistant',content:'先检查文件。\n\n完成，结果已验证。',segments:[
-  {type:'text',content:'先检查文件。'},
-  {type:'tool_result',tool_name:'file.read',status:'success',content:'read result'},
-  {type:'text',content:'完成，结果已验证。'},
-  {type:'artifact',path:'/task/结果.pdf',status:'success'},
- ]};
- const html=ctx.messageHtml(message),answer=html.split('<div class="answer">')[1].split('</div>')[0];
- assert.doesNotMatch(answer,/先检查/);assert.match(answer,/完成，结果已验证/);
- assert.match(html.split('<div class="answer">')[0],/先检查文件/);
- assert.match(html,/1 条进展/);assert.match(html,/data-copy="完成，结果已验证。"/);
- assert.equal(message.content,'先检查文件。\n\n完成，结果已验证。');
- for(const flags of [{streaming:true},{cancelled:true},{error:'interrupted'}]){
-  const partial=ctx.messageHtml({...message,...flags}).split('<div class="answer">')[1].split('</div>')[0];
-  assert.match(partial,/先检查文件/);
+ for(const streaming of [true,false]){
+  const html=ctx.messageHtml({role:'assistant',content:'当前回答',thinking:thoughts,streaming});
+  assert.match(html,/thought-step/);assert.match(html,/当前回答/);
+  assert.doesNotMatch(html,/THINKING_DETAIL/);
  }
- const noFinal={...message,segments:message.segments.slice(0,2)};
- assert.match(ctx.messageHtml(noFinal).split('<div class="answer">')[1],/先检查文件/);
+});
+
+test('thinking without answer content does not display an empty copy action',()=>{
+ const {ctx}=renderer();
+ const waiting=ctx.messageHtml({role:'assistant',content:'',thinking:'正在核对',streaming:true});
+ assert.match(waiting,/<div class="message-actions" hidden>/);
+ const answering=ctx.messageHtml({role:'assistant',content:'已开始输出',streaming:true});
+ assert.match(answering,/<div class="message-actions">/);
+});
+test('thinking, tools and replies form the same ordered timeline during streaming and reload',()=>{
+ const {ctx}=renderer();
+ const run={sequence:0,sessionId:'s',message:{role:'assistant',content:'',thinking:'',segments:[],streaming:true},done:false};
+ const events=[{type:'thinking_delta',content:'想法一'}, {type:'text',content:'先检查文件。'},
+  {type:'tool_start',call_id:'read',tool_name:'file.read',input:{path:'/task/a.txt'}},
+  {type:'tool_result',call_id:'read',tool_name:'file.read',status:'success',content:'真实回执'},
+  {type:'thinking_delta',content:'想法二'}, {type:'text',content:'完成，结果已验证。'}];
+ events.forEach((event,index)=>ctx.projectEvent(run,{...event,sequence:index+1}));
+ const live=ctx.conversationTimeline(run.message);
+ assert.deepEqual(Array.from(live,(p:any)=>p.kind),['thinking','text','tool','thinking','text']);
+ assert.equal(live[2].tool.input.path,'/task/a.txt');assert.equal(live[2].tool.status,'success');
+ const saved={...run.message,streaming:false,segments:events.filter(e=>e.type!=='thinking_delta').slice(0,0)};
+ saved.segments=events.map(e=>({...e,type:e.type==='thinking_delta'?'thinking':e.type}));
+ const reloaded=ctx.conversationTimeline(saved);
+ assert.deepEqual(Array.from(reloaded,(p:any)=>[p.kind,p.content||p.tool.status]),Array.from(live,(p:any)=>[p.kind,p.content||p.tool.status]));
+ const html=ctx.messageHtml(saved);
+ assert.ok(html.indexOf('先检查文件。') < html.indexOf('真实回执'));
+ assert.ok(html.indexOf('真实回执') < html.indexOf('完成，结果已验证。'));
+ assert.match(html,/data-copy="完成，结果已验证。"/);
+ assert.doesNotMatch(html,/<details[^>]+\bopen\b/);
 });
 test('cancelled and failed tools cannot look completed or keep spinning after reload',()=>{
  const {ctx}=renderer();
@@ -102,6 +111,17 @@ test('database receipts distinguish submitted transactions, rollback and readbac
  assert.match(failed,/回读未完成/);assert.match(failed,/失败/);
 });
 
+test('large file deliveries disclose every path without flooding the initial answer',()=>{
+ const {ctx}=renderer();
+ const paths=Array.from({length:9},(_,i)=>`/task/结果 ${i+1}.pdf`);
+ const html=ctx.messageHtml({role:'assistant',content:'已保存文件',segments:paths.map(path=>({type:'artifact',path,status:'success'}))});
+ assert.equal((html.split('<details class="more-files">')[0].match(/class="result-file"/g)||[]).length,3);
+ assert.match(html,/另外 6 个文件/);
+ assert.doesNotMatch(html,/<details class="more-files" open/);
+ for(const path of paths) assert.ok(html.includes(`data-file="${path}"`));
+ assert.equal((html.match(/class="result-file"/g)||[]).length,9);
+});
+
 test('document result cards show delivery files and keep build copies in execution details',()=>{
  const {ctx}=renderer();
  const files=['/task/学生.pdf','/task/教师.pdf','/task/编译维护/源文件/学生.tex','/task/编译维护/源文件/教师.tex'];
@@ -129,4 +149,46 @@ test('terminal receipts expose actual output and paged continuation without decl
  assert.match(html,/测试命令 · 退出码 0 · 1.5 秒/);assert.match(html,/2 assertions passed &lt;literal&gt;/);
  assert.match(html,/data-terminal="exec-owned"/);assert.match(html,/读取完整输出/);
  assert.doesNotMatch(html,/所有测试通过|页面已查看|<literal>/);
+});
+
+ test('incidental Finder metadata is excluded from result cards without deleting the trace',()=>{
+  const {ctx}=renderer();
+  const segments=[{type:'artifact',path:'/task/.DS_Store',status:'success'},{type:'artifact',path:'/task/report.pdf',status:'success'}];
+  const html=ctx.messageHtml({role:'assistant',content:'文件已生成。',segments});
+  assert.match(html,/data-file="\/task\/report.pdf"/);assert.doesNotMatch(html,/data-file="\/task\/.DS_Store"/);
+  assert.equal(segments.length,2);
+ });
+
+test('live work labels express the phase without exposing partial argument counters',()=>{
+ const {ctx}=renderer();
+ assert.equal(ctx.workingLabel('正在准备操作内容 · 已接收 1 字符'),'正在准备工具调用');
+ assert.equal(ctx.workingLabel('正在读取文件'),'正在读取文件');
+ assert.equal(ctx.workingLabel('模型暂停：内存保护'),'模型暂停：内存保护');
+});
+
+test('replaying an older phase cannot rewind a running turn clock or its indicator',()=>{
+ const {ctx}=renderer();
+ const run:any={sequence:4,started:1000,phase:'thinking',message:{content:'',thinking:'',segments:[]}};
+ ctx.projectEvent(run,{type:'text',content:'结果',sequence:5,activity_phase:'output',turn_started_at:2});
+ ctx.projectEvent(run,{type:'thinking_delta',content:'旧事件',sequence:4,activity_phase:'thinking',turn_started_at:1});
+ assert.equal(run.phase,'output');
+ assert.equal(run.started,2000);
+ assert.equal(run.message.thinking,'');
+});
+
+test('completed turn disclosure folds routine steps while preserving failures and answer order',()=>{
+ const {ctx}=renderer();
+ const message={role:'assistant',elapsed_seconds:9,segments:[
+  {type:'thinking',content:'internal example'},
+  {type:'tool_result',tool_name:'file.read',call_id:'ok',status:'success'},
+  {type:'text',content:'已读第一份。'},
+  {type:'tool_result',tool_name:'file.read',call_id:'missing',status:'failed'},
+  {type:'text',content:'第二份缺失。'},
+ ]};
+ const parts=ctx.conversationTimeline(message);
+ assert.deepEqual(Array.from(parts,(p:any)=>ctx.isFoldable(p)),[true,true,false,false,false]);
+ const html=ctx.messageHtml(message);
+ assert.match(html,/data-toggle-thoughts aria-expanded="false"/);
+ assert.doesNotMatch(html,/internal example/);
+ assert.match(ctx.messageHtml({role:'assistant',content:'普通回答。'}),/class="turn-summary" hidden/);
 });

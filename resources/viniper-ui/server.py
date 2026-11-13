@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.request
@@ -34,7 +35,7 @@ from agent_queue import AgentQueueStore
 from agent_run_coordinator import AgentRunCoordinator, AgentRunJournal, DurableInteractionStore
 from native_project_browser import browse_project_files, preview_project_file, ProjectBrowserError
 from skill_sync import localized_skill_fields
-from local_agent_contract import local_agent_contract, local_placeholder_auth
+from local_agent_contract import local_agent_contract, local_placeholder_auth, local_model_notice
 from harness_application_port import HarnessApplicationPort
 from update_manager import (
     OFFICIAL_REPOSITORY, OFFICIAL_MANIFEST_URL, UpdateState,
@@ -2780,11 +2781,12 @@ def skill_file_from_record(skill: dict[str, str], mode: str = MODE_VINIPER, work
 
 
 def strip_goal_control_markers(value: str) -> str:
+    # A session snapshot can end between two streamed tokens. Whitespace at
+    # that boundary belongs to the answer (table rows, code indent, words).
     return (
         str(value or "")
         .replace(GOAL_DONE_MARKER, "")
         .replace(GOAL_CONTINUE_MARKER, "")
-        .strip()
     )
 
 
@@ -2949,6 +2951,7 @@ class HarnessRuntimeTransport:
         if session.get("task_mode") == "plan":
             runtime_prompt += "\n[规划模式] 只做只读调研并给出可执行计划。不要修改文件、运行有副作用的命令或声称已经实施。"
 
+        document_context = runtime_prompt
         harness_instructions = read_agent_instructions(MODE_VINIPER).strip()
         if harness_instructions:
             runtime_prompt = f"[Viniper Harness 独立指令]\n{harness_instructions}\n\n[当前请求]\n{runtime_prompt}"
@@ -2961,6 +2964,9 @@ class HarnessRuntimeTransport:
         elif selected_permission_mode == "plan":
             runtime_prompt = "[Viniper 计划模式：只分析并维护计划，不执行文件修改或有副作用的工具。]\n\n" + runtime_prompt
         cfg = provider_config(model, MODE_VINIPER)
+        notice = local_model_notice(cfg["base_url"], cfg["model"])
+        if notice:
+            raise RuntimeError(notice["message"])
         workdir = existing_workdir(str(session.get("workdir") or ""))
         watched_file_roots = file_change_watch_roots(workdir)
         before_file_state = snapshot_watch_files(watched_file_roots)
@@ -3002,6 +3008,7 @@ class HarnessRuntimeTransport:
         last_save = 0.0
         active_plan_run_id = ""
         plan_touched = False
+        may_have_written = False
         captured_file_changes: list[dict[str, Any]] | None = None
         event_stream = None
         stream_cleanup: asyncio.Task | None = None
@@ -3110,6 +3117,8 @@ class HarnessRuntimeTransport:
 
         def capture_file_changes() -> list[dict[str, Any]]:
             nonlocal captured_file_changes
+            if not may_have_written:
+                return []
             if captured_file_changes is None:
                 captured_file_changes = []
                 for change in file_change_records(before_file_state, before_file_text, watched_file_roots):
@@ -3171,6 +3180,7 @@ class HarnessRuntimeTransport:
             event_stream = self.application_port.stream(
                 session_id=session_id,
                 prompt=runtime_prompt,
+                document_context=document_context,
                 user_text=display_prompt or ("继续推进当前目标。" if suppress_user_message else prompt),
                 model=provider_model,
                 workdir=str(workdir),
@@ -3356,6 +3366,8 @@ class HarnessRuntimeTransport:
                         yield {"type": "thinking_complete", "elapsed": finish_thinking()}
                     continue
                 if event_type == "tool_start":
+                    if event.get("read_only") is not True:
+                        may_have_written = True
                     tool_name = str(event.get("tool_name") or event.get("name") or "工具")
                     call_id = str(event.get("call_id") or event.get("tool_id") or "")
                     tool_content = clean_stream_text(str(event.get("content") or tool_name))
@@ -3415,7 +3427,7 @@ class HarnessRuntimeTransport:
                         "owner": "viniper",
                         "tool_name": str(event.get("tool_name") or "工具"),
                         "content": clean_stream_text(str(event.get("content") or "需要权限")),
-                        "allowed_actions": ["deny", "allow_once"],
+                        "allowed_actions": ["deny", "allow_once", "allow_always"],
                         "status": "waiting",
                     }
                     continue
@@ -3842,9 +3854,16 @@ async def status(mode: str = Query(default=MODE_VINIPER), session_id: str | None
             "configured": configured, "provider": cfg["provider"], "provider_label": cfg["label"],
             "base_url": cfg["base_url"], "model": cfg["model"], "models": base["models"],
             "local_agent": local_agent_contract(cfg["base_url"]), "settings": settings,
+            "model_notice": local_model_notice(cfg["base_url"], cfg["model"]),
             "permission_mode": base["permission_mode"], "permission_modes": base["permission_modes"],
             "engine": "harness-runtime", "data_dir": str(DATA_DIR),
             "features": {"planning": True, "goals": True, "steering": True, "skills": True}}
+
+
+@app.get("/api/model-notice")
+async def model_notice(model: str | None = None):
+    cfg = status_base_snapshot(MODE_VINIPER)["cfg"]
+    return {"notice": local_model_notice(cfg["base_url"], model or cfg["model"])}
 
 
 @app.get("/api/settings")
@@ -4128,6 +4147,8 @@ async def create_goal(request: Request):
     if sid not in sessions:
         raise HTTPException(status_code=404, detail="session not found")
     require_canonical_mode(sessions[sid].get("mode"))
+    body["permission_mode"] = require_permission_mode(
+        body.get("permission_mode") or session_permission_mode(sessions[sid]), MODE_VINIPER)
     sessions[sid]["task_mode"] = "goal"
     sessions[sid]["reasoning"] = str(body.get("reasoning") or "medium")
     sessions[sid]["selected_skills"] = body.get("skills") or []
@@ -4144,7 +4165,10 @@ async def create_goal(request: Request):
 async def control_goal(goal_id: str, request: Request):
     body = await request.json()
     try:
-        goal = await goal_service().control(goal_id, str(body.get("action") or ""))
+        if body.get("action") == "edit":
+            goal = await goal_service().edit(goal_id, body)
+        else:
+            goal = await goal_service().control(goal_id, str(body.get("action") or ""))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="目标不存在") from exc
     except ValueError as exc:
@@ -5001,7 +5025,8 @@ async def answer_run_interaction(session_id: str, request: Request):
     run = _active_runs.get(session_id)
     if run and run.get("kind") == MODE_VINIPER:
         call_id = str(body.get("call_id") or body.get("request_id") or "")
-        decision = "allow-once" if str(body.get("action") or body.get("decision") or "") in {"allow", "allow-once", "allow_once", "accept"} else "reject"
+        action = str(body.get("action") or body.get("decision") or "")
+        decision = "allow-always" if action in {"allow-always", "allow_always"} else "allow-once" if action in {"allow", "allow-once", "allow_once", "accept"} else "reject"
         try:
             snapshot = coordinated_run_snapshot(session_id) or {}
             pending = snapshot.get("pending_interaction") if isinstance(snapshot.get("pending_interaction"), dict) else {}
@@ -5238,7 +5263,7 @@ async def remove_workspace_binding(request: Request):
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str):
-    if _active_runs.get(session_id):
+    if _active_runs.get(session_id) or agent_run_coordinator().has_active(session_id):
         raise HTTPException(status_code=409, detail="运行中的会话必须先停止，才能删除。")
     existed = session_id in sessions
     session = sessions.get(session_id) or {}
@@ -5275,8 +5300,7 @@ async def list_plugins(mode: str = Query(default=MODE_VINIPER), session_id: str 
     return {"ok": True, "mode": MODE_VINIPER, "plugins": payload.get("plugins", [])}
 
 
-@app.get("/api/skills/{filename:path}")
-async def read_skill(filename: str, mode: str = Query(default=MODE_VINIPER), session_id: str = ""):
+def registered_skill(filename: str, mode: str, session_id: str):
     selected_mode = require_canonical_mode(mode)
     workdir = str(safe_session(session_id).get("workdir") or "") if session_id else str(default_session_workdir())
     if not filename or not filename.endswith(".md"):
@@ -5285,17 +5309,64 @@ async def read_skill(filename: str, mode: str = Query(default=MODE_VINIPER), ses
     path = skill_file_from_record(skill, selected_mode, workdir) if skill else None
     if not path:
         raise HTTPException(status_code=404, detail="skill not found")
+    return skill, path, workdir
+
+
+def editable_skill(skill, path: Path, workdir: str) -> bool:
+    roots = dict(unique_skill_source_roots(MODE_VINIPER, workdir))
+    root = roots.get(skill["source"])
+    if not root or skill["source"] not in {"workspace-agents", "workspace-codex", "global-codex", "global-agents"}:
+        return False
+    # Managed links remain owned by their package. Only modify ordinary files in the registered root.
+    return (path.resolve() == path.absolute() and path.is_relative_to(root)
+            and path.is_file() and not path.resolve().is_relative_to(APP_DIR.resolve())
+            and os.access(path, os.W_OK) and os.access(path.parent, os.W_OK))
+
+
+@app.get("/api/skills/{filename:path}")
+async def read_skill(filename: str, mode: str = Query(default=MODE_VINIPER), session_id: str = ""):
+    skill, path, workdir = registered_skill(filename, mode, session_id)
     return {
+        "editable": editable_skill(skill, path, workdir),
         "id": filename,
         "filename": path.name,
         "source": skill.get("source", "") if skill else "",
         "display_name": skill.get("display_name", "") if skill else "",
         "display_description": skill.get("display_description", "") if skill else "",
         "display_category": skill.get("display_category", "") if skill else "",
-        "mode": selected_mode,
+        "mode": MODE_VINIPER,
         "availability": copy.deepcopy(skill.get("availability") or {}) if skill else {},
         "content": path.read_text(encoding="utf-8", errors="replace"),
     }
+
+
+@app.put("/api/skills/{filename:path}")
+async def update_skill(filename: str, request: Request, session_id: str = ""):
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("content"), str) or not body["content"].strip():
+        raise HTTPException(status_code=400, detail="技能说明不能为空")
+    skill, path, workdir = registered_skill(filename, MODE_VINIPER, session_id)
+    if not editable_skill(skill, path, workdir):
+        raise HTTPException(status_code=403, detail="此技能由安装包或共享来源维护")
+    # Compare the editor's original text before replacing; never overwrite newer local changes.
+    original = path.read_bytes()
+    if original.decode("utf-8").replace("\r\n", "\n") != body.get("original"):
+        raise HTTPException(status_code=409, detail="源文件已更改。请保留你的草稿，重新打开编辑页后合并。")
+    content = body["content"].replace("\r\n", "\n")
+    if b"\r\n" in original:
+        content = content.replace("\n", "\r\n")
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".viniper-skill-")
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(content.encode("utf-8"))
+        shutil.copymode(path, temporary)
+        if path.is_symlink() or path.read_bytes() != original:
+            raise HTTPException(status_code=409, detail="源文件已更改，请重新打开后合并")
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    _skills_cache.clear()
+    return {"ok": True}
 
 
 DEFAULT_AUTO_COMPACT_THRESHOLD = 0.95

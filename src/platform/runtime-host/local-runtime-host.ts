@@ -1,5 +1,6 @@
 import net from "node:net";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { lstatSync, mkdirSync, statSync } from "node:fs";
 import { acquireDataRootLease, DataRootBusyError, DataRootLease } from "../persistence/data-root-lease";
 import { AppSnapshot, AgentIntent, PermissionMode, RunSnapshot, SessionSnapshot } from "../../core/contracts";
 import { ArtifactReadInput, ArtifactReadResult } from "../../core/artifact-contracts";
@@ -108,7 +109,7 @@ export async function startRuntimeOwner(options: RuntimeOwnerOptions): Promise<R
       throw error;
     }
   }
-  const endpoint = runtimeEndpoint(options.dataRoot);
+  let endpoint: string;
   const sockets = new Set<net.Socket>();
   const subscribers = new Set<net.Socket>();
   const writers = new Map<net.Socket, SocketOutboundWriter>();
@@ -126,6 +127,12 @@ export async function startRuntimeOwner(options: RuntimeOwnerOptions): Promise<R
   };
 
   try {
+    endpoint = runtimeEndpoint(options.dataRoot);
+    if (process.platform !== "win32" && dirname(endpoint) !== resolve(options.dataRoot)) {
+      const shortDirectory = dirname(endpoint);
+      mkdirSync(shortDirectory, { recursive: true, mode: 0o700 });
+      verifySocketDirectory(shortDirectory);
+    }
     server = net.createServer((socket) => {
       sockets.add(socket);
       writers.set(socket, new SocketOutboundWriter(socket));
@@ -230,7 +237,9 @@ export async function startRuntimeOwner(options: RuntimeOwnerOptions): Promise<R
 }
 
 export async function createRuntimeClient(dataRoot: string): Promise<RuntimeApplicationClient> {
-  const client = new RuntimeApplicationClient(runtimeEndpoint(dataRoot));
+  const endpoint = runtimeEndpoint(dataRoot);
+  if (process.platform !== "win32" && dirname(endpoint) !== resolve(dataRoot)) verifySocketDirectory(dirname(endpoint));
+  const client = new RuntimeApplicationClient(endpoint);
   try {
     await client.getSnapshot();
     return client;
@@ -567,7 +576,19 @@ function runtimeEndpoint(dataRoot: string): string {
     const safe = Buffer.from(normalized, "utf8").toString("base64url").replace(/[^a-zA-Z0-9_-]/gu, "").slice(-80);
     return `${PIPE_PREFIX}${safe}`;
   }
-  return `${normalized}/${SOCKET_FILE}`;
+  const endpoint = join(normalized, SOCKET_FILE);
+  const limit = process.platform === "linux" ? 107 : 103;
+  if (Buffer.byteLength(endpoint) <= limit) return endpoint;
+  // Unix socket addresses have a byte limit. The directory identity survives an owner handoff.
+  const { dev, ino } = statSync(normalized, { bigint: true });
+  return join("/tmp", `viniper-ipc-${process.getuid!()}`, `${dev.toString(36)}-${ino.toString(36)}.sock`);
+}
+
+function verifySocketDirectory(directory: string): void {
+  const stat = lstatSync(directory);
+  if (!stat.isDirectory() || stat.uid !== process.getuid!() || (stat.mode & 0o077) !== 0) {
+    throw new Error("Runtime socket directory must be private to its owner");
+  }
 }
 
 function listen(server: net.Server, endpoint: string): Promise<void> {

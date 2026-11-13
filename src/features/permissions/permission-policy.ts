@@ -101,10 +101,20 @@ function isProjectContainedPath(candidate: string, projectRoot: string): boolean
 }
 
 interface PendingAuthorization {
+  grantKey: string;
   request: ToolApprovalRequest;
   resolution: Promise<ToolAuthorizationResolution>;
   resolve: (resolution: ToolAuthorizationResolution) => void;
   removeAbortListener: () => void;
+}
+
+export interface RememberedAccessStore {
+  load(): Promise<string[] | undefined>;
+  save(grants: string[]): Promise<void>;
+}
+
+export function toolAuthorizationKey(tool: Pick<ToolRequest, "name" | "scope" | "readOnly" | "authorizationIdentity">): string {
+  return JSON.stringify([tool.name, tool.scope, tool.readOnly, tool.authorizationIdentity ?? "built-in"]);
 }
 
 interface PendingRunGrant {
@@ -118,6 +128,9 @@ interface ActiveRunGrant extends PendingRunGrant {
 }
 
 export class PermissionPolicy {
+  private readonly rememberedTools = new Set<string>();
+  private rememberedInitialized = false;
+  private grantWrites: Promise<void> = Promise.resolve();
   private readonly pending = new Map<string, PendingAuthorization>();
   private readonly resolved: ToolApprovalResolutionRecord[] = [];
   private readonly pendingRunGrants = new Map<string, PendingRunGrant>();
@@ -130,6 +143,7 @@ export class PermissionPolicy {
     private readonly approvalHostMode: ApprovalHostMode = "interactive",
     private readonly now: () => number = Date.now,
     private readonly persistence?: PermissionAccessPersistence,
+    private readonly rememberedAccess?: RememberedAccessStore,
   ) {}
 
   async initialize(): Promise<void> {
@@ -138,6 +152,21 @@ export class PermissionPolicy {
       if (root.trim()) this.trustedProjectRoots.set(normalizePath(root), root.trim());
     }
     this.initialized = true;
+    if (this.rememberedAccess) {
+      const grants = await this.rememberedAccess.load();
+      this.rememberedInitialized = grants !== undefined;
+      for (const grant of grants ?? []) this.rememberedTools.add(grant);
+    }
+  }
+
+  /** One migration for capabilities explicitly authorized by this desktop user.
+   * Later tools and wider scopes must obtain their own remembered grant. */
+  async authorizeInitialTools(tools: Array<Pick<ToolRequest, "name" | "scope" | "readOnly" | "authorizationIdentity">>): Promise<void> {
+    if (!this.rememberedAccess || this.rememberedInitialized) return;
+    const keys = tools.map(toolAuthorizationKey);
+    await this.rememberedAccess.save(keys);
+    keys.forEach(key => this.rememberedTools.add(key));
+    this.rememberedInitialized = true;
   }
 
   async setAccess(
@@ -215,7 +244,9 @@ export class PermissionPolicy {
         }),
       };
     }
-    const decision = decideToolPermission(
+    const remembered = this.rememberedAccess && this.rememberedTools.has(toolAuthorizationKey(input.tool));
+    if (remembered) return { state: "allowed", resolution: Promise.resolve({ allowed: true, reason: "remembered-access" }) };
+    const decision = this.rememberedAccess ? { allowed: false as const, reason: "approval-required" as const } : decideToolPermission(
       input.permissionMode,
       input.tool,
       this.effectiveAccess(input.sessionId, input.runId, input.projectRoot),
@@ -273,6 +304,7 @@ export class PermissionPolicy {
     });
     input.signal.addEventListener("abort", abort, { once: true });
     this.pending.set(key, {
+      grantKey: toolAuthorizationKey(input.tool),
       request,
       resolution,
       resolve,
@@ -283,6 +315,8 @@ export class PermissionPolicy {
   }
 
   resolve(sessionId: string, runId: string, callId: string, decision: ToolApprovalDecision): boolean {
+    // Persistent approvals must finish their durable write before execution.
+    if (decision === "allow-always") return false;
     const entry = [...this.pending.entries()].find(([, pending]) =>
       pending.request.sessionId === sessionId
       && pending.request.runId === runId
@@ -292,6 +326,24 @@ export class PermissionPolicy {
     return this.finish(key, decision === "allow-once"
       ? { allowed: true, reason: "allow-once" }
       : { allowed: false, reason: "rejected", message: "用户已拒绝本次工具调用；工具未执行。" });
+  }
+
+  async resolveRemembered(sessionId: string, runId: string, callId: string, decision: ToolApprovalDecision): Promise<boolean> {
+    if (decision !== "allow-always") return this.resolve(sessionId, runId, callId, decision);
+    if (!this.rememberedAccess) return false;
+    let resolved = false;
+    const operation = this.grantWrites.then(async () => {
+      const entry = [...this.pending.entries()].find(([, item]) => item.request.sessionId === sessionId && item.request.runId === runId && item.request.callId === callId);
+      if (!entry) return;
+      const [key, pending] = entry;
+      const grants = [...new Set([...this.rememberedTools, pending.grantKey])];
+      await this.rememberedAccess!.save(grants);
+      this.rememberedTools.add(pending.grantKey);
+      resolved = this.finish(key, { allowed: true, reason: "remembered-access" });
+    });
+    this.grantWrites = operation.catch(() => {});
+    await operation;
+    return resolved;
   }
 
   snapshot(): PermissionSnapshot {

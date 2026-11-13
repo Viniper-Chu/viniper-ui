@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ProviderRequest } from "../../core/provider-contracts";
+import { AgentIterationLimit } from "../../core/contracts";
 
 export interface LocalAgentPolicy {
   endpoint: string;
@@ -9,9 +10,10 @@ export interface LocalAgentPolicy {
   contextTokens: number;
   compactAtTokens: number;
   outputTokens: number;
-  maxIterations: number;
+  maxIterations: AgentIterationLimit;
   defaultReasoning: string;
   reasoningBudgets: Record<string, number>;
+  reasoningBudgetMessage?: string;
   parallelToolCalls: boolean;
   structuredToolsJson: boolean;
   proofFirstJson?: boolean;
@@ -31,7 +33,8 @@ export function loadLocalAgentPolicy(endpoint: string, path = process.env.VINIPE
     const contract = JSON.parse(readFileSync(path, "utf8"));
     if (!contract.endpoint || normalizeEndpoint(endpoint) !== normalizeEndpoint(contract.endpoint)) return undefined;
     const positive = (value: unknown): value is number => Number.isInteger(value) && Number(value) > 0;
-    if (![contract.context_tokens, contract.compaction_trigger_tokens, contract.output_limit, contract.max_iterations].every(positive)
+    if (![contract.context_tokens, contract.compaction_trigger_tokens, contract.output_limit].every(positive)
+      || !(contract.max_iterations === "unlimited" || positive(contract.max_iterations))
       || typeof contract.api_model !== "string") return undefined;
     return {
       endpoint: normalizeEndpoint(endpoint), model: contract.api_model,
@@ -39,6 +42,7 @@ export function loadLocalAgentPolicy(endpoint: string, path = process.env.VINIPE
       outputTokens: contract.output_limit, maxIterations: contract.max_iterations,
       defaultReasoning: contract.thinking_control?.default ?? "medium",
       reasoningBudgets: contract.thinking_control?.budget_tokens ?? { low: 256, medium: 512, high_and_above: 1024 },
+      reasoningBudgetMessage: typeof contract.thinking_control?.budget_message === "string" ? contract.thinking_control.budget_message : undefined,
       parallelToolCalls: contract.parallel_tool_calls === true,
       structuredToolsJson: contract.structured_tools_json === true,
       proofFirstJson: contract.proof_first_json === true,
@@ -65,6 +69,7 @@ export function localRequestOverrides(request: ProviderRequest, policy?: LocalAg
     max_tokens: policy.outputTokens,
     reasoning_effort: thinking ? effort : "none",
     reasoning_budget_tokens: thinking ? policy.reasoningBudgets[effort] ?? policy.reasoningBudgets.high_and_above : 0,
+    ...(thinking && policy.reasoningBudgetMessage ? { reasoning_budget_message: policy.reasoningBudgetMessage } : {}),
     reasoning_format: "deepseek",
     chat_template_kwargs: { enable_thinking: thinking },
     parallel_tool_calls: policy.parallelToolCalls,

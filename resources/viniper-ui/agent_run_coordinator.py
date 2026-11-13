@@ -569,6 +569,8 @@ class AgentRunRecord:
     events: deque[dict[str, Any]] = field(default_factory=deque)
     sequence: int = 0
     status: str = "running"
+    activity_phase: str = "starting"
+    turn_started_at: float = field(default_factory=time.time)
     pending_interaction: dict[str, Any] | None = None
     awaiting_interaction_ack: dict[str, Any] | None = None
     cancel_requested: bool = False
@@ -629,6 +631,8 @@ class AgentRunCoordinator:
             "active": not record.terminal,
             "terminal": record.terminal,
             "status": record.status,
+            "activity_phase": record.activity_phase,
+            "turn_started_at": record.turn_started_at,
             "sequence": record.sequence,
             "first_sequence": record.events[0]["sequence"] if record.events else record.sequence + 1,
             "pending_interaction": copy.deepcopy(record.pending_interaction),
@@ -773,8 +777,28 @@ class AgentRunCoordinator:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    _activity_phases = {
+        "queue_dispatch": "starting", "thinking": "thinking", "thinking_delta": "thinking",
+        "text": "output", "tool_start": "tool", "tool_result": "resume",
+        "permission_resolved": "resume", "interaction_resolved": "resume",
+    }
+
     async def _publish(self, record: AgentRunRecord, payload: dict[str, Any]) -> dict[str, Any]:
         event = copy.deepcopy(payload)
+        kind = event.get("type")
+        phase = self._activity_phases.get(kind)
+        if kind == "working_status":
+            phase = event.get("phase") or "notice"
+        if kind == "steering" and event.get("start_new_message"):
+            phase = "resume"
+        if kind == "queue_dispatch" or (kind == "steering" and event.get("start_new_message")):
+            record.turn_started_at = time.time()
+            event["turn_started_at"] = record.turn_started_at
+        elif record.sequence == 0:
+            event["turn_started_at"] = record.turn_started_at
+        if phase and phase != record.activity_phase:
+            record.activity_phase = phase
+            event["activity_phase"] = phase
         record.sequence += 1
         event["sequence"] = record.sequence
         engine_run_id = str(event.get("engine_run_id") or event.get("run_id") or "")

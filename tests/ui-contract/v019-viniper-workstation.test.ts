@@ -193,8 +193,8 @@ test("v0.19 uses the Viniper sparse structure and Harness circuit-signal visual 
   assert.match(sessions, /<summary class="session-actions-trigger"/u);
   assert.match(styles, /\.sidebar-secondary-action\s*\{\s*display:\s*none/u);
 
-  assert.equal(branding.status, "UNIFIED_3D_NATIVE_SOURCE");
-  assert.equal(branding.variant, "circuit-node-3d");
+  assert.equal(branding.status, "UNIFIED_APPROVED_ARTWORK");
+  assert.equal(branding.variant, "folded-v");
   assert.equal(branding.asset, branding.nativeFallback);
   assert.equal(branding.asset, "viniper-harness-circuit-node.png");
   for (const image of html.matchAll(/<img[^>]*src="([^"]+)"/gu)) {

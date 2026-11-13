@@ -59,5 +59,5 @@ test("stable provider prefix excludes release-only version markers", () => {
   const profile = buildContextProfile({ projectInstructions: "保持同一项目语义。" });
   const project = profile.stableSegments.find((segment) => segment.name === "project")?.text ?? "";
   assert.doesNotMatch(project, /\bv?\d+\.\d+\.\d+\b/u);
-  assert.match(project, /Viniper workstation Preview/u);
+  assert.match(project, /Viniper 是应用内唯一 Agent/u);
 });

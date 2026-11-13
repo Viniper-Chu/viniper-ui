@@ -91,7 +91,9 @@ test("same-session explicit manual and delegated runs overlap with independent r
 });
 
 test("IPC client reconnects to a handed-off owner and receives the canonical snapshot", async () => {
-  const root = await freshRoot("cp2-handoff-");
+  const fixtureRoot = await freshRoot("cp2-handoff-");
+  const root = join(fixtureRoot, "深层工作目录".repeat(9));
+  await mkdir(root);
   const bundle = await createHarnessApplication({
     dataRoot: root,
     workingDirectory: process.cwd(),
@@ -118,7 +120,7 @@ test("IPC client reconnects to a handed-off owner and receives the canonical sna
     unsubscribe();
     await client.dispose();
     await bundle.application.dispose();
-    await rm(root, { recursive: true, force: true });
+    await rm(fixtureRoot, { recursive: true, force: true });
   }
 });
 
@@ -219,7 +221,7 @@ test("restart resumes an unknown run once with visible recovering and replay eve
   try {
     await first.storage.saveSnapshot({
       schemaVersion: 3,
-      productVersion: "2.0.2",
+      productVersion: "2.2.2",
       activeSessionId: session.id,
       sessions: [persisted],
     });
@@ -269,7 +271,7 @@ test("restart does not replay a run with a terminal success event", async () => 
   try {
     await first.storage.saveSnapshot({
       schemaVersion: 3,
-      productVersion: "2.0.2",
+      productVersion: "2.2.2",
       activeSessionId: session.id,
       sessions: [{ ...session, status: "running", activeRunId: runId, activeRunIds: [runId] }],
     });

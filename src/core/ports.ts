@@ -24,6 +24,8 @@ export interface RuntimePersistence {
   saveSnapshot(application: PersistedApplication): Promise<void>;
   appendEvent(event: RuntimeEvent): Promise<void>;
   commitEvent(event: RuntimeEvent, application: PersistedApplication): Promise<RuntimeCommitReceipt>;
+  /** Durable streaming tail; replayed after the last snapshot on recovery. */
+  commitDeltaEvent?(event: RuntimeEvent): Promise<RuntimeCommitReceipt>;
 }
 
 export interface RuntimeCommitReceipt {

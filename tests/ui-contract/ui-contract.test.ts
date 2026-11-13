@@ -207,7 +207,8 @@ test("version and Stable stage are consistent in package, title and settings/abo
   const packageJson = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as { version: string };
   const core = await readFile(join(process.cwd(), "src", "core", "contracts.ts"), "utf8");
   const html = await readFile(join(process.cwd(), "src", "renderer", "shell", "index.html"), "utf8");
-  assert.equal(packageJson.version, "2.0.2");
+  assert.equal(packageJson.version, "2.2.2");
+  assert.equal((await readFile(join(process.cwd(), "resources", "viniper-ui", "VERSION"), "utf8")).trim(), packageJson.version);
   assert.match(core, /Stable（稳定版）/u);
   assert.equal(html.includes(`v${packageJson.version} · Stable（稳定版）`), true);
   assert.doesNotMatch(html, /Beta|公测|\bRC\b|正式版|首次公测更新/u);
@@ -230,7 +231,7 @@ test("Phase 7 Composer never renders a blank selection for an unavailable persis
   assert.match(composer, /selectedOptions\[0\]\?\.disabled/u);
 });
 
-test("visible branding uses the same three-dimensional Viniper source as native Windows surfaces", async () => {
+test("visible branding uses the same approved Viniper source as native Windows surfaces", async () => {
   const packageJson = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as { description: string };
   const html = await readFile(join(process.cwd(), "src", "renderer", "shell", "index.html"), "utf8");
   const desktop = await readFile(join(process.cwd(), "src", "platform", "desktop", "main.ts"), "utf8");
@@ -250,17 +251,17 @@ test("visible branding uses the same three-dimensional Viniper source as native 
   assert.match(visibleBranding, /Viniper workstation/u);
   assert.doesNotMatch(visibleBranding, /平静指挥台/u);
   assert.equal(manifest.brand, "Viniper");
-  assert.equal(manifest.status, "UNIFIED_3D_NATIVE_SOURCE");
+  assert.equal(manifest.status, "UNIFIED_APPROVED_ARTWORK");
   assert.equal(manifest.nativeFallback, "viniper-harness-circuit-node.png");
   assert.equal(manifest.nativeSmall, "viniper-harness-circuit-node-32.png");
   assert.equal(manifest.windowsIco, "viniper-harness-circuit-node.ico");
   assert.equal(manifest.asset, "viniper-harness-circuit-node.png");
   assert.equal(manifest.asset, manifest.nativeFallback);
-  assert.equal(manifest.variant, "circuit-node-3d");
+  assert.equal(manifest.variant, "folded-v");
   assert.deepEqual(manifest.frame, {
     kind: "rounded-square",
-    radius: 24,
-    preserves: "existing V circuit-node mark",
+    radius: 14,
+    preserves: "open folds of the V",
   });
   const approvedIcon = await readFile(join(process.cwd(), "assets", "branding", manifest.asset));
   assert.equal(approvedIcon.byteLength > 0, true);
@@ -268,7 +269,7 @@ test("visible branding uses the same three-dimensional Viniper source as native 
     const nativeIcon = await readFile(join(process.cwd(), "assets", "branding", nativeAsset));
     assert.equal(nativeIcon.byteLength > 0, true, nativeAsset);
   }
-  assert.match(html, /class=["']brand-mark["'][^>]*data-asset-status=["']UNIFIED_3D_NATIVE_SOURCE["'][^>]*viniper-harness-circuit-node\.png/u);
+  assert.match(html, /class=["']brand-mark["'][^>]*data-asset-status=["']UNIFIED_APPROVED_ARTWORK["'][^>]*viniper-harness-circuit-node\.png/u);
   assert.equal((html.match(/viniper-harness-circuit-node\.png/gu) ?? []).length >= 3, true);
   assert.doesNotMatch(html, /PENDING_IMAGE2_ASSET/u);
 });

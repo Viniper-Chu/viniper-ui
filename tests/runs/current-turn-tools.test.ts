@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { toolsForCurrentTurn } from "../../src/features/runs/current-turn-tools";
+import { documentHints, isInlineMathExercise, legacyDocumentHints, relevantFileTools, toolsForCurrentTurn } from "../../src/features/runs/current-turn-tools";
 import { ProviderRegistry } from "../../src/features/providers/provider-registry";
 import { ProviderEvent, ProviderRequest } from "../../src/core/provider-contracts";
 import { createRuntimeFixture, waitFor } from "./runtime-fixture";
@@ -136,8 +136,13 @@ test("steering aborts a streaming answer immediately and resumes with the correc
   registry.register({descriptor:{...registry.get('demo').descriptor},async *stream(request,signal):AsyncIterable<ProviderEvent>{
     requests.push(request);
     if(requests.length===1){
-      started=true;yield {kind:'text.delta',text:'正在整理初步结果。'};
-      await new Promise<void>(resolve=>{ const stop=()=>{aborted=true;resolve();}; signal.aborted?stop():signal.addEventListener('abort',stop,{once:true}); });
+      yield {kind:'text.delta',text:'正在整理初步结果。'};
+      await new Promise<void>(resolve => {
+        const stop = () => { aborted = true; resolve(); };
+        if (signal.aborted) stop();
+        else signal.addEventListener('abort', stop, { once: true });
+        started = true;
+      });
       yield {kind:'text.delta',text:'不应出现的旧输出'};
     }
     else yield {kind:'text.delta',text:'已按补充方向修正。'};
@@ -219,4 +224,27 @@ test("steering cancels an active tool, keeps its result and skips the remaining 
     assert.match(results[1].content, /未执行/);
     assert.equal(fixture.runtime.listRuns(session.id).at(-1)?.status, "completed");
   } finally { await fixture.dispose(); }
+});
+
+test("math routing distinguishes the actual task, attachment and retained document from host instructions", () => {
+  const task = "讨论参数 a 变化时，方程 x²−2x+a=0 有几个实根。";
+  const names = ["file.read", "file.math.handout", "math.quadratic.check", "file.pdf.inspect", "file.image.analyze"];
+  const tools = names.map(name => ({ ...tool, name }));
+  assert.equal(isInlineMathExercise(task), true);
+  for (const request of ["请读取附件并" + task, "从试卷中" + task, "用 Python " + task, task + "画出函数图像。"])
+    assert.equal(isInlineMathExercise(request), false);
+  assert.deepEqual(legacyDocumentHints("[Viniper Harness 独立指令]\n保护 SQLite 和 Word 文档，编译讲义。\n\n[当前请求]\n" + task), ["quadratic"]);
+  for (const text of ["把两道题编译成练习卷", "出一份试卷", "把附件排成学案"]) {
+    const retained = documentHints(text);
+    assert.ok(retained.includes("handout"));
+    assert.ok(relevantFileTools("继续", tools, true, retained).some(t => t.name === "file.math.handout"));
+  }
+  assert.ok(relevantFileTools("根据题图.png 解答", tools, true).some(t => t.name === "file.image.analyze"));
+  assert.ok(!relevantFileTools(task, tools, true).some(t => t.name === "file.math.handout"));
+});
+
+test("explicitly requesting root counts uses the inline verified answer path", () => {
+  for (const text of ["随 t 变化，给出方程 x²−4x+3=t 各支根数。", "列出二次函数 y=x² 与水平线 t 的交点，调用 math.quadratic.check。"])
+    assert.equal(isInlineMathExercise(text), true);
+  assert.equal(isInlineMathExercise("读取试卷文件，列出方程 x²=1 的根数。"), false);
 });

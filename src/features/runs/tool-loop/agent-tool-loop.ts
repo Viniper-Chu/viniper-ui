@@ -1,4 +1,6 @@
-import { ActivityRecord, RuntimeEventType, RuntimePlanSnapshot, ToolRequest } from "../../../core/contracts";
+import { replaceBranchTables, verifiedBranchTables } from "../../math/branch-table";
+import { setImmediate as yieldToHost } from "node:timers/promises";
+import { ActivityRecord, AgentIterationLimit, RuntimeEventType, RuntimePlanSnapshot, ToolRequest } from "../../../core/contracts";
 import {
   ProviderContentItem,
   ProviderEvent,
@@ -39,8 +41,8 @@ export interface AgentToolLoopOptions {
   codeSubcallInvoker?: (input: CodeSubcallInput) => Promise<CodeSubcallResult>;
   signal: AbortSignal;
   now: () => number;
-  maxRounds?: number;
-  maxProviderRequests?: number;
+  maxRounds?: AgentIterationLimit;
+  maxProviderRequests?: AgentIterationLimit;
   noProgressLimit?: number;
   trackReads?: boolean;
   reviewPlan?: ReviewExecutionPlan;
@@ -50,11 +52,12 @@ export interface AgentToolLoopOptions {
   runId?: string;
   permissionPolicy?: PermissionPolicy;
   resourceCoordinator?: ToolResourceCoordinator;
+  completesVerification?(call: ProviderToolCallItem, result: ProviderToolResultItem): boolean;
   onToolResult?(call: ProviderToolCallItem, result: ProviderToolResultItem): Promise<void>;
   artifactService?: ManagedArtifactService;
   onProviderAttempt?(
     attempt: number,
-    budget: { ordinal: number; limit: number; remaining: number },
+    budget: { ordinal: number; limit: AgentIterationLimit; remaining: AgentIterationLimit },
   ): Promise<void> | void;
   onProviderRetry?(input: { attempt: number; nextAttempt: number; error: unknown }): Promise<void> | void;
   providerRetryDelayMs?: number | ((retryNumber: number) => number);
@@ -130,10 +133,10 @@ export class ReviewNoProgressError extends Error {
 class ProviderRequestBudget {
   private started = 0;
 
-  constructor(readonly limit: number) {}
+  constructor(readonly limit: AgentIterationLimit) {}
 
   reserve(): number {
-    if (this.started >= this.limit) throw new ProviderRequestBudgetExceededError(this.limit, this.started);
+    if (this.limit !== "unlimited" && this.started >= this.limit) throw new ProviderRequestBudgetExceededError(this.limit, this.started);
     this.started += 1;
     return this.started;
   }
@@ -153,6 +156,10 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
   const readPaths = new Set<string>();
   let reviewNoProgress: { checkpointId: string; fingerprint: string } | undefined;
   let completeText = "";
+  let verified = false;
+  let retryingAnswer = false;
+  let verifiedEvidence: string[] = [];
+  let branchTables: string[] = [];
 
   if (options.reviewPlan) {
     await options.emit("plan.updated", { plan: projectReviewPlan(options.reviewPlan) });
@@ -163,7 +170,8 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
     });
   }
 
-  for (let round = 1; round <= maxRounds; round += 1) {
+  let round = 1;
+  for (; maxRounds === "unlimited" || round <= maxRounds; round += 1) {
     throwIfCancelled(options.signal);
     if (stagnant) throw new Error(`工具 ${stagnant} 连续返回相同结果且没有进展，已停止续轮。请依据现有结果调整操作。`);
     if (reviewNoProgress) {
@@ -202,10 +210,29 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       await options.emit("steering.updated", { receipt, startNewMessage: receipt === firstSteer });
     }
     if (firstSteer) {
+      verified = false;
+      retryingAnswer = false;
+      verifiedEvidence = [];
+      branchTables = [];
       stagnant = undefined;
       reviewNoProgress = undefined;
       repeatedReads.clear();
       reviewFingerprints.clear();
+    }
+    const stepTools = verified ? [] : frozenTools;
+    // With tools disabled, native tool-call history can prime a local chat template to emit XML as prose.
+    // Feed the writer the original conversation and the actual numeric receipt as ordinary text.
+    let requestHistory = clone(history);
+    if (verified) {
+      const lastUser = requestHistory.map(entry => entry.role).lastIndexOf("user");
+      requestHistory = requestHistory.slice(0, lastUser + 1);
+      requestHistory.push({ id: newId("verified-answer"), role: "user", items: [{ type: "text", text: [
+        "以下为本题的精确验算资料。把它整理成学生可读的定稿。每题给一条完整推导。",
+        ...verifiedEvidence,
+        ...(branchTables.length ? ["本题的分支定义域、值域、各段交点及最终答案将由应用从回执直接排在你文字之后。你负责前半段推导：从题干得到等价方程、原定义域和顶点，写到能按水平线分类为止。左右两支都包含可取的顶点。不要重复分支计数或另选顶点归属约定。若题目还有其他独立小问，也要作答。"] : []),
+        retryingAnswer ? "上一轮没有形成解答。请从第一道题的推导直接写起。" : "现在直接给出各题的中文书面推导与结论。",
+        "如果原题为根式方程 √U=V，先写成 U=V² 且 V≥0。此时 U 非负已由等式保证，不再引入一个移动的区间端点。只保留必要步骤与结论。",
+      ].join("\n") }] });
     }
     const stepController = new AbortController();
     const stepSignal = AbortSignal.any([options.signal, stepController.signal]);
@@ -219,11 +246,35 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       let roundText = "";
       let reasoningText = "";
       let reasoningItemId: string | undefined;
+      let incompleteOutput = false;
+      let verifiedPrefix = "";
+      let proseStarted = !verified;
+      let rawToolMarkup = false;
 
       const consumeProviderEvent = async (event: ProviderEvent) => {
+        // Buffered provider frames can otherwise monopolize the microtask
+        // queue and prevent the host's Stop/steering commands from arriving.
+        await yieldToHost();
         throwIfCancelled(stepSignal);
+        if (verified && !proseStarted && event.kind === "text.delta") {
+          if (rawToolMarkup) return;
+          verifiedPrefix += event.text;
+          const prefix = verifiedPrefix.trimStart().toLowerCase();
+          const toolMarkers = ["<tool_call", "<function=", "<|tool_call"];
+          if (toolMarkers.some(marker => prefix.startsWith(marker))) { rawToolMarkup = true; return; }
+          if (toolMarkers.some(marker => marker.startsWith(prefix))) return;
+          proseStarted = true;
+          event = { ...event, text: verifiedPrefix };
+        }
+        if (branchTables.length && event.kind === "text.delta") {
+          roundText += event.text;
+          return;
+        }
         await options.onProviderEvent(event);
         switch (event.kind) {
+          case "response.incomplete":
+            incompleteOutput = true;
+            break;
           case "text.delta":
             completeText += event.text;
             roundText += event.text;
@@ -266,16 +317,17 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
           signal: stepSignal,
           stream: () => options.provider.stream({
             ...options.request,
-            tools: clone(frozenTools),
+            ...(verified ? { reasoning: "none" } : {}),
+            tools: clone(stepTools),
             frozenRunContext: options.frozenRunContext,
-            history: clone(history),
+            history: requestHistory,
           }, stepSignal),
           onAttempt: async (attempt) => {
             const ordinal = requestBudget.reserve();
             await options.onProviderAttempt?.(attempt, {
               ordinal,
               limit: requestBudget.limit,
-              remaining: requestBudget.limit - ordinal,
+              remaining: requestBudget.limit === "unlimited" ? "unlimited" : requestBudget.limit - ordinal,
             });
           },
           onRetry: options.onProviderRetry,
@@ -309,7 +361,18 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
         throw error;
       }
       if (!providerResult.ok) throw providerResult.error;
+      if (verified && (rawToolMarkup || toolCalls.length)) {
+        if (retryingAnswer) throw new Error("模型在书面解答阶段重复返回工具调用，本题尚未形成完整解答。");
+        retryingAnswer = true;
+        continue;
+      }
 
+      if (branchTables.length && roundText.trim() && !incompleteOutput) {
+        roundText = replaceBranchTables(roundText, branchTables);
+        completeText += roundText;
+        appendAdjacentText(roundItems, roundText);
+        await options.onProviderEvent({ kind: "text.delta", text: roundText });
+      }
       if (reasoningText && !roundItems.some((item) => item.type === "reasoning")) {
         roundItems.unshift({
           type: "reasoning",
@@ -329,6 +392,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       }
 
       if (toolCalls.length === 0) {
+        if (incompleteOutput) throw new Error("模型达到单次输出上限，本轮回复尚不完整。已保留现有输出，不能作为完整交付；请继续当前任务，长内容分批保存到文件后核对完整性。");
         // A steer may arrive while the final answer is streaming. Deliver it
         // in the next request instead of silently completing with it queued.
         if (options.runId && options.steering?.hasPending(options.runId)) {
@@ -359,7 +423,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
         try {
           result = previous ? clone(previous) : stepController.signal.aborted
             ? toolResult(call, "用户已引导当前任务，此操作未执行。请按最新引导继续。", true)
-            : await dispatchToolCall(call, { ...options, signal: stepSignal }, frozenTools);
+            : await dispatchToolCall(call, { ...options, signal: stepSignal }, stepTools);
         } catch (error) {
           throwIfCancelled(options.signal);
           if (!stepController.signal.aborted) throw error;
@@ -387,6 +451,13 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
             const value = JSON.parse(result.content);
             result.content = JSON.stringify({ ...value, read_progress: progress });
           } catch { result.content += `\n本轮读取进度：${JSON.stringify(progress)}`; }
+        }
+        if (!stepController.signal.aborted && options.completesVerification?.(call, result)) {
+          verified = true;
+          if (call.name === "math.quadratic.check") {
+            try { branchTables.push(...verifiedBranchTables(result.content)); } catch { /* Non-JSON receipts carry no verified table. */ }
+          }
+          verifiedEvidence.push("验算输入 " + JSON.stringify(call.arguments) + "\n精确结果 " + result.content);
         }
         completedToolResults.set(call.callId, clone(result));
         await options.onToolResult?.(call, clone(result));
@@ -426,7 +497,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
     }
   }
 
-  return { assistantText: completeText, rounds: maxRounds };
+  return { assistantText: completeText, rounds: round - 1 };
 }
 
 function advanceReviewPlan(plan: ReviewExecutionPlan, readOnly: boolean, failed: boolean): boolean {
@@ -554,7 +625,7 @@ export async function dispatchToolCall(
   const owner = options.toolRegistry.managedOwner(call.name);
   if (call.argumentsError) {
     const reason = call.argumentsError === "output-limit" ? "模型达到单次输出上限，工具参数被截断" : "模型生成的工具参数不是完整的 JSON 对象";
-    const message = `${reason}；本次操作未执行。缩小单次操作内容并重新提供完整参数。长文件分段创建或追加，每次只写一个短小片段，避免再次生成整个文件。`;
+    const message = `${reason}；本次操作未执行。保持原任务范围、题量、答案和完整原解不变。将完整内容分批写入请求文件，每次只写一个完整短片段；file.math.handout 使用 questions_file 和原计划的 expected_question_count 生成。不要把分批执行改成减少交付内容，也不要以精炼版替代完整原解。`;
     await options.emit("tool.requested", activity({ id: activityId, kind: "tool", title: "操作内容未生成完整", detail: message,
       status: "failed", callId: call.callId, toolName: call.name, now: options.now }));
     await options.emit("tool.failed", { activityId, result: message });
@@ -605,6 +676,7 @@ export async function dispatchToolCall(
     readOnly: tool.readOnly,
     scope: tool.authorizationScope ?? "computer",
     input: clone(call.arguments),
+    authorizationIdentity: owner ? `${owner}@${options.extensionSnapshot?.[owner]?.version ?? options.frozenRunContext?.extensions[owner]?.version ?? "unknown"}` : "built-in",
   };
   const permissionPolicy = options.permissionPolicy ?? new PermissionPolicy("fail-closed", options.now);
   const authorization = validation.valid
