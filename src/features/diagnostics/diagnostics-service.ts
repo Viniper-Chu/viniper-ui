@@ -69,8 +69,9 @@ export class DiagnosticsService {
     }
   }
 
-  snapshot(): DiagnosticsSnapshot {
-    return { entries: this.entries.map((entry) => ({ ...entry })), ...(this.detailedRunId ? { detailedRunId: this.detailedRunId } : {}), consent: this.consent, queuedUploads: [...this.queuedUploads], failedUploads: [...this.failedUploads], ...(this.persistenceError ? { persistenceError: this.persistenceError } : {}) };
+  snapshot(recent?: number): DiagnosticsSnapshot {
+    const entries = recent === undefined ? this.entries : this.entries.slice(Math.max(0, this.entries.length - Math.max(0, recent)));
+    return { ...(recent === undefined ? {} : { totalEntries: this.entries.length }), entries: entries.map((entry) => ({ ...entry })), ...(this.detailedRunId ? { detailedRunId: this.detailedRunId } : {}), consent: this.consent, queuedUploads: [...this.queuedUploads], failedUploads: [...this.failedUploads], ...(this.persistenceError ? { persistenceError: this.persistenceError } : {}) };
   }
 
   previewExport(runId?: string): DiagnosticPreview {

@@ -1,6 +1,7 @@
 """Read the local deployment's non-secret public policy for the desktop UI."""
 import json
 import os
+import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -57,7 +58,16 @@ def local_model_notice(base_url, model=None):
         return None
     profile = Path(os.environ.get('VINIPER_LOCAL_AGENT_PROFILE') or Path.home()/'本地模型/开发维护/server-profile.json')
     pause = profile.with_name('暂停运行.json')
+    try:
+        state = json.loads((profile.parent/'logs/server-state.json').read_text())
+        fresh = 0 <= time.time() - float(state.get('updated_at', 0)) < 15
+    except (OSError, ValueError, TypeError, AttributeError):
+        state, fresh = {}, False
     if not pause.is_file():
+        if fresh and state.get('waiting_for_cold_start'):
+            return {'label':'等待启动','message':'本地模型正在检查启动所需内存，草稿可继续编辑。'}
+        if fresh and state.get('cold_wake_blocked'):
+            return {'label':'等待唤醒', 'message':'本地模型已休眠，正在等待内存余量恢复。可以先输入题目。'}
         return None
     try:
         reason = json.loads(pause.read_text()).get('reason')
@@ -65,5 +75,7 @@ def local_model_notice(base_url, model=None):
         reason = 'paused'
     if reason == 'specialist_training':
         return {'label': '本地模型正在维护', 'message': '本地模型正在训练或维护，暂时不能执行任务。恢复服务后可继续发送。'}
+    if reason == 'memory_guard' and fresh and state.get('waiting_for_memory'):
+        return {'label':'等待内存恢复','message':'本地模型已释放内存。系统稳定后会自动重启，当前草稿可继续编辑。'}
     cause = '因内存保护暂停' if reason == 'memory_guard' else '已暂停运行'
     return {'label': '本地模型已暂停', 'message': f'本地模型{cause}，暂时不能开始新任务。请先检查后台内存占用并恢复服务；已有会话和当前输入会保留。'}

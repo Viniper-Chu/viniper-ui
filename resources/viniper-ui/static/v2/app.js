@@ -1,3 +1,4 @@
+import { setupFunctionField } from "./function-field.js";
 import { setupTooltips } from "./tooltips.js";
 import { api, query, state, escape, timeLabel } from "./api.js";
 import { ui } from "./ui.js";
@@ -17,7 +18,7 @@ import {
   toolTitle,
   workingLabel,
 } from "./conversation.js";
-import { showMenu, closeMenu, menuContent, sessionMenuContent } from "./menus.js";
+import { option, showMenu, closeMenu, menuContent, sessionMenuContent } from "./menus.js";
 import {
   loadExtensions,
   renderExtensions,
@@ -25,7 +26,7 @@ import {
   showPlugin,
   backToExtensions,
   useSelectedSkill,
-  editSkill, cancelSkillEdit, saveSkill,
+  editSkill, cancelSkillEdit, saveSkill, skillEditorMode,
 } from "./pages.js";
 import { loadTasks, renderTasks, taskAction, selectTaskFilter, openTaskEditor, backToTasks, showTask, cancelTaskEdit, saveTask } from "./tasks.js";
 import { loadSettings, saveSettings, selectSettingsSection, readingSize, setupPreferenceSearch, clearPreferenceSearch, focusPreference, syncSettings, discardSettings } from "./preferences.js";
@@ -111,14 +112,16 @@ export function view(name, { returning = false } = {}) {
   $("#project-button").hidden = name !== "chat" || !state.session;
   $("#session-more").hidden = name !== "chat";
   closeMenu();
+  let loading;
   if (name === "extensions" && !returning)
-    loadExtensions().catch((e) => toast(e.message, true));
-  if (name === "tasks") loadTasks().catch((e) => toast(e.message, true));
+    loading = loadExtensions().catch((e) => toast(e.message, true));
+  if (name === "tasks") loading = loadTasks().catch((e) => toast(e.message, true));
   if (name === "settings") {
     $(".settings-navigation [aria-selected=true]").focus({ preventScroll: true });
     Promise.resolve(loadSettings()).catch((e) => toast(e.message, true));
   }
   if (innerWidth <= 860 && name !== "settings" && !returning) $("#app").classList.add("sidebar-collapsed");
+  return loading;
 }
 export async function loadStatus() {
   state.status = await api("/api/status?mode=viniper");
@@ -131,7 +134,7 @@ export async function loadStatus() {
     state.session?.workdir || draftDirectory ||
     state.status.settings?.workspace?.default_root ||
     "";
-  state.modelNotice = state.status.model_notice;
+  state.modelNotice = state.model === state.status.model ? state.status.model_notice : null;
   $("#version").textContent = state.status.version;
   if (!state.session) {
     $("#project-name").textContent =
@@ -206,12 +209,19 @@ function renderSessions() {
       row = document.createElement("div");
       row.className = "session-row";
       row.dataset.sessionRow = id;
-      row.innerHTML = `<button class="session-item" data-session="${escape(id)}"><span class="session-state phase-signal" aria-hidden="true"></span><span class="session-name"></span><span class="session-pin" aria-label="已置顶" hidden>${icon("pin")}</span><small class="session-state-label" hidden></small></button><button class="icon-button session-more" data-session-menu="${escape(id)}" aria-haspopup="menu" aria-expanded="false">${icon("more")}</button>`;
+      row.innerHTML = `<button class="session-item" data-session="${escape(id)}"><span class="session-state phase-signal" aria-hidden="true"></span><span class="session-copy"><span class="session-name"></span><span class="session-preview" hidden></span></span><span class="session-pin" aria-label="已置顶" hidden>${icon("pin")}</span><small class="session-state-label" hidden></small></button><button class="icon-button session-more" data-session-menu="${escape(id)}" aria-haspopup="menu" aria-expanded="false">${icon("more")}</button>`;
     }
     rows.delete(id);
     if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
     const label = phase ? phases[phase][0] : "";
     const item = row.querySelector(".session-item");
+    const preview = session.preview || "";
+    const snippet = row.querySelector(".session-preview");
+    if (row._preview !== preview) {
+      snippet.innerHTML = globalThis.ViniperMarkdown.preview(preview);
+      row._preview = preview;
+    }
+    snippet.hidden = !preview;
     if (row._name !== name) {
       row.querySelector(".session-name").textContent = name;
       row.querySelector(".session-more").setAttribute("aria-label", `会话选项：${name}`);
@@ -220,7 +230,7 @@ function renderSessions() {
     row._name = name;
     if (row.dataset.phase !== phase) {
       row.dataset.phase = phase;
-      setMarkup(row.querySelector(".session-state"), phase ? signal(phase) : icon("chat"));
+      setMarkup(row.querySelector(".session-state"), phase ? signal(phase) : icon(session.discussion ? "discussion" : "chat"));
       const status = row.querySelector(".session-state-label");
       status.textContent = label;
       status.hidden = !phase;
@@ -363,12 +373,23 @@ export function syncComposer() {
   const stopping = isStopping();
   const pending = run?.active ? run.interaction : state.session?.pending_interaction;
   const workspace = state.session?.workdir || state.workdir;
+  const group = state.session?.discussion === true && state.mode === "execute";
+  const participants = $("#discussion-people");
+  if (participants) {
+    participants.hidden = !group;
+    if (group) {
+      const recipient = $("#prompt").value.trimStart().match(/^@(解题|复核|并行)(?:[：:，,\s]+|$)/u)?.[1] || "全组";
+      for (const button of participants.querySelectorAll("[data-address]")) button.setAttribute("aria-pressed", String(button.dataset.address === recipient));
+    }
+  }
+  const heading = $("#welcome h1");
+  if (heading) heading.textContent = group ? "这道题，一起讨论" : "今天解哪道题？";
   const connectionStatus = $("#connection-status");
   connectionStatus.textContent = state.modelNotice?.label || (state.status?.configured ? "" : "等待配置模型");
   connectionStatus.hidden = !connectionStatus.textContent;
   $("#model-notice").hidden = !state.modelNotice;
   $("#model-notice").textContent = state.modelNotice?.message || "";
-  $("#prompt").placeholder = active ? "补充任务要求…" : "输入题目，或添加题图、讲义…";
+  $("#prompt").placeholder = active ? "补充任务要求…" : group ? "向讨论组提问，或点名一位成员…" : "输入题目，或添加题图、讲义…";
   $("#prompt").title = active ? "Enter 排队 · ⌘Enter 引导" : "Enter 发送 · Shift Enter 换行";
   $("#project-button").hidden = state.view !== "chat" || !state.session;
   $("#welcome-project").textContent = workspace?.split(/[\\/]/).filter(Boolean).at(-1) || "选择工作目录";
@@ -380,7 +401,7 @@ export function syncComposer() {
   );
   $("#model-label").textContent =
     model?.label || model?.name || state.model || "选择模型";
-  $("#reasoning-label").textContent = {
+  $("#reasoning-label").textContent = model?.reasoning_options?.length === 0 ? "服务默认" : {
     off: "不思考",
     minimal: "极低",
     low: "低",
@@ -418,11 +439,12 @@ export function syncComposer() {
   if (phase) {
     const tool = phase === "tool" ? run?.message?.segments?.findLast(s => s.type === "tool_start") : null;
     const toolName = tool?.tool_name || tool?.name;
-    const statusLabel = toolName ? `正在${toolTitle(toolName)}`
+    const phaseLabel = toolName ? `正在${toolTitle(toolName)}`
       : phase === "notice" && run?.message?.working ? workingLabel(run.message.working) : phases[phase][1];
+    const statusLabel = group && run?.message?.speaker ? run.message.speaker + " · " + phaseLabel : phaseLabel;
     const target = tool?.input?.path || tool?.input?.directory || tool?.input?.cwd || "";
     const detail = $("#work-detail");
-    detail.textContent = String(target).split(/[\\/]/).filter(Boolean).at(-1) || "";
+    detail.textContent = run?.peerPending && run.message.streaming ? "DeepSeek 同时作答中" : String(target).split(/[\\/]/).filter(Boolean).at(-1) || "";
     detail.hidden = !detail.textContent;
     detail.title = target;
     if (strip.dataset.phase !== phase) {
@@ -604,6 +626,7 @@ async function resumeRun(session) {
   }
   if (snapshot.turn_started_at > 0) run.started = snapshot.turn_started_at * 1000;
   run.phase = snapshot.activity_phase;
+  run.peerPending = session.messages?.some(message => message.peer_pending);
   run.sequence = snapshot.sequence || 0;
   run.stopRequested = Boolean(snapshot.cancel_requested);
   run.message.stopping = run.stopRequested;
@@ -852,13 +875,45 @@ export async function refreshGoalBanner() {
 }
 async function handleMenu(action, value) {
   closeMenu();
+  if (action === "save-prompt-skill" || action === "schedule-prompt") {
+    const message = document.getElementById(value)?._message;
+    if (message?.role !== "user" || !message.content?.trim()) return;
+    if (action === "schedule-prompt") {
+      view("tasks");
+      openTaskEditor(true, message.content);
+    } else {
+      dialog("保存为我的技能", `<label class="field">名称<input name="name" maxlength="60" required></label>
+        <label class="field">适用场景<input name="description" maxlength="180" required></label>
+        <label class="field">操作步骤<textarea name="instructions" rows="6" maxlength="24000" required>${escape(message.content)}</textarea></label>`,
+        {label:"保存技能", onSubmit:async form => {
+          await api("/api/skills", {method:"POST", body:Object.fromEntries(form)});
+          toast("已保存到技能与插件");
+        }});
+    }
+    return;
+  }
+  if (action === "new-discussion") {
+    const generation = switchVersion;
+    const room = await api("/api/sessions", {method:"POST",body:{mode:"viniper",discussion:true,workdir:state.workdir}});
+    await loadSessions();
+    if (generation !== switchVersion) return;
+    state.attachments = [];
+    state.selectedSkills = [];
+    await selectSession(room.session_id);
+    $("#prompt").focus();
+    return;
+  }
   if (action === "attach") $("#file-input").click();
   else if (action === "mode") {
     state.mode = state.mode === value ? "execute" : value;
     syncComposer();
     $("#prompt").focus();
   } else if (action === "model") {
+    if (value === "deepseek-flash" && state.status?.local_agent && !state.status.discussion_cloud_configured) {
+      openPreference("connection-settings", "discussion-key"); return;
+    }
     state.model = value;
+    await refreshModelNotice();
     const sid = state.session?.session_id;
     syncComposer();
     if (sid) {
@@ -903,7 +958,16 @@ function openPreference(section, field) {
   }).catch(() => {});
 }
 setupPreferenceSearch(openPreference);
-const navigate = setupNavigator({ openPreference, selectSession, view, newChat, jumpToMessage, openFile, closeMenu, toast, applyStarter });
+async function openRecord(kind, id) {
+  const target = ["skills","plugins"].includes(kind) ? "extensions" : "tasks";
+  await view(target);
+  if (state.view !== target) return;
+  if (!state[kind].some(record => record.id === id)) return toast("这项内容已变更，请重新查找", true);
+  if (kind === "skills") return showSkill(id);
+  if (kind === "plugins") return showPlugin(id);
+  return showTask(kind,id);
+}
+const navigate = setupNavigator({ openRecord, openPreference, selectSession, view, newChat, jumpToMessage, openFile, closeMenu, toast, applyStarter });
 async function dispatch(action) {
   if (action === "quick" || action === "turn-index") return navigate(action);
   if (action === "leave-settings") return leaveSettings();
@@ -954,6 +1018,24 @@ async function click(event) {
   const b = event.target.closest("button,a");
   if (!b) return;
   try {
+    if (b.dataset.address) {
+      const prompt = $("#prompt");
+      if (b.dataset.address === "并行" && !state.status?.discussion_cloud_configured) {
+        openPreference("connection-settings", "discussion-key");
+        return;
+      }
+      const prefix = b.dataset.address === "全组" ? "" : "@" + b.dataset.address + " ";
+      prompt.value = prefix + prompt.value.replace(/^@(解题|复核|并行)(?:[：:，,\s]+|$)/u,"");
+      prompt.focus(); resizePrompt(); rememberDraft(); syncComposer();
+      return;
+    }
+    if (b.hasAttribute("data-reuse-prompt")) {
+      const value = b.closest(".message").id;
+      showMenu(b, option({label:"保存为技能", image:"book", action:"save-prompt-skill", value})
+        + option({label:"设为定时任务", image:"clock", action:"schedule-prompt", value}), {kind:"session"});
+      return;
+    }
+    if (b.dataset.skillMode) return skillEditorMode(b.dataset.skillMode);
     if (b.dataset.recordId) return showTask(b.dataset.recordKind,b.dataset.recordId);
     if (b.dataset.taskFilter) return selectTaskFilter(b.dataset.taskFilter);
     if (b.dataset.extensionFilter) {
@@ -1070,6 +1152,7 @@ $("#session-list").addEventListener("contextmenu", (event) => {
 
 $("#task-search").addEventListener("input", renderTasks);
 $("#task-edit-form").addEventListener("submit",event => { event.preventDefault(); saveTask().catch(error => toast(error.message,true)); });
+$("#skill-edit-form").elements.content.addEventListener("invalid", () => skillEditorMode("source"));
 $("#skill-edit-form").addEventListener("submit",event => { event.preventDefault(); saveSkill().catch(error => toast(error.message,true)); });
 $("#extension-search").addEventListener("input", renderExtensions);
 $(".settings-navigation").addEventListener("keydown", event => {
@@ -1194,6 +1277,7 @@ if (
   document.body.classList.add("platform-mac");
 if (innerWidth <= 860) $("#app").classList.add("sidebar-collapsed");
 hydrateIcons();
+setupFunctionField($("#chat-view"));
 await Promise.all([loadStatus(), loadSessions()]).catch((error) =>
   toast(`连接尚未就绪：${error.message}`, true),
 );

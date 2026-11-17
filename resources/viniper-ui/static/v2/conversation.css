@@ -88,7 +88,7 @@ details[open] > .step-heading .step-chevron, .turn-summary[aria-expanded="true"]
 .more-files-list { display: grid; gap: 8px; padding-top: 4px; }
 .result-file { display: flex; align-items: center; gap: 12px; padding: 12px 16px; width: 100%; text-align: left; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
 .result-file:hover { background: var(--surface-soft); border-color: var(--line-strong); }
-.result-file-icon { width: 24px; height: 32px; display: grid; place-items: center; color: var(--accent); flex: none; }
+.result-file-icon { width: 34px; height: 38px; display: grid; place-items: center; background: var(--surface-soft); border-radius: 8px; color: var(--accent); flex: none; }
 .result-file-copy { min-width: 0; flex: 1; display: grid; gap: 4px; }
 .result-file-copy strong { font-size: var(--text-sm); font-weight: 500; overflow-wrap: anywhere; }
 .result-file-copy small { display: block; font-size: var(--text-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -106,3 +106,22 @@ details[open] > .step-heading .step-chevron, .turn-summary[aria-expanded="true"]
 .answer .math-display { border-left: 2px solid var(--line); padding-left: 12px; }
 .result-file-icon[data-result-type="PDF"] { color: var(--accent); background: var(--accent-soft); font: 600 10px/1 var(--mono); letter-spacing: .015em; border: 1px solid var(--line); border-radius: 6px; }
 .turn-summary[aria-expanded="true"] { color: var(--accent); }
+
+.message.user { align-items: flex-end; gap: 6px; }
+.reuse-prompt { flex: none; width: 28px; height: 28px; min-height: 28px; opacity: 0; color: var(--muted); }
+.message.user:hover .reuse-prompt, .message.user:focus-within .reuse-prompt,
+.reuse-prompt[aria-expanded="true"] { opacity: 1; }
+@media (hover: none) { .reuse-prompt { opacity: 1; } }
+
+.discussion-author { display:flex; align-items:center; gap:6px; font-size:var(--text-sm); color:var(--accent); margin:0 0 6px; }
+.discussion-author svg { width:15px; height:15px; }
+.discussion-author[data-speaker="DeepSeek"], .discussion-author[data-speaker="复核"] { color:var(--secondary); }
+.discussion-author[hidden], #discussion-people[hidden] { display:none; }
+#discussion-people { display:flex; flex-wrap:wrap; gap:4px; padding:0 3px 5px; }
+#discussion-people button { color:var(--secondary); border-radius:6px; padding:3px 7px; font-size:var(--text-xs); }
+#discussion-people button:hover, #discussion-people button:focus-visible { color:var(--ink); background:var(--surface-soft); }
+#discussion-people button[aria-pressed="true"] { color:var(--accent); background:var(--accent-soft); }
+
+#discussion-people [data-address="并行"] { display:inline-flex; align-items:center; gap:4px; }
+#discussion-people [data-address="并行"] svg { width:14px; height:14px; }
+.peer-pending .discussion-author::after { content:"正在独立解答"; color:var(--muted); font-size:var(--text-xs); font-weight:400; }

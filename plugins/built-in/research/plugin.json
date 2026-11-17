@@ -8,6 +8,7 @@
   ],
   "skills": [],
   "tools": [
+    "web.search",
     "web.fetch",
     "github.repository.read"
   ],

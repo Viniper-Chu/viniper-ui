@@ -207,7 +207,7 @@ test("version and Stable stage are consistent in package, title and settings/abo
   const packageJson = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as { version: string };
   const core = await readFile(join(process.cwd(), "src", "core", "contracts.ts"), "utf8");
   const html = await readFile(join(process.cwd(), "src", "renderer", "shell", "index.html"), "utf8");
-  assert.equal(packageJson.version, "2.2.2");
+  assert.equal(packageJson.version, "3.0.0");
   assert.equal((await readFile(join(process.cwd(), "resources", "viniper-ui", "VERSION"), "utf8")).trim(), packageJson.version);
   assert.match(core, /Stable（稳定版）/u);
   assert.equal(html.includes(`v${packageJson.version} · Stable（稳定版）`), true);

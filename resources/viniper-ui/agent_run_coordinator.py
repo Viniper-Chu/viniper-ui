@@ -813,6 +813,8 @@ class AgentRunCoordinator:
 
     def _project_event(self, record: AgentRunRecord, payload: dict[str, Any]) -> None:
         event_type = str(payload.get("type") or "")
+        if event_type == "discussion_peer" and (payload.get("message") or {}).get("error"):
+            record.had_error = True
         if event_type == "interaction_request":
             record.pending_interaction = copy.deepcopy(payload)
             record.awaiting_interaction_ack = None

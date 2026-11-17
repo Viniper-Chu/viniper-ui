@@ -118,10 +118,11 @@ config_scope = {
     'merged_env': lambda **kwargs: {}, 'allowed_model': lambda value, mode: value or provider['model'],
     'read_host_secret': read_secret, 'host_secret_configured': lambda mode: True,
     'provider_env_fallback': lambda value, mode: '', 'local_placeholder_auth': local_placeholder_auth,
-    '_host_secret_request': secret_metadata,
+    '_host_secret_request': secret_metadata, 'local_agent_contract': local_agent_contract,
+    'DEFAULT_DEEPSEEK_MODEL': 'deepseek-flash', 'DEEPSEEK_CHAT_ENDPOINT': 'https://api.deepseek.com/chat/completions',
 }
 config_nodes = [node for node in server_source.body if isinstance(node, ast.FunctionDef)
-                and node.name in {'provider_config', 'public_provider'}]
+                and node.name in {'provider_config', 'public_provider','connection_for_model','has_local_primary'}]
 exec(compile(ast.Module(body=config_nodes, type_ignores=[]), '<server credential projection>', 'exec'), config_scope)
 assert config_scope['provider_config']()['api_key'] == 'cpu-fixture-only'
 assert config_scope['provider_config'](resolve_secret=False)['api_key'] == ''
@@ -130,6 +131,10 @@ assert public['api_key_configured'] and public['api_key_access'] == 'local-place
 assert 'cpu-fixture-only' not in json.dumps(public)
 assert 'cpu-fixture-only' not in json.dumps(local_agent_contract(endpoint))
 assert not secret_reads
+cloud = config_scope['provider_config']('deepseek-flash')
+assert cloud['provider']=='deepseek' and cloud['base_url']=='https://api.deepseek.com/chat/completions'
+assert secret_reads==['discussion']
+secret_reads.clear()
 assert not local_placeholder_auth('https://example.test/v1', 'qwen-local')
 assert not local_placeholder_auth(endpoint, 'different-model')
 assert not local_placeholder_auth(endpoint, '')

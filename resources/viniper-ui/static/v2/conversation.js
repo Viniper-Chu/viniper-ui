@@ -313,16 +313,27 @@ function copyAnswer(message) {
   const final = parts.filter(p => p.final);
   return (final.length ? final : parts).map(p => p.content).join("\n\n");
 }
+function authorMark(speaker) {
+  const glyph = {解题:"book", 复核:"proof", Qwen:"model", DeepSeek:"parallel"}[speaker] || "chat";
+  return icon(glyph) + "<span>" + escape(speaker || "") + "</span>";
+}
 function messageHtml(message) {
   if (message.role === "user")
-    return `<div class="user-content">${message.guidance ? `<span class="guidance-label">${icon("steer")}引导</span>` : ""}${escape(message.content)}${(message.attachments || []).map((a) => `<div><button class="file-link" data-file="${escape(a.path || "")}">${icon("file")}${escape(a.name || a.path)}</button></div>`).join("")}</div>`;
+    return `${message.content?.trim() ? '<button class="icon-button reuse-prompt" data-reuse-prompt aria-label="复用这条提问" aria-haspopup="menu" aria-expanded="false">' + icon("book") + '</button>' : ""}<div class="user-content">${message.guidance ? `<span class="guidance-label">${icon("steer")}引导</span>` : ""}${escape(message.content)}${(message.attachments || []).map((a) => `<div><button class="file-link" data-file="${escape(a.path || "")}">${icon("file")}${escape(a.name || a.path)}</button></div>`).join("")}</div>`;
   const parts = conversationTimeline(message), data = activityData(message, parts), content = copyAnswer(message);
-  return `<button class="turn-summary"${message.streaming || !data.expandable ? " hidden" : ""} data-toggle-thoughts aria-expanded="false"><span class="activity-label">${escape(data.label)}</span><small class="activity-count">${escape(data.count)}</small><span class="step-chevron">${icon("chevron")}</span></button><span class="turn-outcome"${!message.streaming && !data.expandable && data.outcome ? "" : " hidden"}>${escape(data.label)}</span><div class="turn-timeline">${timelineHtml(message, parts)}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : ""}</div><div class="message-actions"${content.trim() ? "" : " hidden"}><button class="icon-button" data-copy="${escape(content)}" aria-label="复制回答">${icon("copy")}</button></div>`;
+  return `<strong class="discussion-author" data-speaker="${escape(message.speaker || "")}"${message.speaker ? "" : " hidden"}>${message.speaker ? authorMark(message.speaker) : ""}</strong><button class="turn-summary"${message.streaming || !data.expandable ? " hidden" : ""} data-toggle-thoughts aria-expanded="false"><span class="activity-label">${escape(data.label)}</span><small class="activity-count">${escape(data.count)}</small><span class="step-chevron">${icon("chevron")}</span></button><span class="turn-outcome"${!message.streaming && !data.expandable && data.outcome ? "" : " hidden"}>${escape(data.label)}</span><div class="turn-timeline">${timelineHtml(message, parts)}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : ""}</div><div class="message-actions"${content.trim() ? "" : " hidden"}><button class="icon-button" data-copy="${escape(content)}" aria-label="复制回答">${icon("copy")}</button></div>`;
 }
 function updateMessage(node, message) {
   node._message = message;
   if (message.role === "user") { updateMarkup(node, messageHtml(message)); return; }
   const parts = conversationTimeline(message), data = activityData(message, parts);
+  const author = node.querySelector(".discussion-author");
+  node.classList.toggle("peer-pending", Boolean(message.peer_pending));
+  if (author && author.dataset.speaker !== (message.speaker || "")) {
+    author.hidden = !message.speaker;
+    author.dataset.speaker = message.speaker || "";
+    author.innerHTML = message.speaker ? authorMark(message.speaker) : "";
+  }
   const summary = node.querySelector(".turn-summary");
   if (summary.hidden && !message.streaming && node.querySelector("details[open]")) summary.setAttribute("aria-expanded", "true");
   summary.hidden = Boolean(message.streaming || !data.expandable);
@@ -398,6 +409,7 @@ export function appendMessage(message, index = $("#messages").children.length) {
   $("#starters").hidden = true;
   const node = document.createElement("article");
   node.className = `message ${message.role}`;
+  node.classList.toggle("peer-pending", Boolean(message.peer_pending));
   node.id = `message-${index}`;
   node.dataset.messageIndex = index;
   node._message = message;
@@ -444,6 +456,28 @@ export function projectEvent(run, event) {
   if (event.activity_phase) run.phase = event.activity_phase;
   if (event.sequence) run.sequence = event.sequence;
   if (event.run_id) run.runId = event.run_id;
+  if (event.type === "discussion_join" || event.type === "discussion_peer") {
+    run.peerPending = event.type === "discussion_join";
+    if (state.session?.session_id === run.sessionId && state.view === "chat") {
+      const node = [...$("#messages").children].find(node => node._message?.peer_id === event.message.peer_id);
+      if (node) updateMessage(node,event.message);
+      else appendMessage(event.message);
+    }
+    return;
+  }
+  if (event.type === "speaker_finished") {
+    run.message.streaming = false;
+    if (event.thinking_elapsed_seconds) run.message.thinking_elapsed_seconds = event.thinking_elapsed_seconds;
+    if (run.node?.isConnected && state.session?.session_id === run.sessionId) updateMessage(run.node, run.message);
+    return;
+  }
+  if (event.type === "assistant_start" && event.speaker) {
+    if (run.message.speaker && run.message.speaker !== event.speaker) {
+      run.node = null;
+      run.message = {role:"assistant", content:"", thinking:"", segments:[], streaming:true, elapsed:0};
+    }
+    run.message.speaker = event.speaker;
+  }
   if (event.type === "queue_dispatch") {
     run.done = false;
     run.message = {
@@ -537,6 +571,7 @@ export function projectEvent(run, event) {
 export function updateRail() {
   const nodes = [...$("#messages").querySelectorAll(".message.user")];
   $("#turn-index-button").hidden = !$("#messages").children.length;
+  $("#session-title").disabled = $("#turn-index-button").hidden;
   $("#message-rail").innerHTML = nodes
     .map(
       (node) =>

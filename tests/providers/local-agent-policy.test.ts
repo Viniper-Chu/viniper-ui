@@ -31,6 +31,9 @@ test("local policy stays deployment scoped, honors manual thinking and gates mix
     request.currentUserText = "读取文件，输出严格 JSON 对象。";
     assert.equal(localRequestOverrides(request, policy).reasoning_budget_tokens, 512);
     assert.equal(localRequestOverrides(request, policy).reasoning_budget_message, "收束草稿，执行必要工具并核对结果。");
+    const tiny = localRequestOverrides({...request, reasoning:"minimal"}, {...policy, templateEfforts:{minimal:"low"}, reasoningBudgets:{minimal:128}});
+    assert.equal(tiny.reasoning_effort, "low");
+    assert.equal(tiny.reasoning_budget_tokens, 128);
     request.reasoning = "off";
     assert.equal(localRequestOverrides(request, policy).reasoning_budget_tokens, 0);
     assert.equal(localRequestOverrides(request, policy).reasoning_budget_message, undefined);

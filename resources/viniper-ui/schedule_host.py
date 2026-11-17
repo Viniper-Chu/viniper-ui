@@ -10,10 +10,19 @@ class ScheduleHost:
 
     async def snapshot(self):
         result = await self.port.control("scheduler.snapshot")
-        history = result.get("history", [])
-        return [{**d, "title": d["name"], "cron": d["schedule"].get("expression", ""),
-                 "last_result": "目标会话已删除；任务已停用，请重新创建任务。" if d.get("status") == "project-invalid" else next((h["detail"] for h in history if h["scheduleId"] == d["id"]), "")}
-                for d in result.get("definitions", []) if d.get("status") != "deleted"]
+        by_schedule = {}
+        for entry in result.get("history", []):
+            by_schedule.setdefault(entry["scheduleId"], []).append(entry)
+        rows = []
+        for definition in result.get("definitions", []):
+            if definition.get("status") == "deleted":
+                continue
+            history = by_schedule.get(definition["id"], [])
+            last = history[0]["detail"] if history else ""
+            rows.append({**definition, "title": definition["name"], "cron": definition["schedule"].get("expression", ""),
+                         "last_result": "目标会话已删除；任务已停用，请重新创建任务。" if definition.get("status") == "project-invalid" else last,
+                         "history": history, "upcoming": result.get("previews", {}).get(definition["id"], [])})
+        return rows
 
     def start(self):
         self.task = asyncio.create_task(self.loop())
@@ -29,6 +38,8 @@ class ScheduleHost:
                     await self.port.control("scheduler.defer", id=job["id"])
                     continue
                 else:
+                    # A schedule stores its own prompt. Composer skills belong to the preceding manual turn.
+                    session["selected_skills"] = []
                     session["task_mode"] = "execute"
                     self.coordinator.start(sid, lambda sid=sid, job=job, session=session: self.stream(sid, job["prompt"],
                         model=session.get("model"), permission_mode=session.get("permission_mode", "ask")),

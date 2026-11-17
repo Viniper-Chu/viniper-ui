@@ -66,7 +66,7 @@ export function renderExtensions() {
     plugins
       .map(
         (p) =>
-          `<button class="capability-card" data-plugin="${escape(p.id)}" data-hint="${escape(p.description || p.name || p.id)}"><span class="card-icon">${icon(p.icon || "plugin")}</span><span class="capability-copy"><span class="capability-name">${escape(p.name || p.id)}</span><small>${escape(p.description || "")}</small></span>${p.status === "unavailable" ? '<small class="card-state">待配置</small>' : ""}</button>`,
+          `<button class="capability-card" data-plugin="${escape(p.id)}" data-hint="${escape(p.description || p.name || p.id)}"><span class="card-icon">${icon(p.icon || "plugin")}</span><span class="capability-copy"><span class="capability-name">${escape(p.name || p.id)}</span><small>${escape(p.description || "")}</small></span>${p.status === "unavailable" ? '<small class="card-state">待配置</small>' : (p.tools?.length ? `<small class="card-state">${p.tools.length} 个工具</small>` : "")}</button>`,
       )
       .join("") || extensionEmpty("plugins", "当前没有匹配的已连接插件。");
   const favorites = [
@@ -74,6 +74,7 @@ export function renderExtensions() {
     "local-math-knowledge",
     "local-small-tasks",
     "local-speech-to-text",
+    "math-solution-review",
     "calm-task-brief",
     "karpathy-llm-wiki",
     "lark-doc",
@@ -163,14 +164,31 @@ export function showPlugin(id) {
   $("#detail-content").innerHTML =
     (plugin.description ? `<p class="detail-intro">${escape(plugin.description)}</p>` : "") +
     (plugin.status === "unavailable" ? '<p class="status-note">待配置</p>' : "") +
-    (rows ? `<h2 class="group-title">工具<span class="section-count">${tools.length} 项</span></h2><label class="field search-field tool-search"><span aria-hidden="true">${icon("search")}</span><input type="search" id="tool-search" aria-label="筛选插件工具" placeholder="查找工具名称或 ID"></label><ul class="tool-directory">${rows}</ul><p id="no-matching-tool" role="status" hidden>没有匹配的工具</p>` : "");
+    (rows ? `<h2 class="group-title">工具<span class="section-count" id="tool-count">${tools.length} 项</span></h2><label class="field search-field tool-search"><span aria-hidden="true">${icon("search")}</span><input type="search" id="tool-search" aria-label="筛选插件工具" placeholder="查找工具名称或 ID"></label><ul class="tool-directory">${rows}</ul><p id="no-matching-tool" role="status" hidden>没有匹配的工具</p>` : "");
   const search = $("#tool-search");
   if (search) search.addEventListener("input", () => {
     const query = search.value.trim().toLocaleLowerCase();
     const rows = [...document.querySelectorAll("#detail-content .tool-directory li")];
     for (const row of rows) row.hidden = !row.textContent.toLocaleLowerCase().includes(query);
-    $("#no-matching-tool").hidden = rows.some(row => !row.hidden);
+    const count = rows.filter(row => !row.hidden).length;
+    $("#tool-count").textContent = query ? `${count} / ${tools.length}` : `${tools.length} 项`;
+    $("#no-matching-tool").hidden = count > 0;
   });
+}
+
+function skillText(content) {
+  return String(content || "").replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, "").trim();
+}
+
+export function skillEditorMode(mode) {
+  const preview = mode === "preview";
+  const form = $("#skill-edit-form");
+  const output = $("#skill-draft-preview");
+  $("#skill-source-field").hidden = preview;
+  output.hidden = !preview;
+  if (preview) output.innerHTML = globalThis.ViniperMarkdown.render(skillText(form.elements.content.value));
+  for (const button of form.querySelectorAll("[data-skill-mode]"))
+    button.setAttribute("aria-pressed", String(button.dataset.skillMode === mode));
 }
 
 export async function showSkill(id) {
@@ -182,7 +200,7 @@ export async function showSkill(id) {
     const skill = await api(`/api/skills/${encodeURIComponent(id)}?${query({ mode: "viniper", session_id: state.session?.session_id || "" })}`);
     if (generation !== detailVersion) return;
     skillRecord = skill;
-    const body = String(skill.content || "").replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, "").trim();
+    const body = skillText(skill.content);
     $("#detail-content").innerHTML = `<div class="answer skill-body">${globalThis.ViniperMarkdown.render(body)}</div>`;
     selectedSkill = id;
     const running = state.runs.get(state.session?.session_id)?.active || state.session?.active_run?.active;
@@ -210,6 +228,7 @@ export function editSkill() {
   $("#skill-editor").hidden = false;
   const form = $("#skill-edit-form");
   form.elements.content.value = skillRecord.content;
+  skillEditorMode("source");
   $("#skill-editor-source").textContent = skillRecord.display_name || skillRecord.filename;
   form.querySelector("[role=status]").textContent = "";
   $("#extensions-view").scrollTop = 0;

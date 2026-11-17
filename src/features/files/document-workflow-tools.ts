@@ -27,7 +27,7 @@ export function createDocumentWorkflowTools(host: DocumentWorkflowHost): ToolExe
   const tools: ToolExecutor[] = [];
   if (host.available("handout")) tools.push({
     name: "file.math.handout", readOnly: false, authorizationScope: "computer",
-    description: "生成师生数学文档。长文档先逐题写入JSON/JSONL文件，再传questions_file与原计划expected_question_count；不要把整份长题解塞进一次调用，不得减题或删原解。章节用sections，题干不重复写题号。先读实际规范、完整题源并独立验算；编译成功不是内容验收，须核对范围、题量、完整解析和每页图。现有项目继续用其编译入口。",
+    description: "生成师生数学文档。代回验算请写“成立”或“不成立”，避免正文字体缺少勾叉符号。长文档先逐题写入JSON/JSONL文件，再传questions_file与原计划expected_question_count；不要把整份长题解塞进一次调用，不得减题或删原解。章节用sections，题干不重复写题号。先读实际规范、完整题源并独立验算；编译成功不是内容验收，须核对范围、题量、完整解析和每页图。现有项目继续用其编译入口。",
     inputSchema: { type: "object", properties: {
       directory: { type: "string", description: "已存在且位于当前工作目录内的输出目录；省略使用当前工作目录。" },
       title_tex: { type: "string", description: "讲义标题，不含文档模板。" },

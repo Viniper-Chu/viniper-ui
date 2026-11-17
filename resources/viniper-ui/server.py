@@ -35,6 +35,7 @@ from agent_queue import AgentQueueStore
 from agent_run_coordinator import AgentRunCoordinator, AgentRunJournal, DurableInteractionStore
 from native_project_browser import browse_project_files, preview_project_file, ProjectBrowserError
 from skill_sync import localized_skill_fields
+from discussion import discussion_events, parallel_discussion
 from local_agent_contract import local_agent_contract, local_placeholder_auth, local_model_notice
 from harness_application_port import HarnessApplicationPort
 from update_manager import (
@@ -593,8 +594,8 @@ def context_usage_ledger() -> ContextUsageLedger:
 
 def context_usage_payload(session_id: str, model: str = "") -> dict[str, Any]:
     mode = normalize_session_mode(sessions.get(str(session_id), {}).get("mode")) if str(session_id) in sessions else MODE_CLAUDE
-    selected_model = allowed_model(model, mode) if model else allowed_model("", mode)
-    provider = provider_for_mode(load_app_settings(), mode)
+    selected_model = allowed_model(model or sessions.get(str(session_id), {}).get("model"), mode)
+    provider = connection_for_model(load_app_settings(), mode, selected_model)
     capacity = model_capacity_metadata(selected_model, provider_id=capacity_provider_id(provider), mode=mode)
     local = local_agent_contract(str(provider.get("base_url") or ""), selected_model) if mode == MODE_VINIPER else None
     if local:
@@ -695,7 +696,7 @@ def normalize_session(session_id: str, raw: dict[str, Any]) -> dict[str, Any]:
         normalized["permission_mode"] = stored_permission_mode
     # These user-owned collections may be present in older/newer compatible
     # session records. Normalization must not discard them during startup.
-    for key in ("reasoning", "task_mode", "selected_skills", "queue", "attachments", "plan", "claude_agents", "native_capabilities", "native_runtime", "native_terminal_sync", "model"):
+    for key in ("discussion", "reasoning", "task_mode", "selected_skills", "queue", "attachments", "plan", "claude_agents", "native_capabilities", "native_runtime", "native_terminal_sync", "model"):
         if key in raw:
             normalized[key] = raw[key]
     for key in (
@@ -1330,7 +1331,7 @@ def _host_secret_request(mode: Any, endpoint: str) -> dict[str, Any]:
     token = str(os.environ.get("VINIPER_HOST_SECRET_BROKER_TOKEN") or "").strip()
     if not port or not token:
         return {}
-    selected_mode = normalize_provider_mode(mode)
+    selected_mode = "discussion" if mode == "discussion" else normalize_provider_mode(mode)
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/secret/{endpoint}?mode={selected_mode}",
         headers={"Authorization": f"Bearer {token}"},
@@ -1750,11 +1751,13 @@ def remove_session_runtime_data(session_id: str) -> None:
 
 
 def create_session_record(session_id: str, *, name: str = "", workdir: str = "",
-                          permission_mode: str = "ask", task_mode: str = "execute") -> dict[str, Any]:
+                          permission_mode: str = "ask", task_mode: str = "execute", discussion: bool = False) -> dict[str, Any]:
     session = {"id": session_id, "mode": MODE_VINIPER, "messages": [],
                "created": now_ts(), "updated": now_ts(), "name": name or next_session_name(MODE_VINIPER),
                "workdir": workdir or str(default_session_workdir()), "pinned": False, "unread": False,
                "last_run_status": "", "summary": "", "permission_mode": permission_mode, "task_mode": task_mode}
+    if discussion:
+        session["discussion"] = True
     sessions[session_id] = session
     save_sessions_to_disk()
     return session
@@ -1841,9 +1844,29 @@ def merged_env(include_app_settings: bool = True, mode: str = MODE_CLAUDE) -> di
     return result
 
 
+DEEPSEEK_CHAT_ENDPOINT = "https://api.deepseek.com/chat/completions"
+
+
+def has_local_primary(provider):
+    return bool(local_agent_contract(str(provider.get("base_url") or ""), str(provider.get("model") or "")))
+
+
+def connection_for_model(settings, mode, model):
+    primary = provider_for_mode(settings, mode)
+    if mode == MODE_VINIPER and model == DEFAULT_DEEPSEEK_MODEL and has_local_primary(primary):
+        return {"id": "deepseek", "label": "DeepSeek Flash", "model": model, "base_url": DEEPSEEK_CHAT_ENDPOINT,
+                "secret_ref": "provider.deepseek.discussion", "credential_mode": "discussion"}
+    return primary
+
+
 def effective_model_options(mode: str = MODE_VINIPER):
     provider = provider_for_mode(load_app_settings(), MODE_VINIPER)
-    return normalize_model_options(provider.get("models"), provider_id=capacity_provider_id(provider), mode=MODE_VINIPER)
+    options = normalize_model_options(provider.get("models"), provider_id=capacity_provider_id(provider), mode=MODE_VINIPER)
+    if mode == MODE_VINIPER and has_local_primary(provider) and all(row["id"] != DEFAULT_DEEPSEEK_MODEL for row in options):
+        cloud, = normalize_model_options([{"id": DEFAULT_DEEPSEEK_MODEL, "label": "DeepSeek Flash",
+            "description": "云端 · 发送本会话上下文并使用工具"}], provider_id="deepseek", mode=mode)
+        options.append({**cloud, "reasoning_options": [], "credential_mode": "discussion"})
+    return options
 
 
 def allowed_model(model: str | None, mode: str = MODE_VINIPER) -> str:
@@ -1952,7 +1975,7 @@ def harness_permission_mode(mode: str | None) -> str:
 def provider_config(model_override: str | None = None, mode: str = MODE_VINIPER, *, resolve_secret: bool = True) -> dict[str, str]:
     selected_mode = normalize_provider_mode(mode)
     settings = load_app_settings()
-    provider = provider_for_mode(settings, selected_mode)
+    provider = connection_for_model(settings, selected_mode, model_override)
     names = provider_env_names(provider)
     env = merged_env(include_app_settings=False, mode=selected_mode)
     base_url = (
@@ -1966,7 +1989,12 @@ def provider_config(model_override: str | None = None, mode: str = MODE_VINIPER,
     api_key = ""
     if resolve_secret:
         local_auth = local_placeholder_auth(base_url, model) if selected_mode == MODE_VINIPER else ""
-        api_key = local_auth or read_host_secret(selected_mode) or provider_env_fallback(provider, selected_mode)
+        if provider.get("credential_mode") == "discussion":
+            api_key = read_host_secret("discussion")
+            if not api_key:
+                raise RuntimeError("请在设置 → 模型连接 → DeepSeek 云端保存或解锁 API 密钥。")
+        else:
+            api_key = local_auth or read_host_secret(selected_mode) or provider_env_fallback(provider, selected_mode)
         if not api_key and host_secret_configured(selected_mode):
             raise RuntimeError("已保存的模型凭据当前无法从系统钥匙串读取；凭据仍保留。请完成系统授权后重试。")
     return {
@@ -2599,7 +2627,7 @@ def skill_aliases(skill: dict[str, str]) -> set[str]:
     return normalized
 
 
-def parse_skill_directive(prompt: str) -> tuple[dict[str, str], str] | None:
+def parse_skill_directive(prompt: str, workdir: str = "") -> tuple[dict[str, str], str] | None:
     stripped = prompt.lstrip()
     if not stripped.startswith("/"):
         return None
@@ -2615,19 +2643,19 @@ def parse_skill_directive(prompt: str) -> tuple[dict[str, str], str] | None:
         token = parts[0].lstrip("/").lower()
         rest = stripped[len(parts[0]):].lstrip()
 
-    for skill in get_skills():
+    for skill in get_skills(MODE_VINIPER, workdir):
         if token in skill_aliases(skill):
             return skill, rest
     return None
 
 
-def expand_skill_prompt(prompt: str) -> str:
-    parsed = parse_skill_directive(prompt)
+def expand_skill_prompt(prompt: str, workdir: str = "") -> str:
+    parsed = parse_skill_directive(prompt, workdir)
     if not parsed:
         return prompt
 
     skill, rest = parsed
-    path = skill_file_from_record(skill)
+    path = skill_file_from_record(skill, MODE_VINIPER, workdir)
     if not path:
         return prompt
     try:
@@ -2668,7 +2696,7 @@ def skill_roots_for_mode(mode: str = MODE_VINIPER, workdir: str = "") -> list[tu
     if workdir:
         roots = [("workspace-agents", Path(workdir).expanduser() / ".agents" / "skills"),
                  ("workspace-codex", Path(workdir).expanduser() / ".codex" / "skills")]
-    return roots + [item for item in SKILL_SOURCE_ROOTS if item[0] != "built-in"] + [item for item in SKILL_SOURCE_ROOTS if item[0] == "built-in"]
+    return roots + [("viniper-user", DATA_DIR / "skills")] + [item for item in SKILL_SOURCE_ROOTS if item[0] != "built-in"] + [item for item in SKILL_SOURCE_ROOTS if item[0] == "built-in"]
 
 
 def unique_skill_dirs(mode: str = MODE_VINIPER, workdir: str = "") -> list[Path]:
@@ -2931,7 +2959,7 @@ class HarnessRuntimeTransport:
         model: str | None = None,
         permission_mode: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
-        suppress_user_message: bool = False, display_prompt: str | None = None,
+        suppress_user_message: bool = False, display_prompt: str | None = None, speaker: str = "",
     ):
         session = safe_session(session_id)
         if normalize_session_mode(session.get("mode")) != MODE_VINIPER:
@@ -2940,8 +2968,8 @@ class HarnessRuntimeTransport:
         if not prompt:
             return
         attachments = attachments or []
-        runtime_prompt = append_attachment_prompt(expand_skill_prompt(prompt), attachments)
         workdir_hint = str(session.get("workdir") or "")
+        runtime_prompt = append_attachment_prompt(expand_skill_prompt(prompt, workdir_hint), attachments)
         records = {str(item.get("id")): item for item in get_skills(MODE_VINIPER, workdir_hint)}
         for skill_id in session.get("selected_skills", []):
             record = records.get(skill_id)
@@ -3078,6 +3106,8 @@ class HarnessRuntimeTransport:
                 "created_at": timestamp,
                 "updated_at": timestamp,
             }
+            if speaker:
+                message["speaker"] = speaker
             thinking_elapsed = thinking_elapsed_seconds()
             if thinking_elapsed > 0:
                 message["thinking_elapsed_seconds"] = thinking_elapsed
@@ -3170,6 +3200,7 @@ class HarnessRuntimeTransport:
         save_progress(force=True)
         yield {
             "type": "assistant_start",
+            **({"speaker": speaker} if speaker else {}),
             "mode": MODE_VINIPER,
             "engine": "harness-runtime",
             "model": selected_model,
@@ -3590,9 +3621,28 @@ async def stream_conversation(session_id: str, user_msg: str, is_guidance: bool 
         _viniper_tasks[session_id] = task
         _active_runs[session_id] = {"kind": MODE_VINIPER, "task": task, "started": now_ts(), "cancel_requested": False}
         try:
-            async for event in VINIPER_TRANSPORT.stream(session_id, user_msg, model, permission_mode,
-                attachments, suppress_user_message=suppress_user_message, display_prompt=display_prompt):
-                yield sse(event)
+            if session.get("discussion") and session.get("task_mode", "execute") == "execute" and not suppress_user_message:
+                mention = re.match(r"^@并行(?:[：:，,\s]+|$)", user_msg.strip())
+                if mention:
+                    cfg = provider_config(model, MODE_VINIPER, resolve_secret=False)
+                    if attachments or not local_agent_contract(cfg["base_url"], cfg["model"]):
+                        raise RuntimeError("双模型独立解答需要本地 Qwen 和文字题")
+                    key = read_host_secret("discussion")
+                    if not key:
+                        raise RuntimeError("请先配置讨论组 DeepSeek API 密钥")
+                    stream = parallel_discussion(VINIPER_TRANSPORT, session, session_id, user_msg,
+                                                 user_msg.strip()[mention.end():].strip(), model, permission_mode,
+                                                 key, save_sessions_to_disk)
+                else:
+                    stream = discussion_events(VINIPER_TRANSPORT, session, session_id, user_msg, model, permission_mode, attachments)
+            else:
+                stream = VINIPER_TRANSPORT.stream(session_id, user_msg, model, permission_mode, attachments,
+                    suppress_user_message=suppress_user_message, display_prompt=display_prompt)
+            try:
+                async for event in stream:
+                    yield sse(event)
+            finally:
+                await stream.aclose()
         finally:
             _viniper_tasks.pop(session_id, None)
             _active_runs.pop(session_id, None)
@@ -3733,7 +3783,16 @@ def skill_metadata(content: str) -> dict[str, str]:
         key, value = line.split(":", 1)
         key = key.strip()
         if key in {"name", "description"}:
-            metadata[key] = value.strip().strip("\"'")
+            raw_value = value.strip()
+            if raw_value.startswith('"'):
+                try:
+                    decoded = json.loads(raw_value)
+                    if isinstance(decoded, str):
+                        metadata[key] = decoded
+                        continue
+                except ValueError:
+                    pass
+            metadata[key] = raw_value.strip("\"'")
     return metadata
 
 
@@ -3851,6 +3910,7 @@ async def status(mode: str = Query(default=MODE_VINIPER), session_id: str | None
     configured = bool(settings["provider"].get("api_key_configured"))
     return {"ok": True, "mode": "viniper", "product_name": APP_TITLE,
             "version": APP_VERSION, "release_revision": APP_RELEASE_REVISION,
+            "discussion_cloud_configured": host_secret_configured("discussion"),
             "configured": configured, "provider": cfg["provider"], "provider_label": cfg["label"],
             "base_url": cfg["base_url"], "model": cfg["model"], "models": base["models"],
             "local_agent": local_agent_contract(cfg["base_url"]), "settings": settings,
@@ -3862,8 +3922,8 @@ async def status(mode: str = Query(default=MODE_VINIPER), session_id: str | None
 
 @app.get("/api/model-notice")
 async def model_notice(model: str | None = None):
-    cfg = status_base_snapshot(MODE_VINIPER)["cfg"]
-    return {"notice": local_model_notice(cfg["base_url"], model or cfg["model"])}
+    cfg = provider_config(model, MODE_VINIPER, resolve_secret=False)
+    return {"notice": local_model_notice(cfg["base_url"], cfg["model"])}
 
 
 @app.get("/api/settings")
@@ -3871,6 +3931,7 @@ async def get_settings(mode: str = Query(default=MODE_VINIPER)):
     selected_mode = require_canonical_mode(mode)
     return {
         "ok": True,
+        "cloud_connection": {"label":"DeepSeek Flash", "endpoint":DEEPSEEK_CHAT_ENDPOINT, "model":DEFAULT_DEEPSEEK_MODEL, "configured":host_secret_configured("discussion")},
         "settings": public_settings(mode=selected_mode),
         "shells": SHELL_OPTIONS,
         "languages": LANGUAGE_OPTIONS,
@@ -4710,6 +4771,20 @@ async def submit_run(session_id: str, request: Request):
     coordinator = agent_run_coordinator()
     if coordinator.has_active(session_id):
         raise HTTPException(status_code=409, detail="当前会话已有任务在运行")
+    chosen_model = body.get("model") or session.get("model")
+    cfg = provider_config(chosen_model, MODE_VINIPER)
+    notice = local_model_notice(cfg["base_url"], cfg["model"])
+    if notice:
+        raise HTTPException(status_code=503, detail=notice["message"])
+    if session.get("discussion") and re.fullmatch(r"@(解题|复核)[：:，,\s]*", user_msg):
+        raise HTTPException(status_code=400, detail="点名后请写下题目或问题")
+    if session.get("discussion") and re.match(r"^@并行(?:[：:，,\s]|$)", user_msg):
+        if not re.sub(r"^@并行[：:，,\s]*", "", user_msg).strip():
+            raise HTTPException(400, "请先写下发送给两位成员的题目")
+        if body.get("attachments") or not local_agent_contract(cfg["base_url"], cfg["model"]):
+            raise HTTPException(400, "双模型独立解答适用于本地 Qwen 和文字题")
+        if not host_secret_configured("discussion"):
+            raise HTTPException(409, "请先在设置中保存讨论组 DeepSeek API 密钥")
     permission_mode = require_permission_mode(session_permission_mode(session), MODE_VINIPER)
     if body.get("permission_mode") and body["permission_mode"] != permission_mode:
         raise HTTPException(status_code=409, detail="访问权限已变化，请刷新后重试")
@@ -4765,11 +4840,15 @@ async def get_agent_run_state(session_id: str):
 
 async def ensure_viniper_coordination_sessions(port) -> dict[str, Any]:
     """Project existing Viniper shell sessions through the host-owned Application Port."""
-    cfg = provider_config(None, MODE_VINIPER)
+    configs = {}
     rows = []
     for item in sessions.values():
         if normalize_session_mode(item.get("mode")) != MODE_VINIPER:
             continue
+        selected_model = item.get("model") or ""
+        if selected_model not in configs:
+            configs[selected_model] = provider_config(selected_model, MODE_VINIPER, resolve_secret=False)
+        cfg = configs[selected_model]
         rows.append({
             "native_session_id": str(item.get("id") or ""),
             "workdir": str(item.get("workdir") or DATA_DIR),
@@ -4777,8 +4856,6 @@ async def ensure_viniper_coordination_sessions(port) -> dict[str, Any]:
             "provider_id": str(cfg.get("provider") or "deepseek"),
             "base_url": str(cfg.get("base_url") or ""),
             "model": provider_model_id(cfg.get("model")),
-            # Host-to-bridge control channel only; never serialized to public API/logs.
-            "host_secret_value": str(cfg.get("api_key") or ""),
             "agent": "viniper",
         })
     return await port.control("sessions.ensure", sessions=rows)
@@ -5065,15 +5142,17 @@ async def new_session(request: Request):
     sid = str(uuid.uuid4())[:8]
     mode = require_canonical_mode(body.get("mode"))
     name = str(body.get("name") or "").strip()
+    discussion = body.get("discussion") is True
     if not name:
-        name = next_session_name(mode)
+        name = "数学讨论组" if discussion else next_session_name(mode)
     workdir = str(body.get("workdir") or default_session_workdir())
     create_session_record(sid, name=name, workdir=workdir,
                           permission_mode=require_permission_mode(body.get("permission_mode") or "ask", MODE_VINIPER),
-                          task_mode=str(body.get("task_mode") or "execute"))
+                          task_mode=str(body.get("task_mode") or "execute"), discussion=discussion)
     return {
         "session_id": sid,
         "mode": mode,
+        "discussion": discussion,
         "name": sessions[sid]["name"],
         "workdir": sessions[sid]["workdir"],
         "pinned": False,
@@ -5086,16 +5165,44 @@ async def new_session(request: Request):
     }
 
 
+def session_preview(session):
+    """One line of visible conversation for the sidebar, including older sessions."""
+    latest_answer = True
+    for message in reversed(session.get("messages") or []):
+        role = message.get("role")
+        if role not in ("assistant", "user") or (role == "assistant" and not latest_answer):
+            continue
+        if role == "assistant":
+            latest_answer = False
+        text = message.get("content")
+        if isinstance(text, str):
+            for line in text[:640].splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith(("```", "|", "$$", "\\")):
+                    break
+                if role == "assistant" and (line in ("由", "解", "解：") or line.endswith(("：", ":")) or re.fullmatch(r"\*\*[^*]+\*\*", line)):
+                    continue
+                line = re.sub(r"\*\*|__", "", line)
+                line = re.sub(r"\bsk-[\w-]{12,}", "••••", line)
+                return " ".join(line.split())[:90]
+        if message.get("attachments"):
+            return "附件"
+    return ""
+
+
 @app.get("/api/sessions")
 async def list_sessions():
     return {
         "sessions": [
             {
                 "id": sid,
-                "mode": normalize_session_mode(session.get("mode")),
+                "mode": normalize_session_mode(session.get("mode")), "discussion": session.get("discussion") is True,
                 "name": session.get("name") or sid,
                 "workdir": session.get("workdir") or "",
                 "count": len(session.get("messages", [])),
+                "preview": session_preview(session),
                 "created": session.get("created", 0),
                 "updated": session.get("updated", session.get("created", 0)),
                 "pinned": bool(session.get("pinned")),
@@ -5140,7 +5247,7 @@ async def last_session(mode: str | None = None):
     return clean_payload_value({
         "session": {
             "session_id": sid,
-            "mode": normalize_session_mode(session.get("mode")),
+            "mode": normalize_session_mode(session.get("mode")), "discussion": session.get("discussion") is True,
             "name": session.get("name", ""),
             "workdir": session.get("workdir", str(default_session_workdir())),
             "pinned": bool(session.get("pinned")),
@@ -5174,7 +5281,7 @@ async def get_session(session_id: str):
     save_sessions_to_disk()
     return clean_payload_value({
         "session_id": session_id,
-        "mode": normalize_session_mode(session.get("mode")),
+        "mode": normalize_session_mode(session.get("mode")), "discussion": session.get("discussion") is True,
         "name": session.get("name", ""),
         "workdir": session.get("workdir", str(default_session_workdir())),
         "pinned": bool(session.get("pinned")),
@@ -5315,12 +5422,47 @@ def registered_skill(filename: str, mode: str, session_id: str):
 def editable_skill(skill, path: Path, workdir: str) -> bool:
     roots = dict(unique_skill_source_roots(MODE_VINIPER, workdir))
     root = roots.get(skill["source"])
-    if not root or skill["source"] not in {"workspace-agents", "workspace-codex", "global-codex", "global-agents"}:
+    if not root or skill["source"] not in {"viniper-user", "workspace-agents", "workspace-codex", "global-codex", "global-agents"}:
         return False
     # Managed links remain owned by their package. Only modify ordinary files in the registered root.
     return (path.resolve() == path.absolute() and path.is_relative_to(root)
             and path.is_file() and not path.resolve().is_relative_to(APP_DIR.resolve())
             and os.access(path, os.W_OK) and os.access(path.parent, os.W_OK))
+
+
+@app.post("/api/skills")
+async def create_personal_skill(request: Request):
+    body = await request.json()
+    values = {}
+    for key, label, limit in (("name", "名称", 60), ("description", "适用场景", 180), ("instructions", "操作步骤", 24000)):
+        value = body.get(key) if isinstance(body, dict) else None
+        if not isinstance(value, str) or not value.strip() or len(value.strip()) > limit:
+            raise HTTPException(400, f"{label}需要 1 至 {limit} 个字符")
+        values[key] = value.strip()
+    if any(len(values[k].splitlines()) != 1 for k in ("name", "description")):
+        raise HTTPException(400, "名称和适用场景各占一行")
+    slug = re.sub(r"[^\w-]+", "-", values["name"].casefold()).strip("-_")
+    if not slug:
+        raise HTTPException(400, "名称中需要包含文字或数字")
+    root = DATA_DIR / "skills"
+    root.mkdir(parents=True, exist_ok=True)
+    directory = root / ("flow-" + slug)
+    try:
+        directory.mkdir()
+    except FileExistsError:
+        raise HTTPException(409, "已有同名技能，请换一个名称")
+    path = directory / "SKILL.md"
+    pending = directory / ".pending"
+    try:
+        header = "\n".join(key + ": " + json.dumps(values[key], ensure_ascii=False) for key in ("name", "description"))
+        pending.write_text("---\n" + header + "\n---\n\n" + values["instructions"] + "\n", encoding="utf-8")
+        pending.replace(path)
+    except OSError:
+        pending.unlink(missing_ok=True)
+        directory.rmdir()
+        raise
+    _skills_cache.clear()
+    return {"id": f"viniper-user:{directory.name}/SKILL.md", "name": values["name"]}
 
 
 @app.get("/api/skills/{filename:path}")
@@ -5388,7 +5530,7 @@ def context_limit_for_model(
     selected_provider = provider_id
     if selected_provider is None:
         try:
-            selected_provider = capacity_provider_id(provider_for_mode(load_app_settings(), selected_mode))
+            selected_provider = capacity_provider_id(connection_for_model(load_app_settings(), selected_mode, model))
         except Exception:
             selected_provider = "deepseek" if selected_mode == MODE_VINIPER else "anthropic"
     capacity = model_capacity_metadata(model, provider_id=selected_provider, mode=selected_mode)
@@ -5461,7 +5603,7 @@ def _startup_cleanup() -> None:
             if isinstance(msg, dict) and is_leaked_goal_control_message(msg):
                 session_changed = True
                 continue
-            if isinstance(msg, dict) and msg.get("pending"):
+            if isinstance(msg, dict) and (msg.get("pending") or msg.pop("peer_pending", False)):
                 session_changed = True
                 detail = "应用在任务完成前重新启动；本轮已中断，可重新发送。"
                 msg["content"] = str(msg.get("content") or detail)

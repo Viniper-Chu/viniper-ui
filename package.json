@@ -1,6 +1,6 @@
 {
   "name": "viniper",
-  "version": "2.2.2",
+  "version": "3.0.0",
   "private": true,
   "description": "Viniper — focused local Agent workspace",
   "main": "dist/src/platform/desktop/main.js",

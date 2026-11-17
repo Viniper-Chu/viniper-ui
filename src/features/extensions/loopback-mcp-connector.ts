@@ -1,3 +1,5 @@
+import { PRODUCT_VERSION } from "../../core/contracts";
+
 /** Minimal host-owned MCP JSON-RPC connector.  Only loopback HTTP endpoints
  * are accepted; the renderer never receives credentials or raw transport
  * details.  The returned discovery snapshot is intentionally data-only so the
@@ -40,7 +42,7 @@ export async function connectLoopbackMcp(endpoint: string): Promise<LoopbackMcpS
   const initialize = await request("initialize", {
     protocolVersion: "2024-11-05",
     capabilities: {},
-      clientInfo: { name: "Viniper workstation", version: "1.9.1" },
+      clientInfo: { name: "Viniper", version: PRODUCT_VERSION },
   });
   const listed = await request("tools/list");
   const tools = Array.isArray(listed.tools)

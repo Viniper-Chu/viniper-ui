@@ -14,6 +14,7 @@ export interface LocalAgentPolicy {
   defaultReasoning: string;
   reasoningBudgets: Record<string, number>;
   reasoningBudgetMessage?: string;
+  templateEfforts?: Record<string, string>;
   parallelToolCalls: boolean;
   structuredToolsJson: boolean;
   proofFirstJson?: boolean;
@@ -42,6 +43,7 @@ export function loadLocalAgentPolicy(endpoint: string, path = process.env.VINIPE
       outputTokens: contract.output_limit, maxIterations: contract.max_iterations,
       defaultReasoning: contract.thinking_control?.default ?? "medium",
       reasoningBudgets: contract.thinking_control?.budget_tokens ?? { low: 256, medium: 512, high_and_above: 1024 },
+      templateEfforts: contract.thinking_control?.template_effort,
       reasoningBudgetMessage: typeof contract.thinking_control?.budget_message === "string" ? contract.thinking_control.budget_message : undefined,
       parallelToolCalls: contract.parallel_tool_calls === true,
       structuredToolsJson: contract.structured_tools_json === true,
@@ -67,7 +69,7 @@ export function localRequestOverrides(request: ProviderRequest, policy?: LocalAg
   const proofFirst = json && !request.tools.length && policy.proofFirstJson === true && requestsProofFieldFirst(text);
   return {
     max_tokens: policy.outputTokens,
-    reasoning_effort: thinking ? effort : "none",
+    reasoning_effort: thinking ? (policy.templateEfforts?.[effort] ?? effort) : "none",
     reasoning_budget_tokens: thinking ? policy.reasoningBudgets[effort] ?? policy.reasoningBudgets.high_and_above : 0,
     ...(thinking && policy.reasoningBudgetMessage ? { reasoning_budget_message: policy.reasoningBudgetMessage } : {}),
     reasoning_format: "deepseek",

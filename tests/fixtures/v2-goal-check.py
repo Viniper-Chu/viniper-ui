@@ -80,12 +80,13 @@ async def main():
     # the same model/permissions/run coordinator, without another agent.
     gate.clear();started.clear();record=coordinator.start('s1',lambda:slow())
     await started.wait();port.due=[{'id':'cron1','native_session_id':'s1','prompt':'定时任务'}]
-    sessions={'s1':{'mode':'viniper','model':'qwen-local','permission_mode':'ask'}}
+    sessions={'s1':{'mode':'viniper','model':'qwen-local','permission_mode':'ask','selected_skills':['previous-turn']}}
     host=ScheduleHost(port,coordinator,stream,sessions);await host.tick()
-    assert port.calls[-1][0]=='scheduler.defer'
+    assert port.calls[-1][0]=='scheduler.defer' and sessions['s1']['selected_skills']==['previous-turn']
     gate.set();await record.task
     await host.tick();assert coordinator.has_active('s1')
     await coordinator._records['s1'].task
+    assert sessions['s1']['selected_skills']==[]
     assert requests[-1][2]['model']=='qwen-local' and requests[-1][2]['permission_mode']=='ask'
     assert any(op=='scheduler.record' and data['accepted'] for op,data in port.calls)
     await service.shutdown();await coordinator.shutdown()

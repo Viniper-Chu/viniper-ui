@@ -98,9 +98,11 @@ export function menuContent(kind) {
         disabled: active,
       }) +
       '<div class="menu-separator"></div>' +
+      option({ label: "新建数学讨论组", image: "discussion", action: "new-discussion" }) +
       option({ label: "选择技能或插件", image: "plugin", action: "extensions" })
     );
-  if (kind === "model")
+  if (kind === "model") {
+    const model = state.status?.models?.find(item => item.id === state.model);
     return (
       "<h3>模型</h3>" +
       (state.status?.models || [])
@@ -116,7 +118,7 @@ export function menuContent(kind) {
           });
         })
         .join("") +
-      '<div class="menu-separator"></div><h3>智能程度</h3><div class="effort-options" role="group" aria-label="智能程度">' +
+      (model?.reasoning_options?.length === 0 ? "" : '<div class="menu-separator"></div><h3>智能程度</h3><div class="effort-options" role="group" aria-label="智能程度">' +
       (
         state.status?.local_agent?.reasoning_options || [
           "off",
@@ -136,8 +138,9 @@ export function menuContent(kind) {
             `<button role="radio" aria-checked="${state.reasoning === id}" data-menu-action="reasoning" data-value="${id}" data-hint="将智能程度设为${escape(label)}">${label}</button>`,
         )
         .join("") +
-      "</div>" + '<div class="menu-separator"></div>' + option({ label: "模型连接设置", image: "settings", action: "connection-settings" })
+      "</div>") + '<div class="menu-separator"></div>' + option({ label: "模型连接设置", image: "settings", action: "connection-settings" })
     );
+  }
   if (kind === "context") {
     const u = state.session?.context_usage || {};
     return `<div class="context-details"><strong>上下文窗口</strong><p>${u.used_tokens ?? "—"} / ${u.context_limit ?? "—"} tokens</p><small>${escape(u.source === "real" ? "按实际模型输入计数" : u.usage_label || "等待模型用量回执")}<br>达到阈值时自动整理，原有会话记录保留。</small></div>`;

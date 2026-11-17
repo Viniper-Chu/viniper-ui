@@ -283,9 +283,35 @@ function waitForRunTerminal(sessionId, nativeSessionId, seenEvents, secrets) {
   });
 }
 
+let loopbackConnection;
+async function ensureLoopbackMcp(endpoint) {
+  const id = "workstation-loopback";
+  const extensions = application.services.extensionManager;
+  if (!endpoint || !extensions) return null;
+  const find = () => extensions.snapshot().mcpConnections.find(item => item.id === id);
+  const existing = find();
+  if (existing?.endpoint === endpoint && existing.connected) return existing;
+  if (!loopbackConnection) {
+    loopbackConnection = (async () => {
+      if (existing?.endpoint !== endpoint) await extensions.configureMcp({id, endpoint});
+      await extensions.connectMcp(id);
+      return find();
+    })().finally(() => { loopbackConnection = null; });
+  }
+  return loopbackConnection;
+}
+
+async function connectDesktopMcp() {
+  const port = Number(process.env.VINIPER_UI_PORT);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+  try { await ensureLoopbackMcp(`http://127.0.0.1:${port}/api/harness/mcp`); }
+  catch { process.stderr.write("Viniper loopback MCP unavailable\n"); }
+}
+
 async function run(request) {
   const nativeSessionId = String(request.native_session_id || "");
   if (activeRuns.has(nativeSessionId)) throw new Error("Harness Application Port already owns this session run");
+  await connectDesktopMcp();
   const provider = await configureProvider(request);
   const secrets = knownSecrets(provider.secret);
   const session = await ensureSession(request, provider);
@@ -426,7 +452,7 @@ function publicHarnessSnapshot() {
     subagents: host.subagentService?.snapshot?.() || {},
     coordination: host.coordination?.snapshot?.() || {},
     composition: host.compositionService?.centerSnapshot?.("desktop") || {},
-    diagnostics: host.diagnostics?.snapshot?.() || {},
+    diagnostics: host.diagnostics?.snapshot?.(100) || {},
     artifacts: host.artifacts?.snapshot?.() || {},
     reviews: host.reviewService?.list?.() || [],
     permissions: application?.services?.runtime?.pendingToolApprovals
@@ -582,15 +608,7 @@ async function handleHarnessOperation(command) {
       host_secret_value: String(args.host_secret_value || ""),
     });
     const mcpEndpoint = String(args.mcp_endpoint || "");
-    if (mcpEndpoint) {
-      const id = "workstation-loopback";
-      const existing = (extensions?.snapshot?.().mcpConnections || []).find((item) => item?.id === id);
-      if (!existing || String(existing.endpoint || "") !== mcpEndpoint) {
-        await extensions.configureMcp({ id, endpoint: mcpEndpoint });
-      }
-      await extensions.connectMcp(id);
-    }
-    const mcpState = (extensions?.snapshot?.().mcpConnections || []).find((item) => item?.id === "workstation-loopback" && item?.endpoint === mcpEndpoint);
+    const mcpState = await ensureLoopbackMcp(mcpEndpoint);
     const plugins = application?.services?.plugins?.list?.() || [];
     return {
       provider: { profileId: provider.providerId, model: provider.model, endpoint: provider.endpoint, configured: Boolean(provider.secret) },
@@ -701,11 +719,49 @@ async function handleHarnessOperation(command) {
   throw new Error(`unsupported Harness operation: ${target}`);
 }
 
+// Independent opinions use the same provider adapter. Each request contains only the current question.
+const opinionRequests = new Map();
+async function deepseekOpinion(command) {
+  if (!allowExternalNetwork) throw new Error("此运行环境已关闭外部模型");
+  const id = String(command.opinion_id || "");
+  if (!id || opinionRequests.has(id)) throw new Error("独立解答已经开始");
+  const model = "deepseek-flash", profile = DOMESTIC_MODEL_PROFILES.find(p => p.id === "deepseek");
+  const { OpenAIChatProvider } = require("./harness-runtime/dist/src/features/providers/protocols/openai-chat/openai-chat-provider.js");
+  const { buildContextProfile, buildCachePlan } = require("./harness-runtime/dist/src/features/cache/cache-plan.js");
+  const text = String(command.question || "").trim();
+  if (!text || !command.host_secret_value) throw new Error("需要本轮文字题和讨论组密钥");
+  const provider = new OpenAIChatProvider({profile, configuration:{profileId:profile.id,endpoint:profile.endpoint.defaultUrl,
+    models:[model],selectedModel:model,connectionState:"connected",message:""},
+    resolveSecret:async () => command.host_secret_value,
+    fetchImpl:(url, init) => fetch(url,{...init,redirect:"error"})});
+  const controller = new AbortController();
+  opinionRequests.set(id,controller);
+  const ctx = buildContextProfile({providerId:profile.id,modelId:model,tools:[],history:[],taskWorkflow:false});
+  const request = {sessionId:id,profileId:profile.id,selectedModel:model,permissionMode:"auto",tools:[],
+    history:[{id:"question",role:"user",items:[{type:"text",text}]}],currentUserText:text,
+    contextProfile:ctx,cachePlan:buildCachePlan(text,ctx)};
+  let answer = "", usage;
+  try {
+    for await (const event of provider.stream(request,AbortSignal.any([controller.signal,AbortSignal.timeout(120000)]))) {
+      if (event.kind === "text.delta") answer += event.text;
+      if (event.kind === "usage.completed") usage = event.usage;
+      if (event.kind === "response.incomplete") throw new Error("DeepSeek 输出未完成");
+    }
+    if (!answer.trim()) throw new Error("DeepSeek 未返回正文");
+    return {answer,model,usage};
+  } finally { opinionRequests.delete(id); }
+}
+
 async function handleControl(command) {
   const requestId = String(command.request_id || "");
   try {
     let data;
-    if (command.op === "run.steer") {
+    if (command.op === "discussion.answer") {
+      data = await deepseekOpinion(command);
+    } else if (command.op === "discussion.cancel") {
+      opinionRequests.get(command.opinion_id)?.abort();
+      data = {ok:true};
+    } else if (command.op === "run.steer") {
       const owned = mappedHarnessSession(command.native_session_id);
       const active = owned && runtime.listRuns(owned.id).find((run) => ["queued", "running", "waiting", "waiting_resource", "recovering", "replaying"].includes(run.status));
       if (!active) throw new Error("当前会话没有可引导的运行");
@@ -786,6 +842,7 @@ async function handleControl(command) {
         provider_settings: Boolean(host.providerSettings),
       };
     } else if (command.op === "plugins.snapshot") {
+      await connectDesktopMcp();
       const host = application?.services || services || {};
       const plugins = typeof host.plugins?.list === "function" ? host.plugins.list() : [];
       data = {
@@ -799,6 +856,13 @@ async function handleControl(command) {
           built_in: plugin.classification === "built-in",
         })).filter((plugin) => plugin.id),
       };
+      for (const connection of host.extensionManager?.snapshot().mcpConnections || []) {
+        const prefix = "mcp." + connection.id + ".";
+        const tools = services.toolRegistry.descriptors().map(tool => tool.name).filter(name => name.startsWith(prefix));
+        data.plugins.push({id: prefix.slice(0,-1), name: connection.id === "workstation-loopback" ? "Viniper 本机 MCP" : connection.id,
+          tools, status: connection.connected ? "available" : "unavailable", icon:"plugin",
+          description: "通过 MCP 发现的本机工具", built_in:false});
+      }
     } else if (command.op === "collaboration.delegate") {
       requireVisibleNativeSessions(command, command.source_native_session_id, command.target_native_session_id);
       const source = mappedHarnessSession(command.source_native_session_id);
@@ -907,7 +971,7 @@ async function main() {
       });
       return;
     }
-    if (["capabilities.snapshot", "plugins.snapshot", "subagent.spawn", "sessions.snapshot", "sessions.ensure", "sessions.delete", "harness.snapshot", "harness.operation", "permissions.snapshot", "permission.resolve"].includes(command.op) || /^(collaboration|scheduler|goals)\./.test(String(command.op || "")) || command.op === "run.steer") {
+    if (["capabilities.snapshot", "plugins.snapshot", "subagent.spawn", "sessions.snapshot", "sessions.ensure", "sessions.delete", "harness.snapshot", "harness.operation", "permissions.snapshot", "permission.resolve"].includes(command.op) || /^(discussion|collaboration|scheduler|goals)\./.test(String(command.op || "")) || command.op === "run.steer") {
       void handleControl(command);
     }
   });

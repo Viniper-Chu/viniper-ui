@@ -19,34 +19,21 @@
     <div id="app" class="app-shell" data-view="chat">
       <aside id="sidebar" class="sidebar" aria-label="导航与历史会话">
         <div class="sidebar-title">
-          <span class="brand-mark" data-icon="brand" aria-hidden="true"></span
-          ><strong>Viniper</strong
-          ><button
-            class="icon-button"
-            data-action="toggle-sidebar"
-            aria-label="收起侧栏"
-            data-hint="收起侧栏 ⌘B"
-            data-icon="sidebar"
-          ></button>
+          <span class="brand-tile" aria-hidden="true"></span><strong>Viniper</strong>
+          <div class="sidebar-actions">
+            <button class="icon-button" data-action="quick" data-icon="search" aria-label="快速查找会话与操作" data-hint="快速查找  ⇧⌘K"></button>
+            <button class="icon-button" data-action="new-chat" data-icon="compose" aria-label="新建会话" data-hint="新建会话  ⌘K"></button>
+            <button class="icon-button" data-action="toggle-sidebar" data-icon="sidebar" aria-label="收起侧栏" data-hint="收起侧栏  ⌘B"></button>
+          </div>
         </div>
-        <button data-hint="开始新会话  ⌘K" class="new-chat" data-action="new-chat">
-          <span data-icon="compose"></span><span>新建会话</span><kbd>⌘K</kbd>
-        </button>
-        <nav class="primary-nav" aria-label="主要页面">
-          <button data-hint="返回会话，继续处理当前题目" class="nav-item active" data-view="chat">
-            <span data-icon="chat"></span>会话</button
-          ><button data-hint="浏览技能和可调用的工具" class="nav-item" data-view="extensions">
-            <span data-icon="grid"></span>技能与插件</button
-          ><button data-hint="查看目标进度和定时任务" class="nav-item" data-view="tasks">
-            <span data-icon="tasks"></span>目标与任务
-          </button>
-        </nav>
-        <button data-hint="查找会话、操作或设置  ⇧⌘K" class="quick-trigger" data-action="quick" aria-label="快速查找会话与操作">
-          <span data-icon="search"></span><span>快速查找</span><kbd>⇧⌘K</kbd>
-        </button>
-        <div id="history-heading" class="history-heading">历史会话</div>
+        <div id="history-heading" class="history-heading">会话</div>
         <nav id="session-list" class="session-list" aria-label="历史会话"></nav>
         <div class="sidebar-footer">
+          <nav class="primary-nav" aria-label="主要页面">
+            <button data-hint="返回当前会话" class="nav-item active" data-view="chat"><span data-icon="chat"></span>会话</button>
+            <button data-hint="浏览技能和可调用的工具" class="nav-item" data-view="extensions"><span data-icon="grid"></span>技能与插件</button>
+            <button data-hint="查看目标进度和定时任务" class="nav-item" data-view="tasks"><span data-icon="tasks"></span>目标与任务</button>
+          </nav>
           <button data-hint="打开模型和应用设置  ⌘," class="profile-button" data-view="settings">
             <span class="profile-avatar" data-icon="settings"></span
             ><span
@@ -68,8 +55,12 @@
             hidden
           ></button>
           <button data-hint="返回会话，继续处理当前题目" id="return-chat" class="text-button back-link" data-view="chat" hidden><span data-icon="back"></span>返回会话</button>
+          <button data-hint="返回原筛选结果  Esc" class="text-button back-link level-back" data-parent="extension-detail" data-action="back-extensions"><span data-icon="back"></span>技能与插件</button>
+          <button data-hint="返回上一级  Esc" class="text-button back-link level-back" data-parent="skill-editor" data-action="cancel-skill-edit"><span data-icon="back"></span>技能详情</button>
+          <button class="text-button back-link level-back" data-parent="task-detail" data-action="back-tasks" data-hint="返回原任务列表  Esc"><span data-icon="back"></span>目标与任务</button>
+          <button data-hint="返回上一级  Esc" class="text-button back-link level-back" data-parent="task-editor" data-action="cancel-task-edit"><span data-icon="back"></span><span id="task-edit-origin"></span></button>
           <div class="page-heading">
-            <span id="session-title" class="title-button"></span
+            <button id="session-title" class="title-button" data-action="turn-index" aria-haspopup="dialog" data-hint="打开本次提问与交付文件"></button
             ><button
               id="project-button"
               hidden
@@ -94,6 +85,16 @@
           </div>
         </header>
         <section id="chat-view" class="page chat-page is-empty" aria-label="对话">
+          <svg class="function-field" aria-hidden="true" focusable="false" fill="none">
+            <defs><pattern id="field-grid" width="36" height="36" patternUnits="userSpaceOnUse"><path d="M36 0H0V36"/></pattern></defs>
+            <rect width="100%" height="100%" fill="url(#field-grid)" class="field-grid"/>
+            <path data-part="axes" class="field-axes"/><path data-part="symmetry" class="field-symmetry"/>
+            <path data-part="curve" class="field-curve"/><path data-part="level" class="field-level"/>
+            <circle data-part="closed" class="field-end closed" r="3"/><circle data-part="open" class="field-end" r="3"/>
+            <circle data-part="leftHalo" class="field-halo" r="9"/><circle data-part="rightHalo" class="field-halo" r="9"/>
+            <circle data-part="left" class="field-root" r="4.5"/><circle data-part="right" class="field-root" r="4.5"/>
+            <text data-part="equation" class="field-equation">y = 4 − (x − 1)²</text><text data-part="label" class="field-readout"></text>
+          </svg>
           <div class="conversation-wrap">
             <nav
               id="message-rail"
@@ -107,16 +108,10 @@
                   <h1>今天解哪道题？</h1>
 <button class="welcome-context" data-action="project" data-hint="选择工作目录"><span data-icon="folder"></span><span id="welcome-project">选择工作目录</span></button>
                 </div>
+                <div class="example-tools"><input id="level-control" type="range" min="-0.5" max="4.5" step="0.05" value="2.25" aria-label="水平线参数 t" data-hint="调节水平线，查看交点">
                 <button class="example-graph" data-hint="将这道参数题放入输入框" aria-label="试一道参数题" data-prompt="在 −1 ≤ x &lt; 3 上，水平线 y=t 与抛物线 y=4−(x−1)² 的左右两支各有几个交点？请给出分段证明。">
-                  <svg viewBox="0 0 155 76" aria-hidden="true" fill="none">
-                    <path class="graph-grid" d="M12 22h131M12 44h131M12 66h131M32 9v58M64 9v58M96 9v58M128 9v58"/>
-                    <path class="graph-axis" d="M10 66h134"/>
-                    <path class="graph-level" d="M14 44h124" stroke-dasharray="3 4"/>
-                    <path class="graph-curve" d="M26 66 Q75 -38 124 66"/>
-                    <g class="graph-points"><circle cx="37.8" cy="44" r="2.7"/><circle cx="112.2" cy="44" r="2.7"/></g>
-                  </svg>
                   <span>试一道参数题<span data-icon="arrowRight"></span></span>
-                </button>
+                </button></div>
               </section>
               <div id="messages" class="messages"></div>
             </div>
@@ -151,6 +146,12 @@
             <div class="composer">
               <div id="attachments" class="attachment-list" hidden></div>
               <div id="mode-chip" class="mode-chip" hidden></div>
+              <div id="discussion-people" aria-label="讨论成员" hidden>
+                <button type="button" data-address="全组" data-hint="解题成员作答后，由复核成员检查">全组</button>
+                <button type="button" data-address="解题" data-hint="只请解题成员回答">@解题</button>
+                <button type="button" data-address="复核" data-hint="只请复核成员回答">@复核</button>
+                <button type="button" data-address="并行" data-hint="将本轮文字题分别发送给本地 Qwen 和 DeepSeek Flash" aria-label="双模型独立解答"><span data-icon="parallel"></span>双模型</button>
+              </div>
               <textarea
                 id="prompt"
                 rows="1"
@@ -173,7 +174,7 @@
                     data-menu="model"
                     aria-label="选择模型与智能程度"
                   >
-                    <span id="model-label">选择模型</span
+                    <span class="compact-model-icon" data-icon="model"></span><span id="model-label">选择模型</span
                     ><span class="model-divider">·</span
                     ><span id="reasoning-label">中</span
                     ><span data-icon="chevron"></span></button
@@ -279,15 +280,19 @@
           </section>
           </div>
           <article id="extension-detail" hidden>
-            <button data-hint="返回原筛选结果  Esc" class="text-button back-link" data-action="back-extensions"><span data-icon="back"></span>技能与插件</button>
-            <header class="detail-heading"><span class="detail-icon" id="detail-icon"></span><h1 id="detail-title" tabindex="-1"></h1></header>
-            <div id="detail-actions" hidden><button class="primary-button" data-action="use-skill"></button><button class="secondary-button" data-action="edit-skill">编辑说明</button></div>
+            <header class="detail-heading"><span class="detail-icon" id="detail-icon"></span><h1 id="detail-title" tabindex="-1"></h1>
+            <div id="detail-actions" hidden><button class="primary-button" data-action="use-skill"></button><button class="secondary-button" data-action="edit-skill">编辑说明</button></div></header>
             <div id="detail-content"></div>
           </article>
           <article class="directory-editor" id="skill-editor" hidden>
-            <button class="text-button back-link" data-action="cancel-skill-edit"><span data-icon="back"></span>技能详情</button>
             <h1 id="skill-edit-title" tabindex="-1">编辑技能说明</h1>
-            <form id="skill-edit-form"><label class="field"><span id="skill-editor-source"></span><textarea name="content" aria-label="技能说明源码" rows="15" required spellcheck="false"></textarea></label>
+            <form id="skill-edit-form">
+              <div class="skill-edit-tools"><span id="skill-editor-source"></span><div class="filter-options" role="group" aria-label="编辑视图">
+                <button type="button" data-skill-mode="source" aria-pressed="true">源码</button>
+                <button type="button" data-skill-mode="preview" aria-pressed="false">预览</button>
+              </div></div>
+              <label class="field" id="skill-source-field"><textarea name="content" aria-label="技能说明源码" rows="15" required spellcheck="false"></textarea></label>
+              <div class="answer" id="skill-draft-preview" aria-label="技能说明预览" hidden></div>
               <footer class="editor-bar"><span role="status"></span><button type="button" class="secondary-button" data-action="cancel-skill-edit">取消</button><button class="primary-button" type="submit">保存修改</button></footer>
             </form>
           </article>
@@ -328,11 +333,9 @@
           </section>
           </div>
           <article id="task-detail" class="directory-detail" hidden>
-            <button class="text-button back-link" data-action="back-tasks" data-hint="返回原任务列表  Esc"><span data-icon="back"></span>目标与任务</button>
             <div id="task-record"></div>
           </article>
           <article class="directory-editor" id="task-editor" hidden>
-            <button class="text-button back-link" data-action="cancel-task-edit"><span data-icon="back"></span><span id="task-edit-origin"></span></button>
             <h1 id="task-edit-title" tabindex="-1"></h1>
             <form id="task-edit-form"></form>
           </article>
@@ -353,7 +356,7 @@
             <button data-hint="设置新会话的默认目录" id="workspace-tab" type="button" role="tab" aria-controls="workspace-settings" aria-selected="false" tabindex="-1" data-settings-section="workspace-settings"><span data-icon="folder"></span>工作目录</button>
             <button data-hint="编辑适用于所有任务的协作规则" id="instruction-tab" type="button" role="tab" aria-controls="instruction-settings" aria-selected="false" tabindex="-1" data-settings-section="instruction-settings"><span data-icon="book"></span>协作规则</button>
           </div>
-          <small class="preferences-version">Viniper <span id="version">2.2.2</span></small>
+          <small class="preferences-version">Viniper <span id="version">3.0.0</span></small>
         </aside>
         <main class="preferences-content" aria-label="设置内容">
           <section id="preference-results" aria-label="设置搜索结果" hidden>
@@ -364,13 +367,21 @@
             <fieldset id="settings-fields" disabled>
               <section id="connection-settings" class="settings-section" role="tabpanel" aria-labelledby="connection-tab">
                 <h2>模型连接</h2>
-                <div class="preference-rows">
+                <fieldset class="pref-group"><legend>服务连接</legend>
                   <label class="field pref-row" data-pref="服务名称"><span>服务名称</span><input name="provider-label" autocomplete="off"></label>
                   <label class="field pref-row" data-pref="协议"><span>协议</span><select name="provider-id"><option value="custom">OpenAI 兼容</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option></select></label>
                   <label class="field pref-row" data-pref="服务地址"><span>服务地址</span><input name="base-url" type="url" placeholder="http://127.0.0.1:18080/v1"></label>
                   <label class="field pref-row" data-pref="模型 ID"><span>模型 ID</span><input name="model-id" autocomplete="off"></label>
+                </fieldset>
+                <fieldset class="pref-group"><legend>访问密钥</legend>
                   <label class="field pref-row" data-pref="API 密钥" data-alias="key 钥匙串"><span>API 密钥</span><input name="api-key" type="password" autocomplete="new-password" placeholder="留空保留现有密钥"></label>
-                </div>
+                </fieldset>
+                <fieldset class="pref-group"><legend>DeepSeek 云端</legend>
+                  <div class="pref-row"><span>模型</span><output id="cloud-model"></output></div>
+                  <div class="pref-row"><span>官方接口</span><output id="cloud-endpoint"></output></div>
+                  <label class="field pref-row" data-pref="DeepSeek API 密钥" data-alias="讨论组 云端 Flash"><span>DeepSeek API 密钥</span><input name="discussion-key" type="password" autocomplete="new-password"></label>
+
+                </fieldset>
               </section>
               <section id="appearance-settings" class="settings-section" role="tabpanel" aria-labelledby="appearance-tab" hidden>
                 <h2>外观</h2>
@@ -387,8 +398,10 @@
               </section>
               <section id="workspace-settings" class="settings-section" role="tabpanel" aria-labelledby="workspace-tab" hidden>
                 <h2>工作目录</h2>
-                <label class="field pref-row" data-pref="默认工作目录" data-alias="文件夹 路径"><span>默认工作目录</span><input name="workdir"></label>
-                <button data-hint="在系统窗口选择默认目录" type="button" class="secondary-button browse-dir" id="browse-workdir" hidden><span data-icon="folder"></span>选择目录</button>
+                <div class="field pref-row" data-pref="默认工作目录" data-alias="文件夹 路径">
+                  <label for="pref-workdir">默认工作目录</label>
+                  <div class="path-control"><input name="workdir" id="pref-workdir"><button data-hint="在系统窗口选择默认目录" aria-label="选择工作目录" type="button" class="icon-button" id="browse-workdir" hidden><span data-icon="folder"></span></button></div>
+                </div>
               </section>
               <section id="instruction-settings" class="settings-section" role="tabpanel" aria-labelledby="instruction-tab" hidden>
                 <h2>协作规则</h2><label class="field" data-pref="长期协作规则" data-alias="指令 AGENT.md"><span>适用于所有任务</span><textarea name="instructions" rows="10" aria-label="长期协作规则" placeholder="输入适用于所有任务的协作约定…"></textarea></label>
@@ -414,6 +427,11 @@
         <input id="navigator-query" role="combobox" aria-expanded="true" aria-controls="navigator-list" aria-autocomplete="list" aria-label="筛选查找结果" autocomplete="off" spellcheck="false">
         <kbd>esc</kbd>
       </label>
+      <div id="index-filter" class="filter-options" role="group" aria-label="会话目录范围" hidden>
+        <button type="button" data-index-group="" aria-pressed="true">全部</button>
+        <button type="button" data-index-group="提问与引导" aria-pressed="false">提问</button>
+        <button type="button" data-index-group="交付文件" aria-pressed="false">文件</button>
+      </div>
       <div id="navigator-list" class="navigator-list" role="listbox" aria-labelledby="navigator-title"></div>
     </dialog>
     <dialog id="dialog" aria-labelledby="dialog-title">

@@ -16,5 +16,10 @@ test("CP7 diagnostics are minimal by default, scoped to one run, previewable, an
   assert.equal(JSON.stringify(preview).includes("id_ed25519"), false);
   service.endRun("run-1");
   assert.equal(service.snapshot().detailedRunId, undefined);
+  const complete = service.snapshot().entries;
+  assert.deepEqual(service.snapshot(1).entries, complete.slice(-1));
+  assert.equal(service.snapshot(1).totalEntries, complete.length);
+  assert.equal(service.snapshot(0).entries.length, 0);
+  assert.deepEqual(service.snapshot().entries, complete);
   assert.equal(service.queueUpload("run-1").status, "unavailable");
 });

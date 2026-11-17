@@ -1,5 +1,5 @@
 import { preferenceFields } from "./preferences.js";
-import { escape, state } from "./api.js";
+import { api, query as params, escape, state } from "./api.js";
 import { icon } from "./icons.js";
 
 export function setupNavigator(actions) {
@@ -7,6 +7,33 @@ export function setupNavigator(actions) {
   const input = document.querySelector("#navigator-query");
   const list = document.querySelector("#navigator-list");
   let items = [], visible = [], selected = 0;
+
+  let directoryVersion = 0, directoryOpened = false, directoryRequested = false;
+  let catalog = [], indexGroup = "";
+  const groups = dialog.querySelector("#index-filter");
+  async function loadCatalog() {
+    if (!directoryOpened || directoryRequested || !input.value.trim()) return;
+    directoryRequested = true;
+    const version = directoryVersion, sid = state.session?.session_id || "";
+    const scope = params({mode:"viniper", session_id:sid});
+    const sources = [
+      ["skills","技能","book", "/api/skills?" + scope],
+      ["plugins","插件","plugin", "/api/plugins?" + scope],
+      ["goals","目标","target", "/api/goals?mode=viniper"],
+      ["schedules","定时任务","clock", "/api/schedules"],
+    ];
+    await Promise.all(sources.map(async ([kind, group, glyph, endpoint]) => {
+      try {
+        const response = await api(endpoint, {signal:AbortSignal.timeout(15000)});
+        if (version !== directoryVersion || !dialog.open || sid !== (state.session?.session_id || "")) return;
+        const records = response[kind] || [];
+        catalog.push(...records.map(record => ({group, glyph, label:record.display_name || record.title || record.name,
+          hint:[record.command, ...(record.tools || [])].filter(Boolean).join(" "),
+          run:() => actions.openRecord(kind,record.id)})));
+        render(true);
+      } catch { /* The other directories and local navigation stay available. */ }
+    }));
+  }
 
   function workItems() {
     const items = [];
@@ -59,9 +86,11 @@ export function setupNavigator(actions) {
       if (scroll) chosen.scrollIntoView({block:"nearest"});
     } else input.removeAttribute("aria-activedescendant");
   }
-  function render() {
+  function render(retain = false) {
+    const previous = retain ? visible[selected] : null;
+    const offset = list.scrollTop;
     const query = input.value.trim().toLocaleLowerCase();
-    visible = items.filter(item => [item.label,item.detail,item.group,item.hint].filter(Boolean).join(" ").toLocaleLowerCase().includes(query));
+    visible = (directoryOpened && query ? [...items, ...catalog] : items).filter(item => (!indexGroup || item.group === indexGroup) && [item.label,item.detail,item.group,item.hint].filter(Boolean).join(" ").toLocaleLowerCase().includes(query));
     let group = "";
     const rows = visible.map((item,index) => {
       const title = group === item.group ? "" : '<div class="navigator-group" role="presentation">'+escape(item.group)+'</div>';
@@ -70,9 +99,9 @@ export function setupNavigator(actions) {
         + icon(item.glyph) + '<span class="nav-result-title">'+escape(item.label)+'</span>'
         + (item.detail ? '<small>'+escape(item.detail)+'</small>' : '') + '</div>';
     });
-    list.innerHTML = rows.join("") || '<p class="nav-empty" role="status">没有匹配的结果</p>';
-    list.scrollTop = 0;
-    highlight(0);
+    list.innerHTML = rows.join("") || `<p class="nav-empty" role="status">${indexGroup === "交付文件" && !query ? "本次会话暂无交付文件" : "没有匹配的结果"}</p>`;
+    list.scrollTop = retain ? offset : 0;
+    highlight(Math.max(0, visible.indexOf(previous)));
   }
   async function choose(index) {
     const item = visible[index];
@@ -80,7 +109,16 @@ export function setupNavigator(actions) {
     dialog.close();
     try { await item.run(); } catch (error) { actions.toast(error.message,true); }
   }
-  input.addEventListener("input",render);
+  function filterIndex(group) {
+    indexGroup = group;
+    for (const button of groups.querySelectorAll("button"))
+      button.setAttribute("aria-pressed", String(button.dataset.indexGroup === group));
+  }
+  groups.addEventListener("click", event => {
+    const button = event.target.closest("[data-index-group]");
+    if (button) { items = turnItems(); filterIndex(button.dataset.indexGroup); render(); }
+  });
+  input.addEventListener("input",() => { render(); loadCatalog(); });
   input.addEventListener("keydown",event => {
     if (event.isComposing) return;
     if (event.key === "Enter") {event.preventDefault();choose(selected);return;}
@@ -103,9 +141,12 @@ export function setupNavigator(actions) {
     if (document.querySelector("dialog[open]")) return;
     actions.closeMenu();
     const index = kind === "turn-index";
+    groups.hidden = !index; filterIndex("");
+    dialog.dataset.layout = index ? "details" : "search";
     dialog.querySelector("h2").textContent = index ? "会话目录" : "快速查找";
     dialog.querySelector("[data-nav-close]").setAttribute("aria-label",index ? "关闭会话目录" : "关闭快速查找");
-    input.placeholder = index ? "查找本次提问或交付文件" : "查找会话、操作或页面";
+    input.placeholder = index ? "查找本次提问或交付文件" : "查找会话、技能或任务";
+    directoryVersion++; directoryOpened = !index; directoryRequested = false; catalog = [];
     items = index ? turnItems() : workItems();
     input.value = "";
     render(); dialog.showModal(); input.focus();

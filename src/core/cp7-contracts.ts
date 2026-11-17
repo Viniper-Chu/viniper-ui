@@ -59,6 +59,7 @@ export interface DiagnosticEntry {
 }
 
 export interface DiagnosticsSnapshot {
+  totalEntries?: number;
   entries: DiagnosticEntry[];
   detailedRunId?: string;
   consent: boolean;

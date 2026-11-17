@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { access, mkdir, readFile, readlink, rename, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { prepareMacPythonEnvironment, activateMacPythonEnvironment } from "./lib/macos-python-runtime.mjs";
@@ -88,7 +88,12 @@ await writeFile(lockedRequirements, `${preparedPython.freeze}\n`);
 const registeredAt = new Date();
 await utimes(destination, registeredAt, registeredAt);
 run("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister", ["-f", destination], { timeout: 10000 });
+const dockBookmark = run("/usr/bin/swift", [join(repositoryRoot, "scripts", "refresh-macos-dock.swift"), destination]);
+if (dockBookmark === "refreshed") {
+  spawnSync("/usr/bin/killall", ["-u", userInfo().username, "-TERM", "Dock"], { timeout: 5000 });
+}
 const result = {
+  dockBookmark,
   status: "MACOS_INSTALLED", installedAt: new Date().toISOString(), version: metadata.version,
   application: destination, dataDirectory: userData, python: pythonPath,
   pythonPolicy: "host-python-dedicated-venv", bundledNode: metadata.node,

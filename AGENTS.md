@@ -4,7 +4,7 @@
 
 - 本项目是 `Viniper` 的唯一工程；`D:\Agent` 与 `D:\Viniper UI\source\viniper-ui` 只作为来源和验收基线，在最终归档门槛前不得改写。
 - 产品只有一个 Harness Runtime、一个 Application Port 和一个结构化数据真源。`Viniper` 是唯一应用内 Agent；Claude Code 仅在用户独立终端中使用，不提供应用内入口。界面不能直接写 SQLite、拼 Provider 请求或持有明文密钥。
-- 前端结构、信息层级、会话轨迹、输入区、菜单和设置布局向 Viniper 看齐；颜色、图标、启动动画、托盘和菜单资产使用 Harness 品牌语言。
+- 前端设计优先对照 Grok Bot 的公开桌面界面和官方交互说明，其他成熟 Agent 用于补充；比较具体组件、尺寸与状态，按数学工作流适配。应用图标为白底折面 V，系统菜单栏使用同轮廓的模板图标。
 - 模型、权限和任务控件以实际后端能力为准；执行过程渐进披露，思考默认折叠。原 Claude 历史与凭据保留，但不迁移成 Viniper 会话。
 
 ## 工作边界

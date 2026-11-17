@@ -18,6 +18,7 @@ MANIFEST_VERSION = 1
 SKILL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 SOURCE_DISPLAY_NAMES = {
+    "viniper-user": "我的技能",
     "built-in": "内置技能",
     "workspace-agents": "项目技能",
     "workspace-codex": "项目技能",
@@ -32,6 +33,7 @@ SOURCE_DISPLAY_NAMES = {
 }
 
 ZH_CN_SKILL_METADATA = {
+    "math-solution-review": {"name": "数学解答复核"},
     "local-math-documents": {"name": "高中数学文档", "description": "制作数学讲义、师生版本和 Word/PDF，保留完整原题原解并核对实际页面。"},
     "karpathy-llm-wiki": {"name": "个人知识库", "description": "按来源组织知识，检索背景并维护可追溯的笔记。"},
     "macos-upgrade-audit": {"name": "Mac 升级评估", "description": "核对系统版本、兼容性和本机环境，再评估是否适合升级。"},
@@ -90,7 +92,10 @@ def localized_skill_fields(record: Mapping[str, Any]) -> dict[str, str]:
     raw_name = str(record.get("name") or slug or "未命名技能").strip()
     raw_description = str(record.get("description") or "").strip()
     localized = ZH_CN_SKILL_METADATA.get(slug, {})
-    if localized.get("name"):
+    source_is_personal = record.get("source") == "viniper-user"
+    if source_is_personal:
+        display_name = raw_name
+    elif localized.get("name"):
         display_name = str(localized["name"])
     elif contains_cjk(raw_name):
         display_name = raw_name
@@ -99,7 +104,9 @@ def localized_skill_fields(record: Mapping[str, Any]) -> dict[str, str]:
         # The Chinese prefix makes the UI explicit while preserving the
         # original title verbatim for recognition and search.
         display_name = f"本地技能 · {raw_name}"
-    if localized.get("description"):
+    if source_is_personal:
+        display_description = raw_description
+    elif localized.get("description"):
         display_description = str(localized["description"])
     elif contains_cjk(raw_description):
         display_description = raw_description

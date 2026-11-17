@@ -157,5 +157,16 @@
   md.renderer.rules.image = (tokens, index) => escape(tokens[index].content);
   md.renderer.rules.table_open = () => '<div class="markdown-table-scroll"><table>\n';
   md.renderer.rules.table_close = () => '</table></div>\n';
-  globalThis.ViniperMarkdown = { render: (text, options = {}) => md.render(String(text || ""), options) };
+  // Sidebar excerpts are inside a button. Only text and inline equations belong there.
+  function preview(text) {
+    const tokens = md.parseInline(text, { streaming: true })[0]?.children || [];
+    return tokens.map(token => {
+      if (token.type === "viniper_math") {
+        if (token.meta.pending) return "…";
+        try { return typeset(token.content, false); } catch { return "…"; }
+      }
+      return ["text", "code_inline", "image"].includes(token.type) ? escape(token.content) : "";
+    }).join("");
+  }
+  globalThis.ViniperMarkdown = { render: (text, options = {}) => md.render(String(text || ""), options), preview };
 })();

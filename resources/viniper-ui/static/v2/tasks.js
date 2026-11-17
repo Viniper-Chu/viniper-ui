@@ -34,6 +34,7 @@ export async function loadTasks() {
 }
 let taskVersion = 0;
 const taskLoads = {};
+const changingSchedules = new Set();
 let taskFilter = "all";
 export function selectTaskFilter(value) {
   taskFilter = value;
@@ -78,7 +79,9 @@ function rememberList(selector) {
   listTop = $("#tasks-view").scrollTop;
   const row = $(selector);
   rowOffset = row?.getBoundingClientRect().top ?? 0;
-  const adjacent = row?.nextElementSibling || row?.previousElementSibling;
+  const container = row?.closest(".routine-row") || row;
+  const sibling = container?.nextElementSibling || container?.previousElementSibling;
+  const adjacent = sibling?.matches("[data-record-id]") ? sibling : sibling?.querySelector("[data-record-id]");
   neighbor = adjacent?.dataset.recordId ? rowSelector(adjacent.dataset.recordKind, adjacent.dataset.recordId) : "";
 }
 
@@ -101,7 +104,25 @@ export function backToTasks() {
 function cadence(job) {
   const pattern = job.schedule || {};
   const cron = job.cron || job.cronExpression || pattern.expression;
-  if (cron) return schedulePresets.get(cron) || cron;
+  if (cron) {
+    if (schedulePresets.has(cron)) return schedulePresets.get(cron);
+    const parts = cron.trim().split(/\s+/);
+    const [minute,hour,day,month,week] = parts;
+    const integer = (s, min, max) => /^\d+$/.test(s) && +s >= min && +s <= max;
+    if (parts.length === 5 && integer(minute,0,59) && integer(hour,0,23)) {
+      const time = hour.padStart(2,"0") + ":" + minute.padStart(2,"0");
+      if (month === "*" && day === "*") {
+        if (week === "*") return "每天 " + time;
+        if (week === "1-5") return "工作日 " + time;
+        if (integer(week,0,7)) return "每周" + "日一二三四五六日"[+week] + " " + time;
+      }
+      if (week === "*" && integer(day,1,31)) {
+        if (month === "*") return `每月 ${+day} 日 ${time}`;
+        if (integer(month,1,12)) return `每年 ${+month} 月 ${+day} 日 ${time}`;
+      }
+    }
+    return cron;
+  }
   const time = [pattern.hour,pattern.minute].map(v => String(v ?? 0).padStart(2,"0")).join(":");
   if (pattern.kind === "daily") return "每天 " + time;
   if (pattern.kind === "weekly") return "每周" + "日一二三四五六"[pattern.weekday] + " " + time;
@@ -114,7 +135,14 @@ function rowHtml(task, kind) {
   const goal = kind === "goals";
   const [group,status] = taskState(task,goal);
   const meta = goal ? `${task.turn_count || 0} 轮` : cadence(task);
-  return `<button class="record-row" data-record-kind="${kind}" data-record-id="${escape(task.id)}" data-hint="查看${goal ? "目标" : "定时任务"}详情"><span class="card-icon">${icon(goal ? "target" : "clock")}</span><span class="capability-copy"><span class="capability-name">${escape(task.title || task.name)}</span><small>${escape(meta)}</small></span><small class="record-state" data-tone="${group}">${escape(status)}</small>${icon("arrowRight")}</button>`;
+  const title = task.title || task.name;
+  const toggle = !goal && task.status !== "project-invalid";
+  const stateText = !toggle || !["已启用","已暂停"].includes(status);
+  const name = escape(title);
+  const row = `<button class="record-row" data-record-kind="${kind}" data-record-id="${escape(task.id)}" data-hint="查看${goal ? "目标" : "定时任务"}详情"><span class="card-icon">${icon(goal ? "target" : "clock")}</span><span class="capability-copy"><span class="capability-name">${name}</span><small>${escape(meta)}</small></span>${stateText ? `<small class="record-state" data-tone="${group}">${escape(status)}</small>` : ""}${goal ? icon("arrowRight") : ""}</button>`;
+  if (!toggle) return row;
+  const verb = task.enabled ? "暂停" : "恢复";
+  return `<div class="routine-row">${row}<button class="schedule-switch" role="switch" aria-checked="${Boolean(task.enabled)}" aria-label="${name}定时执行" data-hint="${verb}此定时任务" data-task-action="${task.enabled ? "pause" : "resume"}" data-schedule-id="${escape(task.id)}" ${changingSchedules.has(task.id) ? "disabled" : ""}></button></div>`;
 }
 
 function setHtml(element, html) {
@@ -177,32 +205,69 @@ function paintDetail() {
   const until = nextRun(task);
   const facts = goal ? [["已用轮次",`${task.turn_count || 0} / ${task.max_turns || "—"}`]] :
     [["执行周期",cadence(task)],["时区",task.schedule?.timeZone],["下次执行",until.replace(/^下次 /,"")]];
-  const sections = [["任务内容",task.prompt],["当前进展",task.current_step],["最近结果",task.last_output || task.last_result || task.lastStatus],["错误",task.last_error]];
+  const scheduleTime = at => {
+    if (!Number.isFinite(at)) return "";
+    try {
+      return new Date(at).toLocaleString("zh-CN", {timeZone:task.schedule?.timeZone, month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit",hour12:false});
+    } catch { return new Date(at).toISOString(); }
+  };
+  const upcoming = (task.upcoming || []).map(entry => scheduleTime(entry.at)).filter(Boolean);
+  const dispatches = (task.history || []).map(entry => {
+    const status = entry.source === "recovery" && entry.status === "pending" && entry.detail?.includes("已跳过") ? "离线跳过" :
+      ({accepted:"已派发",pending:"待处理",failed:"派发失败"}[entry.status] || entry.status);
+    return `<li><time>${escape(scheduleTime(entry.triggeredAt))}</time><strong>${escape(status)}</strong><span>${escape(entry.detail)}</span></li>`;
+  });
+  const sections = [["任务内容",task.prompt],["当前进展",task.current_step],[goal ? "最近结果" : "最近派发",task.last_output || (!dispatches.length && task.last_result) || task.lastStatus],["错误",task.last_error]];
   const html = `<header class="detail-heading"><span class="detail-icon">${icon(goal?"target":"clock")}</span><h1 tabindex="-1">${escape(task.title || task.name)}</h1></header>
-    <div class="record-tools">${actions.join("")}</div>
     <dl class="record-facts"><div><dt>状态</dt><dd class="record-state" data-tone="${group}">${escape(status)}</dd></div>${facts.filter(([,v])=>v).map(([k,v])=>`<div><dt>${k}</dt><dd>${escape(v)}</dd></div>`).join("")}</dl>
     ${sections.filter(([,v])=>v).map(([k,v])=>`<section class="record-section"><h2>${k}</h2><p>${escape(v)}</p></section>`).join("")}
-    <button class="text-button remove-record" data-task-action="delete" ${ref}>${icon("trash")}移除${goal?"目标":"定时任务"}</button>`;
-  setHtml(host,html);
+    ${upcoming.length ? `<details class="schedule-help" data-disclosure="upcoming"><summary>接下来 ${upcoming.length} 次触发</summary><ol class="schedule-records">${upcoming.map(time => `<li>${escape(time)}</li>`).join("")}</ol></details>` : ""}
+    ${!goal ? `<section class="record-section"><h2>派发记录</h2>${dispatches.length ? `<ol class="schedule-records">${dispatches.slice(0,3).join("")}</ol>` : '<p class="quiet-state">暂无派发记录</p>'}${dispatches.length > 3 ? `<details class="schedule-help" data-disclosure="history"><summary>更早的 ${dispatches.length-3} 条记录</summary><ol class="schedule-records">${dispatches.slice(3).join("")}</ol></details>` : ""}</section>` : ""}
+    <footer class="record-tools">${actions.join("")}<button class="text-button remove-record" data-task-action="delete" ${ref}>${icon("trash")}移除${goal?"目标":"定时任务"}</button></footer>`;
+  if (host._taskHtml !== html) {
+    const expanded = host.dataset.record === id ? [...host.querySelectorAll("details[open]")].map(node => node.dataset.disclosure) : [];
+    host.dataset.record = id;
+    setHtml(host,html);
+    for (const node of host.querySelectorAll("[data-disclosure]")) node.open = expanded.includes(node.dataset.disclosure);
+  }
 }
 
 export async function taskAction(action, goalId, scheduleId) {
   const goal = Boolean(goalId), id = goalId || scheduleId;
   if (action === "edit") return openTaskEditor();
+  if (!goal && changingSchedules.has(id)) return;
   const path = `/api/${goal ? "goals" : "schedules"}/${encodeURIComponent(id)}`;
   if (action === "delete") {
-    ui.dialog("移除任务","<p>移除这项任务？相关对话和项目文件会保留。</p>",{label:"移除",danger:true,onSubmit:async()=>{
+    const target = state[goal ? "goals" : "schedules"].find(item => item.id === id);
+    ui.dialog("移除任务",`<p>移除“${escape(target?.title || target?.name || "这项任务")}”？相关对话和项目文件会保留。</p>`,{label:"移除",danger:true,onSubmit:async()=>{
       await api(path,{method:"DELETE"});
       if (state.view === "tasks") { await loadTasks(); if (selected?.id === id) backToTasks(); }
     }});
     return;
   }
-  await api(path,{method:"PATCH",body:{action}});
-  if (state.view === "tasks") await loadTasks();
-  ui.toast(["continue","resume"].includes(action) ? "已继续" : "已暂停");
+  const selector = `[role=switch][data-schedule-id="${CSS.escape(id)}"]`;
+  const returnToSwitch = !goal && document.activeElement?.matches(selector);
+  if (!goal) {
+    changingSchedules.add(id);
+    if ($(selector)) $(selector).disabled = true;
+  }
+  try {
+    await api(path,{method:"PATCH",body:{action}});
+    if (state.view === "tasks") await loadTasks();
+    ui.toast(["continue","resume"].includes(action) ? "已继续" : "已暂停");
+  } finally {
+    changingSchedules.delete(id);
+    if (state.view === "tasks") {
+      renderTasks();
+      const button = $(selector);
+      if (button) button.disabled = false;
+      if (returnToSwitch && document.activeElement === document.body)
+        (button || $("#task-search")).focus({preventScroll:true});
+    }
+  }
 }
 
-export function openTaskEditor(create = false) {
+export function openTaskEditor(create = false, prompt = "") {
   if (saving) return;
   const task = create ? null : record();
   if (!create && !task) return;
@@ -210,7 +275,7 @@ export function openTaskEditor(create = false) {
   detailTop = $("#tasks-view").scrollTop;
   const goal = !create && selected.kind === "goals";
   const zone = task?.schedule?.timeZone || "Asia/Shanghai";
-  editor = {task,goal,zone};
+  editor = {task,goal,zone, target:create ? {session_id:state.session?.session_id || "",workdir:state.workdir,model:state.model} : null};
   surface("task-editor");
   $("#task-edit-title").textContent = create ? "新建定时任务" : goal ? "编辑目标" : "编辑定时任务";
   $("#task-edit-origin").textContent = create ? "目标与任务" : "任务详情";
@@ -218,7 +283,7 @@ export function openTaskEditor(create = false) {
   const cron = task?.cron || task?.schedule?.expression || "0 9 * * 1-5";
   const presets = [...schedulePresets].map(([v,l])=>`<option value="${v}">${l}</option>`).join("");
   form.innerHTML = `<label class="field">名称<input name="title" required maxlength="${goal?160:100}" value="${escape(task?.title || task?.name || "")}"></label>
-   <label class="field">任务内容<textarea name="prompt" rows="6" required>${escape(task?.prompt || "")}</textarea></label>
+   <label class="field">任务内容<textarea name="prompt" rows="6" required>${escape(task?.prompt || prompt)}</textarea></label>
    ${goal ? "" : `<div class="form-grid"><label class="field">执行时间（${escape(zone === "Asia/Shanghai" ? "上海时间" : zone)}）<select name="preset">${presets}<option value="custom">自定义 Cron</option></select></label><label class="field">Cron 表达式<input name="cron" value="${escape(cron)}"></label></div>
    <details class="schedule-help"><summary data-hint="执行规则">执行规则</summary><p>应用运行时执行。会话忙碌时等待空闲，重启时跳过错过的时间。</p></details>`}
    <footer class="editor-bar"><span role="status"></span><button type="button" data-action="cancel-task-edit" class="secondary-button">取消</button><button class="primary-button" type="submit">${create ? "创建" : "保存修改"}</button></footer>`;
@@ -254,7 +319,7 @@ export async function saveTask() {
   if (goal) body.original = {title:task.title,prompt:task.prompt};
   else Object.assign(body,{cron:data.get("preset") === "custom" ? data.get("cron") : data.get("preset"),time_zone:zone});
   const url = goal ? "/api/goals" : "/api/schedules";
-  if (!task) Object.assign(body,{session_id:state.session?.session_id || "",workdir:state.workdir,model:state.model});
+  if (!task) Object.assign(body,current.target);
   else body.action = "edit";
   saving = true;
   const controls = [...form.elements].filter(el=> !el.disabled);

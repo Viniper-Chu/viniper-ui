@@ -95,6 +95,7 @@ let quitPromise = null;
 
 const SECRET_REFS_BY_MODE = Object.freeze({
   viniper: "provider.deepseek",
+  discussion: "provider.deepseek.discussion",
   claude: "provider.anthropic.api-key",
 });
 
@@ -497,7 +498,7 @@ async function readSecureSecret(ref) {
 
 function secretRefForMode(mode) {
   const value = String(mode || "").toLowerCase();
-  return SECRET_REFS_BY_MODE[value === "claude" ? "claude" : "viniper"];
+  return SECRET_REFS_BY_MODE[Object.hasOwn(SECRET_REFS_BY_MODE, value) ? value : "viniper"];
 }
 
 async function writeSecureSecretRef(ref, value) {
@@ -586,7 +587,7 @@ async function startSecretBroker() {
     }
     const url = requestUrl;
     const rawMode = String(url.searchParams.get("mode") || "").toLowerCase();
-    const mode = rawMode === "claude" ? "claude" : "viniper";
+    const mode = Object.hasOwn(SECRET_REFS_BY_MODE, rawMode) ? rawMode : "viniper";
     const ref = SECRET_REFS_BY_MODE[mode];
     if (url.pathname === "/secret/migrate") {
       if (!migrationEnabled || hostMigrationConsumed || migrationHeader !== hostMigrationToken || request.method !== "POST") {
@@ -1035,13 +1036,13 @@ async function createMainWindow() {
     minHeight: 680,
     title: DISPLAY_NAME,
     icon: appIcon(),
-    backgroundColor: nativeTheme.shouldUseDarkColors ? "#152329" : "#F8F8F4",
+    backgroundColor: nativeTheme.shouldUseDarkColors ? "#1A1B1A" : "#FFFFFF",
     show: false,
     autoHideMenuBar: true,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "hidden",
     trafficLightPosition: process.platform === "darwin" ? { x: 14, y: 17 } : undefined,
     titleBarOverlay: process.platform === "win32"
-      ? { color: nativeTheme.shouldUseDarkColors ? "#152329" : "#F8F8F4", symbolColor: nativeTheme.shouldUseDarkColors ? "#E9F1EB" : "#182F37", height: TITLEBAR_HEIGHT }
+      ? { color: nativeTheme.shouldUseDarkColors ? "#1A1B1A" : "#FFFFFF", symbolColor: nativeTheme.shouldUseDarkColors ? "#E9F1EB" : "#182F37", height: TITLEBAR_HEIGHT }
       : undefined,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),

@@ -108,6 +108,7 @@ async function readSettings() {
       "base-url": p.base_url || "",
       "model-id": p.model || state.model,
       "api-key": "",
+      "discussion-key": "",
       theme: s.appearance?.theme || "system",
       "font-size": s.appearance?.font_size || "normal",
       workdir: s.workspace?.default_root || state.workdir,
@@ -121,9 +122,13 @@ async function readSettings() {
       form.elements["provider-id"].add(new Option(p.label || p.id, p.id));
     for (const [key, value] of Object.entries(values))
       form.elements[key].value = value;
-    form.elements["api-key"].placeholder = p.api_key_configured
+    form.elements["api-key"].placeholder = p.api_key_access === "local-placeholder" ? "本地模型无需密钥" : p.api_key_configured
       ? "已安全保存；留空保留现有密钥"
       : "输入 API key";
+    const cloud = settings.cloud_connection || {};
+    document.querySelector("#cloud-model").textContent = cloud.label || "DeepSeek Flash";
+    document.querySelector("#cloud-endpoint").textContent = cloud.endpoint || "—";
+    form.elements["discussion-key"].placeholder = cloud.configured ? "已安全保存 · 可在会话中选择" : "保存后可用于云端会话和双模型讨论";
     baseline = values;
     fields.disabled = false;
     document.querySelector("#browse-workdir").hidden = !window.viniperDesktop?.chooseProject;
@@ -179,12 +184,13 @@ export async function saveSettings() {
   document.querySelector("#settings-fields").disabled = true;
   syncSettings("正在保存…");
   try {
-    if (fields.includes("api-key")) {
+    for (const [field, mode] of [["api-key", "viniper"], ["discussion-key", "discussion"]]) {
+      if (!fields.includes(field)) continue;
       if (!window.viniperDesktop?.saveProviderSecret) throw new Error("请在 Viniper 桌面应用中保存密钥");
-      const stored = await window.viniperDesktop.saveProviderSecret("viniper", values["api-key"].value);
+      const stored = await window.viniperDesktop.saveProviderSecret(mode, values[field].value);
       if (!stored.ok) throw new Error("钥匙串未完成保存");
-      values["api-key"].value = "";
-      values["api-key"].placeholder = "已安全保存，留空保留现有密钥";
+      values[field].value = "";
+      values[field].placeholder = "已安全保存，留空保留现有密钥";
     }
     const mappings = {
       "provider-label": ["provider", "label"], "provider-id": ["provider", "id"],

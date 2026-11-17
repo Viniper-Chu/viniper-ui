@@ -225,7 +225,7 @@ function isObviousPrivateHost(hostname: string): boolean {
     || (first === 192 && second === 168);
 }
 
-async function readBoundedBody(response: Response, maxChars: number): Promise<{ text: string; truncated: boolean }> {
+export async function readBoundedBody(response: Response, maxChars: number): Promise<{ text: string; truncated: boolean }> {
   const maxBytes = maxChars * 4;
   if (!response.body) return { text: (await response.text()).slice(0, maxBytes), truncated: false };
   const reader = response.body.getReader();
@@ -287,7 +287,7 @@ function normalizeText(value: string): string {
   return decodeEntities(value).replace(/\s+/gu, " ").trim();
 }
 
-function decodeEntities(value: string): string {
+export function decodeEntities(value: string): string {
   return value
     .replace(/&nbsp;/giu, " ")
     .replace(/&amp;/giu, "&")

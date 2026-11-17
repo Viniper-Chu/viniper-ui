@@ -59,6 +59,7 @@ import { DiagnosticsService } from "../../features/diagnostics/diagnostics-servi
 import { UpdateService } from "../../features/updates/update-service";
 import { ProductSettingsService } from "../../features/settings/product-settings-service";
 import { ArchiveScope, ArchiveDataset } from "../../core/cp7-contracts";
+import { WebSearchTool } from "../../features/web/web-search-tool";
 import { WebFetchService, createWebFetchTools } from "../../features/web/web-fetch-service";
 import { GitHubRepositoryService, createGitHubRepositoryTools } from "../../features/web/github-repository-service";
 import { CompositionService } from "../../features/composition/composition-service";
@@ -211,6 +212,7 @@ export async function createHarnessApplication(
     allowUnscoped: true,
   }), true);
   for (const tool of createTerminalTools(terminalService)) toolRegistry.register(tool);
+  toolRegistry.register(new WebSearchTool(options.allowExternalNetwork === true, options.webFetchImpl));
   const webFetchService = new WebFetchService({ fetchImpl: options.webFetchImpl });
   for (const tool of createWebFetchTools(webFetchService)) toolRegistry.register(tool);
   for (const tool of createGitHubRepositoryTools(new GitHubRepositoryService())) toolRegistry.register(tool);

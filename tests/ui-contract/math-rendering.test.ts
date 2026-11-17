@@ -96,3 +96,12 @@ test('local file links containing spaces work without rewriting literal code',()
  assert.match(html,/href="\/Users\/example\/My%20Project\//);
  assert.match(html,/My Project\/中文 结果.pdf/);
 });
+
+test("session previews typeset inline math but never add controls inside the session button", () => {
+  const preview = (text: string): string => context.ViniperMarkdown.preview(text);
+  const html = preview(String.raw`在 \(x^2=1\) 时，读[解答](https://example.com)。`);
+  assert.equal(countMath(html), 1);
+  assert.doesNotMatch(html, /<(?:a|button|img)\b/u);
+  assert.equal(preview(String.raw`求 \(x^`), "求 …");
+  assert.equal(preview("<img src=x>"), "&lt;img src=x&gt;");
+});
