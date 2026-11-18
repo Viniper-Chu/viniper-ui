@@ -115,4 +115,6 @@ test("each requested level returns exact algebraic candidates and their branch m
     a: 1, b: -2, c: "-(1+t)", lower: -1, lower_open: true, upper: 2, levels: [-2, -1, 0, 2, "1/4"],
   }}, new AbortController().signal);
   assert.deepEqual(factored.solutions_at_levels, rows);
+  assert.ok(String(factored.branch_table).includes("| $0$ | 1 | 0 | 0 | 1 | 左支 $1-\\sqrt{2}$（保留）；右支 $1+\\sqrt{2}$（域外，舍去）"));
+  assert.ok(String(factored.branch_table).includes("| $-2$ | 1 | 1 | 1 | 1 | 顶点 $1$（保留）"));
 });

@@ -244,7 +244,10 @@ test("math routing distinguishes the actual task, attachment and retained docume
 });
 
 test("explicitly requesting root counts uses the inline verified answer path", () => {
-  for (const text of ["随 t 变化，给出方程 x²−4x+3=t 各支根数。", "列出二次函数 y=x² 与水平线 t 的交点，调用 math.quadratic.check。"])
+  for (const text of ["随 t 变化，给出方程 x²−4x+3=t 各支根数。", "列出二次函数 y=x² 与水平线 t 的交点，调用 math.quadratic.check。",
+    "对 f(x)=(x−1)²−2，定义域 −1<x≤2，讨论 f(x)=t。请按零式给工具传入 -(1+t)，实际调用 math.quadratic.check 验算，列出不同根数。",
+    "请调用 math.quadratic.check 验算 f(x)=(x−1)²−2 在 −1<x≤2 上的零点。"])
     assert.equal(isInlineMathExercise(text), true);
   assert.equal(isInlineMathExercise("读取试卷文件，列出方程 x²=1 的根数。"), false);
+  assert.equal(isInlineMathExercise("用 math.quadratic.check 验算方程 x²=1，然后用工具画图。"), false);
 });

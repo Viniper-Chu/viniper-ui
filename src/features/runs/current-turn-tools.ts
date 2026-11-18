@@ -58,10 +58,13 @@ function sameNames(left: Set<string>, right: Set<string>): boolean {
 /** Fully stated exercises can use calculation tools without initiating unrelated workspace actions. */
 export function isInlineMathExercise(request: string): boolean {
   // Explicitly asking for the built-in root checker still describes an inline calculation.
+  if (/\bmath\.quadratic\.check\b/iu.test(request)) {
+    request = request.replace(/(?:给|向)(?:该|这个|上述)?工具(?:传入|传递|提交)/gu, "传入");
+  }
   request = request.replace(/math\.quadratic\.check|(?:二次方程|实根|根数)(?:核验|验算|检查)?工具/giu, "根数验算");
   if (/附件|题图|如图|图中|文件|文档|目录|项目|题库|资料|教材|源码|原卷|原稿|讲义|试卷|排版|编译|绘制|画|作图|作出.{0,8}图|示意图|图形文件|搜索|检索|查找|查询|读取|保存|写入|生成|工具|脚本|计算机|程序|代码|上面|上题|之前|刚才|根据图|阅读|资料库|联网|验证器|实验|导出|绘图|上一|前面|前述|插件|技能|[a-z]+\.[a-z]{2,}\b|\b(?:python|pdf|tex|word|tikz|excel|latex|cas)\b/iu.test(request)) return false;
-  return /求|证明|证出|判定|判断|解答|解下列|解方程|解不等式|讨论|给出|列出|有几个|几条|多少/iu.test(request)
-    && /方程|函数|实根|不等式|三角形|切线|数列|向量|直线|抛物线|椭圆|双曲线|多面体|概率|正实数|导数/iu.test(request)
+  return /求|证明|证出|判定|判断|解答|解下列|解方程|解不等式|讨论|给出|列出|验算|有几个|几条|多少/iu.test(request)
+    && /方程|函数|实根|根数|零点|单调支|不等式|三角形|切线|数列|向量|直线|抛物线|椭圆|双曲线|多面体|概率|正实数|导数/iu.test(request)
     && /[0-9=<>≤≥∈√²³]|\\(?:frac|sqrt|in|le|ge)\b/u.test(request);
 }
 

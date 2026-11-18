@@ -247,10 +247,12 @@ def level_counts(family):
         if not isinstance(requested, list) or len(requested) > 64:
             raise ValueError('levels 须为最多 64 个有理参数值的数组。')
         # In addition to requested horizontal lines, verify zeros and all finite boundaries.
-        levels = sorted(cuts | {Fraction(0)} | {rational(t) for t in requested})
-        result['solutions_at_levels'] = [
-            {'level': str(t), 'candidates': quadratic_candidates(a, b, c-t, count_at(t))}
-            for t in levels]
+        requested_levels = list(dict.fromkeys(rational(t) for t in requested))
+        solutions = {}
+        for t in sorted(cuts | {Fraction(0)} | set(requested_levels)):
+            counts = count_at(t)
+            solutions[t] = {'level': str(t), **counts, 'candidates': quadratic_candidates(a, b, c-t, counts)}
+        result['solutions_at_levels'] = list(solutions.values())
         lines = [f"在定义域 $x\\in {domain}$ 内，以 $x={vertex}$ 为分界。顶点若为解，左右列各含一次，总数扣除重复。",
                  "", "左支"+describe_branch(True)+"；右支"+describe_branch(False)+"。",
                  "", f"| 参数 {parameter} | 左支（$x\\le {vertex}$） | 右支（$x\\ge {vertex}$） | 共同顶点 | 不同实根数 |",
@@ -258,6 +260,24 @@ def level_counts(family):
         for piece in pieces:
             label = level_label(piece)
             lines.append(f"| ${label}$ | {piece['left_branch']} | {piece['right_branch']} | {piece['shared_vertex']} | {piece['distinct_roots']} |")
+        if requested_levels:
+            lines.extend(["", f"| 指定值 ${parameter}$ | 左支根数 | 右支根数 | 共同顶点 | 不同实根数 | 候选根与取舍 |",
+                          "|---|---:|---:|---:|---:|---|"])
+            for t in requested_levels:
+                row = solutions[t]
+                notes = []
+                for candidate in row['candidates']:
+                    branch = {'left': '左支', 'right': '右支', 'vertex': '顶点'}[candidate['branch']]
+                    root = re.sub(r'sqrt\(([^)]+)\)', lambda m: r'\sqrt{' + m[1] + '}', candidate['x'])
+                    root = re.sub(r'(\d+)/(\d+)', lambda m: r'\frac{' + m[1] + '}{' + m[2] + '}', root)
+                    decision = '保留' if candidate['included'] else '域外，舍去'
+                    if lo is not None and candidate['x'] == str(lo):
+                        decision = ('左开端点' if left_open else '左闭端点') + '，' + decision
+                    if hi is not None and candidate['x'] == str(hi):
+                        decision = ('右开端点' if right_open else '右闭端点') + '，' + decision
+                    notes.append(f"{branch} ${root}$（{decision}）")
+                lines.append(f"| ${t}$ | {row['left_branch']} | {row['right_branch']} | {row['shared_vertex']} | {row['distinct_roots']} | "
+                             + ('；'.join(notes) or '无实根') + ' |')
         result['branch_table'] = '\n'.join(lines)
     return result
 
