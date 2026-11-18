@@ -99,7 +99,7 @@ export function menuContent(kind) {
         disabled: active,
       }) +
       '<div class="menu-separator"></div>' +
-      option({ label: "新建数学讨论组", image: "discussion", action: "new-discussion" }) +
+      option({ label: "新建群聊", image: "discussion", action: "new-discussion" }) +
       option({ label: "选择技能或插件", image: "plugin", action: "extensions" })
     );
   if (kind === "model") {

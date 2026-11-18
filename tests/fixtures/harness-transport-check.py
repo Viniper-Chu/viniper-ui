@@ -90,7 +90,7 @@ async def main():
         sid = "harness-" + ending
         server.sessions[sid] = {"id": sid, "mode": "viniper", "workdir": str(workdir),
                                 "messages": [], "permission_mode": "default"}
-        server.provider_config = lambda *_args: {"api_key": "dummy-fixture-value", "model": "fixture-model",
+        server.provider_config = lambda *_args, **_kwargs: {"api_key": "dummy-fixture-value", "model": "fixture-model",
                                                  "provider": "fixture", "base_url": "http://fixture.invalid"}
         port = LocalEffectsPort(ending)
         transport = server.HarnessRuntimeTransport(port)
@@ -179,7 +179,7 @@ async def main():
     finally:
         server.VINIPER_TRANSPORT, server.agent_run_coordinator = previous_transport, previous_coordinator
 
-    server.provider_config = lambda *_args: {"api_key": "", "model": "fixture-model", "provider": "fixture", "base_url": ""}
+    server.provider_config = lambda *_args, **_kwargs: {"api_key": "", "model": "fixture-model", "provider": "fixture", "base_url": ""}
     sid = "harness-unconfigured"
     workdir = root / "unconfigured"
     workdir.mkdir()

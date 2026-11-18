@@ -221,7 +221,7 @@ test("restart resumes an unknown run once with visible recovering and replay eve
   try {
     await first.storage.saveSnapshot({
       schemaVersion: 3,
-      productVersion: "3.0.0",
+      productVersion: "3.0.1",
       activeSessionId: session.id,
       sessions: [persisted],
     });
@@ -271,7 +271,7 @@ test("restart does not replay a run with a terminal success event", async () => 
   try {
     await first.storage.saveSnapshot({
       schemaVersion: 3,
-      productVersion: "3.0.0",
+      productVersion: "3.0.1",
       activeSessionId: session.id,
       sessions: [{ ...session, status: "running", activeRunId: runId, activeRunIds: [runId] }],
     });

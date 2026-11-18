@@ -69,7 +69,7 @@ readline.createInterface({input:process.stdin, crlfDelay:Infinity}).on('line', l
 
 async def main():
     port = port_module.HarnessApplicationPort(runtime_script=bridge, runtime_data_root=root / "bridge-data")
-    server.provider_config = lambda *_args: {"api_key": "local-fixture-only", "provider": "fixture", "model": "fixture", "base_url": ""}
+    server.provider_config = lambda *_args, **_kwargs: {"api_key": "local-fixture-only", "provider": "fixture", "model": "fixture", "base_url": ""}
     transport = server.HarnessRuntimeTransport(port)
     healthy_dir = root / "healthy"
     healthy_dir.mkdir()

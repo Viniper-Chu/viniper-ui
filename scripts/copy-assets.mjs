@@ -1,4 +1,5 @@
-import { cpSync, mkdirSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
+import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const root = process.cwd();
@@ -38,3 +39,9 @@ cpSync(join(root, "plugins"), join(root, "resources", "viniper-ui", "harness-run
 const runtimeVendor = join(root, "resources", "viniper-ui", "harness-runtime", "vendor");
 mkdirSync(runtimeVendor, { recursive: true });
 cpSync(join(root, "node_modules", "typescript", "lib", "typescript.js"), join(runtimeVendor, "typescript.js"));
+
+// Keep the desktop connector picker on the same fixed endpoints as the Runtime.
+const { PROVIDER_PROFILES } = createRequire(import.meta.url)("../dist/src/features/providers/profiles/index.js");
+const services = PROVIDER_PROFILES.filter(p => p.endpoint.mode === "fixed" && p.endpoint.defaultUrl.startsWith("https://")
+  && p.auth.length === 1 && p.auth[0].id === "api-key").map(p => ({id:p.id, label:p.label, endpoint:p.endpoint.defaultUrl}));
+writeFileSync(join(root,"resources","viniper-ui","harness-runtime","model-services.json"), JSON.stringify(services));

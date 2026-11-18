@@ -1,6 +1,6 @@
-# Viniper 3.0.0
+# Viniper 3.0.1
 
-本地 Qwen 与 DeepSeek Flash 可按会话选择。云端连接在「设置与模型 → 模型连接 → DeepSeek 云端」配置；选择云端后，本会话上下文会发往 DeepSeek。数学讨论组另外提供仅发送本轮文字题的双模型独立作答。
+群聊可邀请 2–6 位成员，各自指定已接入的模型和职责。可点名、请全体发言，或让主接成员把任务交给队友。云端成员会收到相关群聊上下文。
 
 
 Viniper 是面向高中数学解答与讲义制作的本地桌面 Agent，也支持文件、代码和资料任务。它使用同一个 Harness Runtime 管理会话、模型、工具、访问权限和执行记录，提供原生 macOS `.app` 入口。
@@ -42,4 +42,4 @@ npm run typecheck
 npm test
 ```
 
-macOS 与 Windows 分别验收；本次交付目标是 Apple Silicon macOS，不能据此认定 Windows 安装器已经完成回归。3.0.0 的 Apple Silicon 构建及发布说明见 [GitHub Releases](https://github.com/Viniper-Chu/viniper-ui/releases/tag/v3.0.0)。
+macOS 与 Windows 分别验收；本次交付目标是 Apple Silicon macOS，不能据此认定 Windows 安装器已经完成回归。3.0.1 的 Apple Silicon 构建及发布说明见 [GitHub Releases](https://github.com/Viniper-Chu/viniper-ui/releases/tag/v3.0.1)。

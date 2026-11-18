@@ -1,3 +1,4 @@
+import { editRoom } from "./room.js";
 import { bindEffortControl, selectedEffort, effortLabel } from "./effort.js";
 import { setupFunctionField } from "./function-field.js";
 import { setupTooltips } from "./tooltips.js";
@@ -30,11 +31,13 @@ import {
   editSkill, cancelSkillEdit, saveSkill, skillEditorMode,
 } from "./pages.js";
 import { loadTasks, renderTasks, taskAction, selectTaskFilter, openTaskEditor, backToTasks, showTask, cancelTaskEdit, saveTask } from "./tasks.js";
-import { loadSettings, saveSettings, selectSettingsSection, readingSize, setupPreferenceSearch, clearPreferenceSearch, focusPreference, syncSettings, discardSettings } from "./preferences.js";
+import { editModelService, loadSettings, saveSettings, selectSettingsSection, readingSize, setupPreferenceSearch, clearPreferenceSearch, focusPreference, syncSettings, discardSettings } from "./preferences.js";
 const $ = (s) => document.querySelector(s);
 let switchVersion = 0;
 let toastTimer;
 let busySending = false;
+let submitting = null;
+let sessionsVersion = 0;
 let busySteering = false;
 let draftDirectory = "";
 function setMarkup(element, html) {
@@ -112,6 +115,7 @@ export function view(name, { returning = false } = {}) {
   $("#session-title").textContent = name === "chat" ? state.session?.name || "" : "";
   $("#project-button").hidden = name !== "chat" || !state.session;
   $("#session-more").hidden = name !== "chat";
+  $("#room-header").hidden = name !== "chat" || !state.session?.discussion;
   closeMenu();
   let loading;
   if (name === "extensions" && !returning)
@@ -148,7 +152,9 @@ async function refreshModelNotice() {
   syncComposer();
 }
 export async function loadSessions() {
+  const revision = ++sessionsVersion;
   const data = await api("/api/sessions");
+  if (revision !== sessionsVersion) return;
   state.sessions = (data.sessions || []).filter((s) => s.mode === "viniper");
   if (state.session && !state.sessions.some(s => s.id === state.session.session_id) && !state.runs.get(state.session.session_id)?.active) {
     const attachments = state.attachments, skills = state.selectedSkills, mode = state.mode;
@@ -163,6 +169,7 @@ export async function loadSessions() {
   renderSessions();
 }
 const phases = {
+  submitting: ["提交", "正在提交消息", "orbit"],
   notice: ["处理", "正在处理", "orbit"],
   starting: ["准备", "正在连接模型", "orbit"],
   context: ["读入", "正在读入上下文", "orbit"],
@@ -314,7 +321,9 @@ export async function ensureSession() {
     state.session = created;
     $("#session-title").textContent = created.name;
   }
-  await loadSessions();
+  sessionsVersion++;
+  state.sessions = [{...created, id:created.session_id}, ...state.sessions.filter(item => item.id !== created.session_id)];
+  renderSessions();
   return created;
 }
 
@@ -347,13 +356,14 @@ function resizePrompt() {
   }
   const stopping = isStopping();
   const empty = !prompt.value.trim();
+  const notice = state.session?.discussion && state.mode === "execute" ? null : state.modelNotice;
   const send = $("#send-button");
   const steer = $("#steer-button");
   send.hidden = send.dataset.icon === "enqueue" && empty;
-  send.disabled = stopping || Boolean(state.modelNotice) || empty;
+  send.disabled = busySending || stopping || Boolean(notice) || empty;
   steer.disabled = busySteering || stopping || empty;
   if (stopping) send.dataset.hint = "任务正在停止，请稍候";
-  else if (state.modelNotice) send.dataset.hint = state.modelNotice.message || "模型暂时不可用";
+  else if (notice) send.dataset.hint = notice.message || "模型暂时不可用";
   else if (empty) send.dataset.hint = "先输入要发送的消息";
   else send.dataset.hint = send.dataset.icon === "enqueue" ? "本轮结束后发送  Enter" : "发送消息  Enter";
   if (stopping) steer.dataset.hint = "任务正在停止，请稍候";
@@ -371,21 +381,20 @@ export function syncComposer() {
   const pending = run?.active ? run.interaction : state.session?.pending_interaction;
   const workspace = state.session?.workdir || state.workdir;
   const group = state.session?.discussion === true && state.mode === "execute";
-  const participants = $("#discussion-people");
-  if (participants) {
-    participants.hidden = !group;
-    if (group) {
-      const recipient = $("#prompt").value.trimStart().match(/^@(解题|复核|并行)(?:[：:，,\s]+|$)/u)?.[1] || "全组";
-      for (const button of participants.querySelectorAll("[data-address]")) button.setAttribute("aria-pressed", String(button.dataset.address === recipient));
-    }
-  }
+  const room = state.session?.discussion === true;
+  const notice = group ? null : state.modelNotice;
+  $("#room-header").hidden = !room || state.view !== "chat";
+  $("#room-header").disabled = active || busySending;
+  if (room) setMarkup($("#room-header"), icon("discussion") + "群成员 · " + state.session.members.length);
+  $("#mention-member").hidden = !group;
+  $("#model-button").hidden = group;
   const heading = $("#welcome h1");
   if (heading) heading.textContent = group ? "这道题，一起讨论" : "今天解哪道题？";
   const connectionStatus = $("#connection-status");
-  connectionStatus.textContent = state.modelNotice?.label || (state.status?.configured ? "" : "等待配置模型");
+  connectionStatus.textContent = notice?.label || (state.status?.configured ? "" : "等待配置模型");
   connectionStatus.hidden = !connectionStatus.textContent;
-  $("#model-notice").hidden = !state.modelNotice;
-  $("#model-notice").textContent = state.modelNotice?.message || "";
+  $("#model-notice").hidden = !notice;
+  $("#model-notice").textContent = notice?.message || "";
   $("#prompt").placeholder = active ? "补充任务要求…" : group ? "向讨论组提问，或点名一位成员…" : "输入题目，或添加题图、讲义…";
   $("#prompt").title = active ? "Enter 排队 · ⌘Enter 引导" : "Enter 发送 · Shift Enter 换行";
   $("#project-button").hidden = state.view !== "chat" || !state.session;
@@ -425,7 +434,7 @@ export function syncComposer() {
   );
   $("#input-hint").hidden = !active;
   $("#input-hint").textContent = stopping ? "停止后可发送下一条消息" : "Enter 排队 · ⌘Enter 引导";
-  const phase = activePhase(run, state.session?.active_run);
+  const phase = submitting?.generation === switchVersion ? "submitting" : activePhase(run, state.session?.active_run);
   const strip = $("#work-indicator");
   strip.hidden = !phase;
   if (phase) {
@@ -436,7 +445,7 @@ export function syncComposer() {
     const statusLabel = group && run?.message?.speaker ? run.message.speaker + " · " + phaseLabel : phaseLabel;
     const target = tool?.input?.path || tool?.input?.directory || tool?.input?.cwd || "";
     const detail = $("#work-detail");
-    detail.textContent = run?.peerPending && run.message.streaming ? "DeepSeek 同时作答中" : String(target).split(/[\\/]/).filter(Boolean).at(-1) || "";
+    detail.textContent = String(target).split(/[\\/]/).filter(Boolean).at(-1) || "";
     detail.hidden = !detail.textContent;
     detail.title = target;
     if (strip.dataset.phase !== phase) {
@@ -493,21 +502,29 @@ async function send() {
   };
   const visible = () => generation === switchVersion;
   const clear = () => {
-    state.drafts.delete(originalId);
+    if (!preview || !state.drafts.get(originalId) || state.drafts.get(originalId).trim() === text) state.drafts.delete(originalId);
     if (visible()) {
-      $("#prompt").value = "";
+      if (!preview) $("#prompt").value = "";
       $("#prompt").style.height = "";
-      state.attachments = [];
+      state.attachments = state.attachments.filter(a => !controls.attachments.includes(a));
       syncComposer();
     }
   };
+  const alreadyActive = state.runs.get(originalId)?.active || state.session?.active_run?.active;
+  const preview = !alreadyActive && controls.mode !== "goal" ? newRun(originalId, null) : null;
   busySending = true;
+  if (preview) {
+    submitting = {generation};
+    appendMessage({role:"user", content:text});
+    preview.node = appendMessage(preview.message);
+    $("#prompt").value = "";
+    syncComposer();
+    bottom(true);
+  }
   try {
-    await refreshModelNotice();
-    if (state.modelNotice) throw new Error(state.modelNotice.message);
     const session = await ensureSession(),
       sid = session.session_id;
-    if (!visible()) return;
+    if (preview) preview.sessionId = sid;
     const existing = state.runs.get(sid);
     if (existing?.active || session.active_run?.active) {
       await api(`/api/runs/${sid}/queue`, {
@@ -564,20 +581,38 @@ async function send() {
       throw new Error(error.detail || "发送失败");
     }
     clear();
-    const run = newRun(sid, response.headers.get("X-Viniper-Run-Id"));
+    const run = preview || newRun(sid, null);
+    submitting = null;
+    run.sessionId = sid;
+    run.runId = response.headers.get("X-Viniper-Run-Id");
+    run.phase = "starting";
     run.message.planned = controls.mode === "plan";
     state.runs.set(sid, run);
     if (visible()) {
-      appendMessage({ role: "user", content: text });
-      run.node = appendMessage(run.message);
+      if (!preview) {
+        appendMessage({ role: "user", content: text });
+        run.node = appendMessage(run.message);
+      }
       syncComposer();
       bottom(true);
     }
     void consume(response, run);
   } catch (error) {
+    if (preview) {
+      if (visible()) {
+        renderMessages(state.session?.messages || []);
+        $("#prompt").value = [text, $("#prompt").value].filter(Boolean).join("\n");
+        rememberDraft();
+      } else {
+        const key = preview.sessionId;
+        state.drafts.set(key, [text, state.drafts.get(key)].filter(Boolean).join("\n"));
+      }
+    }
     toast(error.message, true);
   } finally {
+    submitting = null;
     busySending = false;
+    syncComposer();
   }
 }
 
@@ -618,7 +653,6 @@ async function resumeRun(session) {
   }
   if (snapshot.turn_started_at > 0) run.started = snapshot.turn_started_at * 1000;
   run.phase = snapshot.activity_phase;
-  run.peerPending = session.messages?.some(message => message.peer_pending);
   run.sequence = snapshot.sequence || 0;
   run.stopRequested = Boolean(snapshot.cancel_requested);
   run.message.stopping = run.stopRequested;
@@ -884,16 +918,27 @@ async function handleMenu(action, value) {
     }
     return;
   }
-  if (action === "new-discussion") {
-    const generation = switchVersion;
-    const room = await api("/api/sessions", {method:"POST",body:{mode:"viniper",discussion:true,workdir:state.workdir}});
-    await loadSessions();
-    if (generation !== switchVersion) return;
-    state.attachments = [];
-    state.selectedSkills = [];
-    await selectSession(room.session_id);
-    $("#prompt").focus();
+  if (action === "new-discussion" || action === "room-members") {
+    const room = action === "room-members" ? state.session : null;
+    const workdir = state.workdir, generation = switchVersion;
+    editRoom(dialog, room, state.status?.models || [], state.model, async fields => {
+      const result = room
+        ? await api("/api/sessions/" + room.session_id, {method:"PUT",body:fields})
+        : await api("/api/sessions", {method:"POST",body:{...fields,mode:"viniper",discussion:true,workdir}});
+      if (generation === switchVersion) {
+        if (!room) { state.attachments = []; state.selectedSkills = []; }
+        await selectSession(room?.session_id || result.session_id);
+      }
+      await loadSessions();
+    });
     return;
+  }
+  if (action === "mention") {
+    const input = $("#prompt");
+    const start = input.selectionStart, end = input.selectionEnd;
+    const before = input.value.slice(0,start);
+    input.setRangeText((before.endsWith("@") ? "" : (before && !/\s$/.test(before) ? " @" : "@")) + value + " ",start,end,"end");
+    input.focus(); rememberDraft(); resizePrompt(); return;
   }
   if (action === "attach") $("#file-input").click();
   else if (action === "mode") {
@@ -901,7 +946,7 @@ async function handleMenu(action, value) {
     syncComposer();
     $("#prompt").focus();
   } else if (action === "model") {
-    if (value === "deepseek-flash" && state.status?.local_agent && !state.status.discussion_cloud_configured) {
+    if (state.status?.models.find(m => m.id === value)?.credential_mode === "discussion" && !state.status.discussion_cloud_configured) {
       openPreference("connection-settings", "discussion-key"); return;
     }
     state.model = value;
@@ -962,10 +1007,17 @@ const navigate = setupNavigator({ openRecord, openPreference, selectSession, vie
 async function dispatch(action) {
   if (action === "quick" || action === "turn-index") return navigate(action);
   if (action === "leave-settings") return leaveSettings();
+  if (action === "add-model-service") return editModelService();
   if (action === "send") return send();
   if (action === "steer") return steer();
   if (action === "stop") return stop();
   if (action === "new-chat") return newChat();
+  if (action === "new-discussion" || action === "room-members") return handleMenu(action);
+  if (action === "mentions" || action === "type-mention") {
+    const members = state.session?.members || [];
+    showMenu(action === "type-mention" ? $("#prompt") : $("#mention-member"), members.map(m => option({label:"@" + m.name,detail:m.role,image:"model",action:"mention",value:m.name})).join("") + option({label:"@全体",image:"discussion",action:"mention",value:"全体"}));
+    return;
+  }
   if (action === "new-goal") {
     newChat();
     state.mode = "goal";
@@ -1009,17 +1061,7 @@ async function click(event) {
   const b = event.target.closest("button,a");
   if (!b) return;
   try {
-    if (b.dataset.address) {
-      const prompt = $("#prompt");
-      if (b.dataset.address === "并行" && !state.status?.discussion_cloud_configured) {
-        openPreference("connection-settings", "discussion-key");
-        return;
-      }
-      const prefix = b.dataset.address === "全组" ? "" : "@" + b.dataset.address + " ";
-      prompt.value = prefix + prompt.value.replace(/^@(解题|复核|并行)(?:[：:，,\s]+|$)/u,"");
-      prompt.focus(); resizePrompt(); rememberDraft(); syncComposer();
-      return;
-    }
+    if (b.dataset.modelService) return editModelService(b.dataset.modelService);
     if (b.hasAttribute("data-reuse-prompt")) {
       const value = b.closest(".message").id;
       showMenu(b, option({label:"保存为技能", image:"book", action:"save-prompt-skill", value})
@@ -1175,7 +1217,9 @@ $("#settings-form").addEventListener("submit", (event) => {
   event.preventDefault();
   saveSettings().catch((error) => toast(error.message, true));
 });
-$("#prompt").addEventListener("input", () => {
+$("#prompt").addEventListener("input", event => {
+  if (!event.isComposing && event.data === "@" && state.session?.discussion && state.mode === "execute"
+      && /(?:^|\s)@$/.test(event.target.value.slice(0,event.target.selectionStart))) dispatch("type-mention");
   rememberDraft();
   resizePrompt();
 });
@@ -1256,6 +1300,7 @@ window.viniperDesktop?.onCommand((payload) => {
   if (["new-session", "new-chat", "new-viniper-session"].includes(cmd))
     newChat();
   if (["settings", "open-settings"].includes(cmd)) view("settings");
+  if (cmd === "new-discussion") handleMenu("new-discussion").catch(e => toast(e.message,true));
   if (cmd === "quick-navigator") navigate("quick");
   if (cmd === "toggle-sidebar") dispatch("toggle-sidebar");
   if (cmd === "attach-file") $("#file-input").click();
@@ -1300,7 +1345,7 @@ setInterval(async () => {
       );
       if (
         state.view === "chat" && listed?.active_run?.active &&
-        !state.runs.get(listed.id)?.active
+        !state.runs.get(listed.id)?.active && !busySending
       )
         await selectSession(listed.id);
     }

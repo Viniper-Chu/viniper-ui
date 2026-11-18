@@ -74,7 +74,8 @@ test("the broker serves status while encrypted credentials remain locked, withou
   const brokerStart = main.indexOf("async function startSecretBroker()");
   const brokerEnd = main.indexOf("\nasync function closeSecretBroker", brokerStart);
   assert.ok(brokerEnd > brokerStart);
-  const startBroker = runInNewContext(`${main.slice(brokerStart, brokerEnd)}; startSecretBroker`, {
+  const refResolver = main.slice(main.indexOf("function secretRefForMode("), main.indexOf("async function writeSecureSecretRef("));
+  const startBroker = runInNewContext(`${refResolver}\n${main.slice(brokerStart, brokerEnd)}; startSecretBroker`, {
     secretBroker: null, secretBrokerToken: "", hostMigrationToken: "", hostMigrationConsumed: false,
     migrateSecureVault: () => { throw new Error("startup cannot migrate credentials"); },
     readSecureSecret: () => { throw new Error("status cannot decrypt credentials"); },

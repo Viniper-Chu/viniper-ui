@@ -668,7 +668,7 @@ class HarnessApplicationPort:
     async def control(self, operation: str, **payload: Any) -> dict[str, Any]:
         """Invoke a non-renderer Harness Application Port operation."""
         concurrent_controls = {
-            "discussion.answer", "discussion.cancel", "run.steer", "goals.load", "goals.save", "plugins.snapshot",
+            "run.steer", "goals.load", "goals.save", "plugins.snapshot",
             "scheduler.defer", "scheduler.update", "scheduler.snapshot", "scheduler.create", "scheduler.claim", "scheduler.record", "scheduler.delete", "scheduler.toggle",
             "permission.resolve", "collaboration.snapshot", "collaboration.send",
             "collaboration.delegate", "collaboration.wait", "collaboration.cancel-wait",
@@ -698,7 +698,7 @@ class HarnessApplicationPort:
                 if self._bridge_process is not self._control_owners[request_id]:
                     raise RuntimeError("Harness bridge changed before the control request was sent")
                 await self._send({"op": str(operation), "request_id": request_id, **payload})
-            message = await asyncio.wait_for(waiter, timeout=130.0 if operation == "discussion.answer" else 20.0)
+            message = await asyncio.wait_for(waiter, timeout=20.0)
         finally:
             self._control_waiters.pop(request_id, None)
             self._control_owners.pop(request_id, None)

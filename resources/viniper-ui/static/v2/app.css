@@ -193,7 +193,8 @@ kbd { display: inline-flex; align-items: center; min-height: 20px; padding: 0 4p
 .composer textarea { grid-area: 4 / 2; min-width: 0; width: 100%; border: 0; background: none; resize: none; min-height: 28px; max-height: 180px; padding: 3px 2px; font-size: var(--chat-size); line-height: 1.45; }
 #attachments { grid-area: 1 / 1 / 2 / -1; }
 #mode-chip { grid-area: 2 / 1 / 3 / -1; justify-self: start; }
-#discussion-people { grid-area: 3 / 1 / 4 / -1; }
+#mention-member { grid-area: 4 / 3; width:28px; padding:0; color:var(--accent); }
+#room-header { white-space:nowrap; }
 .composer textarea::placeholder { color: var(--muted); }
 
 .composer-toolbar,.composer-left { display: contents; }

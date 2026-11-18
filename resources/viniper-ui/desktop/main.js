@@ -99,6 +99,15 @@ const SECRET_REFS_BY_MODE = Object.freeze({
   claude: "provider.anthropic.api-key",
 });
 
+// The generated catalog contains only fixed upstream endpoints with one API key.
+function registeredServiceRef(mode) {
+  if (!/^service-[a-z0-9-]+$/.test(mode)) return "";
+  try {
+    const services = JSON.parse(fs.readFileSync(path.join(APP_ROOT, "harness-runtime", "model-services.json"), "utf8"));
+    return services.some(service => mode === "service-" + service.id) ? "provider." + mode : "";
+  } catch { return ""; }
+}
+
 function handleStdioError(error) {
   if (error && error.code === "EPIPE") {
     stdioBroken = true;
@@ -498,11 +507,11 @@ async function readSecureSecret(ref) {
 
 function secretRefForMode(mode) {
   const value = String(mode || "").toLowerCase();
-  return SECRET_REFS_BY_MODE[Object.hasOwn(SECRET_REFS_BY_MODE, value) ? value : "viniper"];
+  return Object.hasOwn(SECRET_REFS_BY_MODE, value) ? SECRET_REFS_BY_MODE[value] : registeredServiceRef(value);
 }
 
 async function writeSecureSecretRef(ref, value) {
-  if (!Object.values(SECRET_REFS_BY_MODE).includes(ref)) {
+  if (!Object.values(SECRET_REFS_BY_MODE).includes(ref) && (!ref || registeredServiceRef(ref.replace(/^provider\./, "")) !== ref)) {
     return { ok: false, configured: false, length: 0, reason: "unsupported secret ref" };
   }
   if (!await secureStorageAvailable()) {
@@ -531,6 +540,7 @@ async function writeSecureSecretRef(ref, value) {
 
 async function writeSecureSecret(mode, value) {
   const ref = secretRefForMode(mode);
+  if (!ref) return {ok:false, configured:false};
   await migrateSecureVault(ref);
   return writeSecureSecretRef(ref, value);
 }
@@ -587,8 +597,9 @@ async function startSecretBroker() {
     }
     const url = requestUrl;
     const rawMode = String(url.searchParams.get("mode") || "").toLowerCase();
-    const mode = Object.hasOwn(SECRET_REFS_BY_MODE, rawMode) ? rawMode : "viniper";
-    const ref = SECRET_REFS_BY_MODE[mode];
+    const mode = rawMode;
+    const ref = secretRefForMode(mode);
+    if (!ref && url.pathname !== "/secret/migrate") { response.writeHead(404); response.end(); return; }
     if (url.pathname === "/secret/migrate") {
       if (!migrationEnabled || hostMigrationConsumed || migrationHeader !== hostMigrationToken || request.method !== "POST") {
         response.writeHead(404);
@@ -1223,6 +1234,7 @@ function createApplicationMenu() {
       label: "文件",
       submenu: [
         { label: "新建会话", accelerator: "CmdOrCtrl+N", click: () => sendRendererCommand("new-viniper-session") },
+        { label: "新建群聊", accelerator: "CmdOrCtrl+Shift+N", click: () => sendRendererCommand("new-discussion") },
         { label: "快速查找…", accelerator: "CmdOrCtrl+Shift+K", click: () => sendRendererCommand("quick-navigator") },
         { label: "添加附件", accelerator: "CmdOrCtrl+O", click: () => sendRendererCommand("attach-file") },
         { label: "选择目录", accelerator: "CmdOrCtrl+Shift+O", click: () => sendRendererCommand("change-workdir") },

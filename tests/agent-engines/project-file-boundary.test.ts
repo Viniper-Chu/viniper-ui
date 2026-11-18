@@ -38,12 +38,11 @@ write(ordinary,'user dataset')
 write(source,'print("before")\n')
 write(deleted,'old file')
 roots=server.file_change_watch_roots(project)
-before=server.snapshot_watch_files(roots)
-before_text=server.snapshot_watch_text(roots)
+before,before_text=server.snapshot_workspace(roots)
 assert len(before)==3 and len(before_text)==3
 assert os.path.normcase(str(ordinary)) in before and os.path.normcase(str(source)) in before_text
 assert all(not Path(path).is_relative_to(app_data) for path in before)
-assert server.snapshot_watch_files([app_data])=={} and server.snapshot_watch_text([app_data/'runtime'])=={}
+assert server.snapshot_workspace([app_data,app_data/'runtime'])==({},{})
 assert server.file_change_watch_roots(app_data)==[]
 assert server.file_change_watch_roots(app_data/'runtime')==[]
 
@@ -98,7 +97,7 @@ write(cases/'becomes-binary.txt','text before\n')
 (cases/'deleted-binary.dat').write_bytes(b'\xff\x00old')
 (cases/'invalid-encoding.dat').write_bytes(b'\xffold')
 write(cases/'prefix-lines.txt','--old\n')
-before=server.snapshot_watch_files([cases]);before_text=server.snapshot_watch_text([cases])
+before,before_text=server.snapshot_workspace([cases])
 write(cases/'becomes-large.txt','large\n'*60000)
 (cases/'becomes-binary.txt').write_bytes(b'\x00new')
 (cases/'deleted-binary.dat').unlink()

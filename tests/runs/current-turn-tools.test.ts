@@ -231,6 +231,8 @@ test("math routing distinguishes the actual task, attachment and retained docume
   const names = ["file.read", "file.math.handout", "math.quadratic.check", "file.pdf.inspect", "file.image.analyze"];
   const tools = names.map(name => ({ ...tool, name }));
   assert.equal(isInlineMathExercise(task), true);
+  assert.equal(isInlineMathExercise("创建一个讨论组，由你开一个数学话题让另一位成员尝试进行论证。"), true);
+  assert.equal(isInlineMathExercise("讨论数学话题，最后编译成学生版讲义。"), false);
   for (const request of ["请读取附件并" + task, "从试卷中" + task, "用 Python " + task, task + "画出函数图像。"])
     assert.equal(isInlineMathExercise(request), false);
   assert.deepEqual(legacyDocumentHints("[Viniper Harness 独立指令]\n保护 SQLite 和 Word 文档，编译讲义。\n\n[当前请求]\n" + task), ["quadratic"]);

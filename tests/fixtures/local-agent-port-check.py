@@ -98,6 +98,7 @@ import ast
 # Loading only this function avoids starting a second application/server.
 server_source = ast.parse((repository/'resources/viniper-ui/server.py').read_text())
 from local_agent_contract import local_agent_contract, local_placeholder_auth
+from model_catalog import OFFICIAL_DEEPSEEK_ENDPOINTS
 
 # Stored cloud credentials must not be decrypted by local runs or status
 # projection; changing the host/model/auth kind must retain the vault boundary.
@@ -110,6 +111,7 @@ def secret_metadata(mode, action):
     assert action == 'status', 'public status cannot read credentials'
     return {'configured': True, 'access': 'not-checked'}
 config_scope = {
+    'MODEL_SERVICES': {}, 'OFFICIAL_DEEPSEEK_ENDPOINTS': OFFICIAL_DEEPSEEK_ENDPOINTS,
     'Any': object, 'json': json, 'MODE_VINIPER': 'viniper', 'MODE_CLAUDE': 'claude',
     'MODE_SECRET_REFS': {'viniper': 'provider.deepseek', 'claude': 'provider.anthropic.api-key'},
     'normalize_provider_mode': lambda mode: mode,
@@ -134,6 +136,13 @@ assert not secret_reads
 cloud = config_scope['provider_config']('deepseek-flash')
 assert cloud['provider']=='deepseek' and cloud['base_url']=='https://api.deepseek.com/chat/completions'
 assert secret_reads==['discussion']
+secret_reads.clear()
+catalog = {'moonshot-kimi':{'label':'Kimi','endpoint':'https://official.invalid/v1/chat/completions'}}
+config_scope['MODEL_SERVICES'] = catalog
+config_scope['load_app_settings'] = lambda: {'service_models':{'moonshot-kimi':['fixture']}}
+third = config_scope['provider_config']('moonshot-kimi::fixture')
+assert third['provider']=='service:moonshot-kimi' and third['base_url']==catalog['moonshot-kimi']['endpoint']
+assert secret_reads==['service-moonshot-kimi']
 secret_reads.clear()
 assert not local_placeholder_auth('https://example.test/v1', 'qwen-local')
 assert not local_placeholder_auth(endpoint, 'different-model')

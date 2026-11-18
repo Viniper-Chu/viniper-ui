@@ -22,6 +22,7 @@
           <span class="brand-tile" aria-hidden="true"></span><strong>Viniper</strong>
           <div class="sidebar-actions">
             <button class="icon-button" data-action="quick" data-icon="search" aria-label="快速查找会话与操作" data-hint="快速查找  ⇧⌘K"></button>
+            <button class="icon-button" data-action="new-discussion" data-icon="discussion" aria-label="新建群聊" data-hint="新建群聊"></button>
             <button class="icon-button" data-action="new-chat" data-icon="compose" aria-label="新建会话" data-hint="新建会话  ⌘K"></button>
             <button class="icon-button" data-action="toggle-sidebar" data-icon="sidebar" aria-label="收起侧栏" data-hint="收起侧栏  ⌘B"></button>
           </div>
@@ -72,6 +73,7 @@
             </button>
           </div>
           <div class="topbar-actions">
+            <button id="room-header" class="text-button" data-action="room-members" data-hint="查看或编辑群成员与分工" hidden></button>
             <button data-hint="跳转到本次提问或打开交付文件" id="turn-index-button" class="text-button index-trigger" data-action="turn-index" aria-label="会话目录与文件" hidden>
               <span data-icon="outline"></span><span>会话目录</span>
             </button>
@@ -138,12 +140,6 @@
             <div class="composer">
               <div id="attachments" class="attachment-list" hidden></div>
               <div id="mode-chip" class="mode-chip" hidden></div>
-              <div id="discussion-people" aria-label="讨论成员" hidden>
-                <button type="button" data-address="全组" data-hint="解题成员作答后，由复核成员检查">全组</button>
-                <button type="button" data-address="解题" data-hint="只请解题成员回答">@解题</button>
-                <button type="button" data-address="复核" data-hint="只请复核成员回答">@复核</button>
-                <button type="button" data-address="并行" data-hint="将本轮文字题分别发送给本地 Qwen 和 DeepSeek Flash" aria-label="双模型独立解答"><span data-icon="parallel"></span>双模型</button>
-              </div>
               <textarea
                 id="prompt"
                 rows="1"
@@ -152,6 +148,7 @@
               ></textarea>
               <div class="composer-toolbar">
                 <div class="composer-left">
+                  <button id="mention-member" class="text-button" aria-label="点名群成员" data-action="mentions" data-hint="选择本轮发言的成员" hidden>@</button>
                   <button
                     class="icon-button"
                     id="add-button"
@@ -348,7 +345,7 @@
             <button data-hint="设置新会话的默认目录" id="workspace-tab" type="button" role="tab" aria-controls="workspace-settings" aria-selected="false" tabindex="-1" data-settings-section="workspace-settings"><span data-icon="folder"></span>工作目录</button>
             <button data-hint="编辑适用于所有任务的协作规则" id="instruction-tab" type="button" role="tab" aria-controls="instruction-settings" aria-selected="false" tabindex="-1" data-settings-section="instruction-settings"><span data-icon="book"></span>协作规则</button>
           </div>
-          <small class="preferences-version">Viniper <span id="version">3.0.0</span></small>
+          <small class="preferences-version">Viniper <span id="version">3.0.1</span></small>
         </aside>
         <main class="preferences-content" aria-label="设置内容">
           <section id="preference-results" aria-label="设置搜索结果" hidden>
@@ -363,11 +360,13 @@
                   <label class="field pref-row" data-pref="服务名称"><span>服务名称</span><input name="provider-label" autocomplete="off"></label>
                   <label class="field pref-row" data-pref="协议"><span>协议</span><select name="provider-id"><option value="custom">OpenAI 兼容</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option></select></label>
                   <label class="field pref-row" data-pref="服务地址"><span>服务地址</span><input name="base-url" type="url" placeholder="http://127.0.0.1:18080/v1"></label>
-                  <label class="field pref-row" data-pref="模型 ID"><span>模型 ID</span><input name="model-id" autocomplete="off"></label>
+                  <label class="field pref-row" data-pref="可选模型"><span>可选模型</span><textarea name="model-list" rows="2" placeholder="每行一个模型 ID"></textarea></label>
+                  <label class="field pref-row" data-pref="模型 ID"><span>默认模型 ID</span><input name="model-id" autocomplete="off"></label>
                 </fieldset>
                 <fieldset class="pref-group"><legend>访问密钥</legend>
                   <label class="field pref-row" data-pref="API 密钥" data-alias="key 钥匙串"><span>API 密钥</span><input name="api-key" type="password" autocomplete="new-password" placeholder="留空保留现有密钥"></label>
                 </fieldset>
+                <fieldset class="pref-group"><legend>其他模型服务</legend><div id="registered-services"></div><button class="text-button" type="button" data-action="add-model-service" data-hint="连接额外服务供会话与群聊选择">添加模型服务</button></fieldset>
                 <fieldset class="pref-group"><legend>DeepSeek 云端</legend>
                   <div class="pref-row"><span>模型</span><output id="cloud-model"></output></div>
                   <div class="pref-row"><span>官方接口</span><output id="cloud-endpoint"></output></div>

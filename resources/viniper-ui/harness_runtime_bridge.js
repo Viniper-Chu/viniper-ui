@@ -8,7 +8,7 @@ const path = require("node:path");
 const readline = require("node:readline");
 
 const { createHarnessApplication } = require("./harness-runtime/dist/src/platform/bootstrap/create-harness-application.js");
-const { DOMESTIC_MODEL_PROFILES } = require("./harness-runtime/dist/src/features/providers/profiles/domestic-models.js");
+const { PROVIDER_PROFILES } = require("./harness-runtime/dist/src/features/providers/profiles/index.js");
 const { loadLocalAgentPolicy } = require("./harness-runtime/dist/src/features/local-models/local-agent-policy.js");
 const {
   normalizeRawAnthropicEndpoint,
@@ -118,7 +118,10 @@ async function saveSessionMap() {
 
 function profileFor(providerId) {
   const normalized = String(providerId || "").trim().toLowerCase();
-  if (normalized === "deepseek") return DOMESTIC_MODEL_PROFILES.find((profile) => profile.id === "deepseek") || null;
+  if (normalized.startsWith("service:") || normalized === "deepseek") {
+    const id = normalized.replace(/^service:/, "");
+    return PROVIDER_PROFILES.find(profile => profile.id === id) || null;
+  }
   return null;
 }
 
@@ -140,6 +143,9 @@ async function configureProviderMetadata(request) {
   const baseUrl = String(request.base_url || "").trim();
   const localPolicy = loadLocalAgentPolicy(baseUrl);
   const requestedProfile = profileFor(requestedProvider);
+  if (requestedProvider.startsWith("service:") && (!requestedProfile || requestedProfile.endpoint.defaultUrl !== baseUrl)) {
+    throw new Error("模型服务与已注册端点不匹配");
+  }
   // The existing DeepSeek gateway is Anthropic-compatible when its configured
   // endpoint is /anthropic; use the matching real profile instead of sending
   // an OpenAI payload to that endpoint.
@@ -720,48 +726,11 @@ async function handleHarnessOperation(command) {
 }
 
 // Independent opinions use the same provider adapter. Each request contains only the current question.
-const opinionRequests = new Map();
-async function deepseekOpinion(command) {
-  if (!allowExternalNetwork) throw new Error("此运行环境已关闭外部模型");
-  const id = String(command.opinion_id || "");
-  if (!id || opinionRequests.has(id)) throw new Error("独立解答已经开始");
-  const model = "deepseek-flash", profile = DOMESTIC_MODEL_PROFILES.find(p => p.id === "deepseek");
-  const { OpenAIChatProvider } = require("./harness-runtime/dist/src/features/providers/protocols/openai-chat/openai-chat-provider.js");
-  const { buildContextProfile, buildCachePlan } = require("./harness-runtime/dist/src/features/cache/cache-plan.js");
-  const text = String(command.question || "").trim();
-  if (!text || !command.host_secret_value) throw new Error("需要本轮文字题和讨论组密钥");
-  const provider = new OpenAIChatProvider({profile, configuration:{profileId:profile.id,endpoint:profile.endpoint.defaultUrl,
-    models:[model],selectedModel:model,connectionState:"connected",message:""},
-    resolveSecret:async () => command.host_secret_value,
-    fetchImpl:(url, init) => fetch(url,{...init,redirect:"error"})});
-  const controller = new AbortController();
-  opinionRequests.set(id,controller);
-  const ctx = buildContextProfile({providerId:profile.id,modelId:model,tools:[],history:[],taskWorkflow:false});
-  const request = {sessionId:id,profileId:profile.id,selectedModel:model,permissionMode:"auto",tools:[],
-    history:[{id:"question",role:"user",items:[{type:"text",text}]}],currentUserText:text,
-    contextProfile:ctx,cachePlan:buildCachePlan(text,ctx)};
-  let answer = "", usage;
-  try {
-    for await (const event of provider.stream(request,AbortSignal.any([controller.signal,AbortSignal.timeout(120000)]))) {
-      if (event.kind === "text.delta") answer += event.text;
-      if (event.kind === "usage.completed") usage = event.usage;
-      if (event.kind === "response.incomplete") throw new Error("DeepSeek 输出未完成");
-    }
-    if (!answer.trim()) throw new Error("DeepSeek 未返回正文");
-    return {answer,model,usage};
-  } finally { opinionRequests.delete(id); }
-}
-
 async function handleControl(command) {
   const requestId = String(command.request_id || "");
   try {
     let data;
-    if (command.op === "discussion.answer") {
-      data = await deepseekOpinion(command);
-    } else if (command.op === "discussion.cancel") {
-      opinionRequests.get(command.opinion_id)?.abort();
-      data = {ok:true};
-    } else if (command.op === "run.steer") {
+    if (command.op === "run.steer") {
       const owned = mappedHarnessSession(command.native_session_id);
       const active = owned && runtime.listRuns(owned.id).find((run) => ["queued", "running", "waiting", "waiting_resource", "recovering", "replaying"].includes(run.status));
       if (!active) throw new Error("当前会话没有可引导的运行");

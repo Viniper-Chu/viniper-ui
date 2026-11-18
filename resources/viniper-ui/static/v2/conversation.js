@@ -314,15 +314,15 @@ function copyAnswer(message) {
   const final = parts.filter(p => p.final);
   return (final.length ? final : parts).map(p => p.content).join("\n\n");
 }
-function authorMark(speaker) {
-  const glyph = {解题:"book", 复核:"proof", Qwen:"model", DeepSeek:"parallel"}[speaker] || "chat";
-  return icon(glyph) + "<span>" + escape(speaker || "") + "</span>";
+function authorMark(speaker, model) {
+  const label = state.status?.models?.find(m => m.id === model)?.label || model || "";
+  return icon("discussion") + "<span>" + escape(speaker) + "</span><small>" + escape(label) + "</small>";
 }
 function messageHtml(message) {
   if (message.role === "user")
     return `${message.content?.trim() ? '<button class="icon-button reuse-prompt" data-reuse-prompt aria-label="复用这条提问" aria-haspopup="menu" aria-expanded="false">' + icon("book") + '</button>' : ""}<div class="user-content">${message.guidance ? `<span class="guidance-label">${icon("steer")}引导</span>` : ""}${escape(message.content)}${(message.attachments || []).map((a) => `<div><button class="file-link" data-file="${escape(a.path || "")}">${icon("file")}${escape(a.name || a.path)}</button></div>`).join("")}</div>`;
   const parts = conversationTimeline(message), data = activityData(message, parts), content = copyAnswer(message);
-  return `<strong class="discussion-author" data-speaker="${escape(message.speaker || "")}"${message.speaker ? "" : " hidden"}>${message.speaker ? authorMark(message.speaker) : ""}</strong><button class="turn-summary"${message.streaming || !data.expandable ? " hidden" : ""} data-toggle-thoughts aria-expanded="false"><span class="activity-label">${escape(data.label)}</span><small class="activity-count">${escape(data.count)}</small><span class="step-chevron">${icon("chevron")}</span></button><span class="turn-outcome"${!message.streaming && !data.expandable && data.outcome ? "" : " hidden"}>${escape(data.label)}</span><div class="turn-timeline">${timelineHtml(message, parts)}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : ""}</div><div class="message-actions"${content.trim() ? "" : " hidden"}><button class="icon-button" data-copy="${escape(content)}" aria-label="复制回答">${icon("copy")}</button></div>`;
+  return `<strong class="discussion-author" data-speaker="${escape(message.speaker || "")}"${message.speaker ? "" : " hidden"}>${message.speaker ? authorMark(message.speaker, message.model) : ""}</strong><button class="turn-summary"${message.streaming || !data.expandable ? " hidden" : ""} data-toggle-thoughts aria-expanded="false"><span class="activity-label">${escape(data.label)}</span><small class="activity-count">${escape(data.count)}</small><span class="step-chevron">${icon("chevron")}</span></button><span class="turn-outcome"${!message.streaming && !data.expandable && data.outcome ? "" : " hidden"}>${escape(data.label)}</span><div class="turn-timeline">${timelineHtml(message, parts)}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : ""}</div><div class="message-actions"${content.trim() ? "" : " hidden"}><button class="icon-button" data-copy="${escape(content)}" aria-label="复制回答">${icon("copy")}</button></div>`;
 }
 function updateMessage(node, message) {
   node._message = message;
@@ -333,7 +333,7 @@ function updateMessage(node, message) {
   if (author && author.dataset.speaker !== (message.speaker || "")) {
     author.hidden = !message.speaker;
     author.dataset.speaker = message.speaker || "";
-    author.innerHTML = message.speaker ? authorMark(message.speaker) : "";
+    author.innerHTML = message.speaker ? authorMark(message.speaker, message.model) : "";
   }
   const summary = node.querySelector(".turn-summary");
   if (summary.hidden && !message.streaming && node.querySelector("details[open]")) summary.setAttribute("aria-expanded", "true");
@@ -457,19 +457,12 @@ export function projectEvent(run, event) {
   if (event.activity_phase) run.phase = event.activity_phase;
   if (event.sequence) run.sequence = event.sequence;
   if (event.run_id) run.runId = event.run_id;
-  if (event.type === "discussion_join" || event.type === "discussion_peer") {
-    run.peerPending = event.type === "discussion_join";
-    if (state.session?.session_id === run.sessionId && state.view === "chat") {
-      const node = [...$("#messages").children].find(node => node._message?.peer_id === event.message.peer_id);
-      if (node) updateMessage(node,event.message);
-      else appendMessage(event.message);
-    }
-    return;
-  }
   if (event.type === "speaker_finished") {
+    run.phase = "notice";
+    run.message.working = "交接给 " + event.next_speaker;
     run.message.streaming = false;
     if (event.thinking_elapsed_seconds) run.message.thinking_elapsed_seconds = event.thinking_elapsed_seconds;
-    if (run.node?.isConnected && state.session?.session_id === run.sessionId) updateMessage(run.node, run.message);
+    paintRun(run);
     return;
   }
   if (event.type === "assistant_start" && event.speaker) {
@@ -478,6 +471,7 @@ export function projectEvent(run, event) {
       run.message = {role:"assistant", content:"", thinking:"", segments:[], streaming:true, elapsed:0};
     }
     run.message.speaker = event.speaker;
+    run.message.model = event.model;
   }
   if (event.type === "queue_dispatch") {
     run.done = false;

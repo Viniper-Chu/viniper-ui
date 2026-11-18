@@ -1,106 +1,60 @@
-"""Exercise speaker ownership, handoff, failure and closing a live group stream."""
+"""Verify configurable rooms through the same streaming transport as normal turns."""
 import asyncio
 import sys
 from pathlib import Path
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "resources/viniper-ui"))
-from discussion import discussion_events, parallel_discussion
+from discussion import addressed, discussion_events, room_members, validate_members
 
 
 async def check():
-    calls = []
+    members = [{"name": n, "role": r, "model": m} for n,r,m in [
+        ("主答","分工","cloud-a"), ("计算","求解","cloud-b"), ("检查","校验","cloud-c")]]
+    ids = {m["model"] for m in members}
+    assert validate_members(members, ids) == members
+    assert room_members({"model":"legacy"}, "")[1]["model"] == "legacy"
+    for invalid in [members[:1], members * 3, [members[0], members[0]], [members[0], {**members[1],"model":"missing"}]]:
+        try: validate_members(invalid, ids)
+        except ValueError: pass
+        else: raise AssertionError(invalid)
+    assert addressed("@检查 @主答 检查", members) == ["检查","主答"]
+    assert addressed("发给 a@domain.com", members) == []
+    for text in ["@missing 题目","@everyone"]:
+        try: addressed(text, members)
+        except ValueError: pass
+        else: raise AssertionError(text)
+    calls, closed = [], []
     session = {"messages": []}
-    closed = []
-    fail = False
-
-    class Model:
+    failed = False
+    class Transport:
         async def stream(self, sid, prompt, model, mode, attachments, *, speaker, display_prompt, suppress_user_message):
-            calls.append((speaker, prompt, suppress_user_message))
+            calls.append((speaker,model,prompt,suppress_user_message))
             try:
-                yield {"type": "assistant_start", "speaker": speaker}
-                answer = "两个候选根" if speaker == "解题" else "代回排除增根"
-                session["messages"].append({"role": "assistant", "speaker": speaker, "content": answer})
-                session["last_run_status"] = "failed" if fail else "completed"
-                yield {"type": "done"}
+                yield {"type":"assistant_start","speaker":speaker,"model":model}
+                answer = {"主答":"取代号枫针\n交接给 @计算：算出结果", "计算":"结果 42\n交接给 @检查：复核", "检查":"无误\n交接给 @主答：收束"}[speaker]
+                session["messages"].append({"role":"assistant","speaker":speaker,"content":answer})
+                session["last_run_status"] = "failed" if failed else "completed"
+                yield {"type":"done"}
             finally:
                 closed.append(speaker)
-
     def start(text):
-        return discussion_events(Model(), session, "room", text, "qwen-local", "ask", [])
-
-    events = [event async for event in start("审题")]
-    assert [event["type"] for event in events] == ["assistant_start", "speaker_finished", "assistant_start", "done"]
-    assert [c[0] for c in calls] == ["解题", "复核"] and calls[1][2] and "两个候选根" in calls[1][1]
+        return discussion_events(Transport(),session,"room",text,members,"ask",[])
+    events = [e async for e in start("求解")]
+    assert [c[1] for c in calls] == ["cloud-a","cloud-b","cloud-c","cloud-a"]
+    assert [c[3] for c in calls] == [False,True,True,True]
+    assert "取代号枫针" in calls[1][2] and "结果 42" in calls[2][2]
+    assert [e["next_speaker"] for e in events if e["type"]=="speaker_finished"] == ["计算","检查","主答"]
+    assert events[-1]["type"] == "done"
+    for text, expected in [("@全体 回答",list(ids)), ("@检查 再看看",["cloud-c"]),("@检查 @主答 回答",["cloud-c","cloud-a"])]:
+        calls.clear()
+        events = [e async for e in start(text)]
+        actual = [c[1] for c in calls]
+        assert (set(actual) == ids and len(actual)==3) if text.startswith("@全体") else actual == expected
     calls.clear()
-    events = [event async for event in start("@复核：重查端点")]
-    assert len(calls) == 1 and calls[0][0] == "复核" and not calls[0][2]
-    calls.clear()
-    fail = True
-    events = [event async for event in start("审题")]
-    assert len(calls) == 1 and events[-1]["type"] == "done"
-    fail = False
-    calls.clear()
-    live = start("审题")
+    failed = True
+    events = [e async for e in start("审题")]
+    assert len(calls)==1 and events[-1]["type"]=="done"
+    live = start("取消测试")
     await anext(live)
     await live.aclose()
-    assert len(calls) == 1 and closed[-1] == "解题"
-
-
-async def check_parallel():
-    cloud_started, local_open, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    class Port:
-        async def control(self, op, **data):
-            if op == "discussion.answer":
-                assert set(data) == {"opinion_id","question","host_secret_value"}
-                assert data["question"] == "本轮题目"
-                cloud_started.set()
-                await local_open.wait()
-                return {"answer":"独立答案"}
-    class Transport:
-        application_port = Port()
-        async def stream(self, *args, **kwargs):
-            yield {"type":"assistant_start", "speaker":"Qwen"}
-            local_open.set()
-            await cloud_started.wait()
-            await release.wait()
-            yield {"type":"text","content":"本地答案"}
-            yield {"type":"done"}
-    session = {"messages":[]}
-    events = []
-    async for event in parallel_discussion(Transport(),session,"room","@并行 本轮题目","本轮题目","qwen-local","ask","test",lambda:None):
-        events.append(event["type"])
-        if event["type"] == "discussion_peer":
-            assert event["message"]["speaker"] == "DeepSeek"
-            release.set()
-    assert events.index("discussion_peer") < events.index("text") and events[-1] == "done"
-    assert session["messages"][0]["content"] == "独立答案"
-
-async def check_parallel_stop():
-    engaged, aborted = asyncio.Event(), asyncio.Event()
-    never = asyncio.Event()
-    class Port:
-        async def control(self, op, **kwargs):
-            if op == "discussion.cancel":
-                aborted.set()
-            else:
-                engaged.set()
-                await never.wait()
-    class Transport:
-        application_port = Port()
-        async def stream(self,*_,**kwargs):
-            yield {"type":"assistant_start"}
-            await never.wait()
-    session = {"messages":[]}
-    stream = parallel_discussion(Transport(),session,"room","@并行 题","题","qwen-local","ask","test",lambda:None)
-    await anext(stream)
-    assert (await anext(stream))["type"] == "discussion_join"
-    await engaged.wait()
-    await stream.aclose()
-    assert aborted.is_set() and session["messages"][0]["cancelled"]
-    assert "peer_pending" not in session["messages"][0]
-
-
+    assert closed[-1]=="主答"
 asyncio.run(check())
-asyncio.run(asyncio.wait_for(check_parallel(), 3))
-
-asyncio.run(asyncio.wait_for(check_parallel_stop(), 3))

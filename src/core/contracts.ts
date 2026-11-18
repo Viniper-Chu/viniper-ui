@@ -1,4 +1,4 @@
-export const PRODUCT_VERSION = "3.0.0" as const;
+export const PRODUCT_VERSION = "3.0.1" as const;
 export type AgentIterationLimit = number | "unlimited";
 /** Stable is the published channel.  Preview builds set VINIPER_UI_RELEASE_STAGE=preview
  * in their isolated launcher and retain their already-built rollback artifact. */
@@ -6,8 +6,8 @@ const isPreviewBuild = typeof process !== "undefined"
   && process.env?.VINIPER_UI_RELEASE_STAGE === "preview";
 export const RELEASE_STAGE = (isPreviewBuild ? "Preview" : "Stable") as "Preview" | "Stable";
 export const PRODUCT_NAME = "Viniper" as const;
-export const PRODUCT_BADGE = (isPreviewBuild ? "v3.0.0 · Preview（预览版）" : "v3.0.0 · Stable（稳定版）") as
-  "v3.0.0 · Preview（预览版）" | "v3.0.0 · Stable（稳定版）";
+export const PRODUCT_BADGE = (isPreviewBuild ? "v3.0.1 · Preview（预览版）" : "v3.0.1 · Stable（稳定版）") as
+  "v3.0.1 · Preview（预览版）" | "v3.0.1 · Stable（稳定版）";
 export const PRODUCT_TITLE = `${PRODUCT_NAME} · ${PRODUCT_BADGE}` as const;
 
 import { CoordinationSnapshot, CoordinationWait } from "./coordination-contracts";

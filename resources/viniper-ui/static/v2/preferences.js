@@ -69,6 +69,40 @@ export function selectSettingsSection(id) {
     document.getElementById(tab.dataset.settingsSection).hidden = !selected;
   }
 }
+let services = [];
+let serviceModels = {};
+export function editModelService(id) {
+  if (!services.length) return ui.toast("模型服务目录尚未就绪", true);
+  const choices = services.map(s => `<option value="${escape(s.id)}" ${s.id === id ? "selected" : ""}>${escape(s.label)}</option>`).join("");
+  ui.dialog("模型服务", `<label class="field">服务<select name="service">${choices}</select></label>
+    <label class="field">模型 ID<textarea name="models" rows="3" placeholder="每行一个模型 ID"></textarea></label>
+    <label class="field">API 密钥<input type="password" name="credential" autocomplete="new-password" placeholder="留空保留现有密钥"></label>
+    <p class="room-note" id="service-endpoint"></p>`,
+    {label:"保存服务",onSubmit:async data => {
+      const service = data.get("service"), models = [...new Set(data.get("models").trim().split(/\s+/).filter(Boolean))];
+      const key = data.get("credential").trim();
+      if (key) {
+        const saved = await window.viniperDesktop?.saveProviderSecret(service === "deepseek" ? "discussion" : "service-" + service, key);
+        if (!saved?.ok) throw new Error("请在桌面应用中保存服务密钥");
+      }
+      await api("/api/model-services/" + encodeURIComponent(service), {method:"PUT",body:{models}});
+      serviceModels[service] = models;
+      renderServices();
+      await ui.loadStatus();
+    }});
+  const form = document.querySelector("#dialog form");
+  function select() {
+    const id = form.elements.service.value;
+    form.elements.models.value = (serviceModels[id] || []).join("\n");
+    form.elements.credential.value = "";
+    document.querySelector("#service-endpoint").textContent = services.find(s => s.id === id)?.endpoint || "";
+  }
+  form.elements.service.onchange = select; select();
+}
+function renderServices() {
+  document.querySelector("#registered-services").innerHTML = services.filter(s => serviceModels[s.id]?.length).map(s =>
+    `<button type="button" class="text-button" data-model-service="${escape(s.id)}" data-hint="编辑服务模型">${escape(s.label)} · ${serviceModels[s.id].length}</button>`).join("");
+}
 let baseline = null;
 let pending = null;
 let saving = false;
@@ -107,6 +141,7 @@ async function readSettings() {
       "provider-id": p.id || "custom",
       "base-url": p.base_url || "",
       "model-id": p.model || state.model,
+      "model-list": (p.models || []).map(m => m.id).join("\n"),
       "api-key": "",
       "discussion-key": "",
       theme: s.appearance?.theme || "system",
@@ -125,10 +160,13 @@ async function readSettings() {
     form.elements["api-key"].placeholder = p.api_key_access === "local-placeholder" ? "本地模型无需密钥" : p.api_key_configured
       ? "已安全保存；留空保留现有密钥"
       : "输入 API key";
+    services = settings.model_services || [];
+    serviceModels = s.service_models || {};
+    renderServices();
     const cloud = settings.cloud_connection || {};
     document.querySelector("#cloud-model").textContent = cloud.label || "DeepSeek Flash";
     document.querySelector("#cloud-endpoint").textContent = cloud.endpoint || "—";
-    form.elements["discussion-key"].placeholder = cloud.configured ? "已安全保存 · 可在会话中选择" : "保存后可用于云端会话和双模型讨论";
+    form.elements["discussion-key"].placeholder = cloud.configured ? "已安全保存 · 可在会话中选择" : "保存后可用于云端会话和群聊";
     baseline = values;
     fields.disabled = false;
     document.querySelector("#browse-workdir").hidden = !window.viniperDesktop?.chooseProject;
@@ -194,14 +232,18 @@ export async function saveSettings() {
     }
     const mappings = {
       "provider-label": ["provider", "label"], "provider-id": ["provider", "id"],
-      "base-url": ["provider", "base_url"], "model-id": ["provider", "model"],
+      "base-url": ["provider", "base_url"], "model-id": ["provider", "model"], "model-list": ["provider", "models"],
       theme: ["appearance", "theme"], "font-size": ["appearance", "font_size"], workdir: ["workspace", "default_root"],
     };
     const settings = {};
     const preferences = fields.filter(name => mappings[name]);
     for (const name of preferences) {
       const [group, key] = mappings[name];
-      (settings[group] ||= {})[key] = values[name].value;
+      const known = state.status?.models || [];
+      (settings[group] ||= {})[key] = name === "model-list"
+        ? [...new Set([values["model-id"].value.trim(), ...values[name].value.split(/\s+/)].filter(Boolean))]
+          .map(id => ({id,label:known.find(m => m.id === id)?.label || id}))
+        : values[name].value;
     }
     if (preferences.length) {
       await api("/api/settings", { method: "PUT", body: { mode: "viniper", settings } });
