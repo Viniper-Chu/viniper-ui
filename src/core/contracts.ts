@@ -74,6 +74,8 @@ export interface AgentIntent {
   userText?: string;
   /** Task plus selected attachments/skills, before global host instructions. */
   documentContext?: string;
+  /** The host supplied the room transcript and handoffs in this message. */
+  roomTranscript?: boolean;
   attachments: string[];
   selectedModel: string;
   permissionMode: PermissionMode;
@@ -106,6 +108,8 @@ export interface AgentMessage {
 
 export interface QueuedIntent {
   documentContext?: string;
+  /** The host supplied the room transcript and handoffs in this message. */
+  roomTranscript?: boolean;
   id: string;
   engineId?: AgentEngineId;
   sessionId?: string;

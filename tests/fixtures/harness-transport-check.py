@@ -39,6 +39,9 @@ class LocalEffectsPort:
         self.calls = []
         self.closed = False
 
+    async def needs_workspace_snapshot(self, user_text, document_context, planning):
+        return self.ending != "read_only"
+
     async def stream(self, **kwargs):
         try:
             async for event in self.events(**kwargs):
@@ -95,11 +98,18 @@ async def main():
         port = LocalEffectsPort(ending)
         transport = server.HarnessRuntimeTransport(port)
         events = []
+        original_snapshot = server.snapshot_workspace
+        def counted_snapshot(roots):
+            assert ending != "read_only", "A proven read-only turn must not traverse the work directory"
+            return original_snapshot(roots)
+        server.snapshot_workspace = counted_snapshot
         try:
             async for event in transport.stream(sid, "Use only the local fixture"):
                 events.append(event)
         except asyncio.CancelledError:
             assert ending == "cancelled"
+        finally:
+            server.snapshot_workspace = original_snapshot
         session = server.safe_session(sid)
         assert session["last_run_status"] == ("completed" if ending == "read_only" else ending)
         messages = session["messages"]

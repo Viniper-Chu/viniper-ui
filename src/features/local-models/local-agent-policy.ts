@@ -68,6 +68,7 @@ export function localRequestOverrides(request: ProviderRequest, policy?: LocalAg
   const json = requestsStrictJsonObject(text) && (!request.tools.length || policy.structuredToolsJson);
   const proofFirst = json && !request.tools.length && policy.proofFirstJson === true && requestsProofFieldFirst(text);
   return {
+    cache_prompt: true,
     max_tokens: policy.outputTokens,
     reasoning_effort: thinking ? (policy.templateEfforts?.[effort] ?? effort) : "none",
     reasoning_budget_tokens: thinking ? policy.reasoningBudgets[effort] ?? policy.reasoningBudgets.high_and_above : 0,

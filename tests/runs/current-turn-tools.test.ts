@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { documentHints, isInlineMathExercise, legacyDocumentHints, relevantFileTools, toolsForCurrentTurn } from "../../src/features/runs/current-turn-tools";
+import { documentHints, isConversationOnlyTurn, isInlineMathExercise, legacyDocumentHints, relevantFileTools, toolsForCurrentTurn } from "../../src/features/runs/current-turn-tools";
 import { ProviderRegistry } from "../../src/features/providers/provider-registry";
 import { ProviderEvent, ProviderRequest } from "../../src/core/provider-contracts";
 import { createRuntimeFixture, waitFor } from "./runtime-fixture";
@@ -252,4 +252,44 @@ test("explicitly requesting root counts uses the inline verified answer path", (
     assert.equal(isInlineMathExercise(text), true);
   assert.equal(isInlineMathExercise("读取试卷文件，列出方程 x²=1 的根数。"), false);
   assert.equal(isInlineMathExercise("用 math.quadratic.check 验算方程 x²=1，然后用工具画图。"), false);
+});
+
+test("self-authored room problems need math tools without a workspace baseline", () => {
+  for (const text of ["本轮数学话题：Qwen 自拟一道含参数数学题并完整求解，DeepSeek 复核后交回。",
+    "请自己出一道高中数学参数题，独立复核，给出定稿。", "请心算 6×7，只回复阿拉伯数字。本轮不使用工具。"]) {
+    assert.equal(isConversationOnlyTurn(text, text), true);
+  }
+  for (const text of ["从文件中选题并编译成试卷", "请解释“不使用工具”", "本轮不使用工具，然后用文件工具修改资料。"]) {
+    assert.equal(isConversationOnlyTurn(text, text), false);
+  }
+  const text = "请自拟一道高中数学参数题";
+  assert.deepEqual(relevantFileTools(text, ["math.quadratic.check","math.rational.evaluate"].map(name => ({ ...tool,name }))).map(t=>t.name),
+    ["math.quadratic.check","math.rational.evaluate"]);
+  assert.equal(isConversationOnlyTurn(text, text + " 请使用附件题图。"), false);
+});
+
+test("a room exercise sends its shared transcript once and keeps earlier native history on disk", async () => {
+  const requests: ProviderRequest[] = [];
+  const registry = new ProviderRegistry(0, []);
+  registry.register({descriptor:{...registry.get("demo").descriptor}, async *stream(request): AsyncIterable<ProviderEvent> {
+    requests.push(request);
+    yield {kind:"text.delta",text:"已确认"};
+  }});
+  const fixture = await createRuntimeFixture({registry});
+  try {
+    const session = fixture.runtime.snapshot().sessions[0];
+    const send = async (text: string, roomTranscript = false) => {
+      const accepted = await fixture.runtime.send({sessionId:session.id,selectedModel:session.selectedModel,permissionMode:session.permissionMode,
+        text,attachments:[],userText:text,documentContext:text,roomTranscript});
+      assert.equal(accepted.accepted,true,accepted.reason);
+      await waitFor(() => !fixture.runtime.isRunning(session.id));
+    };
+    await send("昨天的无关工作记录");
+    await send("自拟一道高中数学参数题。群内复核意见：别漏端点。", true);
+    const outgoing = JSON.stringify(requests.at(-1)?.history);
+    assert.match(outgoing,/别漏端点/u);
+    assert.doesNotMatch(outgoing,/昨天的无关工作记录/u);
+    await send("读取文件核对上次的推导",true);
+    assert.match(JSON.stringify(requests.at(-1)?.history),/昨天的无关工作记录/u);
+  } finally { await fixture.dispose(); }
 });

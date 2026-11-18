@@ -40,6 +40,7 @@ async def check():
         return discussion_events(Transport(),session,"room",text,members,"ask",[])
     events = [e async for e in start("求解")]
     assert [c[1] for c in calls] == ["cloud-a","cloud-b","cloud-c","cloud-a"]
+    assert "交回给你" in calls[-1][2] and "交回给你" not in calls[0][2]
     assert [c[3] for c in calls] == [False,True,True,True]
     assert "取代号枫针" in calls[1][2] and "结果 42" in calls[2][2]
     assert [e["next_speaker"] for e in events if e["type"]=="speaker_finished"] == ["计算","检查","主答"]

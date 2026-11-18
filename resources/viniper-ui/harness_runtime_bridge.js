@@ -9,6 +9,7 @@ const readline = require("node:readline");
 
 const { createHarnessApplication } = require("./harness-runtime/dist/src/platform/bootstrap/create-harness-application.js");
 const { PROVIDER_PROFILES } = require("./harness-runtime/dist/src/features/providers/profiles/index.js");
+const { isConversationOnlyTurn } = require("./harness-runtime/dist/src/features/runs/current-turn-tools.js");
 const { loadLocalAgentPolicy } = require("./harness-runtime/dist/src/features/local-models/local-agent-policy.js");
 const {
   normalizeRawAnthropicEndpoint,
@@ -342,6 +343,7 @@ async function run(request) {
       selectedModel: session.selectedModel,
       permissionMode: session.permissionMode,
       origin: { kind: "user" },
+      roomTranscript: request.room_transcript === true,
       memoryEnabled: request.memory_enabled !== false,
       planning: request.planning === true,
     });
@@ -730,7 +732,9 @@ async function handleControl(command) {
   const requestId = String(command.request_id || "");
   try {
     let data;
-    if (command.op === "run.steer") {
+    if (command.op === "turn.workspace-policy") {
+      data = {needs_snapshot: !command.planning && !isConversationOnlyTurn(command.user_text, command.document_context)};
+    } else if (command.op === "run.steer") {
       const owned = mappedHarnessSession(command.native_session_id);
       const active = owned && runtime.listRuns(owned.id).find((run) => ["queued", "running", "waiting", "waiting_resource", "recovering", "replaying"].includes(run.status));
       if (!active) throw new Error("当前会话没有可引导的运行");
@@ -943,7 +947,7 @@ async function main() {
       });
       return;
     }
-    if (["capabilities.snapshot", "plugins.snapshot", "subagent.spawn", "sessions.snapshot", "sessions.ensure", "sessions.delete", "harness.snapshot", "harness.operation", "permissions.snapshot", "permission.resolve"].includes(command.op) || /^(discussion|collaboration|scheduler|goals)\./.test(String(command.op || "")) || command.op === "run.steer") {
+    if (["turn.workspace-policy", "capabilities.snapshot", "plugins.snapshot", "subagent.spawn", "sessions.snapshot", "sessions.ensure", "sessions.delete", "harness.snapshot", "harness.operation", "permissions.snapshot", "permission.resolve"].includes(command.op) || /^(discussion|collaboration|scheduler|goals)\./.test(String(command.op || "")) || command.op === "run.steer") {
       void handleControl(command);
     }
   });

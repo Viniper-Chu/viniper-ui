@@ -1,19 +1,35 @@
 import { ProviderToolDefinition } from "../../core/provider-contracts";
 
-/** Only an explicit instruction in the current message changes this run's tools. */
-export function toolsForCurrentTurn(text: string, tools: ProviderToolDefinition[]): ProviderToolDefinition[] {
+function turnProse(text: string) {
   const request = text.split("<runtime_context>", 1)[0];
   const quoted = [...request.matchAll(/```[\s\S]*?```|`[^`]*`|"[^"\n]*"|“[^”]*”|'[^'\n]*'|^\s*>[^\n]*/gmu)];
   const insideQuote = (index: number) => quoted.some((match) => index >= match.index! && index < match.index! + match[0].length);
   const prose = request.replace(/```[\s\S]*?```|`[^`]*`|"[^"\n]*"|“[^”]*”|'[^'\n]*'|^\s*>[^\n]*/gmu, (value) => " ".repeat(value.length));
   const isNegated = (index: number) => /(?:不要|不得|不能|不可|不应|不许|不准|无需|不必|禁止|勿|不需要|无须|do not|don't)\s*$/iu.test(prose.slice(Math.max(0, index - 14), index));
   const clauses = prose.split(/[，,。；;！？!?\n]/u).map((part) => part.trim());
-  const noTools = clauses.some((part) => /^(?:(?:本轮|这轮|本次|这次|现在|请)\s*)*(?:不要(?:再)?(?:使用|调用)|不(?:再)?(?:使用|调用)|不用)(?:任何)?工具(?:作答|回答)?$/u.test(part)
-    || /^(?:please\s+)?(?:do not|don't)\s+(?:use|call)\s+(?:any\s+)?tools[.]?$/iu.test(part));
   // A multi-stage request needs the model's interpretation, not a blanket ban.
   const laterTools = [...prose.matchAll(/(?:然后|随后|之后|接着|再)(?:使用|调用|用).*工具|\bthen\s+use\b/giu)]
     .some(match => !isNegated(match.index!));
-  if (noTools && !laterTools && ![...request.matchAll(/(?:用|使用|调用)\s*`?([a-z][a-z0-9_.]*)/gu)].some((m) => !insideQuote(m.index!) && canonicalTool(m[1], tools))) return [];
+  return { request, insideQuote, prose, isNegated, clauses, laterTools };
+}
+
+function prohibitsTools(parsed: ReturnType<typeof turnProse>, knownTool: (name: string) => boolean): boolean {
+  const {request, insideQuote, clauses, laterTools} = parsed;
+  const noTools = clauses.some((part) => /^(?:(?:本轮|这轮|本次|这次|现在|请)\s*)*(?:不要(?:再)?(?:使用|调用)|不(?:再)?(?:使用|调用)|不用)(?:任何)?工具(?:作答|回答)?$/u.test(part)
+    || /^(?:please\s+)?(?:do not|don't)\s+(?:use|call)\s+(?:any\s+)?tools[.]?$/iu.test(part));
+  return noTools && !laterTools && ![...request.matchAll(/(?:用|使用|调用)\s*`?([a-z][a-z0-9_.]*)/gu)].some((m) => !insideQuote(m.index!) && knownTool(m[1]));
+}
+
+/** A proof that even a newly registered tool cannot write files on this turn. */
+export function isConversationOnlyTurn(text: string, documentContext: string): boolean {
+  return isInlineMathExercise(documentContext) || prohibitsTools(turnProse(text), () => true);
+}
+
+/** Only an explicit instruction in the current message changes this run's tools. */
+export function toolsForCurrentTurn(text: string, tools: ProviderToolDefinition[]): ProviderToolDefinition[] {
+  const parsed = turnProse(text);
+  const {request, insideQuote, prose, isNegated, clauses, laterTools} = parsed;
+  if (prohibitsTools(parsed, name => Boolean(canonicalTool(name, tools)))) return [];
   const documentReview = /\bPDF\b|\bTeX\b|\.docx\b|Word\s*文档|师生版本|学生版|教师版/iu.test(prose);
   const readOnly = clauses.some((part) => /^(?:(?:本轮|这轮|本次|这次|现在|请|最后)\s*)*(?:仅|只)(?:进行)?(?:只读操作|读|读取)(?:操作|检查)?$/u.test(part)
     || (documentReview && (/^(?:(?:本轮|这轮|本次|这次|现在|请|最后)\s*)*(?:仅(?:进行)?|只进行)?只读(?:复核|检查|查看|读取|审查|审阅|核对)/u.test(part)
@@ -65,11 +81,18 @@ export function isInlineMathExercise(request: string): boolean {
   request = request.replace(/math\.rational\.evaluate/giu, "算式验算");
   if (/附件|题图|如图|图中|文件|文档|目录|项目|题库|资料|教材|源码|原卷|原稿|讲义|试卷|排版|编译|绘制|画|作图|作出.{0,8}图|示意图|图形文件|搜索|检索|查找|查询|读取|保存|写入|生成|工具|脚本|计算机|程序|代码|上面|上题|之前|刚才|根据图|阅读|资料库|联网|验证器|实验|导出|绘图|上一|前面|前述|插件|技能|[a-z]+\.[a-z]{2,}\b|\b(?:python|pdf|tex|word|tikz|excel|latex|cas)\b/iu.test(request)) return false;
   // Choosing and debating an original topic does not require a workspace search.
-  if (/(?:数学.{0,5}(?:话题|议题|命题)|(?:数学|几何|代数)(?:讨论|辩论))/u.test(request)
-      && /讨论|开题|论证|辩论|探讨|选题/u.test(request)) return true;
+  if (isOriginalMathTopic(request)) return true;
   return /求|证明|证出|判定|判断|解答|解下列|解方程|解不等式|讨论|给出|列出|验算|有几个|几条|多少/iu.test(request)
     && /算式验算|方程|函数|实根|根数|零点|单调支|不等式|三角形|切线|数列|向量|直线|抛物线|椭圆|双曲线|多面体|概率|正实数|导数/iu.test(request)
     && /[0-9=<>≤≥∈√²³]|\\(?:frac|sqrt|in|le|ge)\b/u.test(request);
+}
+
+function isOriginalMathTopic(text: string): boolean {
+  const discussesTopic = /数学.{0,5}(?:话题|议题|命题)|(?:数学|几何|代数)(?:讨论|辩论)/u.test(text)
+    && /讨论|开题|论证|辩论|探讨|选题|自拟|自编|出.{0,6}题/u.test(text);
+  const authorsProblem = /(?:自拟|自编|原创|设计|出).{0,16}(?:参数题|含参.{0,6}题)/u.test(text)
+    && /数学|函数|方程|不等式|高中/u.test(text);
+  return discussesTopic || authorsProblem;
 }
 
 /** Compact, provider-independent hints retained for follow-ups such as “把上一份再编一次”. */
@@ -97,8 +120,9 @@ export function legacyDocumentHints(text: string): string[] {
 
 export function relevantFileTools(text: string, tools: ProviderToolDefinition[], vision = false, previous: string[] = []): ProviderToolDefinition[] {
   const hints = new Set([...documentHints(text), ...previous]);
-  return tools.filter((tool) => (tool.name !== "math.quadratic.check" || hints.has("quadratic"))
-    && (tool.name !== "math.rational.evaluate" || hints.has("quadratic") || /算式|验算|计算|数值|求值|三角|角度|夹角|四面体|外接球|math\.rational\.evaluate/iu.test(text))
+  const originalTopic = isOriginalMathTopic(text);
+  return tools.filter((tool) => (tool.name !== "math.quadratic.check" || hints.has("quadratic") || originalTopic)
+    && (tool.name !== "math.rational.evaluate" || hints.has("quadratic") || originalTopic || /算式|验算|计算|数值|求值|三角|角度|夹角|四面体|外接球|math\.rational\.evaluate/iu.test(text))
     && (!tool.name.startsWith("file.docx.") || hints.has("docx"))
     && (!tool.name.startsWith("file.sqlite.") || hints.has("sqlite"))
     && (!tool.name.startsWith("file.pdf.") || hints.has("pdf"))

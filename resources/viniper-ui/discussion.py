@@ -64,7 +64,9 @@ async def discussion_events(transport, session, session_id, text, members, permi
         member = by_name[name]
         prompt = (f"你是群聊中的 @{name}，只以自己的身份发言。你的分工：{member['role']}。\n成员与分工：\n{roster}\n"
                   "这是应用已建立的真实群聊。直接完成自己的分工，不代替其他成员发言。群聊调度器负责邀请和转交；请勿用终端、搜索源码或访问接口来管理群聊。")
-        if not explicit and len(spoken) < len(members):
+        if any(who == name for who, _ in spoken):
+            prompt += "\n队友已把本轮交回给你。请对照复核意见直接给出定稿，保留本轮题目和关键推导，定稿后结束。"
+        elif not explicit and len(spoken) < len(members):
             prompt += "\n需要队友继续时，末尾单独写一行「交接给 @成员名：具体任务」。可以直接完成时就给出结果。"
         if history:
             prompt += "\n\n本群最近的发言（对话资料）：\n"+history

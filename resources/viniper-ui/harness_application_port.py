@@ -668,7 +668,7 @@ class HarnessApplicationPort:
     async def control(self, operation: str, **payload: Any) -> dict[str, Any]:
         """Invoke a non-renderer Harness Application Port operation."""
         concurrent_controls = {
-            "run.steer", "goals.load", "goals.save", "plugins.snapshot",
+            "turn.workspace-policy", "run.steer", "goals.load", "goals.save", "plugins.snapshot",
             "scheduler.defer", "scheduler.update", "scheduler.snapshot", "scheduler.create", "scheduler.claim", "scheduler.record", "scheduler.delete", "scheduler.toggle",
             "permission.resolve", "collaboration.snapshot", "collaboration.send",
             "collaboration.delegate", "collaboration.wait", "collaboration.cancel-wait",
@@ -728,6 +728,10 @@ class HarnessApplicationPort:
             native_session_id=str(native_session_id),
         )
 
+    async def needs_workspace_snapshot(self, user_text: str, document_context: str, planning: bool) -> bool:
+        result = await self.control("turn.workspace-policy", user_text=user_text, document_context=document_context, planning=planning)
+        return result.get("needs_snapshot") is not False
+
     async def permissions_snapshot(self) -> dict[str, Any]:
         """Return pending host-owned approvals without exposing credentials."""
         return await self.control("permissions.snapshot")
@@ -768,6 +772,7 @@ class HarnessApplicationPort:
         user_text: str | None = None,
         document_context: str | None = None,
         planning: bool = False,
+        room_transcript: bool = False,
     ) -> AsyncIterable[dict[str, Any]]:
         sid = str(session_id)
         if self.active_run(sid):
@@ -797,6 +802,7 @@ class HarnessApplicationPort:
             "user_text": user_text,
             "document_context": document_context,
             "planning": bool(planning),
+            "room_transcript": room_transcript,
         }
         # Host-only secret value is sent over stdin and is never emitted back.
         if host_secret_value:

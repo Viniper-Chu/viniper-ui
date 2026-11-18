@@ -97,6 +97,7 @@ interface RunControl {
   text: string;
   userText?: string;
   documentContext?: string;
+  roomTranscript?: boolean;
   status: RunStatus;
   createdAt: number;
   recovery?: boolean;
@@ -726,6 +727,7 @@ export class AgentRuntime {
         memoryEnabled: intent.memoryEnabled,
         planning: intent.planning,
         userText: intent.userText,
+        roomTranscript: intent.roomTranscript,
         documentContext,
       });
       await this.record(session, "queue.updated", { queue });
@@ -750,6 +752,7 @@ export class AgentRuntime {
       memoryEnabled: intent.memoryEnabled,
       planning: intent.planning,
       userText: intent.userText,
+      roomTranscript: intent.roomTranscript,
       documentContext,
     };
     this.registerRun(session, control);
@@ -954,14 +957,18 @@ export class AgentRuntime {
       const enabledSkills = engineId === "viniper"
         ? stableContextSkills(await (this.options.skillLoader?.loadForRun(session.id) ?? Promise.resolve([])))
         : [];
-      if (!localPolicy) await this.options.compactionService?.maybeCompact({
+      const roomProvidesHistory = Boolean(control.roomTranscript && inlineExercise && !control.recovery);
+      if (!localPolicy && !roomProvidesHistory) await this.options.compactionService?.maybeCompact({
         sessionId: session.id,
         providerId: control.providerSnapshot!.providerId,
         modelId: control.providerSnapshot!.modelId,
         history: session.providerHistory,
       });
-      const contextHistory = this.options.compactionService?.projectHistory(session.id, session.providerHistory, control.providerSnapshot!.providerId, control.providerSnapshot!.modelId)
-        ?? session.providerHistory;
+      // For a self-contained room exercise the host has already included the visible
+      // discussion. Replaying previous native tool transcripts would duplicate it.
+      const projectHistory = () => this.options.compactionService?.projectHistory(session.id, session.providerHistory,
+        control.providerSnapshot!.providerId, control.providerSnapshot!.modelId) ?? session.providerHistory;
+      const contextHistory = roomProvidesHistory ? [] : projectHistory();
       const memoryEntries = engineId === "viniper" ? (this.options.memoryService?.selectForInjection({
         sessionId: session.id,
         projectRoot: session.projectAccess?.enabled ? session.workingDirectory : undefined,
@@ -985,7 +992,7 @@ export class AgentRuntime {
         // Only the matched local deployment receives this host path context.
         ...(localPolicy ? { taskDirectory: workspaceRoot ?? session.workingDirectory } : {}),
         projectInstructions: `${projectInstructions.text ?? ""}${memoryText}${control.planning ? "\n\n本轮为规划模式：只读调研，给出可执行的方案、取舍和验证方法。不得修改文件、运行有副作用命令或启动其他执行任务。完成方案后等待用户选择开始实施。" : ""}`,
-        taskWorkflow: engineId === "viniper",
+        taskWorkflow: engineId === "viniper" && !(localPolicy && (inlineExercise || !toolDefinitions.length)),
       });
       const cachePlan = buildCachePlan(text, contextProfile);
       control.providerSnapshot = {
@@ -1039,6 +1046,7 @@ export class AgentRuntime {
       this.updateRunSnapshot(control, "running");
       await this.record(session, "session.updated", { cachePlan, unread: false });
       await this.options.tokenLedger.start(engineId, effectiveRunId, session.id, cachePlan.reusablePrefix + text);
+      let roomHistory: ProviderHistoryEntry[] | undefined;
       if (!control.recovery) {
         const userMessage: AgentMessage = {
           id: engineScopedId(engineId, "item", newId("message")),
@@ -1056,6 +1064,7 @@ export class AgentRuntime {
           role: "user",
           items: [{ type: "text", text }],
         };
+        if (roomProvidesHistory) roomHistory = [userHistoryEntry];
         await this.record(session, "provider.history.appended", { entries: [userHistoryEntry], runId: effectiveRunId });
       }
 
@@ -1077,7 +1086,7 @@ export class AgentRuntime {
         permissionMode: session.permissionMode,
         reasoning: control.providerSnapshot!.reasoning,
         currentUserText: control.userText ?? text,
-        history: this.options.compactionService?.projectHistory(session.id, session.providerHistory, control.providerSnapshot!.providerId, control.providerSnapshot!.modelId) ?? session.providerHistory,
+        history: roomHistory ?? projectHistory(),
         tools: engineId === "viniper" ? toolDefinitions : [],
         cachePlan,
         contextProfile,
@@ -1376,6 +1385,7 @@ export class AgentRuntime {
         origin: next.origin ?? { kind: "user" },
         text: next.text,
         userText: next.userText,
+        roomTranscript: next.roomTranscript,
         documentContext: next.documentContext,
         status: "queued",
         createdAt: this.now(),

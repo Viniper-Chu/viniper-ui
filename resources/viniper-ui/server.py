@@ -3277,12 +3277,18 @@ class HarnessRuntimeTransport:
                     raise RuntimeError(notice["message"])
             if not offline_demo and not cfg.get("api_key"):
                 raise RuntimeError("请先在 Viniper 的“连接与模型”中保存 API key，再发送任务。")
-            before_file_state, before_file_text = await asyncio.to_thread(snapshot_workspace, watched_file_roots)
+            user_text = display_prompt or ("继续推进当前目标。" if suppress_user_message else prompt)
+            planning = session.get("task_mode") == "plan"
+            preflight = getattr(self.application_port, "needs_workspace_snapshot", None)
+            if preflight and not await preflight(user_text, document_context, planning):
+                watched_file_roots = []
+            if watched_file_roots:
+                before_file_state, before_file_text = await asyncio.to_thread(snapshot_workspace, watched_file_roots)
             event_stream = self.application_port.stream(
                 session_id=session_id,
                 prompt=runtime_prompt,
                 document_context=document_context,
-                user_text=display_prompt or ("继续推进当前目标。" if suppress_user_message else prompt),
+                user_text=user_text,
                 model=provider_model,
                 workdir=str(workdir),
                 permission_mode=harness_permission_mode(selected_permission_mode),
@@ -3291,7 +3297,8 @@ class HarnessRuntimeTransport:
                 host_secret_value="" if offline_demo else cfg.get("api_key", ""),
                 memory_enabled=bool(load_app_settings().get("runtime", {}).get("memory_enabled", True)),
                 reasoning=run_reasoning(cfg, model, None, session.get("reasoning")) if speaker else session.get("reasoning"),
-                planning=session.get("task_mode") == "plan",
+                planning=planning,
+                **({"room_transcript": True} if speaker else {}),
             )
             async for envelope in event_stream:
                 if envelope.get("type") == "runtime.finalization_timeout":
