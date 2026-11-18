@@ -144,21 +144,12 @@ kbd { display: inline-flex; align-items: center; min-height: 20px; padding: 0 4p
 .welcome-context .icon { width: 13px; height: 13px; }
 .welcome-context:hover { color: var(--accent); }
 .welcome-context span:last-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.function-field { display: none; }
+.function-field, .field-caption { display: none; }
 .chat-page.is-empty { position: relative; isolation: isolate; }
-.is-empty .function-field { display: block; position: absolute; top: 0; left: 0; width: 100%; height: clamp(112px,37%,400px); z-index: -1; pointer-events: none; }
-.field-grid { mask-image: radial-gradient(ellipse 62% 72% at 63% 54%,black 25%,transparent 98%); }
-#field-grid path { stroke: var(--ink); stroke-opacity: .09; stroke-width: 1; }
-.field-axes { stroke: var(--secondary); opacity: .19; }
-.field-symmetry { stroke: var(--secondary); opacity: .23; stroke-dasharray: 2 6; }
-.field-curve { stroke: var(--accent); stroke-width: 2; opacity: .71; stroke-linecap: round; }
-.field-level { stroke: var(--graph-level); opacity: .56; stroke-dasharray: 5 6; }
-.field-halo { fill: var(--graph-level); opacity: .16; }
-.field-root { fill: var(--graph-level); stroke: var(--bg); stroke-width: 2; }
-.field-end { fill: var(--bg); stroke: var(--accent); stroke-width: 1.4; }
-.field-end.closed { fill: var(--accent); }
-.field-equation { font: italic 15px Georgia, "Times New Roman", serif; fill: var(--secondary); }
-.field-readout { font: 11px var(--mono); fill: var(--graph-level); }
+.is-empty .function-field { display: block; position: absolute; inset: 0; width: 100%; height: 100%; z-index: -1; pointer-events: none; }
+.is-empty .field-caption { display: flex; position: absolute; top: 28px; right: 36px; gap: 18px; align-items: baseline; color: var(--secondary); opacity: .58; pointer-events: none; font: italic 14px Georgia, "Times New Roman", serif; }
+.field-readout { font: 10px var(--mono); color: var(--graph-level); }
+@media (max-width: 600px) { .is-empty .field-caption { top: 14px; right: 20px; gap: 12px; font-size: 12px; } }
 .example-tools { display: flex; align-items: center; justify-content: flex-end; gap: 9px; }
 #level-control { appearance: none; width: 48px; height: 24px; margin: 0; background: transparent; cursor: ew-resize; }
 #level-control::-webkit-slider-runnable-track { height: 2px; border-radius: 2px; background: var(--line-strong); }

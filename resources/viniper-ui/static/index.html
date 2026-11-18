@@ -85,16 +85,8 @@
           </div>
         </header>
         <section id="chat-view" class="page chat-page is-empty" aria-label="对话">
-          <svg class="function-field" aria-hidden="true" focusable="false" fill="none">
-            <defs><pattern id="field-grid" width="36" height="36" patternUnits="userSpaceOnUse"><path d="M36 0H0V36"/></pattern></defs>
-            <rect width="100%" height="100%" fill="url(#field-grid)" class="field-grid"/>
-            <path data-part="axes" class="field-axes"/><path data-part="symmetry" class="field-symmetry"/>
-            <path data-part="curve" class="field-curve"/><path data-part="level" class="field-level"/>
-            <circle data-part="closed" class="field-end closed" r="3"/><circle data-part="open" class="field-end" r="3"/>
-            <circle data-part="leftHalo" class="field-halo" r="9"/><circle data-part="rightHalo" class="field-halo" r="9"/>
-            <circle data-part="left" class="field-root" r="4.5"/><circle data-part="right" class="field-root" r="4.5"/>
-            <text data-part="equation" class="field-equation">y = 4 − (x − 1)²</text><text data-part="label" class="field-readout"></text>
-          </svg>
+          <canvas class="function-field" aria-hidden="true"></canvas>
+          <div class="field-caption" aria-hidden="true"><span>f(x) = ln x + eˣ − 5x</span><span class="field-readout">t = −2</span></div>
           <div class="conversation-wrap">
             <nav
               id="message-rail"
@@ -108,8 +100,8 @@
                   <h1>今天解哪道题？</h1>
 <button class="welcome-context" data-action="project" data-hint="选择工作目录"><span data-icon="folder"></span><span id="welcome-project">选择工作目录</span></button>
                 </div>
-                <div class="example-tools"><input id="level-control" type="range" min="-0.5" max="4.5" step="0.05" value="2.25" aria-label="水平线参数 t" data-hint="调节水平线，查看交点">
-                <button class="example-graph" data-hint="将这道参数题放入输入框" aria-label="试一道参数题" data-prompt="在 −1 ≤ x &lt; 3 上，水平线 y=t 与抛物线 y=4−(x−1)² 的左右两支各有几个交点？请给出分段证明。">
+                <div class="example-tools"><input id="level-control" type="range" min="-4" max="1" step="0.05" value="-2" aria-label="水平线参数 t" data-hint="调节水平线，查看交点">
+                <button class="example-graph" data-hint="将这道参数题放入输入框" aria-label="试一道参数题" data-prompt="设 f(x)=ln x+e^x−5x，0&lt;x≤5/2。请用导数分析单调性，并讨论方程 f(x)=t 的不同实根个数。临界值可以用函数极值表示，需要近似时请说明。">
                   <span>试一道参数题<span data-icon="arrowRight"></span></span>
                 </button></div>
               </section>
