@@ -1,3 +1,4 @@
+import { bindEffortControl, selectedEffort, effortLabel } from "./effort.js";
 import { setupFunctionField } from "./function-field.js";
 import { setupTooltips } from "./tooltips.js";
 import { api, query, state, escape, timeLabel } from "./api.js";
@@ -126,10 +127,6 @@ export function view(name, { returning = false } = {}) {
 export async function loadStatus() {
   state.status = await api("/api/status?mode=viniper");
   state.model = state.model || state.status.model;
-  state.reasoning =
-    state.session?.reasoning ||
-    state.status.local_agent?.default_reasoning ||
-    state.reasoning;
   state.workdir =
     state.session?.workdir || draftDirectory ||
     state.status.settings?.workspace?.default_root ||
@@ -401,13 +398,8 @@ export function syncComposer() {
   );
   $("#model-label").textContent =
     model?.label || model?.name || state.model || "选择模型";
-  $("#reasoning-label").textContent = model?.reasoning_options?.length === 0 ? "服务默认" : {
-    off: "不思考",
-    minimal: "极低",
-    low: "低",
-    medium: "中",
-    high: "高",
-  }[state.reasoning] || state.reasoning;
+  state.reasoning = selectedEffort(model, state.reasoning);
+  $("#reasoning-label").textContent = effortLabel(state.reasoning);
   const u = run?.usage || state.session?.context_usage || {};
   const ratio = Math.max(0, Math.min(1, Number(u.ratio) || 0));
   $("#context-progress").style.strokeDashoffset = 53.407 * (1 - ratio);
@@ -913,6 +905,7 @@ async function handleMenu(action, value) {
       openPreference("connection-settings", "discussion-key"); return;
     }
     state.model = value;
+    state.reasoning = selectedEffort(state.status.models.find(m => m.id === value), state.reasoning);
     await refreshModelNotice();
     const sid = state.session?.session_id;
     syncComposer();
@@ -925,9 +918,7 @@ async function handleMenu(action, value) {
         syncComposer();
       }
     }
-  } else if (action === "reasoning") {
-    state.reasoning = value;
-    syncComposer();
+
   } else if (action === "connection-settings") openPreference("connection-settings");
   else if (action === "extensions") view("extensions");
   else if (action === "rename") await rename(value || undefined);
@@ -1277,6 +1268,10 @@ if (
   document.body.classList.add("platform-mac");
 if (innerWidth <= 860) $("#app").classList.add("sidebar-collapsed");
 hydrateIcons();
+bindEffortControl($("#popover"), value => {
+  state.reasoning = value;
+  syncComposer();
+});
 setupFunctionField($("#chat-view"));
 await Promise.all([loadStatus(), loadSessions()]).catch((error) =>
   toast(`连接尚未就绪：${error.message}`, true),

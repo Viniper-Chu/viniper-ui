@@ -42,11 +42,16 @@ def local_agent_contract(base_url, model=None):
         data = _matching_deployment(base_url, model)
         if not data:
             return None
+        control = data.get('thinking_control', {})
+        budgets = control.get('budget_tokens', {'low': 256, 'medium': 512, 'high_and_above': 1024})
+        options = ['off'] + [level for level in ('minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+                             if budgets.get(level, budgets.get('high_and_above') if level == 'high' else 0)]
+        default = control.get('default', 'medium')
         return {'model': data['api_model'], 'context_tokens': data['context_tokens'],
                 'compact_at_tokens': data['compaction_trigger_tokens'], 'output_tokens': data['output_limit'],
                 'max_iterations': data['max_iterations'],
-                'default_reasoning': data.get('thinking_control', {}).get('default', 'medium'),
-                'reasoning_options': ['off', *(['minimal'] if 'minimal' in data.get('thinking_control', {}).get('budget_tokens', {}) else []), 'low', 'medium', 'high'],
+                'default_reasoning': default if default in options else options[-1],
+                'reasoning_options': options,
                 'structured_tools_json': data.get('structured_tools_json') is True}
     except (OSError, ValueError, KeyError, TypeError):
         return None

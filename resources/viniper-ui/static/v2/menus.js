@@ -1,3 +1,4 @@
+import { effortControl } from "./effort.js";
 import { state, escape, api } from "./api.js";
 import { icon } from "./icons.js";
 const box = () => document.querySelector("#popover");
@@ -118,27 +119,7 @@ export function menuContent(kind) {
           });
         })
         .join("") +
-      (model?.reasoning_options?.length === 0 ? "" : '<div class="menu-separator"></div><h3>智能程度</h3><div class="effort-options" role="group" aria-label="智能程度">' +
-      (
-        state.status?.local_agent?.reasoning_options || [
-          "off",
-          "low",
-          "medium",
-          "high",
-        ]
-      )
-        .map((id) => [
-          id,
-          { off: "关闭", minimal: "极低", low: "低", medium: "中", high: "高" }[
-            id
-          ] || id,
-        ])
-        .map(
-          ([id, label]) =>
-            `<button role="radio" aria-checked="${state.reasoning === id}" data-menu-action="reasoning" data-value="${id}" data-hint="将智能程度设为${escape(label)}">${label}</button>`,
-        )
-        .join("") +
-      "</div>") + '<div class="menu-separator"></div>' + option({ label: "模型连接设置", image: "settings", action: "connection-settings" })
+      effortControl(model, state.reasoning) + '<div class="menu-separator"></div>' + option({ label: "模型连接设置", image: "settings", action: "connection-settings" })
     );
   }
   if (kind === "context") {
@@ -173,7 +154,7 @@ document.addEventListener("keydown", (event) => {
     closeMenu();
     trigger?.focus({ preventScroll: true });
   }
-  if (event.key === "Tab" && !box().hidden) closeMenu();
+  if (event.key === "Tab" && !box().hidden && !box().querySelector(".effort-control")) closeMenu();
   if (!box().hidden && ["ArrowDown", "ArrowUp"].includes(event.key)) {
     event.preventDefault();
     const list = [...box().querySelectorAll("button:not(:disabled)")];
@@ -182,4 +163,8 @@ document.addEventListener("keydown", (event) => {
       (index + (event.key === "ArrowDown" ? 1 : -1) + list.length) % list.length
     ]?.focus();
   }
+});
+
+document.addEventListener("focusout", event => {
+  if (box().contains(event.target) && event.relatedTarget && !box().contains(event.relatedTarget)) closeMenu();
 });

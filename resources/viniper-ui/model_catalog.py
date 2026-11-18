@@ -9,6 +9,7 @@ CATALOG = json.loads(Path(__file__).with_name("model-capabilities.json").read_te
 DEFAULT_DEEPSEEK_MODEL = CATALOG["default_deepseek_model"]
 PROVIDER_MODEL_ALIASES = CATALOG["provider_model_aliases"]
 OFFICIAL_DEEPSEEK_ENDPOINTS = {"https://api.deepseek.com", "https://api.deepseek.com/v1",
+                              "https://api.deepseek.com/chat/completions", "https://api.deepseek.com/v1/chat/completions",
                               "https://api.deepseek.com/anthropic", "https://api.deepseek.com/anthropic/v1/messages"}
 
 

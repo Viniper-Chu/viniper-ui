@@ -1,3 +1,4 @@
+import { deepSeekEffort } from "../shared/deepseek-effort";
 import {
   ProviderEvent,
   ProviderActivityEvent,
@@ -116,6 +117,7 @@ export class OpenAIChatProvider implements ModelProvider {
       if (messages[0]?.role === "system") messages[0].content = `${String(messages[0].content)}\n${guidance}`;
       else messages.unshift({ role: "system", content: guidance });
     }
+    Object.assign(body, deepSeekEffort(this.transport.endpoint(), request.selectedModel, request.reasoning, "openai-chat"));
     Object.assign(body, localRequestOverrides(request, this.localPolicy));
     const local = this.runtimePolicyFor(request.selectedModel);
     if (local) {
@@ -217,7 +219,7 @@ export function serializeOpenAIChat(
     model: request.selectedModel,
     messages: [
       ...(instructions ? [{ role: "system", content: instructions }] : []),
-      ...chatMessages(request.history, profile, toolNames),
+      ...chatMessages(request.history, profile, toolNames, tools.length > 0),
     ],
     ...(tools.length ? { tools: tools.map((tool) => ({
       type: "function",
@@ -249,6 +251,7 @@ function chatMessages(
   history: ProviderHistoryEntry[],
   profile: ProviderProfile,
   toolNames: OpenAIChatToolNameProjection,
+  offersTools: boolean,
 ): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
   for (const entry of history) {
@@ -282,10 +285,8 @@ function chatMessages(
       // assistant turns.  null can make a durable reasoning-only turn poison
       // every later request with a 400.
       content,
-      // DeepSeek requires reasoning passback on tool-call turns.  It ignores
-      // reasoning from plain turns, so omitting it keeps later append-only
-      // prefixes smaller without changing conversation semantics.
-      ...(toolCalls.length && reasoning ? { reasoning_content: reasoning } : {}),
+      // When tools are offered, DeepSeek also requires reasoning from earlier plain turns.
+      ...((toolCalls.length || (offersTools && profile.id === "deepseek")) && reasoning ? { reasoning_content: reasoning } : {}),
       ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
     });
   }

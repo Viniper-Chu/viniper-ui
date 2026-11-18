@@ -65,7 +65,7 @@
 例程尺寸来自 xAI 公开桌面示例的未缩放布局。公式预览和本机文件入口是数学工作流的适配。派发状态仅说明本机调度器的回执。[设计示例](https://x.ai/news/designing-grok-bot) · [技能与例程管理](https://docs.x.ai/grok-bot/skills-routines-and-automations) · [连接应用](https://docs.x.ai/grok-bot/computer-and-apps) · [设置分区](https://docs.x.ai/grok-bot/settings-and-notifications)
 
 
-## 3.0.0 待审范围
+## 3.0.0 实现范围
 
 | 产品能力 | Viniper 的实际边界 |
 |---|---|

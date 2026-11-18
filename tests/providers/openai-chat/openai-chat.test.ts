@@ -202,7 +202,7 @@ test("DeepSeek tool projection rejects an alias collision while other OpenAI Cha
   assert.equal(name, canonical);
 });
 
-test("DeepSeek keeps tool-call reasoning only and serializes text-less assistant content as an empty string", () => {
+test("DeepSeek replays reasoning from plain and tool turns when the request offers tools", () => {
   const deepseek = DOMESTIC_MODEL_PROFILES.find((profile) => profile.id === "deepseek")!;
   const base = protocolRequest(deepseek, "deepseek-v4-flash");
   const serialized = serializeOpenAIChat({
@@ -225,7 +225,7 @@ test("DeepSeek keeps tool-call reasoning only and serializes text-less assistant
   }, deepseek);
   const assistants = (serialized.messages as Array<Record<string, unknown>>).filter((message) => message.role === "assistant");
   assert.equal(assistants[0].content, "");
-  assert.equal(assistants[0].reasoning_content, undefined);
+  assert.equal(assistants[0].reasoning_content, "plain-hidden");
   assert.equal(assistants[1].content, "");
   assert.equal(assistants[1].reasoning_content, "required-passback");
 });

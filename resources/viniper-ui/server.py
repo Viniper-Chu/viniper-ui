@@ -27,7 +27,7 @@ from local_request_guard import LocalRequestGuard
 from context_lifecycle import ContextLifecycle
 from context_usage import ContextUsageLedger
 from daily_usage import DailyUsageLedger
-from model_catalog import DEFAULT_DEEPSEEK_MODEL, PROVIDER_MODEL_ALIASES, capacity_provider_id, deepseek_model_options, migrate_official_deepseek_provider
+from model_catalog import OFFICIAL_DEEPSEEK_ENDPOINTS, DEFAULT_DEEPSEEK_MODEL, PROVIDER_MODEL_ALIASES, capacity_provider_id, deepseek_model_options, migrate_official_deepseek_provider
 from agent_instructions import AgentInstructionsStore
 from goal_service import GoalService
 from schedule_host import ScheduleHost
@@ -1859,13 +1859,39 @@ def connection_for_model(settings, mode, model):
     return primary
 
 
+def reasoning_capability(provider, model):
+    endpoint = str(provider.get("base_url") or "").rstrip("/")
+    local = local_agent_contract(endpoint, model)
+    if local:
+        return {"reasoning_options": local["reasoning_options"], "default_reasoning": local["default_reasoning"]}
+    if endpoint in OFFICIAL_DEEPSEEK_ENDPOINTS and provider_model_id(model) in {DEFAULT_DEEPSEEK_MODEL, "deepseek-v4-pro"}:
+        return {"reasoning_options": ["off", "low", "high", "max"], "default_reasoning": "high"}
+    return {"reasoning_options": [], "default_reasoning": None}
+
+
+def run_reasoning(provider, model, requested, previous):
+    capability = reasoning_capability(provider, model)
+    options = capability["reasoning_options"]
+    if requested and requested not in options:
+        if requested in {"off", "minimal", "low", "medium", "high"} and not options:
+            return None  # Older clients sent a level even for an automatic provider.
+        if capability["default_reasoning"] == "high" and requested == "medium":
+            return "high"  # Older cloud sessions used the service default.
+        raise HTTPException(400, "当前模型不支持所选思考档位")
+    return requested or (previous if previous in options else capability["default_reasoning"])
+
+
 def effective_model_options(mode: str = MODE_VINIPER):
-    provider = provider_for_mode(load_app_settings(), MODE_VINIPER)
+    settings = load_app_settings()
+    provider = provider_for_mode(settings, MODE_VINIPER)
     options = normalize_model_options(provider.get("models"), provider_id=capacity_provider_id(provider), mode=MODE_VINIPER)
     if mode == MODE_VINIPER and has_local_primary(provider) and all(row["id"] != DEFAULT_DEEPSEEK_MODEL for row in options):
         cloud, = normalize_model_options([{"id": DEFAULT_DEEPSEEK_MODEL, "label": "DeepSeek Flash",
             "description": "云端 · 发送本会话上下文并使用工具"}], provider_id="deepseek", mode=mode)
-        options.append({**cloud, "reasoning_options": [], "credential_mode": "discussion"})
+        options.append({**cloud, "credential_mode": "discussion"})
+    for row in options:
+        connection = connection_for_model(settings, mode, row["id"])
+        row.update(reasoning_capability(connection, row["id"]))
     return options
 
 
@@ -4210,8 +4236,10 @@ async def create_goal(request: Request):
     require_canonical_mode(sessions[sid].get("mode"))
     body["permission_mode"] = require_permission_mode(
         body.get("permission_mode") or session_permission_mode(sessions[sid]), MODE_VINIPER)
-    sessions[sid]["task_mode"] = "goal"
-    sessions[sid]["reasoning"] = str(body.get("reasoning") or "medium")
+    model = allowed_model(body.get("model") or sessions[sid].get("model"), MODE_VINIPER)
+    cfg = provider_config(model, MODE_VINIPER, resolve_secret=False)
+    reasoning = run_reasoning(cfg, model, body.get("reasoning"), sessions[sid].get("reasoning"))
+    sessions[sid].update(task_mode="goal", model=model, reasoning=reasoning)
     sessions[sid]["selected_skills"] = body.get("skills") or []
     body["attachments"] = save_run_attachments(sid, body.get("attachments") or [])
     save_sessions_to_disk()
@@ -4771,7 +4799,7 @@ async def submit_run(session_id: str, request: Request):
     coordinator = agent_run_coordinator()
     if coordinator.has_active(session_id):
         raise HTTPException(status_code=409, detail="当前会话已有任务在运行")
-    chosen_model = body.get("model") or session.get("model")
+    chosen_model = allowed_model(body.get("model") or session.get("model"), MODE_VINIPER)
     cfg = provider_config(chosen_model, MODE_VINIPER)
     notice = local_model_notice(cfg["base_url"], cfg["model"])
     if notice:
@@ -4788,9 +4816,7 @@ async def submit_run(session_id: str, request: Request):
     permission_mode = require_permission_mode(session_permission_mode(session), MODE_VINIPER)
     if body.get("permission_mode") and body["permission_mode"] != permission_mode:
         raise HTTPException(status_code=409, detail="访问权限已变化，请刷新后重试")
-    reasoning = str(body.get("reasoning") or session.get("reasoning") or "medium")
-    if reasoning not in {"off", "minimal", "low", "medium", "high"}:
-        raise HTTPException(status_code=400, detail="invalid reasoning selection")
+    reasoning = run_reasoning(cfg, chosen_model, body.get("reasoning"), session.get("reasoning"))
     task_mode = str(body.get("task_mode") or "execute")
     if task_mode not in {"execute", "plan"}:
         raise HTTPException(status_code=400, detail="目标任务请从目标入口创建")
@@ -4800,7 +4826,7 @@ async def submit_run(session_id: str, request: Request):
         raise HTTPException(status_code=400, detail="所选技能不可用，请刷新技能列表")
     session.update(reasoning=reasoning, task_mode=task_mode, selected_skills=selected)
     save_sessions_to_disk()
-    model = allowed_model(str(body.get("model") or ""), MODE_VINIPER)
+    model = chosen_model
     session["model"] = model
     attachments = save_run_attachments(session_id, body.get("attachments") or [])
     record = coordinator.start(session_id,

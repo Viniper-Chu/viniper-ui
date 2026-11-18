@@ -53,7 +53,7 @@ test("pixel lens settles, honors reduced motion and stops drawing when a convers
   assert.ok(maximum > 6, "the pointer enlarges pixels");
   reduced.matches = true;
   slider.value = "-2.05"; events["slider-input"](); tick();
-  assert.equal(readout.textContent, "t = -2.05");
+  assert.equal(readout.textContent, "−2.05");
   assert.equal(frames.size, 0);
   slider.value = "-1"; events["slider-input"]();
   empty = false; observers[0]();

@@ -99,7 +99,7 @@ export function setupFunctionField(page) {
       }
     }
     context.globalAlpha = 1;
-    readout.textContent = "t = " + Number(level.toFixed(2));
+    readout.textContent = String(Number(level.toFixed(2))).replace("-", "−");
   }
 
   function animate(now) {
