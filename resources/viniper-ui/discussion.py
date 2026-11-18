@@ -50,7 +50,7 @@ def addressed(text, members):
 def requested_review_chain(text, members, explicit):
     """A named review and return is a user assignment, even if a model forgets its handoff line."""
     # Do not schedule tools/providers from code, quotations or a negated/conditional example.
-    prose = re.sub(r"```.*?(?:```|$)|`[^`\n]*`|「[^」]*」|“[^”]*”|《[^》]*》|"[^"\n]*"", " ", text, flags=re.S)
+    prose = re.sub(r'```.*?(?:```|$)|`[^`\n]*`|「[^」]*」|“[^”]*”|《[^》]*》|"[^"\n]*"', " ", text, flags=re.S)
     names = {m["name"].casefold():m["name"] for m in members}
     roster = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
     transfers = list(re.finditer(r"(交给|交由|转给|交回|转回)\s*@?(" + roster + r")(?![a-zA-Z0-9_-])", prose, re.I))
