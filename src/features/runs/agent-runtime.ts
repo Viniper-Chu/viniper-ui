@@ -1175,7 +1175,7 @@ export class AgentRuntime {
         runId: effectiveRunId,
         // A successful batch closes the calculation phase of a standalone exercise.
         // An explicit request for tools, an attachment, or a document task retains the ordinary loop.
-        ...(inlineExercise && localPolicy ? { finishRepeatedArithmetic: true, completesVerification: (call: ProviderToolCallItem, result: ProviderToolResultItem) =>
+        ...(inlineExercise && localPolicy ? { finishRepeatedArithmetic: true, finishRoomArithmetic: roomProvidesHistory, completesVerification: (call: ProviderToolCallItem, result: ProviderToolResultItem) =>
           call.name === "math.quadratic.check" && !result.isError } : {}),
         // Local deployment limits come from its host-owned contract. Explicit
         // acceptance overrides still take precedence; cloud defaults stay bounded.

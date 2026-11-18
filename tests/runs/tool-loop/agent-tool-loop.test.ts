@@ -601,3 +601,24 @@ test("an inline exercise turns repeated successful arithmetic into a written pro
   assert.ok(JSON.stringify(provider.requests[2].history).includes("1/2+1/2"));
   assert.match(result.assistantText,/端点/);
 });
+
+test("two distinct silent arithmetic rounds in a room lead to prose with one intact user handoff", async () => {
+  const name = "math.rational.evaluate";
+  const registry = new ToolRegistry();
+  registry.register({ name, description: "rational", readOnly: true, inputSchema: {type: "object"},
+    async execute(req) { return {toolId: req.id, text: JSON.stringify(req.input)}; } });
+  const provider = new ScriptedProvider([
+    [{kind: "tool-call.completed", call: toolCall("first", name, '{"expressions":["1+1"]}')}],
+    [{kind: "tool-call.completed", call: toolCall("second", name, '{"expressions":["2+1"]}')}],
+    [{kind: "text.delta", text: "交接给 @复核：核查端点"}],
+  ]);
+  const request = providerRequest(registry,"auto");
+  request.history = [{ id:"question",role:"user",items:[{type:"text",text:"原群完整题面与分工"}] }];
+  await runAgentToolLoop({provider, request, toolRegistry: registry, finishRepeatedArithmetic: true, finishRoomArithmetic: true,
+    signal: new AbortController().signal, now: () => 1, emit: async () => {}, onProviderEvent: async () => {}, appendHistory: async () => {}});
+  assert.deepEqual(provider.requests.map(r => r.tools.length),[1,1,0]);
+  const writer = provider.requests[2];
+  assert.equal(writer.history.length,1);
+  for (const required of ["原群完整题面与分工","1+1","2+1","所需交接"]) assert.ok(JSON.stringify(writer.history).includes(required));
+  assert.equal(writer.reasoning,request.reasoning);
+});

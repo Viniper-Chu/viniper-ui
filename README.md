@@ -42,4 +42,4 @@ npm run typecheck
 npm test
 ```
 
-macOS 与 Windows 分别验收；本次交付目标是 Apple Silicon macOS，不能据此认定 Windows 安装器已经完成回归。3.0.1 的 Apple Silicon 构建及发布说明见 [GitHub Releases](https://github.com/Viniper-Chu/viniper-ui/releases/tag/v3.0.1-r5)。
+macOS 与 Windows 分别验收；本次交付目标是 Apple Silicon macOS，不能据此认定 Windows 安装器已经完成回归。3.0.1 的 Apple Silicon 构建及发布说明见 [GitHub Releases](https://github.com/Viniper-Chu/viniper-ui/releases/tag/v3.0.1-r6)。

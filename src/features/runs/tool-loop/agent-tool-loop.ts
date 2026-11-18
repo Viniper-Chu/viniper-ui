@@ -46,6 +46,7 @@ export interface AgentToolLoopOptions {
   noProgressLimit?: number;
   trackReads?: boolean;
   finishRepeatedArithmetic?: boolean;
+  finishRoomArithmetic?: boolean;
   reviewPlan?: ReviewExecutionPlan;
   onProviderEvent(event: ProviderEvent): Promise<void>;
   appendHistory(entries: ProviderHistoryEntry[]): Promise<void>;
@@ -160,6 +161,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
   let verified = false;
   let retryingAnswer = false;
   let arithmeticOnly = false;
+  let silentArithmeticRounds = 0;
   let verifiedEvidence: string[] = [];
   let branchTables: string[] = [];
 
@@ -215,6 +217,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       verified = false;
       retryingAnswer = false;
       arithmeticOnly = false;
+      silentArithmeticRounds = 0;
       verifiedEvidence = [];
       branchTables = [];
       stagnant = undefined;
@@ -229,14 +232,24 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
     if (verified) {
       const lastUser = requestHistory.map(entry => entry.role).lastIndexOf("user");
       requestHistory = requestHistory.slice(0, lastUser + 1);
-      requestHistory.push({ id: newId("verified-answer"), role: "user", items: [{ type: "text", text: [
-        "以下为本题的精确验算资料。把它整理成学生可读的定稿。每题给一条完整推导。",
+      const writerInstructions = [
+        options.finishRoomArithmetic
+          ? "你已取得本轮数值验算记录。请依照原群题面和你被分配的角色，写出这一位成员的发言和所需交接。不再调用算术工具。"
+          : "以下为本题的精确验算资料。把它整理成学生可读的定稿。每题给一条完整推导。",
         ...verifiedEvidence,
         ...(arithmeticOnly ? ["这些是数值代入记录。请从题面独立列式证明；样值用于检错，若算式与题设不符，应订正算式。现在用已得资料完成全部小问。"] : []),
         ...(branchTables.length ? ["本题的分支定义域、值域、各段交点及最终答案将由应用从回执直接排在你文字之后。你负责前半段推导：从题干得到等价方程、原定义域和顶点，写到能按水平线分类为止。左右两支都包含可取的顶点。不要重复分支计数或另选顶点归属约定。若题目还有其他独立小问，也要作答。"] : []),
         retryingAnswer ? "上一轮没有形成解答。请从第一道题的推导直接写起。" : "现在直接给出各题的中文书面推导与结论。",
         "如果原题为根式方程 √U=V，先写成 U=V² 且 V≥0。此时 U 非负已由等式保证，不再引入一个移动的区间端点。只保留必要步骤与结论。",
-      ].join("\n") }] });
+      ].join("\n");
+      const task = requestHistory.at(-1);
+      if (options.finishRoomArithmetic && task?.role === "user") {
+        // Keep the protected live room prompt and its receipts in the same message.
+        // A second user message would make the original handoff eligible for compaction.
+        task.items.push({ type: "text", text: "\n\n" + writerInstructions });
+      } else {
+        requestHistory.push({ id: newId("verified-answer"), role: "user", items: [{ type: "text", text: writerInstructions }] });
+      }
     }
     const stepController = new AbortController();
     const stepSignal = AbortSignal.any([options.signal, stepController.signal]);
@@ -421,6 +434,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
         throw new ToolLoopLimitError(maxRounds);
       }
 
+      let onlySilentArithmetic = options.finishRoomArithmetic && !roundText.trim();
       for (const call of toolCalls) {
         const previous = completedToolResults.get(call.callId);
         let result: ProviderToolResultItem;
@@ -434,6 +448,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
           result = toolResult(call, "用户已引导当前任务，此操作已中断；已完成的更改保留，请核对结果后按最新引导继续。", true);
         }
         if (!previous && result.providerUsage) await options.onProviderEvent({ kind: "usage.completed", usage: result.providerUsage });
+        onlySilentArithmetic = onlySilentArithmetic && call.name === "math.rational.evaluate" && !result.isError && !stepController.signal.aborted;
         let repeatedArithmetic = false;
         if (!stepController.signal.aborted && options.finishRepeatedArithmetic && call.name === "math.rational.evaluate" && !result.isError) {
           const evidence = "有理数验算 " + result.content;
@@ -507,6 +522,11 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
           }
         }
         if (options.signal.aborted) throw new Error("当前运行已取消。");
+      }
+      silentArithmeticRounds = onlySilentArithmetic ? silentArithmeticRounds + 1 : 0;
+      if (silentArithmeticRounds >= 2) {
+        verified = true;
+        arithmeticOnly = branchTables.length === 0;
       }
     } finally {
       unbind?.();
