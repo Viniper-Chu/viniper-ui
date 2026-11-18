@@ -197,7 +197,7 @@ export class DesktopApplication {
       ...(this.services.workflowService ? { workflows: this.services.workflowService.snapshot() } : {}),
       ...(this.services.subagentService ? { subagents: this.services.subagentService.snapshot() } : {}),
       ...(this.services.compositionService ? { compositionCenter: this.services.compositionService.centerSnapshot("desktop") } : {}),
-      ...(this.services.diagnostics ? { diagnostics: this.services.diagnostics.snapshot() } : {}),
+      ...(this.services.diagnostics ? { diagnostics: this.services.diagnostics.snapshot(100) } : {}),
       ...(this.services.updates ? { updates: this.services.updates.snapshot() } : {}),
       ...(this.services.settings ? { settings: this.services.settings.snapshot() } : {}),
     });

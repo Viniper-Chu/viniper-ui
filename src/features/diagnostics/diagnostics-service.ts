@@ -3,8 +3,9 @@ import { dirname } from "node:path";
 import { DiagnosticEntry, DiagnosticPreview, DiagnosticsSnapshot } from "../../core/cp7-contracts";
 
 export interface DiagnosticsPersistence {
-  load(): Promise<DiagnosticEntry[]>;
-  save(entries: DiagnosticEntry[]): Promise<void>;
+  count(): number;
+  read(limit?: number, runId?: string): DiagnosticEntry[];
+  append(entries: readonly DiagnosticEntry[]): void;
 }
 
 export interface DiagnosticUploadTransport {
@@ -17,22 +18,51 @@ export interface DiagnosticsServiceOptions {
   uploadTransport?: DiagnosticUploadTransport;
 }
 
+const RECENT_ENTRIES = 100;
+
 export class DiagnosticsService {
   private entries: DiagnosticEntry[] = [];
   private detailedRunId?: string;
   private consent = false;
   private queuedUploads: string[] = [];
   private failedUploads: string[] = [];
-  private persistChain: Promise<void> = Promise.resolve();
+  private pending: DiagnosticEntry[] = [];
+  private totalEntries = 0;
   private persistenceError?: string;
 
   constructor(private readonly options: DiagnosticsServiceOptions = {}) {}
 
   async initialize(): Promise<void> {
-    this.entries = (await this.options.persistence?.load()) ?? [];
+    const store = this.options.persistence;
+    if (store) {
+      this.totalEntries = store.count();
+      this.entries = store.read(RECENT_ENTRIES);
+    }
   }
 
-  async flush(): Promise<void> { await this.persistChain; }
+  async flush(): Promise<void> { this.persistPending(); }
+
+  private persistPending(): void {
+    if (!this.pending.length || !this.options.persistence) return;
+    try {
+      this.options.persistence.append(this.pending);
+      this.pending.length = 0;
+      this.persistenceError = undefined;
+    } catch (error) {
+      this.persistenceError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private history(limit?: number, runId?: string): DiagnosticEntry[] {
+    const store = this.options.persistence;
+    if (!store || (runId === undefined && limit !== undefined && limit <= RECENT_ENTRIES)) {
+      const entries = runId === undefined ? this.entries : this.entries.filter(entry => entry.runId === runId);
+      return entries.slice(limit === undefined ? 0 : Math.max(0, entries.length - limit)).map(entry => ({...entry}));
+    }
+    const pending = runId === undefined ? this.pending : this.pending.filter(entry => entry.runId === runId);
+    const retained = limit === undefined ? pending : pending.slice(Math.max(0, pending.length - limit));
+    return store.read(limit === undefined ? undefined : limit - retained.length, runId).concat(retained.map(entry => ({...entry})));
+  }
 
   setConsent(enabled: boolean): void { this.consent = enabled; }
 
@@ -61,21 +91,21 @@ export class DiagnosticsService {
       ...(typeof input.runId === "string" && input.runId === this.detailedRunId ? { detailed: true } : {}),
     };
     this.entries.push(entry);
+    this.totalEntries++;
     if (this.options.persistence) {
-      const copy = this.entries.map((item) => ({ ...item }));
-      this.persistChain = this.persistChain.then(() => this.options.persistence!.save(copy)).catch((error) => {
-        this.persistenceError = error instanceof Error ? error.message : String(error);
-      });
+      if (this.entries.length > RECENT_ENTRIES) this.entries.shift();
+      this.pending.push(entry);
+      this.persistPending();
     }
   }
 
   snapshot(recent?: number): DiagnosticsSnapshot {
-    const entries = recent === undefined ? this.entries : this.entries.slice(Math.max(0, this.entries.length - Math.max(0, recent)));
-    return { ...(recent === undefined ? {} : { totalEntries: this.entries.length }), entries: entries.map((entry) => ({ ...entry })), ...(this.detailedRunId ? { detailedRunId: this.detailedRunId } : {}), consent: this.consent, queuedUploads: [...this.queuedUploads], failedUploads: [...this.failedUploads], ...(this.persistenceError ? { persistenceError: this.persistenceError } : {}) };
+    const entries = this.history(recent === undefined ? undefined : Math.max(0, Math.floor(recent)));
+    return { ...(recent === undefined ? {} : { totalEntries: this.totalEntries }), entries, ...(this.detailedRunId ? { detailedRunId: this.detailedRunId } : {}), consent: this.consent, queuedUploads: [...this.queuedUploads], failedUploads: [...this.failedUploads], ...(this.persistenceError ? { persistenceError: this.persistenceError } : {}) };
   }
 
   previewExport(runId?: string): DiagnosticPreview {
-    const fields = this.entries.filter((entry) => !runId || entry.runId === runId).map((entry) => ({ ...entry }));
+    const fields = this.history(undefined, runId);
     return { ...(runId ? { runId } : {}), fields, containsMessageBodies: false, containsCommandBodies: false, containsCredentialValues: false };
   }
 

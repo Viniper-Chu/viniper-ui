@@ -243,8 +243,9 @@ export async function createHarnessApplication(
   });
   const diagnosticsService = new DiagnosticsService({
     persistence: {
-      load: async () => (await store.loadSetting<import("../../core/cp7-contracts").DiagnosticEntry[]>("cp7.diagnostics")) ?? [],
-      save: (entries) => store.saveSetting("cp7.diagnostics", entries),
+      count: () => store.countDiagnosticEntries(),
+      read: (limit, runId) => store.readDiagnosticEntries(limit, runId),
+      append: entries => store.appendDiagnosticEntries(entries),
     },
   });
   const settingsService = new ProductSettingsService({

@@ -1,3 +1,4 @@
+import type { DiagnosticEntry } from "../../core/cp7-contracts";
 import { copyFile, mkdir, readFile, readdir, rename, rm } from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { dirname, join, relative } from "node:path";
@@ -368,6 +369,40 @@ export class SQLiteStore implements RuntimePersistence, CoordinationPersistence,
       .run(JSON.stringify(records), Date.now());
   }
 
+  countDiagnosticEntries(): number {
+    const row = this.requiredDatabase().prepare(`
+      SELECT (SELECT COUNT(*) FROM diagnostic_entries) + COALESCE(
+        (SELECT json_array_length(value_json) FROM settings WHERE key = 'cp7.diagnostics'), 0) AS total
+    `).get();
+    return Number(row!.total);
+  }
+
+  appendDiagnosticEntries(entries: readonly DiagnosticEntry[]): void {
+    const db = this.requiredDatabase();
+    const insert = db.prepare("INSERT INTO diagnostic_entries (run_id, payload_json) VALUES (?, ?)");
+    inTransaction(db, () => {
+      for (const entry of entries) insert.run(entry.runId ?? null, JSON.stringify(entry));
+    });
+  }
+
+  readDiagnosticEntries(limit?: number, runId?: string): DiagnosticEntry[] {
+    if (limit === 0) return [];
+    const db = this.requiredDatabase();
+    const parameters = runId === undefined ? [] : [runId];
+    const recent = db.prepare(`SELECT payload_json FROM diagnostic_entries
+      ${runId === undefined ? "" : "WHERE run_id = ?"} ORDER BY id DESC LIMIT ?`)
+      .all(...parameters, limit ?? -1).reverse();
+    const decode = (row: DatabaseRow) => parseJson<DiagnosticEntry>(row.payload_json, "diagnostics");
+    if (limit !== undefined && recent.length === limit) return recent.map(decode);
+
+    // Releases before revision 3 stored one JSON array. Read that immutable prefix
+    // only for startup or history/export, and keep new writes independent of its size.
+    const legacy = db.prepare(`SELECT j.value AS payload_json FROM settings AS s, json_each(s.value_json) AS j
+      WHERE s.key = 'cp7.diagnostics' ${runId === undefined ? "" : "AND json_extract(j.value, '$.runId') = ?"}
+      ORDER BY j.key DESC LIMIT ?`).all(...parameters, limit === undefined ? -1 : limit - recent.length).reverse();
+    return legacy.concat(recent).map(decode);
+  }
+
   async loadSetting<T>(key: string): Promise<T | undefined> {
     const row = this.requiredDatabase().prepare("SELECT value_json FROM settings WHERE key = ?").get(key) as DatabaseRow | undefined;
     return row ? parseJson<T>(row.value_json, `settings.${key}`) : undefined;
@@ -646,6 +681,10 @@ function ensureSchema(database: DatabaseSync): void {
       updated_at INTEGER NOT NULL,
       payload_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS diagnostic_entries (
+      id INTEGER PRIMARY KEY, run_id TEXT, payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS diagnostic_entries_run ON diagnostic_entries(run_id, id);
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value_json TEXT NOT NULL,
