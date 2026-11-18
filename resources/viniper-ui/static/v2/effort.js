@@ -10,7 +10,7 @@ export function effortControl(model, requested) {
   const options = model?.reasoning_options || [];
   const selected = selectedEffort(model, requested);
   const ticks = levels.map(id => effortButton(id, selected, options.includes(id))).join("");
-  const other = ["off", "minimal"].filter(id => options.includes(id)).map(id => effortButton(id, selected, true)).join("");
+  const other = ["auto", "off", "minimal"].filter(id => options.includes(id)).map(id => effortButton(id, selected, true)).join("");
   const index = levels.indexOf(selected);
   return `<div class="menu-separator"></div><h3>Thinking effort</h3>
     <div class="effort-control">

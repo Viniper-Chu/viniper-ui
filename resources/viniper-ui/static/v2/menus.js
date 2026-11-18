@@ -1,5 +1,5 @@
 import { effortControl } from "./effort.js";
-import { state, escape, api } from "./api.js";
+import { state, escape, api, composerContextUsage } from "./api.js";
 import { icon } from "./icons.js";
 const box = () => document.querySelector("#popover");
 let opener = null;
@@ -123,7 +123,7 @@ export function menuContent(kind) {
     );
   }
   if (kind === "context") {
-    const u = state.session?.context_usage || {};
+    const u = composerContextUsage();
     return `<div class="context-details"><strong>上下文窗口</strong><p>${u.used_tokens ?? "—"} / ${u.context_limit ?? "—"} tokens</p><small>${escape(u.source === "real" ? "按实际模型输入计数" : u.usage_label || "等待模型用量回执")}<br>达到阈值时自动整理，原有会话记录保留。</small></div>`;
   }
   return (

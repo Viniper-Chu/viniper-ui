@@ -36,7 +36,7 @@ from agent_run_coordinator import AgentRunCoordinator, AgentRunJournal, DurableI
 from native_project_browser import browse_project_files, preview_project_file, ProjectBrowserError
 from skill_sync import localized_skill_fields
 from discussion import addressed, discussion_events, room_members, validate_members
-from local_agent_contract import local_agent_contract, local_placeholder_auth, local_model_notice
+from local_agent_contract import choose_local_effort, local_agent_contract, local_placeholder_auth, local_model_notice
 from harness_application_port import HarnessApplicationPort
 from update_manager import (
     OFFICIAL_REPOSITORY, OFFICIAL_MANIFEST_URL, UpdateState,
@@ -709,7 +709,7 @@ def normalize_session(session_id: str, raw: dict[str, Any]) -> dict[str, Any]:
         normalized["permission_mode"] = stored_permission_mode
     # These user-owned collections may be present in older/newer compatible
     # session records. Normalization must not discard them during startup.
-    for key in ("discussion", "members", "reasoning", "task_mode", "selected_skills", "queue", "attachments", "plan", "claude_agents", "native_capabilities", "native_runtime", "native_terminal_sync", "model"):
+    for key in ("discussion", "members", "reasoning", "local_reasoning_preference", "task_mode", "selected_skills", "queue", "attachments", "plan", "claude_agents", "native_capabilities", "native_runtime", "native_terminal_sync", "model"):
         if key in raw:
             normalized[key] = raw[key]
     for key in (
@@ -1888,18 +1888,21 @@ def connection_for_model(settings, mode, model):
     return primary
 
 
-def reasoning_capability(provider, model):
+def model_capabilities_for_connection(provider, model):
     endpoint = str(provider.get("base_url") or "").rstrip("/")
     local = local_agent_contract(endpoint, model)
     if local:
-        return {"reasoning_options": local["reasoning_options"], "default_reasoning": local["default_reasoning"]}
+        return {"reasoning_options": local["reasoning_options"], "default_reasoning": local["default_reasoning"],
+                "context": local["context_tokens"], "context_window": local["context_tokens"],
+                "max_output_tokens": local["output_tokens"], "context_status": "verified",
+                "context_source": "本机模型部署配置", "context_source_url": ""}
     if endpoint in OFFICIAL_DEEPSEEK_ENDPOINTS and provider_model_id(model) in {DEFAULT_DEEPSEEK_MODEL, "deepseek-v4-pro"}:
         return {"reasoning_options": ["off", "low", "high", "max"], "default_reasoning": "high"}
     return {"reasoning_options": [], "default_reasoning": None}
 
 
 def run_reasoning(provider, model, requested, previous):
-    capability = reasoning_capability(provider, model)
+    capability = model_capabilities_for_connection(provider, model)
     options = capability["reasoning_options"]
     if requested and requested not in options:
         if requested in {"off", "minimal", "low", "medium", "high"} and not options:
@@ -1933,7 +1936,7 @@ def effective_model_options(mode: str = MODE_VINIPER):
         connection = connection_for_model(settings, mode, row["id"])
         if connection.get("credential_mode"):
             row["credential_mode"] = connection["credential_mode"]
-        row.update(reasoning_capability(connection, row["id"]))
+        row.update(model_capabilities_for_connection(connection, row["id"]))
     return options
 
 
@@ -3069,6 +3072,18 @@ class HarnessRuntimeTransport:
         offline_demo = env_value("VINIPER_UI_DEMO_ONLY", "").strip() == "1"
         selected_model = "demo-default" if offline_demo else cfg["model"]
         provider_model = provider_model_id(selected_model)
+        local = local_agent_contract(cfg["base_url"], selected_model)
+        if speaker and local:
+            preference = "auto"  # Each group member uses its own model's capabilities.
+        elif speaker:
+            preference = run_reasoning(cfg, model, None, session.get("reasoning"))
+        elif local and session.get("task_mode") != "goal":
+            preference = session.get("local_reasoning_preference") or "auto"
+        else:
+            preference = run_reasoning(cfg, model, None, session.get("reasoning"))
+        effective_effort = choose_local_effort(display_prompt or prompt, local,
+            task_mode=session.get("task_mode", "execute"), attachments=bool(attachments),
+            skills=bool(session.get("selected_skills"))) if local and preference == "auto" else preference
         message_created_at = now_ts()
         user_message: dict[str, Any] = {
             "role": "user",
@@ -3170,6 +3185,8 @@ class HarnessRuntimeTransport:
                 "created_at": timestamp,
                 "updated_at": timestamp,
             }
+            if local:
+                message.update(reasoning_preference=preference, reasoning_effort=effective_effort)
             if speaker:
                 message["speaker"] = speaker
             thinking_elapsed = thinking_elapsed_seconds()
@@ -3264,6 +3281,8 @@ class HarnessRuntimeTransport:
         save_progress(force=True)
         yield {
             "type": "assistant_start",
+            "created_at": session["messages"][-1]["created_at"],
+            **({"reasoning_preference": preference, "reasoning_effort": effective_effort} if local else {}),
             **({"speaker": speaker} if speaker else {}),
             "mode": MODE_VINIPER,
             "engine": "harness-runtime",
@@ -3296,7 +3315,7 @@ class HarnessRuntimeTransport:
                 base_url="" if offline_demo else cfg.get("base_url", ""),
                 host_secret_value="" if offline_demo else cfg.get("api_key", ""),
                 memory_enabled=bool(load_app_settings().get("runtime", {}).get("memory_enabled", True)),
-                reasoning=run_reasoning(cfg, model, None, session.get("reasoning")) if speaker else session.get("reasoning"),
+                reasoning=effective_effort,
                 planning=planning,
                 **({"room_transcript": True} if speaker else {}),
             )
@@ -4296,7 +4315,8 @@ async def create_goal(request: Request):
         body.get("permission_mode") or session_permission_mode(sessions[sid]), MODE_VINIPER)
     model = allowed_model(body.get("model") or sessions[sid].get("model"), MODE_VINIPER)
     cfg = provider_config(model, MODE_VINIPER, resolve_secret=False)
-    reasoning = run_reasoning(cfg, model, body.get("reasoning"), sessions[sid].get("reasoning"))
+    previous = sessions[sid].get("local_reasoning_preference") if local_agent_contract(cfg["base_url"], model) else sessions[sid].get("reasoning")
+    reasoning = run_reasoning(cfg, model, body.get("reasoning"), previous)
     body.update(model=model, reasoning=reasoning)
     body["attachments"] = save_run_attachments(sid, body.get("attachments") or [])
     try:
@@ -4875,7 +4895,9 @@ async def submit_run(session_id: str, request: Request):
     permission_mode = require_permission_mode(session_permission_mode(session), MODE_VINIPER)
     if body.get("permission_mode") and body["permission_mode"] != permission_mode:
         raise HTTPException(status_code=409, detail="访问权限已变化，请刷新后重试")
-    reasoning = run_reasoning(cfg, chosen_model, None if group else body.get("reasoning"), session.get("reasoning"))
+    local = local_agent_contract(cfg["base_url"], chosen_model)
+    previous = session.get("local_reasoning_preference") if local else session.get("reasoning")
+    reasoning = run_reasoning(cfg, chosen_model, None if group else body.get("reasoning"), previous)
     if task_mode not in {"execute", "plan"}:
         raise HTTPException(status_code=400, detail="目标任务请从目标入口创建")
     selected = body.get("skills") or []
@@ -4885,6 +4907,8 @@ async def submit_run(session_id: str, request: Request):
     model = chosen_model
     session.update(reasoning=reasoning, task_mode=task_mode, selected_skills=selected)
     if not group:
+        if local:
+            session["local_reasoning_preference"] = reasoning
         session["model"] = model
     save_sessions_to_disk()
     attachments = save_run_attachments(session_id, body.get("attachments") or [])
@@ -5301,7 +5325,8 @@ async def list_sessions():
                 "revision": context_revision(session),
                 "context_usage": context_usage_payload(sid),
                 "permission_mode": str(session.get("permission_mode") or "ask"),
-        "task_mode": session.get("task_mode", "execute"), "reasoning": session.get("reasoning", "medium"),
+        "task_mode": session.get("task_mode", "execute"), "reasoning": session.get("reasoning"),
+        "local_reasoning_preference": session.get("local_reasoning_preference"),
         "model": session.get("model") or allowed_model(None, MODE_VINIPER),
             }
             for sid, session in sorted(sessions.items(), key=session_sort_key)
@@ -5352,7 +5377,8 @@ async def last_session(mode: str | None = None):
             "revision": context_revision(session),
             "context_usage": context_usage_payload(sid),
             "permission_mode": str(session.get("permission_mode") or "ask"),
-        "task_mode": session.get("task_mode", "execute"), "reasoning": session.get("reasoning", "medium"),
+        "task_mode": session.get("task_mode", "execute"), "reasoning": session.get("reasoning"),
+        "local_reasoning_preference": session.get("local_reasoning_preference"),
         "model": session.get("model") or allowed_model(None, MODE_VINIPER),
         }
     })
@@ -5387,7 +5413,8 @@ async def get_session(session_id: str):
         "revision": context_revision(session),
         "context_usage": context_usage_payload(session_id),
         "permission_mode": str(session.get("permission_mode") or "ask"),
-        "task_mode": session.get("task_mode", "execute"), "reasoning": session.get("reasoning", "medium"),
+        "task_mode": session.get("task_mode", "execute"), "reasoning": session.get("reasoning"),
+        "local_reasoning_preference": session.get("local_reasoning_preference"),
         "model": session.get("model") or allowed_model(None, MODE_VINIPER),
     })
 

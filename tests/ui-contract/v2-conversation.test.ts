@@ -59,7 +59,8 @@ test('thinking, tools and replies form the same ordered timeline during streamin
  const html=ctx.messageHtml(saved);
  assert.ok(html.indexOf('先检查文件。') < html.indexOf('真实回执'));
  assert.ok(html.indexOf('真实回执') < html.indexOf('完成，结果已验证。'));
- assert.match(html,/data-copy="完成，结果已验证。"/);
+ assert.match(html,/data-message-menu/);
+ assert.equal(ctx.copyAnswer(saved),"完成，结果已验证。");
  assert.doesNotMatch(html,/<details[^>]+\bopen\b/);
 });
 test('cancelled and failed tools cannot look completed or keep spinning after reload',()=>{
@@ -191,4 +192,13 @@ test('completed turn disclosure folds routine steps while preserving failures an
  assert.match(html,/data-toggle-thoughts aria-expanded="false"/);
  assert.doesNotMatch(html,/internal example/);
  assert.match(ctx.messageHtml({role:'assistant',content:'普通回答。'}),/class="turn-summary" hidden/);
+});
+
+test('message actions use a single More menu and a real timestamp when available',()=>{
+ const {ctx}=renderer();
+ assert.match(ctx.messageHtml({role:'user',content:'hello'}),/data-message-menu/);
+ const dated=ctx.messageHtml({role:'assistant',content:'hello',created_at:1795000000});
+ assert.match(dated,/<time class="message-time">[^<]+<\/time>/);
+ assert.match(dated,/aria-label="更多消息操作"/);
+ assert.equal(ctx.messageTime(null),'');
 });

@@ -43,3 +43,13 @@ assert pause.read_text() == '{"reason":"memory_guard"}'
 pause.unlink()
 assert contract.local_model_notice('http://127.0.0.1:18080/v1', 'qwen-local') is None
 print('PASS: matching local protection status is visible and never cleared by the UI')
+
+policy = {"normal_reasoning":"medium","reasoning_options":["auto","off","low","medium","high"]}
+for text, expected in [
+    ("你好！","off"), ("@主答 请心算 6×7，只回复阿拉伯数字。本轮不使用工具。","off"),
+    ("只回复「收到」","off"), ("证明这个不等式","high"), ("你好，请帮我核对整个项目","medium"),
+    ("41+1，再证明一个结论","high"), ("继续","medium"),
+]:
+    assert contract.choose_local_effort(text,policy)==expected, text
+assert contract.choose_local_effort("你好",policy,attachments=True)=="medium"
+assert contract.choose_local_effort("你好",policy,task_mode="plan")=="high"

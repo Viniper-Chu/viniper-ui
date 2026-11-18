@@ -31,11 +31,11 @@
         <nav id="session-list" class="session-list" aria-label="历史会话"></nav>
         <div class="sidebar-footer">
           <nav class="primary-nav" aria-label="主要页面">
-            <button data-hint="返回当前会话" class="nav-item active" data-view="chat"><span data-icon="chat"></span>会话</button>
-            <button data-hint="浏览技能和可调用的工具" class="nav-item" data-view="extensions"><span data-icon="grid"></span>技能与插件</button>
-            <button data-hint="查看目标进度和定时任务" class="nav-item" data-view="tasks"><span data-icon="tasks"></span>目标与任务</button>
+            <button data-hint="打开会话" class="nav-item active" data-view="chat"><span data-icon="chat"></span>会话</button>
+            <button data-hint="打开技能与插件" class="nav-item" data-view="extensions"><span data-icon="grid"></span>技能与插件</button>
+            <button data-hint="打开目标与任务" class="nav-item" data-view="tasks"><span data-icon="tasks"></span>目标与任务</button>
           </nav>
-          <button data-hint="打开模型和应用设置  ⌘," class="profile-button" data-view="settings">
+          <button data-hint="打开设置  ⌘," class="profile-button" data-view="settings">
             <span class="profile-avatar" data-icon="settings"></span
             ><span
               ><strong>设置与模型</strong
@@ -55,10 +55,10 @@
             data-hint="展开侧栏 ⌘B"
             hidden
           ></button>
-          <button data-hint="返回会话，继续处理当前题目" id="return-chat" class="text-button back-link" data-view="chat" hidden><span data-icon="back"></span>返回会话</button>
-          <button data-hint="返回原筛选结果  Esc" class="text-button back-link level-back" data-parent="extension-detail" data-action="back-extensions"><span data-icon="back"></span>技能与插件</button>
+          <button data-hint="返回会话" id="return-chat" class="text-button back-link" data-view="chat" hidden><span data-icon="back"></span>返回会话</button>
+          <button data-hint="返回技能与插件  Esc" class="text-button back-link level-back" data-parent="extension-detail" data-action="back-extensions"><span data-icon="back"></span>技能与插件</button>
           <button data-hint="返回上一级  Esc" class="text-button back-link level-back" data-parent="skill-editor" data-action="cancel-skill-edit"><span data-icon="back"></span>技能详情</button>
-          <button class="text-button back-link level-back" data-parent="task-detail" data-action="back-tasks" data-hint="返回原任务列表  Esc"><span data-icon="back"></span>目标与任务</button>
+          <button class="text-button back-link level-back" data-parent="task-detail" data-action="back-tasks" data-hint="返回目标与任务  Esc"><span data-icon="back"></span>目标与任务</button>
           <button data-hint="返回上一级  Esc" class="text-button back-link level-back" data-parent="task-editor" data-action="cancel-task-edit"><span data-icon="back"></span><span id="task-edit-origin"></span></button>
           <div class="page-heading">
             <button id="session-title" class="title-button" data-action="turn-index" aria-haspopup="dialog" data-hint="打开本次提问与交付文件"></button
@@ -73,11 +73,11 @@
             </button>
           </div>
           <div class="topbar-actions">
-            <button id="room-header" class="text-button" data-action="room-members" data-hint="查看或编辑群成员与分工" hidden></button>
-            <button data-hint="跳转到本次提问或打开交付文件" id="turn-index-button" class="text-button index-trigger" data-action="turn-index" aria-label="会话目录与文件" hidden>
+            <button id="room-header" class="text-button" data-action="room-members" data-hint="管理群成员" hidden></button>
+            <button data-hint="会话目录与文件" id="turn-index-button" class="text-button index-trigger" data-action="turn-index" aria-label="会话目录与文件" hidden>
               <span data-icon="outline"></span><span>会话目录</span>
             </button>
-            <button data-hint="查看会话操作与工作目录"
+            <button data-hint="会话选项"
               id="session-more"
               class="icon-button"
               data-menu="session"
@@ -340,10 +340,10 @@
             <span data-icon="search"></span><input id="preference-query" type="search" aria-label="搜索设置" placeholder="搜索设置" autocomplete="off" spellcheck="false">
           </label>
           <div class="settings-navigation" role="tablist" aria-label="设置章节">
-            <button data-hint="设置模型、服务地址和密钥" id="connection-tab" type="button" role="tab" aria-controls="connection-settings" aria-selected="true" tabindex="0" data-settings-section="connection-settings"><span data-icon="model"></span>模型连接</button>
-            <button data-hint="预览主题和解答字号" id="appearance-tab" type="button" role="tab" aria-controls="appearance-settings" aria-selected="false" tabindex="-1" data-settings-section="appearance-settings"><span data-icon="appearance"></span>外观</button>
-            <button data-hint="设置新会话的默认目录" id="workspace-tab" type="button" role="tab" aria-controls="workspace-settings" aria-selected="false" tabindex="-1" data-settings-section="workspace-settings"><span data-icon="folder"></span>工作目录</button>
-            <button data-hint="编辑适用于所有任务的协作规则" id="instruction-tab" type="button" role="tab" aria-controls="instruction-settings" aria-selected="false" tabindex="-1" data-settings-section="instruction-settings"><span data-icon="book"></span>协作规则</button>
+            <button data-hint="模型连接" id="connection-tab" type="button" role="tab" aria-controls="connection-settings" aria-selected="true" tabindex="0" data-settings-section="connection-settings"><span data-icon="model"></span>模型连接</button>
+            <button data-hint="外观" id="appearance-tab" type="button" role="tab" aria-controls="appearance-settings" aria-selected="false" tabindex="-1" data-settings-section="appearance-settings"><span data-icon="appearance"></span>外观</button>
+            <button data-hint="默认工作目录" id="workspace-tab" type="button" role="tab" aria-controls="workspace-settings" aria-selected="false" tabindex="-1" data-settings-section="workspace-settings"><span data-icon="folder"></span>工作目录</button>
+            <button data-hint="协作规则" id="instruction-tab" type="button" role="tab" aria-controls="instruction-settings" aria-selected="false" tabindex="-1" data-settings-section="instruction-settings"><span data-icon="book"></span>协作规则</button>
           </div>
           <small class="preferences-version">Viniper <span id="version">3.0.1</span></small>
         </aside>
@@ -391,7 +391,7 @@
                 <h2>工作目录</h2>
                 <div class="field pref-row" data-pref="默认工作目录" data-alias="文件夹 路径">
                   <label for="pref-workdir">默认工作目录</label>
-                  <div class="path-control"><input name="workdir" id="pref-workdir"><button data-hint="在系统窗口选择默认目录" aria-label="选择工作目录" type="button" class="icon-button" id="browse-workdir" hidden><span data-icon="folder"></span></button></div>
+                  <div class="path-control"><input name="workdir" id="pref-workdir"><button data-hint="选择工作目录" aria-label="选择工作目录" type="button" class="icon-button" id="browse-workdir" hidden><span data-icon="folder"></span></button></div>
                 </div>
               </section>
               <section id="instruction-settings" class="settings-section" role="tabpanel" aria-labelledby="instruction-tab" hidden>

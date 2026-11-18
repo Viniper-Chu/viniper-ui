@@ -1,4 +1,5 @@
 """Read the local deployment's non-secret public policy for the desktop UI."""
+import re
 import json
 import os
 import time
@@ -50,11 +51,31 @@ def local_agent_contract(base_url, model=None):
         return {'model': data['api_model'], 'context_tokens': data['context_tokens'],
                 'compact_at_tokens': data['compaction_trigger_tokens'], 'output_tokens': data['output_limit'],
                 'max_iterations': data['max_iterations'],
-                'default_reasoning': default if default in options else options[-1],
-                'reasoning_options': options,
+                'default_reasoning': 'auto',
+                'normal_reasoning': default if default in options else options[-1],
+                'reasoning_options': ['auto', *options],
                 'structured_tools_json': data.get('structured_tools_json') is True}
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def choose_local_effort(text, contract, *, task_mode="execute", attachments=False, skills=False):
+    """Choose once per user turn; manual levels bypass this function."""
+    prompt = re.sub(r"^(?:@[\w-]+[：:,，\s]+)+", "", str(text or "").strip())
+    options = contract["reasoning_options"]
+    normal = contract["normal_reasoning"]
+    if re.search(r"证明|论证|推导|参数题|参数.{0,12}(?:范围|取值)|含参|实根|单调|分类讨论|复核|验算|定稿|解方程|不等式|排查|调试|规划|\b(?:prove|proof|derive|debug)\b", prompt, re.I) or task_mode in {"plan", "goal"}:
+        return "high" if "high" in options else normal
+    if attachments or skills:
+        return normal
+    greeting = r"(?:你好(?:呀|啊|吗)?|您好|早上好|下午好|晚上好|谢谢(?:你)?|多谢|收到|再见|在吗|hi|hello|thanks|thank you)"
+    arithmetic = r"(?:请)?(?:帮我)?(?:心算|计算|算一下|算算|求)?\s*[-+]?\d{1,2}\s*[+＋×*÷/−-]\s*[-+]?\d{1,2}(?:\s*(?:=|等于|是)?\s*(?:多少|几))?"
+    suffix = r"(?:[，,。；;]\s*(?:只(?:需)?(?:回复|回答)(?:阿拉伯数字|数字|结果|答案)|本轮不使用工具))*[。.!！?？\s]*"
+    if re.fullmatch(r"(?:" + greeting + "|" + arithmetic + ")" + suffix, prompt, re.I):
+        return "off"
+    if re.fullmatch(r"(?:请)?只(?:需)?(?:回复|输出|回答)[：:\s]*[“「][^”」\n]{1,64}[”」][。！!\s]*", prompt):
+        return "off"
+    return normal
 
 
 def local_model_notice(base_url, model=None):

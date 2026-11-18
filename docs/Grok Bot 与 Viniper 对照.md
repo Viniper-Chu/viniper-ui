@@ -76,3 +76,8 @@
 | 设计参考与交互 | Grok 的侧栏、例程与连接管理是主参考，Claude 的产物分区作为补充；首页借鉴 DeepSeek 官网将互动置于背景的方式。对数指数函数的像素点阵、数值交点与指针局部放大由 Viniper 在本地绘制，支持触控和键盘。 |
 
 对照依据为公开产品界面与行为文档，无法从中审计 Grok 私有后端的实现。[Grok Bot 概览](https://docs.x.ai/grok-bot/overview) · [DeepSeek 官网](https://www.deepseek.com/)
+
+
+### 消息悬浮操作
+
+Grok Bot 的桌面更新记录说明，悬停 Bot 消息可查看发送时间；文件操作说明将消息操作放在悬停显示的三点按钮中。Viniper 的回答使用已保存的发送时间，三点菜单提供复制文本，群聊内可回复实际发言成员；用户消息保留已有的保存为技能和设为定时任务。键盘聚焦也能打开菜单，触屏直接显示入口。官方更新按钮的提示直接说明重启更新这一动作；Viniper 的导航、设置页签及菜单悬浮提示采用对应的短名称，已有快捷键和禁用原因保留。未取得 Grok Bot 桌面提示的像素或延迟数据，本次沿用 Viniper 的现有控件尺寸与提示延迟。[官方更新](https://x.ai/changelog/bot) · [官方消息操作](https://docs.x.ai/grok-bot/files-and-results) · [群内回复](https://docs.x.ai/grok-bot/chat-and-collaboration)

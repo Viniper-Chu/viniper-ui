@@ -11,7 +11,13 @@ function hintFor(control) {
   }
   if (control.dataset.file) return "打开 " + control.dataset.file;
   if (control.dataset.jump) return control.getAttribute("aria-label");
-  return control.dataset.hint || control.getAttribute("aria-label") || control.textContent.trim();
+  if (control.matches(".menu-option:not(:disabled)") && !/[⌘⇧]|\b(?:Esc|Enter)\b/.test(control.dataset.hint || "")) {
+    const action = control.querySelector(".option-copy strong")?.textContent.trim();
+    if (action) return action;
+  }
+  // A compound card can contain a whole preview. Use its name for the hint.
+  const label = control.querySelector("strong, h3, .session-name")?.textContent.trim();
+  return control.dataset.hint || control.getAttribute("aria-label") || label || control.textContent.trim();
 }
 
 export function setupTooltips() {

@@ -309,7 +309,7 @@ function timelineHtml(message, parts) {
     return `<div class="timeline-part" data-kind="${part.kind}" data-foldable="${isFoldable(part)}" data-thinking="${thinking}" data-part-key="${escape(part.key)}">${timelinePartHtml(part, Boolean(message.streaming), last, thinking)}</div>`;
   }).join("");
 }
-function copyAnswer(message) {
+export function copyAnswer(message) {
   const parts = conversationTimeline(message).filter(p => p.kind === "text");
   const final = parts.filter(p => p.final);
   return (final.length ? final : parts).map(p => p.content).join("\n\n");
@@ -318,11 +318,20 @@ function authorMark(speaker, model) {
   const label = state.status?.models?.find(m => m.id === model)?.label || model || "";
   return icon("discussion") + "<span>" + escape(speaker) + "</span><small>" + escape(label) + "</small>";
 }
+const sentTimeFormat = new Intl.DateTimeFormat("zh-CN", {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"});
+function messageTime(value) {
+  if (!value) return "";
+  const date = new Date(typeof value === "number" && value < 1e12 ? value * 1000 : value);
+  return Number.isFinite(date.getTime()) ? sentTimeFormat.format(date) : "";
+}
+function messageMenu(extraClass = "") {
+  return `<button class="icon-button message-more ${extraClass}" data-message-menu aria-label="更多消息操作" aria-haspopup="menu" aria-expanded="false">${icon("more")}</button>`;
+}
 function messageHtml(message) {
   if (message.role === "user")
-    return `${message.content?.trim() ? '<button class="icon-button reuse-prompt" data-reuse-prompt aria-label="复用这条提问" aria-haspopup="menu" aria-expanded="false">' + icon("book") + '</button>' : ""}<div class="user-content">${message.guidance ? `<span class="guidance-label">${icon("steer")}引导</span>` : ""}${escape(message.content)}${(message.attachments || []).map((a) => `<div><button class="file-link" data-file="${escape(a.path || "")}">${icon("file")}${escape(a.name || a.path)}</button></div>`).join("")}</div>`;
+    return `${message.content?.trim() ? messageMenu("reuse-prompt") : ""}<div class="user-content">${message.guidance ? `<span class="guidance-label">${icon("steer")}引导</span>` : ""}${escape(message.content)}${(message.attachments || []).map((a) => `<div><button class="file-link" data-file="${escape(a.path || "")}">${icon("file")}${escape(a.name || a.path)}</button></div>`).join("")}</div>`;
   const parts = conversationTimeline(message), data = activityData(message, parts), content = copyAnswer(message);
-  return `<strong class="discussion-author" data-speaker="${escape(message.speaker || "")}"${message.speaker ? "" : " hidden"}>${message.speaker ? authorMark(message.speaker, message.model) : ""}</strong><button class="turn-summary"${message.streaming || !data.expandable ? " hidden" : ""} data-toggle-thoughts aria-expanded="false"><span class="activity-label">${escape(data.label)}</span><small class="activity-count">${escape(data.count)}</small><span class="step-chevron">${icon("chevron")}</span></button><span class="turn-outcome"${!message.streaming && !data.expandable && data.outcome ? "" : " hidden"}>${escape(data.label)}</span><div class="turn-timeline">${timelineHtml(message, parts)}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : ""}</div><div class="message-actions"${content.trim() ? "" : " hidden"}><button class="icon-button" data-copy="${escape(content)}" aria-label="复制回答">${icon("copy")}</button></div>`;
+  return `<strong class="discussion-author" data-speaker="${escape(message.speaker || "")}"${message.speaker ? "" : " hidden"}>${message.speaker ? authorMark(message.speaker, message.model) : ""}</strong><button class="turn-summary"${message.streaming || !data.expandable ? " hidden" : ""} data-toggle-thoughts aria-expanded="false"><span class="activity-label">${escape(data.label)}</span><small class="activity-count">${escape(data.count)}</small><span class="step-chevron">${icon("chevron")}</span></button><span class="turn-outcome"${!message.streaming && !data.expandable && data.outcome ? "" : " hidden"}>${escape(data.label)}</span><div class="turn-timeline">${timelineHtml(message, parts)}</div><div class="message-results">${resultFiles(message)}</div><div class="message-plan">${message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : ""}</div><div class="message-actions"${content.trim() ? "" : " hidden"}><time class="message-time">${escape(messageTime(message.created_at))}</time>${messageMenu()}</div>`;
 }
 function updateMessage(node, message) {
   node._message = message;
@@ -379,9 +388,10 @@ function updateMessage(node, message) {
   for (const slot of [...list.children]) if (!retained.has(slot.dataset.partKey)) slot.remove();
   updateMarkup(node.querySelector(".message-results"), resultFiles(message));
   updateMarkup(node.querySelector(".message-plan"), message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : "");
-  const answer = copyAnswer(message), copy = node.querySelector("[data-copy]");
-  node.querySelector(".message-actions").hidden = !answer.trim();
-  if (copy.dataset.copy !== answer) copy.dataset.copy = answer;
+  const actions = node.querySelector(".message-actions");
+  actions.hidden = !copyAnswer(message).trim();
+  const time = actions.querySelector("time"), label = messageTime(message.created_at);
+  if (time.textContent !== label) time.textContent = label;
 }
 export function renderMessages(messages, { preserveView = false } = {}) {
   const visible = (messages || []).filter(
@@ -473,6 +483,7 @@ export function projectEvent(run, event) {
     run.message.speaker = event.speaker;
     run.message.model = event.model;
   }
+  if (event.type === "assistant_start" && event.created_at) run.message.created_at = event.created_at;
   if (event.type === "queue_dispatch") {
     run.done = false;
     run.message = {

@@ -43,7 +43,7 @@ export const state = {
   attachments: [],
   mode: "execute",
   model: "",
-  reasoning: "medium",
+  reasoning: null,
   workdir: "",
   skills: [],
   plugins: [],
@@ -51,3 +51,12 @@ export const state = {
   schedules: [],
   selectedSkills: [],
 };
+
+export function composerContextUsage() {
+  const run = state.runs.get(state.session?.session_id);
+  if (run?.active && run.usage) return run.usage;
+  const saved = state.session?.context_usage;
+  if (saved && (!saved.model || saved.model === state.model || state.session?.discussion)) return saved;
+  const model = state.status?.models?.find(item => item.id === state.model);
+  return {used_tokens: state.session ? undefined : 0, context_limit: model?.context_window || undefined};
+}

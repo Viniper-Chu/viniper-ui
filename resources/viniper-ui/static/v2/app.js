@@ -2,7 +2,7 @@ import { editRoom } from "./room.js";
 import { bindEffortControl, selectedEffort, effortLabel } from "./effort.js";
 import { setupFunctionField } from "./function-field.js";
 import { setupTooltips } from "./tooltips.js";
-import { api, query, state, escape, timeLabel } from "./api.js";
+import { api, query, state, escape, timeLabel, composerContextUsage } from "./api.js";
 import { ui } from "./ui.js";
 import { setupNavigator } from "./navigator.js";
 import { icon, hydrateIcons } from "./icons.js";
@@ -19,6 +19,7 @@ import {
   readTerminalOutput,
   toolTitle,
   workingLabel,
+  copyAnswer,
 } from "./conversation.js";
 import { option, showMenu, closeMenu, menuContent, sessionMenuContent } from "./menus.js";
 import {
@@ -258,10 +259,8 @@ export async function selectSession(id) {
     : state.status?.model;
   state.workdir = session.workdir;
   state.mode = session.task_mode || "execute";
-  state.reasoning =
-    session.reasoning ||
-    state.status?.local_agent?.default_reasoning ||
-    "medium";
+  const activeModel = state.status?.models?.find(m => m.id === state.model);
+  state.reasoning = selectedEffort(activeModel, activeModel?.reasoning_options?.includes("auto") ? session.local_reasoning_preference : session.reasoning);
   view("chat");
   $("#project-name").textContent =
     session.workdir?.split("/").filter(Boolean).slice(-1)[0] || "选择工作目录";
@@ -286,6 +285,7 @@ export function newChat() {
   rememberDraft();
   switchVersion++;
   state.session = null;
+  state.reasoning = selectedEffort(state.status?.models?.find(m => m.id === state.model), null);
   state.workdir = draftDirectory || state.status?.settings?.workspace?.default_root || "";
   state.mode = "execute";
   state.attachments = [];
@@ -409,7 +409,7 @@ export function syncComposer() {
     model?.label || model?.name || state.model || "选择模型";
   state.reasoning = selectedEffort(model, state.reasoning);
   $("#reasoning-label").textContent = effortLabel(state.reasoning);
-  const u = run?.usage || state.session?.context_usage || {};
+  const u = composerContextUsage();
   const ratio = Math.max(0, Math.min(1, Number(u.ratio) || 0));
   $("#context-progress").style.strokeDashoffset = 53.407 * (1 - ratio);
   $("#context-button").dataset.hint = u.used_tokens != null && u.context_limit
@@ -901,6 +901,14 @@ export async function refreshGoalBanner() {
 }
 async function handleMenu(action, value) {
   closeMenu();
+  if (action === "copy-message") {
+    const message = document.getElementById(value)?._message;
+    if (message) {
+      await navigator.clipboard.writeText(message.role === "assistant" ? copyAnswer(message) : message.content);
+      toast("已复制");
+    }
+    return;
+  }
   if (action === "save-prompt-skill" || action === "schedule-prompt") {
     const message = document.getElementById(value)?._message;
     if (message?.role !== "user" || !message.content?.trim()) return;
@@ -950,7 +958,8 @@ async function handleMenu(action, value) {
       openPreference("connection-settings", "discussion-key"); return;
     }
     state.model = value;
-    state.reasoning = selectedEffort(state.status.models.find(m => m.id === value), state.reasoning);
+    const nextModel = state.status.models.find(m => m.id === value);
+    state.reasoning = selectedEffort(nextModel, nextModel?.reasoning_options?.includes("auto") ? state.session?.local_reasoning_preference : state.reasoning);
     await refreshModelNotice();
     const sid = state.session?.session_id;
     syncComposer();
@@ -1062,10 +1071,16 @@ async function click(event) {
   if (!b) return;
   try {
     if (b.dataset.modelService) return editModelService(b.dataset.modelService);
-    if (b.hasAttribute("data-reuse-prompt")) {
-      const value = b.closest(".message").id;
-      showMenu(b, option({label:"保存为技能", image:"book", action:"save-prompt-skill", value})
-        + option({label:"设为定时任务", image:"clock", action:"schedule-prompt", value}), {kind:"session"});
+    if (b.hasAttribute("data-message-menu")) {
+      const article = b.closest(".message"), value = article.id, message = article._message;
+      let actions = option({label:"复制文本",image:"copy",action:"copy-message",value});
+      if (message.role === "user") {
+        actions += option({label:"保存为技能",image:"book",action:"save-prompt-skill",value})
+          + option({label:"设为定时任务",image:"clock",action:"schedule-prompt",value});
+      } else if (state.session?.members?.some(m => m.name === message.speaker)) {
+        actions += option({label:"回复 " + message.speaker,image:"chat",action:"mention",value:message.speaker});
+      }
+      showMenu(b, actions, {kind:"session"});
       return;
     }
     if (b.dataset.skillMode) return skillEditorMode(b.dataset.skillMode);
