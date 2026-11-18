@@ -47,11 +47,41 @@ def addressed(text, members):
     return picked
 
 
+def requested_review_chain(text, members, explicit):
+    """A named review and return is a user assignment, even if a model forgets its handoff line."""
+    # Do not schedule tools/providers from code, quotations or a negated/conditional example.
+    prose = re.sub(r"```.*?(?:```|$)|`[^`\n]*`|「[^」]*」|“[^”]*”|《[^》]*》|"[^"\n]*"", " ", text, flags=re.S)
+    names = {m["name"].casefold():m["name"] for m in members}
+    roster = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    transfers = list(re.finditer(r"(交给|交由|转给|交回|转回)\s*@?(" + roster + r")(?![a-zA-Z0-9_-])", prose, re.I))
+    if not transfers or len(transfers) > 2 or transfers[-1][1] not in {"交回", "转回"}:
+        return []
+    lead = names[transfers[-1][2].casefold()]
+    if len(transfers) == 2:
+        reviewer = names[transfers[0][2].casefold()]
+    else:
+        prefix = prose[:transfers[0].start()]
+        assigned = list(re.finditer(r"@?(" + roster + r")\s*(?:独立)?(?:复核|复查|审题|校验)", prefix, re.I))
+        if len(assigned) != 1 or not re.search(re.escape(lead) + r"\s*(?:先)?(?:出题|自拟|主答|解题|初解)", prefix, re.I):
+            return []
+        reviewer = names[assigned[0][1].casefold()]
+        if re.search(r"不用|不要|无需|不必|禁止|假如|如果|是否", prefix):
+            return []
+    for transfer in transfers:
+        clause = re.split(r"[，,。！？；;\n]", prose[:transfer.start()])[-1]
+        if re.search(r"不要|不必|无需|不用|不再|不应|别|禁止|是否|如果|假如|例如|举例|能否|避免|取消", clause):
+            return []
+    if reviewer == lead or any(n not in (lead, reviewer) for n in explicit):
+        return []
+    return [lead, reviewer, lead]
+
+
 async def discussion_events(transport, session, session_id, text, members, permission, attachments):
     """One shared outcome. Honor explicit recipients, or let the lead hand off the work."""
     by_name = {m["name"]: m for m in members}
     explicit = addressed(text.strip(), members)
-    order = list(explicit) or [members[0]["name"]]
+    prescribed = requested_review_chain(text, members, explicit)
+    order = list(prescribed or explicit) or [members[0]["name"]]
     roster = "\n".join(f"@{m['name']}（{m['model']}）：{m['role']}" for m in members)
     history = []
     for m in session.get("messages", [])[-16:]:
@@ -75,6 +105,8 @@ async def discussion_events(transport, session, session_id, text, members, permi
         returning = any(who == name for who, _ in spoken)
         if returning:
             prompt += "\n队友已把本轮交回给你。先写明等价变形的适用条件，明确区分局部极值与全局最值。只保留服务于证明的验算，引用的算式须与实际计算一致。请对照复核意见直接给出定稿，保留本轮题目和已核对的关键推导；新补充的数值等式或不等式须独立验算，非负根式可通过比较平方核对。定稿后结束。"
+        elif prescribed and order:
+            prompt += f"\n本轮下一位已由用户指定为 @{order[0]}。请只提交你本人的" + ("初解" if not spoken else "独立复核与本轮新抽查") + "，由应用实际转交。先前群聊的复核仅供参考，不能代替这次发言。"
         elif not explicit and len(spoken) < len(members):
             prompt += "\n需要队友继续时，末尾单独写一行「交接给 @成员名：具体任务」。可以直接完成时就给出结果。"
         prompt += "\n\n本轮用户消息：\n"+text
@@ -109,7 +141,7 @@ async def discussion_events(transport, session, session_id, text, members, permi
                     return
                 correction = ""
                 spoken.append((name, reply))
-                if not explicit and len(spoken) <= len(members) and sum(who == name for who,_ in spoken) == 1:
+                if not (explicit or prescribed) and len(spoken) <= len(members) and sum(who == name for who,_ in spoken) == 1:
                     handoff = re.fullmatch(r"交接给\s*@([\w-]+)(?:\s*[：:]\s*.+)?", reply.splitlines()[-1].strip().strip("*"))
                     target = handoff[1] if handoff else ""
                     already = {who for who,_ in spoken}

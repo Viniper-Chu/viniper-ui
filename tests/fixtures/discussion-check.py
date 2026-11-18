@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "resources/viniper-ui"))
 from math_review import inconsistent_equality
-from discussion import addressed, discussion_events, room_members, validate_members
+from discussion import requested_review_chain, addressed, discussion_events, room_members, validate_members
 
 
 async def check():
@@ -62,6 +62,15 @@ async def check():
         events = [e async for e in start(text)]
         actual = [c[1] for c in calls]
         assert (set(actual) == ids and len(actual)==3) if text.startswith("@全体") else actual == expected
+    calls.clear()
+    assert requested_review_chain("主答写完后交给 检查 复核，再交回 主答。",members,[]) == ["主答","检查","主答"]
+    assert requested_review_chain("主答出题、检查复核、再交回主答定稿",members,[]) == ["主答","检查","主答"]
+    assert not requested_review_chain("不要交给 检查 复核，再交回 主答。",members,[])
+    assert not requested_review_chain("解释「交给 检查 复核，再交回 主答」",members,[])
+    events = [e async for e in start("主答出题，交给 检查 复核，再交回 主答 定稿。")]
+    assert [c[0] for c in calls]==["主答","检查","主答"]
+    assert [e["next_speaker"] for e in events if e["type"]=="speaker_finished"]==["检查","主答"]
+    assert "本轮下一位" in calls[0][2] and "交回给你" in calls[2][2]
     calls.clear()
     retries = 1
     events = [e async for e in start("求解")]
