@@ -151,10 +151,14 @@ export class SchedulerService {
     return () => this.listeners.delete(listener);
   }
 
-  async create(draft: ScheduleDraft): Promise<ScheduleDefinition> {
-    if (!draft.name.trim() || !draft.prompt.trim()) throw new Error("自动任务名称和内容不能为空。 ");
-    if (draft.target.kind === "existing-session" && !this.runtime.getSession(draft.target.sessionId)) throw new Error("目标会话已不存在，请选择现有会话。");
+  validateDraft(draft: Pick<ScheduleDraft, "name" | "prompt" | "schedule">): void {
+    if (!draft.name.trim() || !draft.prompt.trim()) throw new Error("自动任务名称和内容不能为空。");
     validatePattern(draft.schedule);
+  }
+
+  async create(draft: ScheduleDraft): Promise<ScheduleDefinition> {
+    this.validateDraft(draft);
+    if (draft.target.kind === "existing-session" && !this.runtime.getSession(draft.target.sessionId)) throw new Error("目标会话已不存在，请选择现有会话。");
     const now = this.clock.now();
     const definition: ScheduleDefinition = {
       id: newId("schedule"),
@@ -170,7 +174,8 @@ export class SchedulerService {
     };
     definition.nextRunAt = nextOccurrence(definition.schedule, now, definition);
     this.definitions.set(definition.id, definition);
-    await this.persistDefinitions();
+    try { await this.persistDefinitions(); }
+    catch (error) { this.definitions.delete(definition.id); throw error; }
     this.armTimer();
     this.publish();
     return clone(definition);

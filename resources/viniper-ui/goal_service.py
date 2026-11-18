@@ -62,7 +62,11 @@ class GoalService:
                 "turn_count": 0, "max_turns": min(100, max(1, int(body.get("max_turns") or 12))),
                 "created": now, "updated": now, "current_step": "准备开始", "last_output": "", "last_error": ""}
         self.items[goal["id"]] = goal
-        await self.save()
+        try:
+            await self.save()
+        except Exception:
+            self.items.pop(goal["id"], None)
+            raise
         return copy.deepcopy(goal)
 
     async def list(self, sid=None):

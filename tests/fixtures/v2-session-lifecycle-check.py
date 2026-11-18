@@ -11,7 +11,9 @@ import httpx,server
 class Port:
     async def delete_session(self,sid):return {'deleted':True}
     async def control(self,op,**kwargs):
-        if op=='scheduler.create':return {'schedule':{'id':'fixture-cron','native_session_id':kwargs['native_session_id']}}
+        if op=='scheduler.create':
+            if kwargs.get('cron')=='bad':raise RuntimeError('invalid cron')
+            return {'schedule':{'id':'fixture-cron','native_session_id':kwargs['native_session_id']}}
         return {'ok':True}
 server.VINIPER_TRANSPORT.application_port=Port()
 server.provider_config=lambda *_args,**_kwargs:{'model':'fixture','provider':'fixture','base_url':'http://127.0.0.1:1','api_key':''}
@@ -69,6 +71,8 @@ async def main():
             r=await client.get(path);assert r.status_code==404,(path,r.text)
         assert sid not in server.sessions
         assert not (await client.get('/api/sessions')).json()['sessions']
+        invalid=await client.post('/api/schedules',json={'title':'invalid','prompt':'example','cron':'bad','workdir':str(root)})
+        assert invalid.status_code==400 and not server.sessions
         scheduled=await client.post('/api/schedules',json={'title':'fixture','prompt':'future work','cron':'0 9 * * *','workdir':str(root),'permission_mode':'ask'})
         assert scheduled.status_code==200,scheduled.text
         schedule_sid=scheduled.json()['schedule']['native_session_id']

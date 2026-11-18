@@ -4181,25 +4181,27 @@ async def list_schedules():
 async def create_schedule(request: Request):
     body = await request.json()
     sid = str(body.get("session_id") or uuid.uuid4().hex[:8])
-    if not body.get("session_id"):
-        create_session_record(sid)
-    session = safe_session(sid)
-    require_canonical_mode(session.get("mode"))
-    session.update(workdir=str(body.get("workdir") or session["workdir"]),
-        permission_mode=require_permission_mode(body.get("permission_mode") or session.get("permission_mode"), MODE_VINIPER),
-        model=allowed_model(str(body.get("model") or ""), MODE_VINIPER))
-    save_sessions_to_disk()
-    cfg = provider_config(session["model"], MODE_VINIPER)
-    port = VINIPER_TRANSPORT.application_port
+    existing = safe_session(sid) if body.get("session_id") else None
+    if existing is not None:
+        require_canonical_mode(existing.get("mode"))
+    previous = existing or {}
+    workdir = str(body.get("workdir") or previous.get("workdir") or default_session_workdir())
+    permission = require_permission_mode(body.get("permission_mode") or previous.get("permission_mode") or "ask", MODE_VINIPER)
+    model = allowed_model(body.get("model") or previous.get("model"), MODE_VINIPER)
+    cfg = provider_config(model, MODE_VINIPER)
     try:
-        await port.control("sessions.ensure", sessions=[{"native_session_id": sid, "workdir": session["workdir"],
-            "permission_mode": harness_permission_mode(session["permission_mode"]), "model": cfg["model"],
-            "provider_id": cfg["provider"], "base_url": cfg["base_url"], "host_secret_value": cfg.get("api_key", "")}])
-        result = await port.control("scheduler.create", native_session_id=sid, title=str(body.get("title") or ""),
-            prompt=str(body.get("prompt") or ""), cron=str(body.get("cron") or ""), time_zone=str(body.get("time_zone") or "Asia/Shanghai"))
+        result = await VINIPER_TRANSPORT.application_port.control("scheduler.create", native_session_id=sid,
+            session={"native_session_id": sid, "workdir": workdir, "permission_mode": harness_permission_mode(permission),
+                     "model": model, "provider_id": cfg["provider"], "base_url": cfg["base_url"],
+                     "host_secret_value": cfg.get("api_key", "")},
+            title=str(body.get("title") or ""), prompt=str(body.get("prompt") or ""),
+            cron=str(body.get("cron") or ""), time_zone=str(body.get("time_zone") or "Asia/Shanghai"))
     except RuntimeError as exc:
         detail = "模型连接不可用，请先检查设置中的服务、模型和凭据。" if "provider/model unavailable" in str(exc) else str(exc)
         raise HTTPException(status_code=400, detail=detail) from exc
+    session = existing if existing is not None else create_session_record(sid, workdir=workdir, permission_mode=permission)
+    session.update(workdir=workdir, permission_mode=permission, model=model)
+    save_sessions_to_disk()
     return {"ok": True, **result}
 
 @app.patch("/api/schedules/{schedule_id}")
@@ -4239,14 +4241,14 @@ async def create_goal(request: Request):
     model = allowed_model(body.get("model") or sessions[sid].get("model"), MODE_VINIPER)
     cfg = provider_config(model, MODE_VINIPER, resolve_secret=False)
     reasoning = run_reasoning(cfg, model, body.get("reasoning"), sessions[sid].get("reasoning"))
-    sessions[sid].update(task_mode="goal", model=model, reasoning=reasoning)
-    sessions[sid]["selected_skills"] = body.get("skills") or []
+    body.update(model=model, reasoning=reasoning)
     body["attachments"] = save_run_attachments(sid, body.get("attachments") or [])
-    save_sessions_to_disk()
     try:
         goal = await goal_service().create(body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    sessions[sid].update(task_mode="goal", model=model, reasoning=reasoning, selected_skills=body.get("skills") or [])
+    save_sessions_to_disk()
     return {"ok": True, "goal": goal}
 
 

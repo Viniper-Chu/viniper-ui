@@ -770,10 +770,13 @@ async function handleControl(command) {
       const scheduler = application.services.scheduler;
       if (command.op === "scheduler.snapshot") { data = scheduler.snapshot(); data.definitions = data.definitions.map(d => ({...d, native_session_id: nativeIdForHarness(d.target.sessionId)})); }
       else if (command.op === "scheduler.create") {
+        const draft = {name:command.title, prompt:command.prompt,
+          schedule:{kind:"cron",expression:command.cron,timeZone:command.time_zone||"Asia/Shanghai"}};
+        scheduler.validateDraft(draft);
+        if (command.session) await ensureCollaborationSessions([command.session]);
         const target = mappedHarnessSession(command.native_session_id);
         if (!target) throw new Error("目标会话尚未注册");
-        data = { schedule: await scheduler.create({name:command.title, prompt:command.prompt,
-          schedule:{kind:"cron",expression:command.cron,timeZone:command.time_zone||"Asia/Shanghai"},
+        data = { schedule: await scheduler.create({...draft,
           target:{kind:"existing-session",sessionId:target.id}}) };
       } else if (command.op === "scheduler.claim") data = { due: (await scheduler.claimDue()).map(d => ({...d, native_session_id: nativeIdForHarness(d.target.sessionId)})) };
       else if (command.op === "scheduler.defer") { await scheduler.deferExternal(command.id); data = {ok:true}; }

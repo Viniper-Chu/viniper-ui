@@ -1,5 +1,6 @@
 """Count distinct real roots in a rational interval, without floating-point square roots."""
 from fractions import Fraction
+from math import isqrt
 import re
 
 
@@ -27,7 +28,32 @@ def coefficients_and_interval(case):
 
 
 def check(case):
-    return branch_counts(*coefficients_and_interval(case))
+    coefficients = coefficients_and_interval(case)
+    counts = branch_counts(*coefficients)
+    if coefficients[0]:
+        counts['candidates'] = quadratic_candidates(*coefficients[:3], counts)
+    return counts
+
+
+def quadratic_candidates(a, b, c, counts):
+    """Exact left/right solutions of (x-h)^2=r, with interval membership from the same count."""
+    h = -b / (2*a)
+    radius_squared = h*h - c/a
+    if radius_squared < 0:
+        return []
+    if radius_squared == 0:
+        return [{'branch': 'vertex', 'x': str(h), 'included': bool(counts['shared_vertex'])}]
+    n, d = isqrt(radius_squared.numerator), isqrt(radius_squared.denominator)
+    perfect = n*n == radius_squared.numerator and d*d == radius_squared.denominator
+    roots = []
+    for side, sign in [('left', -1), ('right', 1)]:
+        if perfect:
+            root = str(h + sign * Fraction(n, d))
+        else:
+            radical = 'sqrt(' + str(radius_squared) + ')'
+            root = (str(h) if h else '') + ('-' if sign < 0 else '+' if h else '') + radical
+        roots.append({'branch': side, 'x': root, 'included': bool(counts[side+'_branch'])})
+    return roots
 
 
 def count_roots(a, b, c, lo, hi, left_open, right_open):
@@ -212,6 +238,14 @@ def level_counts(family):
             if lower is None:
                 return f'{parameter} < {upper}' if upper is not None else '全部实数'
             return f'{lower} < {parameter} < {upper}' if upper is not None else f'{parameter} > {lower}'
+        requested = family.get('levels', [])
+        if not isinstance(requested, list) or len(requested) > 64:
+            raise ValueError('levels 须为最多 64 个有理参数值的数组。')
+        # In addition to requested horizontal lines, verify zeros and all finite boundaries.
+        levels = sorted(cuts | {Fraction(0)} | {rational(t) for t in requested})
+        result['solutions_at_levels'] = [
+            {'level': str(t), 'candidates': quadratic_candidates(a, b, c-t, count_at(t))}
+            for t in levels]
         lines = [f"在定义域 $x\\in {domain}$ 内，以 $x={vertex}$ 为分界。顶点若为解，左右列各含一次，总数扣除重复。",
                  "", "左支"+describe_branch(True)+"；右支"+describe_branch(False)+"。",
                  "", f"| 参数 {parameter} | 左支（$x\\le {vertex}$） | 右支（$x\\ge {vertex}$） | 共同顶点 | 不同实根数 |",

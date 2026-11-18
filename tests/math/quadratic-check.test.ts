@@ -102,3 +102,13 @@ test("open endpoints, excluded vertices and singleton branches have the advertis
     for (const text of expected) assert.ok(String(v.branch_table).includes(text),text);
   }
 });
+
+test("each requested level returns exact algebraic candidates and their branch membership", async () => {
+  const result = await host.execute("math.quadratic.check", {level_family: {
+    a: 1, b: -2, c: -1, lower: -1, lower_open: true, upper: 2, levels: [-2, -1, 0, 2, "1/4"],
+  }}, new AbortController().signal);
+  const rows = result.solutions_at_levels as Array<{level: string, candidates: Array<{x:string, included:boolean}>}>;
+  assert.deepEqual(rows.map(r => [r.level, r.candidates.filter(c => c.included).map(c => c.x)]),
+    [["-2", ["1"]], ["-1", ["0","2"]], ["0", ["1-sqrt(2)"]], ["1/4", ["-1/2"]], ["2", []]]);
+  assert.deepEqual(rows.at(-1)?.candidates.map(c => c.x), ["-1","3"]);
+});
