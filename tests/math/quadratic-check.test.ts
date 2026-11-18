@@ -118,3 +118,11 @@ test("each requested level returns exact algebraic candidates and their branch m
   assert.ok(String(factored.branch_table).includes("| $0$ | 1 | 0 | 0 | 1 | 左支 $1-\\sqrt{2}$（保留）；右支 $1+\\sqrt{2}$（域外，舍去）"));
   assert.ok(String(factored.branch_table).includes("| $-2$ | 1 | 1 | 1 | 1 | 顶点 $1$（保留）"));
 });
+
+test("the bundled rational evaluator checks endpoint substitutions, signed powers and exact decimals", async () => {
+  const evaluate = (expressions: string[]) => host.execute("math.rational.evaluate", {expressions}, new AbortController().signal);
+  const result = await evaluate(["4+9+16", "(-1/3)*3^2-2*(-1/3)*3+1", "0.1+0.2", "−2^2", "2^(-3)"]);
+  assert.equal(result.ok, true);
+  assert.deepEqual((result.results as {value: string}[]).map(row => row.value), ["29","0","3/10","-4","1/8"]);
+  for (const expression of ["1/0", "2^1000", "0.5^0.5", "sum(1,2)"]) assert.equal((await evaluate([expression])).ok, false);
+});

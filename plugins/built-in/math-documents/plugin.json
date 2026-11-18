@@ -5,6 +5,6 @@
   "version": "2.0.0",
   "capabilities": ["documents", "math"],
   "skills": [],
-  "tools": ["math.quadratic.check", "file.math.handout", "file.pdf.inspect", "file.pdf.render"],
+  "tools": ["math.quadratic.check", "math.rational.evaluate", "file.math.handout", "file.pdf.inspect", "file.pdf.render"],
   "providers": []
 }

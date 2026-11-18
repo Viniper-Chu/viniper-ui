@@ -97,7 +97,7 @@ export function toolTitle(name) {
     "file.docx.edit": "调整文档文字与格式", "file.sqlite.inspect": "查看数据库结构",
     "file.sqlite.query": "查询数据", "file.sqlite.apply": "更新并回读数据",
     "file.image.analyze": "检查图片",
-    "math.quadratic.check": "验算实根个数", "file.math.handout": "制作师生讲义", "file.pdf.inspect": "读取 PDF 页面", "file.pdf.render": "渲染 PDF 页面",
+    "math.quadratic.check": "验算实根个数", "math.rational.evaluate": "复算有理数", "file.math.handout": "制作师生讲义", "file.pdf.inspect": "读取 PDF 页面", "file.pdf.render": "渲染 PDF 页面",
     "terminal.run": "运行命令", "terminal.output": "查看命令输出",
     "web.search": "搜索资料", "web.fetch": "阅读网页",
   }[name] || name;
@@ -110,6 +110,7 @@ function toolReceipt(tool) {
   const name = tool.tool_name || tool.name;
   let data;
   try { data = JSON.parse(tool.content || tool.output || ""); } catch { return ""; }
+  if (name === "math.rational.evaluate" && data?.ok === true && Array.isArray(data.results)) return "已复算 " + data.results.length + " 个算式";
   if (name === "math.quadratic.check" && data?.ok === true) {
     const families = Array.isArray(data.families) ? data.families : [data];
     const pieces = families.flatMap(f => Array.isArray(f?.pieces) ? f.pieces : []);

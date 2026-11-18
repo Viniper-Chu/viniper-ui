@@ -33,7 +33,7 @@ import { createFileTools } from "../../features/files/file-tools";
 import { createStructuredFileTools } from "../../features/files/structured-file-tools";
 import { createLocalImageTool } from "../../features/files/local-image-tool";
 import { createDocumentWorkflowTools } from "../../features/files/document-workflow-tools";
-import { createQuadraticCheckTool } from "../../features/math/quadratic-tool";
+import { createQuadraticCheckTool, createRationalTool } from "../../features/math/quadratic-tool";
 import { discoverDocumentWorkflowHost } from "../process/local-document-workflow-host";
 import { LocalFileHelperHost } from "../process/local-file-helper-host";
 import { WindowsProcessHost } from "../process/windows-process-host";
@@ -202,6 +202,7 @@ export async function createHarnessApplication(
   const helperHost = new LocalFileHelperHost(join(options.assetsRoot, "agent-helpers"));
   for (const tool of createStructuredFileTools(helperHost)) toolRegistry.register(tool);
   toolRegistry.register(createQuadraticCheckTool(helperHost));
+  toolRegistry.register(createRationalTool(helperHost));
   toolRegistry.register(createLocalImageTool(registry));
   const documentWorkflowHost = discoverDocumentWorkflowHost();
   if (documentWorkflowHost) for (const tool of createDocumentWorkflowTools(documentWorkflowHost)) toolRegistry.register(tool);
