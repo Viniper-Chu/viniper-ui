@@ -45,6 +45,7 @@ export interface AgentToolLoopOptions {
   maxProviderRequests?: AgentIterationLimit;
   noProgressLimit?: number;
   trackReads?: boolean;
+  finishRepeatedArithmetic?: boolean;
   reviewPlan?: ReviewExecutionPlan;
   onProviderEvent(event: ProviderEvent): Promise<void>;
   appendHistory(entries: ProviderHistoryEntry[]): Promise<void>;
@@ -158,6 +159,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
   let completeText = "";
   let verified = false;
   let retryingAnswer = false;
+  let arithmeticOnly = false;
   let verifiedEvidence: string[] = [];
   let branchTables: string[] = [];
 
@@ -212,6 +214,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
     if (firstSteer) {
       verified = false;
       retryingAnswer = false;
+      arithmeticOnly = false;
       verifiedEvidence = [];
       branchTables = [];
       stagnant = undefined;
@@ -229,6 +232,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       requestHistory.push({ id: newId("verified-answer"), role: "user", items: [{ type: "text", text: [
         "以下为本题的精确验算资料。把它整理成学生可读的定稿。每题给一条完整推导。",
         ...verifiedEvidence,
+        ...(arithmeticOnly ? ["这些是数值代入记录。请从题面独立列式证明；样值用于检错，若算式与题设不符，应订正算式。现在用已得资料完成全部小问。"] : []),
         ...(branchTables.length ? ["本题的分支定义域、值域、各段交点及最终答案将由应用从回执直接排在你文字之后。你负责前半段推导：从题干得到等价方程、原定义域和顶点，写到能按水平线分类为止。左右两支都包含可取的顶点。不要重复分支计数或另选顶点归属约定。若题目还有其他独立小问，也要作答。"] : []),
         retryingAnswer ? "上一轮没有形成解答。请从第一道题的推导直接写起。" : "现在直接给出各题的中文书面推导与结论。",
         "如果原题为根式方程 √U=V，先写成 U=V² 且 V≥0。此时 U 非负已由等式保证，不再引入一个移动的区间端点。只保留必要步骤与结论。",
@@ -317,7 +321,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
           signal: stepSignal,
           stream: () => options.provider.stream({
             ...options.request,
-            ...(verified ? { reasoning: "none" } : {}),
+            ...(verified && !arithmeticOnly ? { reasoning: "none" } : {}),
             tools: clone(stepTools),
             frozenRunContext: options.frozenRunContext,
             history: requestHistory,
@@ -430,7 +434,18 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
           result = toolResult(call, "用户已引导当前任务，此操作已中断；已完成的更改保留，请核对结果后按最新引导继续。", true);
         }
         if (!previous && result.providerUsage) await options.onProviderEvent({ kind: "usage.completed", usage: result.providerUsage });
-        if (!stepController.signal.aborted && options.noProgressLimit && options.toolRegistry.has(call.name)) {
+        let repeatedArithmetic = false;
+        if (!stepController.signal.aborted && options.finishRepeatedArithmetic && call.name === "math.rational.evaluate" && !result.isError) {
+          const evidence = "有理数验算 " + result.content;
+          repeatedArithmetic = verifiedEvidence.includes(evidence);
+          if (repeatedArithmetic) {
+            verified = true;
+            arithmeticOnly = branchTables.length === 0;
+          } else {
+            verifiedEvidence.push(evidence);
+          }
+        }
+        if (!stepController.signal.aborted && !repeatedArithmetic && options.noProgressLimit && options.toolRegistry.has(call.name)) {
           const tool = options.toolRegistry.get(call.name);
           if (tool.readOnly || result.isError) {
             const fingerprint = reviewToolFingerprint(call, result);
@@ -454,6 +469,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
         }
         if (!stepController.signal.aborted && options.completesVerification?.(call, result)) {
           verified = true;
+          arithmeticOnly = false;
           if (call.name === "math.quadratic.check") {
             try { branchTables.push(...verifiedBranchTables(result.content)); } catch { /* Non-JSON receipts carry no verified table. */ }
           }
@@ -472,7 +488,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
           const tool = options.toolRegistry.has(call.name) ? options.toolRegistry.get(call.name) : undefined;
           if (tool?.readOnly) {
             const fingerprint = reviewToolFingerprint(call, result);
-            if (reviewFingerprints.has(fingerprint)) {
+            if (reviewFingerprints.has(fingerprint) && !repeatedArithmetic) {
               reviewNoProgress = { checkpointId: options.reviewPlan.checkpointId, fingerprint };
             } else {
               reviewFingerprints.add(fingerprint);

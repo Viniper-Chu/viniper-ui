@@ -582,3 +582,22 @@ test("the student sees exact branch counts even if the writer fills the two bran
   assert.ok(!result.assistantText.includes("| 2 | 0 |"));
   assert.ok(result.assistantText.includes("顶点重合时去重。"));
 });
+
+test("an inline exercise turns repeated successful arithmetic into a written proof with its requested reasoning", async () => {
+  const name = "math.rational.evaluate";
+  const registry = new ToolRegistry();
+  registry.register({ name, description: "rational", readOnly: true, inputSchema: {type: "object"},
+    async execute(req) { return {toolId: req.id, text: JSON.stringify({ok: true, results: [{expression: "1/2+1/2", value: "1"}]})}; } });
+  const provider = new ScriptedProvider([
+    [{kind: "tool-call.completed", call: toolCall("first", name, '{"expressions":["1/2+1/2"]}')}],
+    [{kind: "tool-call.completed", call: toolCall("repeat", name, '{"expressions":["1/2+1/2"]}')}],
+    [{kind: "text.delta", text: "已核对端点，按符号变化可得结论。"}],
+  ]);
+  const request = providerRequest(registry,"auto");
+  const result = await runAgentToolLoop({provider, request, toolRegistry: registry, finishRepeatedArithmetic: true, noProgressLimit: 2,
+    signal: new AbortController().signal, now: () => 1, emit: async () => {}, onProviderEvent: async () => {}, appendHistory: async () => {}});
+  assert.deepEqual(provider.requests.map(r => r.tools.length), [1,1,0]);
+  assert.equal(provider.requests[2].reasoning, request.reasoning);
+  assert.ok(JSON.stringify(provider.requests[2].history).includes("1/2+1/2"));
+  assert.match(result.assistantText,/端点/);
+});
