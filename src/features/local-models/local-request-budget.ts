@@ -8,7 +8,7 @@ type ToolExchange = { request: Message; calls: ToolCall[]; receipts: Message[] }
 
 /** Count the rendered wire request, not the accounting estimate or just history. */
 export async function boundLocalRequest(
-  body: Record<string, unknown>, policy: LocalAgentPolicy, transport: ProviderTransport, signal: AbortSignal, imageTokens = 0,
+  body: Record<string, unknown>, policy: LocalAgentPolicy, transport: ProviderTransport, signal: AbortSignal, imageTokens = 0, roomHistory: readonly string[] = [],
 ): Promise<LocalContextReduction> {
   const endpoint = new URL(policy.endpoint).origin;
   const json = async (route: string, value: unknown): Promise<any> => {
@@ -30,6 +30,48 @@ export async function boundLocalRequest(
   };
   const outputReserved = policy.outputTokens;
   const limit = Math.min(policy.compactAtTokens, policy.contextTokens - outputReserved);
+  // Old room messages are optional context. Never count them as an indivisible
+  // part of the live user instruction, the author's solution or the review.
+  if (roomHistory.length) {
+    const live = [...messages].reverse().find(message => message.role === "user");
+    if (!live || typeof live.content !== "string") throw new Error("群聊缺少本轮请求文本。");
+    const original = live.content;
+    const include = (items: readonly string[], omitted: boolean) => {
+      const heading = omitted ? "此前群聊节选（更早内容已省略）" : "此前群聊发言";
+      live.content = heading + "（历史资料）：\n" + items.join("\n") + "\n\n本轮请求与交接：\n" + original;
+    };
+    include(roomHistory, false);
+    const inputBefore = await count();
+    if (inputBefore <= limit) return {inputBefore, inputAfter:inputBefore, outputReserved, historyTurns:0, toolResults:0};
+    live.content = original;
+    // First make room for the unabridged current turn with the normal tool/history policy.
+    const base = await boundLocalRequest(body, policy, transport, signal, imageTokens);
+    let low = 1, high = roomHistory.length, retained = 0, inputAfter = base.inputAfter;
+    while (low <= high) {
+      const size = Math.floor((low + high) / 2);
+      include(roomHistory.slice(-size), size < roomHistory.length);
+      const tokens = await count();
+      if (tokens <= limit) {
+        retained = size;
+        inputAfter = tokens;
+        low = size + 1;
+      } else high = size - 1;
+    }
+    if (retained) {
+      include(roomHistory.slice(-retained), retained < roomHistory.length);
+    } else {
+      // A very long single earlier answer often puts its conditions at the top
+      // and its corrected endpoints at the end. Keep both, with an explicit omission.
+      const latest = roomHistory[roomHistory.length - 1];
+      for (const size of [1600, 640, 240]) {
+        include([excerpt(latest, size)], true);
+        inputAfter = await count();
+        if (inputAfter <= limit) break;
+      }
+      if (inputAfter > limit) throw new Error("本轮任务与交接材料已占满窗口，无法保留最近群聊摘录；请明确指定所需的前文。");
+    }
+    return {...base, inputBefore, inputAfter, historyTurns:base.historyTurns + roomHistory.length - retained};
+  }
   const inputBefore = await count();
   if (inputBefore <= limit) return { inputBefore, inputAfter: inputBefore, outputReserved, historyTurns: 0, toolResults: 0 };
   let inputAfter = inputBefore, historyTurns = 0;

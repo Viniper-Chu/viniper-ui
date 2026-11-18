@@ -207,6 +207,8 @@ export interface ProviderRequest {
   permissionMode: PermissionMode;
   history: ProviderHistoryEntry[];
   currentUserText?: string;
+  /** Older speaker-attributed room messages, independent of the complete live task. */
+  roomHistory?: string[];
   tools: ProviderToolDefinition[];
   cachePlan: CachePlan;
   contextProfile: ContextProfile;

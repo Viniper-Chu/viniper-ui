@@ -98,6 +98,7 @@ interface RunControl {
   userText?: string;
   documentContext?: string;
   roomTranscript?: boolean;
+  roomHistory?: string[];
   status: RunStatus;
   createdAt: number;
   recovery?: boolean;
@@ -728,6 +729,7 @@ export class AgentRuntime {
         planning: intent.planning,
         userText: intent.userText,
         roomTranscript: intent.roomTranscript,
+        roomHistory: intent.roomHistory,
         documentContext,
       });
       await this.record(session, "queue.updated", { queue });
@@ -753,6 +755,7 @@ export class AgentRuntime {
       planning: intent.planning,
       userText: intent.userText,
       roomTranscript: intent.roomTranscript,
+      roomHistory: intent.roomHistory,
       documentContext,
     };
     this.registerRun(session, control);
@@ -1086,6 +1089,7 @@ export class AgentRuntime {
         permissionMode: session.permissionMode,
         reasoning: control.providerSnapshot!.reasoning,
         currentUserText: control.userText ?? text,
+        roomHistory: control.roomHistory,
         history: roomHistory ?? projectHistory(),
         tools: engineId === "viniper" ? toolDefinitions : [],
         cachePlan,
@@ -1386,6 +1390,7 @@ export class AgentRuntime {
         text: next.text,
         userText: next.userText,
         roomTranscript: next.roomTranscript,
+        roomHistory: next.roomHistory,
         documentContext: next.documentContext,
         status: "queued",
         createdAt: this.now(),

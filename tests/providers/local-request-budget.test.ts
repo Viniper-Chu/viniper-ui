@@ -155,3 +155,20 @@ test("long live turns have one bounded recap and keep a native last tool result 
     assert.deepEqual(body.messages.at(-1), original.messages.at(-1));
   }
 });
+
+test("a 16K room drops older background before the latest correction and preserves the complete live handoff", async () => {
+  const {transport} = fixture();
+  const task = "本轮题面=" + "保留".repeat(1750) + "；主答端点=2；复核抽查=5/3";
+  const sig = new AbortController().signal;
+  for (const [prior, latest] of [
+    [["很早的材料".repeat(3400)], "最近更正：3<√11<4"],
+    [[], "先检查原题端点" + "长回复".repeat(7000) + "最近更正：3<√11<4"],
+  ] as Array<[string[],string]>) {
+    const body = { messages:[{role:"user",content:task}] };
+    const r = await boundLocalRequest(body,policy,transport,sig,0,[...prior,latest]);
+    assert.ok(r.inputBefore>12288 && r.inputAfter<=12288);
+    assert.ok(body.messages[0].content.endsWith(task));
+    assert.match(body.messages[0].content,/最近更正：3<√11<4/u);
+  }
+  await assert.rejects(boundLocalRequest({messages:[{role:"user",content:"本轮".repeat(7000)}]},policy,transport,sig,0,["旧记录"]),/超过本机输入预算/u);
+});

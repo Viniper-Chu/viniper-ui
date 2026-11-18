@@ -18,12 +18,13 @@ export function enqueueIntent(
     userText?: string;
     documentContext?: string;
     roomTranscript?: boolean;
+    roomHistory?: string[];
   },
 ): QueuedIntent[] {
   const engineId = sessionAgentEngine(session.engineId);
   return [...session.queue, {
     id: engineScopedId(engineId, "queue", newId("queue")), engineId, sessionId: session.id, text, createdAt: now, origin,
-    ...(controls?.roomTranscript ? {roomTranscript:true} : {}),
+    ...(controls?.roomTranscript ? {roomTranscript:true, roomHistory:controls.roomHistory} : {}),
     ...(controls?.documentContext !== undefined ? { documentContext: controls.documentContext } : {}),
     ...(controls?.workspaceMode ? { workspaceMode: controls.workspaceMode } : {}),
     ...(controls?.reviewPolicy ? { reviewPolicy: controls.reviewPolicy } : {}),

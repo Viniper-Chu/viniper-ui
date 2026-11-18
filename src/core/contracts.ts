@@ -76,6 +76,7 @@ export interface AgentIntent {
   documentContext?: string;
   /** The host supplied the room transcript and handoffs in this message. */
   roomTranscript?: boolean;
+  roomHistory?: string[];
   attachments: string[];
   selectedModel: string;
   permissionMode: PermissionMode;
@@ -110,6 +111,7 @@ export interface QueuedIntent {
   documentContext?: string;
   /** The host supplied the room transcript and handoffs in this message. */
   roomTranscript?: boolean;
+  roomHistory?: string[];
   id: string;
   engineId?: AgentEngineId;
   sessionId?: string;

@@ -773,6 +773,7 @@ class HarnessApplicationPort:
         document_context: str | None = None,
         planning: bool = False,
         room_transcript: bool = False,
+        room_history: list[str] | None = None,
     ) -> AsyncIterable[dict[str, Any]]:
         sid = str(session_id)
         if self.active_run(sid):
@@ -803,6 +804,7 @@ class HarnessApplicationPort:
             "document_context": document_context,
             "planning": bool(planning),
             "room_transcript": room_transcript,
+            "room_history": room_history,
         }
         # Host-only secret value is sent over stdin and is never emitted back.
         if host_secret_value:

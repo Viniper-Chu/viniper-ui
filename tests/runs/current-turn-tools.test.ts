@@ -256,7 +256,7 @@ test("explicitly requesting root counts uses the inline verified answer path", (
 
 test("self-authored room problems need math tools without a workspace baseline", () => {
   for (const text of ["本轮数学话题：Qwen 自拟一道含参数数学题并完整求解，DeepSeek 复核后交回。",
-    "请自己出一道高中数学参数题，独立复核，给出定稿。", "请心算 6×7，只回复阿拉伯数字。本轮不使用工具。"]) {
+    "请自己出一道高中数学参数题，独立复核，给出定稿。", "先回顾上一题的根式估界，再自拟一道不同的高中数学参数题。", "请心算 6×7，只回复阿拉伯数字。本轮不使用工具。"]) {
     assert.equal(isConversationOnlyTurn(text, text), true);
   }
   for (const text of ["从文件中选题并编译成试卷", "请解释“不使用工具”", "本轮不使用工具，然后用文件工具修改资料。"]) {

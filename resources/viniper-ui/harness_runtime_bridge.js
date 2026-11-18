@@ -344,6 +344,7 @@ async function run(request) {
       permissionMode: session.permissionMode,
       origin: { kind: "user" },
       roomTranscript: request.room_transcript === true,
+      roomHistory: request.room_transcript && Array.isArray(request.room_history) ? request.room_history : undefined,
       memoryEnabled: request.memory_enabled !== false,
       planning: request.planning === true,
     });

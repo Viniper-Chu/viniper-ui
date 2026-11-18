@@ -26,11 +26,11 @@ async def check():
     session = {"messages": []}
     failed = False
     class Transport:
-        async def stream(self, sid, prompt, model, mode, attachments, *, speaker, display_prompt, suppress_user_message):
+        async def stream(self, sid, prompt, model, mode, attachments, *, speaker, display_prompt, suppress_user_message, room_history):
             calls.append((speaker,model,prompt,suppress_user_message))
             try:
                 yield {"type":"assistant_start","speaker":speaker,"model":model}
-                answer = {"主答":"取代号枫针\n交接给 @计算：算出结果", "计算":"结果 42\n交接给 @检查：复核", "检查":"无误\n交接给 @主答：收束"}[speaker]
+                answer = {"主答":"题面区间含左端点\n" + "推导" * 1800 + "取代号枫针\n交接给 @计算：算出结果", "计算":"结果 42\n交接给 @检查：复核", "检查":"无误\n交接给 @主答：收束"}[speaker]
                 session["messages"].append({"role":"assistant","speaker":speaker,"content":answer})
                 session["last_run_status"] = "failed" if failed else "completed"
                 yield {"type":"done"}
@@ -42,7 +42,7 @@ async def check():
     assert [c[1] for c in calls] == ["cloud-a","cloud-b","cloud-c","cloud-a"]
     assert "交回给你" in calls[-1][2] and "交回给你" not in calls[0][2]
     assert [c[3] for c in calls] == [False,True,True,True]
-    assert "取代号枫针" in calls[1][2] and "结果 42" in calls[2][2]
+    assert "题面区间含左端点" in calls[1][2] and "取代号枫针" in calls[1][2] and "结果 42" in calls[2][2]
     assert [e["next_speaker"] for e in events if e["type"]=="speaker_finished"] == ["计算","检查","主答"]
     assert events[-1]["type"] == "done"
     for text, expected in [("@全体 回答",list(ids)), ("@检查 再看看",["cloud-c"]),("@检查 @主答 回答",["cloud-c","cloud-a"])]:

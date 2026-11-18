@@ -79,6 +79,7 @@ export function isInlineMathExercise(request: string): boolean {
   }
   request = request.replace(/math\.quadratic\.check|(?:二次方程|实根|根数)(?:核验|验算|检查)?工具/giu, "根数验算");
   request = request.replace(/math\.rational\.evaluate/giu, "算式验算");
+  if (isOriginalMathTopic(request)) request = request.replace(/上一题|上题/gu, "前题");
   if (/附件|题图|如图|图中|文件|文档|目录|项目|题库|资料|教材|源码|原卷|原稿|讲义|试卷|排版|编译|绘制|画|作图|作出.{0,8}图|示意图|图形文件|搜索|检索|查找|查询|读取|保存|写入|生成|工具|脚本|计算机|程序|代码|上面|上题|之前|刚才|根据图|阅读|资料库|联网|验证器|实验|导出|绘图|上一|前面|前述|插件|技能|[a-z]+\.[a-z]{2,}\b|\b(?:python|pdf|tex|word|tikz|excel|latex|cas)\b/iu.test(request)) return false;
   // Choosing and debating an original topic does not require a workspace search.
   if (isOriginalMathTopic(request)) return true;

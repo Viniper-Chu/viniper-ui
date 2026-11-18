@@ -53,11 +53,18 @@ async def discussion_events(transport, session, session_id, text, members, permi
     explicit = addressed(text.strip(), members)
     order = list(explicit) or [members[0]["name"]]
     roster = "\n".join(f"@{m['name']}（{m['model']}）：{m['role']}" for m in members)
-    previous = []
+    history = []
     for m in session.get("messages", [])[-16:]:
-        if m.get("role") in ("assistant", "user") and m.get("content") and not m.get("pending"):
-            previous.append(f"{m.get('speaker') or ('用户' if m['role']=='user' else '成员')}：{m['content'][:2500]}")
-    history = "\n".join(previous)[-12000:]
+        if m.get("role") not in ("assistant", "user") or m.get("pending") or m.get("error") or m.get("cancelled"):
+            continue
+        content = m.get("content", "").strip()
+        if content:
+            author = m.get("speaker") or ("用户" if m["role"] == "user" else "成员")
+            if len(content) > 8192:
+                content = content[:4000] + "\n[早先发言中段省略，完整内容保存在群聊]\n" + content[-4000:]
+            history.append(f"{author}：{content}")
+    if history and history[-1] == f"用户：{text}":
+        history.pop()  # A retry may immediately follow a failed turn with no reply.
     spoken = []
     while order:
         name = order.pop(0)
@@ -68,13 +75,11 @@ async def discussion_events(transport, session, session_id, text, members, permi
             prompt += "\n队友已把本轮交回给你。请对照复核意见直接给出定稿，保留本轮题目和已核对的关键推导；新补充的数值等式或不等式须独立验算，非负根式可通过比较平方核对。定稿后结束。"
         elif not explicit and len(spoken) < len(members):
             prompt += "\n需要队友继续时，末尾单独写一行「交接给 @成员名：具体任务」。可以直接完成时就给出结果。"
-        if history:
-            prompt += "\n\n本群最近的发言（对话资料）：\n"+history
         prompt += "\n\n本轮用户消息：\n"+text
         if spoken:
-            prompt += "\n\n本轮成员发言：\n"+"\n".join(f"@{who}：{reply[-3500:]}" for who,reply in spoken)
+            prompt += "\n\n本轮成员发言：\n"+"\n".join(f"@{who}：{reply}" for who,reply in spoken)
         stream = transport.stream(session_id, prompt, member["model"], permission, attachments,
-                                  suppress_user_message=bool(spoken), display_prompt=text, speaker=name)
+                                  suppress_user_message=bool(spoken), display_prompt=text, speaker=name, room_history=history)
         advanced = False
         try:
             async for event in stream:

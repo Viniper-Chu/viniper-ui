@@ -3030,6 +3030,7 @@ class HarnessRuntimeTransport:
         permission_mode: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         suppress_user_message: bool = False, display_prompt: str | None = None, speaker: str = "",
+        room_history: list[str] | None = None,
     ):
         session = safe_session(session_id)
         if normalize_session_mode(session.get("mode")) != MODE_VINIPER:
@@ -3073,6 +3074,12 @@ class HarnessRuntimeTransport:
         selected_model = "demo-default" if offline_demo else cfg["model"]
         provider_model = provider_model_id(selected_model)
         local = local_agent_contract(cfg["base_url"], selected_model)
+        if room_history and not local:
+            # Keep the cloud context bounded too. Current-round handoffs stay in the complete request.
+            history = "\n".join(room_history)
+            if len(history) > 12000:
+                history = "（较早发言已省略）\n" + history[-12000:]
+            runtime_prompt = "此前群聊发言（历史资料）：\n" + history + "\n\n本轮请求与交接：\n" + runtime_prompt
         if speaker and local:
             preference = "auto"  # Each group member uses its own model's capabilities.
         elif speaker:
@@ -3317,7 +3324,7 @@ class HarnessRuntimeTransport:
                 memory_enabled=bool(load_app_settings().get("runtime", {}).get("memory_enabled", True)),
                 reasoning=effective_effort,
                 planning=planning,
-                **({"room_transcript": True} if speaker else {}),
+                **({"room_transcript": True, "room_history": room_history if local else None} if speaker else {}),
             )
             async for envelope in event_stream:
                 if envelope.get("type") == "runtime.finalization_timeout":

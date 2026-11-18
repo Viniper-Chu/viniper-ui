@@ -121,7 +121,7 @@ export class OpenAIChatProvider implements ModelProvider {
     Object.assign(body, localRequestOverrides(request, this.localPolicy));
     const local = this.runtimePolicyFor(request.selectedModel);
     if (local) {
-      const reduction = await boundLocalRequest(body, local, this.transport, signal);
+      const reduction = await boundLocalRequest(body, local, this.transport, signal, 0, request.roomHistory);
       if (reduction.inputBefore !== reduction.inputAfter) yield { kind: "context.compacted", ...reduction };
       yield { kind: "context.budget", inputCount: reduction.inputAfter, windowSize: local.contextTokens, outputReserved: local.outputTokens };
       // Local cold prefill of a full 12K input can exceed 90s before any SSE
