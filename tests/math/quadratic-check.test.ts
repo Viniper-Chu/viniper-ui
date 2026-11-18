@@ -57,7 +57,7 @@ test("classifies all levels of a restricted polynomial including an excluded bou
 test("normalizes a parameter in either order in the constant term of a zero-form family", async () => {
   const classify = (c: string) => host.execute("math.quadratic.check",
     { level_family: { a: 2, b: 4, c, lower: 0 } }, new AbortController().signal);
-  for (const c of ["1/3-2k", "-2*k+1/3", "1/3 − 2k"]) {
+  for (const c of ["1/3-2k", "-2*k+1/3", "1/3 − 2k", "−(2k−1/3)", "1/3*(1-6k)"]) {
     const result = await classify(c);
     assert.equal(result.ok, true);
     assert.equal(result.parameter, "k");
@@ -68,7 +68,7 @@ test("normalizes a parameter in either order in the constant term of a zero-form
       .map(row => [row.left_branch,row.right_branch,row.shared_vertex,row.distinct_roots]),
       [[0,0,0,0], [0,1,0,1], [0,1,0,1]]);
   }
-  for (const c of ["a+b", "x+2", "0m-3", "t*t"]) assert.equal((await classify(c)).ok, false);
+  for (const c of ["a+b", "x+2", "0m-3", "t*t", "0*(k+1)", "(k+1)*(k-1)"]) assert.equal((await classify(c)).ok, false);
 });
 
 test("classifies multiple independent equations in one verification phase", async () => {
@@ -111,4 +111,8 @@ test("each requested level returns exact algebraic candidates and their branch m
   assert.deepEqual(rows.map(r => [r.level, r.candidates.filter(c => c.included).map(c => c.x)]),
     [["-2", ["1"]], ["-1", ["0","2"]], ["0", ["1-sqrt(2)"]], ["1/4", ["-1/2"]], ["2", []]]);
   assert.deepEqual(rows.at(-1)?.candidates.map(c => c.x), ["-1","3"]);
+  const factored = await host.execute("math.quadratic.check", {level_family: {
+    a: 1, b: -2, c: "-(1+t)", lower: -1, lower_open: true, upper: 2, levels: [-2, -1, 0, 2, "1/4"],
+  }}, new AbortController().signal);
+  assert.deepEqual(factored.solutions_at_levels, rows);
 });

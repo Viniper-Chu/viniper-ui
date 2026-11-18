@@ -133,15 +133,20 @@ def affine_constant(text):
     value = ''.join(text.split()).replace('−', '-')
     if len(value) > 64:
         raise ValueError('含参数的常数项过长。')
+    scale = Fraction(1)
+    group = re.fullmatch(rf'(?P<sign>[+-]?)(?:(?P<scale>{number})\*?)?\((?P<body>[^()]+)\)', value)
+    if group:
+        scale = rational(group['scale'] or 1) * (-1 if group['sign'] == '-' else 1)
+        value = group['body']
     left = rf'(?P<offset>[+-]?{number})(?P<sign>[+-]){atom}'
     right = rf'(?P<sign>[+-]?){atom}(?P<offset>[+-]{number})?'
     term = re.fullmatch(left, value) or re.fullmatch(right, value)
     if not term or term['parameter'].lower() == 'x':
         raise ValueError('零式的常数项只支持一个有理常数与一个一次参数项；也可先把参数独立移至右边，再传三个有理系数。')
-    slope = rational(term['factor'] or 1) * (-1 if term['sign'] == '-' else 1)
+    slope = scale * rational(term['factor'] or 1) * (-1 if term['sign'] == '-' else 1)
     if not slope:
         raise ValueError('参数的系数不能为零。')
-    return rational(term['offset'] or 0), slope, term['parameter']
+    return scale * rational(term['offset'] or 0), slope, term['parameter']
 
 
 def level_counts(family):
