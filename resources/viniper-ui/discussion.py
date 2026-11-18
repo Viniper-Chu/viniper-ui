@@ -66,20 +66,25 @@ async def discussion_events(transport, session, session_id, text, members, permi
     if history and history[-1] == f"用户：{text}":
         history.pop()  # A retry may immediately follow a failed turn with no reply.
     spoken = []
+    correction = ""
     while order:
         name = order.pop(0)
         member = by_name[name]
         prompt = (f"你是群聊中的 @{name}，只以自己的身份发言。你的分工：{member['role']}。\n成员与分工：\n{roster}\n"
                   "这是应用已建立的真实群聊。直接完成自己的分工，不代替其他成员发言。群聊调度器负责邀请和转交；请勿用终端、搜索源码或访问接口来管理群聊。")
-        if any(who == name for who, _ in spoken):
-            prompt += "\n队友已把本轮交回给你。请对照复核意见直接给出定稿，保留本轮题目和已核对的关键推导；新补充的数值等式或不等式须独立验算，非负根式可通过比较平方核对。定稿后结束。"
+        returning = any(who == name for who, _ in spoken)
+        if returning:
+            prompt += "\n队友已把本轮交回给你。先写明等价变形的适用条件，明确区分局部极值与全局最值。只保留服务于证明的验算，引用的算式须与实际计算一致。请对照复核意见直接给出定稿，保留本轮题目和已核对的关键推导；新补充的数值等式或不等式须独立验算，非负根式可通过比较平方核对。定稿后结束。"
         elif not explicit and len(spoken) < len(members):
             prompt += "\n需要队友继续时，末尾单独写一行「交接给 @成员名：具体任务」。可以直接完成时就给出结果。"
         prompt += "\n\n本轮用户消息：\n"+text
         if spoken:
             prompt += "\n\n本轮成员发言：\n"+"\n".join(f"@{who}：{reply}" for who,reply in spoken)
+        if correction:
+            prompt += "\n定稿算式核验发现了不相等的两侧：" + correction + "请重新给出完整定稿，删去无关的验算；区分原式的适用条件，逐项核对保留的等式。"
+        verify_math = returning or bool(explicit and re.search(r"定稿|终稿", text))
         stream = transport.stream(session_id, prompt, member["model"], permission, attachments,
-                                  suppress_user_message=bool(spoken), display_prompt=text, speaker=name, room_history=history)
+                                  suppress_user_message=bool(spoken or correction), display_prompt=text, speaker=name, room_history=history, verify_final_math=verify_math)
         advanced = False
         try:
             async for event in stream:
@@ -88,9 +93,21 @@ async def discussion_events(transport, session, session_id, text, members, permi
                     continue
                 last = session["messages"][-1] if session.get("messages") else {}
                 reply = last.get("content", "").strip()
+                issue = event.get("arithmetic_issue")
+                if issue:
+                    if correction:
+                        yield {"type":"error", "content":"再次核算仍有不等的两侧，本轮未通过定稿核验。" + issue}
+                        yield event
+                        return
+                    correction = issue
+                    order.insert(0, name)
+                    yield {**event, "type":"speaker_finished", "next_speaker":name}
+                    advanced = True
+                    continue
                 if session.get("last_run_status") != "completed" or last.get("speaker") != name or not reply:
                     yield event
                     return
+                correction = ""
                 spoken.append((name, reply))
                 if not explicit and len(spoken) <= len(members) and sum(who == name for who,_ in spoken) == 1:
                     handoff = re.fullmatch(r"交接给\s*@([\w-]+)(?:\s*[：:]\s*.+)?", reply.splitlines()[-1].strip().strip("*"))

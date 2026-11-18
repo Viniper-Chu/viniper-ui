@@ -35,6 +35,7 @@ from agent_queue import AgentQueueStore
 from agent_run_coordinator import AgentRunCoordinator, AgentRunJournal, DurableInteractionStore
 from native_project_browser import browse_project_files, preview_project_file, ProjectBrowserError
 from skill_sync import localized_skill_fields
+from math_review import inconsistent_equality
 from discussion import addressed, discussion_events, room_members, validate_members
 from local_agent_contract import choose_local_effort, local_agent_contract, local_placeholder_auth, local_model_notice
 from harness_application_port import HarnessApplicationPort
@@ -3030,7 +3031,7 @@ class HarnessRuntimeTransport:
         permission_mode: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         suppress_user_message: bool = False, display_prompt: str | None = None, speaker: str = "",
-        room_history: list[str] | None = None,
+        room_history: list[str] | None = None, verify_final_math: bool = False,
     ):
         session = safe_session(session_id)
         if normalize_session_mode(session.get("mode")) != MODE_VINIPER:
@@ -3627,10 +3628,16 @@ class HarnessRuntimeTransport:
             if thinking_started:
                 yield {"type": "thinking_complete", "elapsed": finish_thinking()}
             await close_owned_stream()
-            finalize_assistant("completed")
+            issue = inconsistent_equality(assistant_text) if verify_final_math else ""
+            note = "定稿算式未通过核算。" + issue if issue else ""
+            finalize_assistant("failed" if issue else "completed", note)
+            if issue:
+                yield {"type":"text", "content":"\n\n" + note}
             for artifact in capture_file_changes():
                 yield artifact
             done = {"type": "done"}
+            if issue:
+                done["arithmetic_issue"] = issue
             if turn_usage:
                 done["turn_usage"] = copy.deepcopy(turn_usage)
             if thinking_elapsed_seconds() > 0:

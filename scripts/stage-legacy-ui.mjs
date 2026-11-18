@@ -5,6 +5,7 @@ const LEGACY_RUNTIME_FILES = [
   "agent_instructions.py",
   "goal_service.py",
   "discussion.py",
+  "math_review.py",
   "schedule_host.py",
   "agent_queue.py",
   "agent_run_coordinator.py",

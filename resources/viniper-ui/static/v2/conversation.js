@@ -476,7 +476,7 @@ export function projectEvent(run, event) {
     return;
   }
   if (event.type === "assistant_start" && event.speaker) {
-    if (run.message.speaker && run.message.speaker !== event.speaker) {
+    if (run.message.speaker && (run.message.speaker !== event.speaker || run.message.streaming === false)) {
       run.node = null;
       run.message = {role:"assistant", content:"", thinking:"", segments:[], streaming:true, elapsed:0};
     }
