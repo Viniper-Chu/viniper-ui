@@ -332,12 +332,19 @@ kbd { display: inline-flex; align-items: center; min-height: 20px; padding: 0 4p
 .menu-option.danger[aria-checked="true"] { background: var(--danger-soft); }
 .menu-separator { height: 1px; background: var(--line); margin: 8px 0; }
 .effort-control { padding: 0 8px 8px; }
-.effort-control input[type=range] { display: block; margin: 4px 0 0 10%; width: 80%; height: 24px; accent-color: var(--accent); cursor: pointer; }
-.effort-control input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.effort-control input:disabled { opacity: .35; cursor: default; }
-.effort-ticks { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); }
-.effort-ticks button, .effort-other button { font-size: 11px; line-height: 1.2; min-height: 28px; color: var(--secondary); }
-.effort-ticks button:disabled { color: var(--muted); opacity: .48; }
+.effort-scale { position: relative; width: min(100%, 244px); margin: 7px auto 0; --block-gap: 3px; --block-height: 40px; }
+.effort-scale input { appearance: none; position: absolute; left: 0; top: 0; z-index: 1; width: 100%; height: var(--block-height); margin: 0; background: transparent; cursor: ew-resize; }
+.effort-scale input::-webkit-slider-runnable-track { background: transparent; height: 100%; }
+.effort-scale input::-webkit-slider-thumb { appearance: none; width: calc((100% - 4 * var(--block-gap)) / 5); height: 100%; background: transparent; }
+.effort-scale input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+.effort-scale input:disabled { cursor: default; }
+.effort-ticks { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: var(--block-gap); }
+.effort-ticks button, .effort-other button { font-size: 11px; line-height: 1.2; color: var(--secondary); }
+.effort-ticks button { display: flex; flex-direction: column; justify-content: flex-start; align-items: stretch; gap: 5px; padding-bottom: 3px; white-space: nowrap; }
+.effort-ticks button::before { content: ""; box-sizing: border-box; height: var(--block-height); border-radius: 3px; border: 1px solid var(--control-edge); background: var(--surface-soft); }
+.effort-ticks button[aria-pressed=true]::before { background: var(--accent); border-color: var(--accent); }
+.effort-ticks button:disabled { color: var(--muted); opacity: .54; }
+.effort-ticks button:disabled::before { background: repeating-linear-gradient(135deg,transparent 0 4px,var(--line) 4px 5px); }
 .effort-control button[aria-pressed=true] { color: var(--accent); font-weight: 650; }
 .effort-other { display: flex; gap: 14px; padding: 4px 8px 0; }
 .effort-other button { text-decoration: underline; text-underline-offset: 3px; }

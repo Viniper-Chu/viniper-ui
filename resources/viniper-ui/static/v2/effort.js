@@ -14,9 +14,9 @@ export function effortControl(model, requested) {
   const index = levels.indexOf(selected);
   return `<div class="menu-separator"></div><h3>Thinking effort</h3>
     <div class="effort-control">
-      <input type="range" min="0" max="4" step="1" value="${Math.max(0,index)}"
+      <div class="effort-scale"><input type="range" min="0" max="4" step="1" value="${Math.max(0,index)}"
         aria-label="Thinking effort" aria-valuetext="${effortLabel(selected)}" ${levels.some(id => options.includes(id)) ? "" : "disabled"}>
-      <div class="effort-ticks">${ticks}</div>${other ? `<div class="effort-other">${other}</div>` : ""}
+      <div class="effort-ticks">${ticks}</div></div>${other ? `<div class="effort-other">${other}</div>` : ""}
     </div>`;
 }
 
@@ -38,6 +38,13 @@ export function bindEffortControl(popover, onChange) {
   popover.addEventListener("click", event => {
     const button = event.target.closest("[data-effort]");
     if (button) choose(button.closest(".effort-control"), button.dataset.effort);
+  });
+  popover.addEventListener("pointerdown", event => {
+    if (event.target.type !== "range" || !event.target.closest(".effort-scale")) return;
+    const control = event.target.closest(".effort-control");
+    const ticks = control.querySelector(".effort-ticks").getBoundingClientRect();
+    const index = Math.max(0, Math.min(levels.length - 1, Math.floor((event.clientX - ticks.left) / ticks.width * levels.length)));
+    if (control.querySelector(`[data-effort="${levels[index]}"]`).disabled) event.preventDefault();
   });
   popover.addEventListener("input", event => {
     const control = event.target.closest(".effort-control");
