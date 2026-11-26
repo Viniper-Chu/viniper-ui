@@ -13,6 +13,10 @@ export interface LocalAgentPolicy {
   maxIterations: AgentIterationLimit;
   defaultReasoning: string;
   reasoningBudgets: Record<string, number>;
+  nativeEfforts?: string[];
+  nativeEffortAliases?: Record<string, string>;
+  nativeEffortInTemplate?: boolean;
+  templateKwargs?: Record<string, unknown>;
   reasoningBudgetMessage?: string;
   templateEfforts?: Record<string, string>;
   parallelToolCalls: boolean;
@@ -22,6 +26,7 @@ export interface LocalAgentPolicy {
   visionEnabled: boolean;
   visionMaxTokens?: number;
   mathOutputGuidance?: string;
+  animatedSvgChunkTokens?: number;
   thinkingSampling?: { temperature?: number; top_p?: number; top_k?: number };
 }
 
@@ -37,11 +42,34 @@ export function loadLocalAgentPolicy(endpoint: string, path = process.env.VINIPE
     if (![contract.context_tokens, contract.compaction_trigger_tokens, contract.output_limit].every(positive)
       || !(contract.max_iterations === "unlimited" || positive(contract.max_iterations))
       || typeof contract.api_model !== "string") return undefined;
+    const chunkTokens = contract.task_profiles?.animated_svg?.target_chunk_tokens;
+    const control = contract.thinking_control;
+    let nativeEfforts: string[] | undefined;
+    const nativeEffortAliases: Record<string, string> = {};
+    if (control?.protocol === "reasoning_effort") {
+      nativeEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"].filter(level =>
+        Array.isArray(control.supported_efforts) && control.supported_efforts.includes(level));
+      const aliases = control.effort_aliases;
+      if (aliases && typeof aliases === "object" && !Array.isArray(aliases)) {
+        for (const level of nativeEfforts) {
+          const target = aliases[level];
+          if (nativeEfforts.includes(target) && !Object.hasOwn(aliases, target)) nativeEffortAliases[level] = target;
+        }
+        nativeEfforts = nativeEfforts.filter(level => !Object.hasOwn(nativeEffortAliases, level));
+      }
+      if (!nativeEfforts.length) return undefined;
+    }
+    const nativeEffortInTemplate = Boolean(nativeEfforts && control.wire_parameter === "chat_template_kwargs.reasoning_effort");
+    const requestedDefault = control?.default === "off" ? "none" : (nativeEffortAliases[control?.default] ?? control?.default ?? "medium");
     return {
       endpoint: normalizeEndpoint(endpoint), model: contract.api_model,
       contextTokens: contract.context_tokens, compactAtTokens: contract.compaction_trigger_tokens,
       outputTokens: contract.output_limit, maxIterations: contract.max_iterations,
-      defaultReasoning: contract.thinking_control?.default ?? "medium",
+      animatedSvgChunkTokens: positive(chunkTokens) && chunkTokens < contract.output_limit ? chunkTokens : undefined,
+      defaultReasoning: nativeEfforts && !nativeEfforts.includes(requestedDefault) ? nativeEfforts[0] : requestedDefault,
+      nativeEfforts, nativeEffortAliases, nativeEffortInTemplate,
+      templateKwargs: nativeEffortInTemplate && contract.chat_template_kwargs && typeof contract.chat_template_kwargs === "object"
+        && !Array.isArray(contract.chat_template_kwargs) ? contract.chat_template_kwargs : undefined,
       reasoningBudgets: contract.thinking_control?.budget_tokens ?? { low: 256, medium: 512, high_and_above: 1024 },
       templateEfforts: contract.thinking_control?.template_effort,
       reasoningBudgetMessage: typeof contract.thinking_control?.budget_message === "string" ? contract.thinking_control.budget_message : undefined,
@@ -59,28 +87,42 @@ export function loadLocalAgentPolicy(endpoint: string, path = process.env.VINIPE
   } catch { return undefined; }
 }
 
-export function localRequestOverrides(request: ProviderRequest, policy?: LocalAgentPolicy): Record<string, unknown> {
-  if (!policy || request.selectedModel !== policy.model) return {};
-  const effort = request.reasoning || policy.defaultReasoning;
+export function localRequestOverrides(request: ProviderRequest, policy?: LocalAgentPolicy, body: Record<string, unknown> = {}): Record<string, unknown> {
+  if (!policy || request.selectedModel !== policy.model) return body;
+  const selected = request.reasoning === "off" ? "none" : request.reasoning;
+  const requested = selected && (policy.nativeEffortAliases?.[selected] ?? selected);
+  const effort = !requested || (policy.nativeEfforts && !policy.nativeEfforts.includes(requested))
+    ? policy.defaultReasoning : requested;
   const thinking = !["off", "none"].includes(effort.toLowerCase());
   const user = [...request.history].reverse().find((entry) => entry.role === "user");
   const text = request.currentUserText ?? user?.items.filter((item) => item.type === "text").map((item) => item.text).join("\n") ?? "";
   const json = requestsStrictJsonObject(text) && (!request.tools.length || policy.structuredToolsJson);
   const proofFirst = json && !request.tools.length && policy.proofFirstJson === true && requestsProofFieldFirst(text);
-  return {
+  const template = body.chat_template_kwargs as Record<string, unknown> | undefined;
+  const result: Record<string, unknown> = {
+    ...body,
     cache_prompt: true,
     max_tokens: policy.outputTokens,
-    reasoning_effort: thinking ? (policy.templateEfforts?.[effort] ?? effort) : "none",
-    reasoning_budget_tokens: thinking ? policy.reasoningBudgets[effort] ?? policy.reasoningBudgets.high_and_above : 0,
-    ...(thinking && policy.reasoningBudgetMessage ? { reasoning_budget_message: policy.reasoningBudgetMessage } : {}),
-    reasoning_format: "deepseek",
-    chat_template_kwargs: { enable_thinking: thinking },
     parallel_tool_calls: policy.parallelToolCalls,
     ...(thinking && policy.thinkingSampling ? policy.thinkingSampling : {}),
     ...(json ? { response_format: proofFirst ? { type: "json_schema", json_schema: {
       name: "proof_before_fields", schema: { type: "object", properties: { proof: {} }, required: ["proof"], additionalProperties: true },
     } } : { type: "json_object" } } : {}),
   };
+  if (policy.nativeEffortInTemplate) {
+    // Some llama.cpp forks give the top-level effort precedence, even for "none".
+    delete result.reasoning_effort;
+    result.chat_template_kwargs = { ...policy.templateKwargs, ...template, reasoning_effort: effort };
+  } else if (policy.nativeEfforts) {
+    result.reasoning_effort = effort;
+  } else {
+    result.reasoning_effort = thinking ? (policy.templateEfforts?.[effort] ?? effort) : "none";
+    result.reasoning_budget_tokens = thinking ? policy.reasoningBudgets[effort] ?? policy.reasoningBudgets.high_and_above : 0;
+    if (thinking && policy.reasoningBudgetMessage) result.reasoning_budget_message = policy.reasoningBudgetMessage;
+    result.reasoning_format = "deepseek";
+    result.chat_template_kwargs = { ...template, enable_thinking: thinking };
+  }
+  return result;
 }
 
 export function requestsStrictJsonObject(text: string): boolean {

@@ -17,19 +17,23 @@ import {
 
 test("long streamed tool arguments report bounded real progress before completing JSON", async () => {
   const profile = testProfile("openai-chat", "http://127.0.0.1/v1/chat/completions");
+  const ticks = [1_000, 2_050, 2_100];
+  let tickIndex = 0;
   const source = new ReadableStream<Uint8Array>({
-    async start(controller) {
+    start(controller) {
       const send = (delta: unknown) => controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\n`));
       send({ tool_calls: [{ index: 0, id: "long-call", function: { name: "demo.inspect", arguments: '{"topic":"' } }] });
-      await new Promise((resolve) => setTimeout(resolve, 1050));
       send({ tool_calls: [{ index: 0, function: { arguments: '正文'.repeat(2000) } }] });
-      await new Promise((resolve) => setTimeout(resolve, 50));
       send({ tool_calls: [{ index: 0, function: { arguments: '"}' } }] });
       controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
       controller.close();
     },
   });
-  const provider = new OpenAIChatProvider({ ...providerOptions(profile), fetchImpl: async () => new Response(source) });
+  const provider = new OpenAIChatProvider({
+    ...providerOptions(profile),
+    now: () => ticks[Math.min(tickIndex++, ticks.length - 1)],
+    fetchImpl: async () => new Response(source),
+  });
   const events = [];
   for await (const event of provider.stream(protocolRequest(profile), new AbortController().signal)) events.push(event);
   const progress = events.filter((e) => e.kind === "provider.activity");

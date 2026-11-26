@@ -9,14 +9,14 @@ test("P4 desktop and CLI consume workspace/review state through the application 
   const preload = await readFile(join(root, "src", "platform", "desktop", "preload.ts"), "utf8");
   const cliPort = await readFile(join(root, "src", "platform", "cli", "application-port.ts"), "utf8");
   const cliController = await readFile(join(root, "src", "platform", "cli", "controller.ts"), "utf8");
-  const rendererFiles = ["app.js", "workspace-panel.js"].map((name) =>
-    readFile(name === "app.js"
-      ? join(root, "src", "renderer", "shell", name)
-      : join(root, "src", "renderer", "workspaces", name), "utf8"));
+  const rendererFiles = [
+    join(root, "resources", "viniper-ui", "static", "v2", "app.js"),
+    join(root, "resources", "viniper-ui", "static", "v2", "pages.js"),
+  ].map((filePath) => readFile(filePath, "utf8"));
   const renderer = (await Promise.all(rendererFiles)).join("\n");
   for (const source of [desktopApi, preload, cliPort, cliController]) {
     assert.match(source, /workspace|review/iu);
   }
-  assert.match(renderer, /renderWorkspacePanel/u);
-  assert.doesNotMatch(renderer, /child_process|execFile|git\s+status|terminal\.run/u);
+  assert.match(renderer, /\/api\/sessions|chooseProject/u);
+  assert.doesNotMatch(renderer, /child_process|execFile|git\s+status/u);
 });

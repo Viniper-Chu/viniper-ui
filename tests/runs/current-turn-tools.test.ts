@@ -293,3 +293,9 @@ test("a room exercise sends its shared transcript once and keeps earlier native 
     assert.match(JSON.stringify(requests.at(-1)?.history),/昨天的无关工作记录/u);
   } finally { await fixture.dispose(); }
 });
+
+test("asking to switch to a new parameter exercise uses math tools without replaying file work", () => {
+  const text = "Qwen 请换一道高中数学参数题：自拟一道在半开区间上讨论函数取值或方程根数的题，交给 DeepSeek 复核。";
+  assert.equal(isInlineMathExercise(text), true);
+  assert.equal(isInlineMathExercise(text + "请从附件中选题。"), false);
+});

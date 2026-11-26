@@ -212,6 +212,12 @@ function sumUsage(values: TokenUsage[]): TokenUsage {
     reasoning: values.reduce((sum, usage) => sum + usage.reasoning, 0),
     toolUse: values.reduce((sum, usage) => sum + usage.toolUse, 0),
     total: values.reduce((sum, usage) => sum + usage.total, 0),
+    ...(values.some((u) => typeof u.promptMs === "number")
+      ? { promptMs: values.reduce((sum, u) => sum + (typeof u.promptMs === "number" ? u.promptMs : 0), 0) }
+      : {}),
+    ...(values.some((u) => typeof u.outputMs === "number")
+      ? { outputMs: values.reduce((sum, u) => sum + (typeof u.outputMs === "number" ? u.outputMs : 0), 0) }
+      : {}),
     source: values.every((usage) => usage.source === "provider") ? "provider" : "estimated",
   };
 }
@@ -234,6 +240,8 @@ function normalizeUsage(usage: TokenUsage): TokenUsage {
     reasoning: safeNumber(usage.reasoning),
     toolUse: safeNumber(usage.toolUse),
     total: safeNumber(usage.total),
+    ...(typeof usage.promptMs === "number" && Number.isFinite(usage.promptMs) ? { promptMs: Math.max(0, Math.round(usage.promptMs)) } : {}),
+    ...(typeof usage.outputMs === "number" && Number.isFinite(usage.outputMs) ? { outputMs: Math.max(0, Math.round(usage.outputMs)) } : {}),
     source: usage.source === "provider" ? "provider" : "estimated",
   };
 }

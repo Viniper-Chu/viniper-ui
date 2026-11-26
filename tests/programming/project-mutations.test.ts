@@ -136,7 +136,7 @@ test("P2-01 project.edit validates every exact replacement before one atomic com
     const changed = await scene.filesystem.edit(scene.canonical, {
       path: "existing.txt",
       edits: [
-        { oldText: "alpha", newText: "ALPHA", expectedMatches: 1 },
+        { oldText: "alpha", newText: "ALPHA" },
         { oldText: "gamma", newText: "GAMMA", expectedMatches: 1 },
       ],
     }, scene.context);
@@ -145,6 +145,11 @@ test("P2-01 project.edit validates every exact replacement before one atomic com
     assert.equal(await readFile(join(scene.root, "existing.txt"), "utf8"), "ALPHA\nbeta\nGAMMA\n");
 
     const beforeConflict = await readFile(join(scene.root, "existing.txt"), "utf8");
+    const ambiguous = await scene.filesystem.edit(scene.canonical, {
+      path: "existing.txt", edits: [{oldText:"A",newText:"X"}],
+    }, scene.context);
+    assert.equal(ambiguous.ok,false);
+    assert.equal(await readFile(join(scene.root,"existing.txt"),"utf8"),beforeConflict);
     const conflict = await scene.filesystem.edit(scene.canonical, {
       path: "existing.txt",
       edits: [

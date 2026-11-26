@@ -122,6 +122,7 @@ export class SQLiteStore implements RuntimePersistence, CoordinationPersistence,
 
   async close(): Promise<void> {
     if (!this.database) return;
+    try { this.database.exec("PRAGMA wal_checkpoint(TRUNCATE)"); } catch {}
     this.database.close();
     this.database = undefined;
     this.initialized = false;
@@ -208,12 +209,15 @@ export class SQLiteStore implements RuntimePersistence, CoordinationPersistence,
       const existing = database.prepare("SELECT sequence_no, engine_id, session_id, run_id, item_id, type, timestamp, payload_json FROM events WHERE id = ?").get(event.id) as DatabaseRow | undefined;
       if (existing) return { event: eventFromRow(event.id, existing), duplicate: true };
       const committed = insertEvent(database, event);
-      saveApplication(database, {
-        ...application,
-        sessions: application.sessions.map((session) => session.id === committed.sessionId
-          ? { ...session, replayCursor: committed.sequence ?? session.replayCursor }
-          : session),
-      });
+      database.prepare("INSERT INTO app_state (id, product_version, active_session_id) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET product_version = excluded.product_version, active_session_id = excluded.active_session_id")
+        .run(application.productVersion, application.activeSessionId);
+      for (const session of application.sessions) {
+        if (session.id === committed.sessionId) {
+          saveSession(database, { ...session, replayCursor: committed.sequence ?? session.replayCursor });
+        } else if (!sessionExists(database, session.id)) {
+          saveSession(database, session);
+        }
+      }
       updateRunProjection(database, committed);
       return { event: committed, duplicate: false };
     });
@@ -474,7 +478,7 @@ export class SQLiteStore implements RuntimePersistence, CoordinationPersistence,
     let stage: DatabaseSync | undefined;
     let preserveStage = false;
     try {
-      stage = openDatabase(this.stagePath);
+      stage = openDatabase(this.stagePath, false);
       ensureSchema(stage);
       inTransaction(stage, () => {
         if (legacy.application) saveApplication(stage!, legacy.application);
@@ -508,9 +512,14 @@ export class SQLiteStore implements RuntimePersistence, CoordinationPersistence,
   }
 }
 
-function openDatabase(path: string): DatabaseSync {
+function openDatabase(path: string, enableWal = true): DatabaseSync {
   const database = new DatabaseSync(path, { timeout: 2500 });
   database.exec("PRAGMA foreign_keys = ON");
+  if (enableWal) {
+    try {
+      database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
+    } catch {}
+  }
   return database;
 }
 

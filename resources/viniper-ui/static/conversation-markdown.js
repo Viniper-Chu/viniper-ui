@@ -22,7 +22,25 @@
   });
   const escape = md.utils.escapeHtml;
   const formulaCache = new Map();
+  const previewFormulaCache = new Map();
+  const FORMULA_CACHE_LIMIT = 512;
+  const PREVIEW_CACHE_LIMIT = 128;
+  let streamCache = { prefix: "", html: "" };
   const delimiters = [["$$", "$$", true], ["\\[", "\\]", true], ["\\(", "\\)", false], ["$", "$", false]];
+
+  function lruGet(cache, key) {
+    if (!cache.has(key)) return undefined;
+    const value = cache.get(key);
+    cache.delete(key);
+    cache.set(key, value);
+    return value;
+  }
+
+  function lruSet(cache, limit, key, value) {
+    if (cache.has(key)) cache.delete(key);
+    else if (cache.size >= limit) cache.delete(cache.keys().next().value);
+    cache.set(key, value);
+  }
 
   function escapedAt(text, index) {
     let slashes = 0;
@@ -42,16 +60,24 @@
     return -1;
   }
 
-  function typeset(source, display) {
+  function typeset(source, display, cache = formulaCache, limit = FORMULA_CACHE_LIMIT) {
     const key = `${display}:${source}`;
-    if (formulaCache.has(key)) return formulaCache.get(key);
-    const html = globalThis.katex.renderToString(source, {
-      displayMode: display, output: "htmlAndMathml", throwOnError: true,
-      strict: "ignore", trust: false, maxSize: 20, maxExpand: 1000,
-    });
-    if (formulaCache.size >= 256) formulaCache.delete(formulaCache.keys().next().value);
-    formulaCache.set(key, html);
-    return html;
+    const cached = lruGet(cache, key);
+    if (cached !== undefined) {
+      if (cached && typeof cached === "object" && cached.error) throw cached.error;
+      return cached;
+    }
+    try {
+      const html = globalThis.katex.renderToString(source, {
+        displayMode: display, output: "htmlAndMathml", throwOnError: true,
+        strict: "ignore", trust: false, maxSize: 20, maxExpand: 1000,
+      });
+      lruSet(cache, limit, key, html);
+      return html;
+    } catch (err) {
+      lruSet(cache, limit, key, { error: err });
+      throw err;
+    }
   }
 
   function formula(source, display, { pending = false, raw = source } = {}) {
@@ -145,6 +171,10 @@
         // Full TeX documents and unsupported packages are code, not equations.
       }
     }
+    if (language === "math-check") {
+      if (env.streaming && index === tokens.length - 1) return "";
+      return '<div class="math-check-badge" role="note">✓ 定稿结论已附结构化数据并经应用有理数抽样核对</div>\n';
+    }
     return codeBlock(code, language);
   };
   md.renderer.rules.code_block = (tokens, index) => codeBlock(tokens[index].content.replace(/\n$/, ""), "");
@@ -163,10 +193,69 @@
     return tokens.map(token => {
       if (token.type === "viniper_math") {
         if (token.meta.pending) return "…";
-        try { return typeset(token.content, false); } catch { return "…"; }
+        try { return typeset(token.content, false, previewFormulaCache, PREVIEW_CACHE_LIMIT); } catch { return "…"; }
       }
       return ["text", "code_inline", "image"].includes(token.type) ? escape(token.content) : "";
     }).join("");
   }
-  globalThis.ViniperMarkdown = { render: (text, options = {}) => md.render(String(text || ""), options), preview };
+
+  function safeStreamingSplitIndex(src) {
+    if (src.length < 1600 || /^\s*\[[^\]]+\]:/m.test(src)) return -1;
+    const lines = src.split("\n");
+    let fenceChar = "";
+    let fenceLen = 0;
+    let inMathBlock = "";
+    let offset = 0;
+    let lastSafe = -1;
+    for (let i = 0; i < lines.length - 1; i++) {
+      const line = lines[i];
+      const trimmed = line.trimStart();
+      const lineLen = line.length + 1;
+      if (fenceChar) {
+        const closeRe = new RegExp(`^${fenceChar}{${fenceLen},}\\s*$`);
+        if (closeRe.test(trimmed)) { fenceChar = ""; fenceLen = 0; }
+      } else if (inMathBlock) {
+        const closeToken = inMathBlock === "$$" ? "$$" : "\\]";
+        if (closingAt(line, closeToken, 0) >= 0) inMathBlock = "";
+      } else {
+        const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmed);
+        if (fenceMatch) {
+          fenceChar = fenceMatch[1][0];
+          fenceLen = fenceMatch[1].length;
+        } else if (trimmed.startsWith("$$") && closingAt(trimmed.slice(2), "$$", 0) < 0) {
+          inMathBlock = "$$";
+        } else if (trimmed.startsWith("\\[") && closingAt(trimmed.slice(2), "\\]", 0) < 0) {
+          inMathBlock = "\\[";
+        } else if (
+          line.trim() === ""
+          && i > 0
+          && lines[i + 1]
+          && !/^(?:\s{2,}|\t|[-*+]\s|\d+[.)]\s|>|\||(?:-{3,}|\*{3,}|_{3,})\s*$)/.test(lines[i + 1])
+          && !/^\s*\|/.test(lines[i - 1])
+        ) {
+          lastSafe = offset + lineLen;
+        }
+      }
+      offset += lineLen;
+    }
+    return lastSafe > 400 && src.length - lastSafe > 40 ? lastSafe : -1;
+  }
+
+  function renderMarkdown(text, options = {}) {
+    const src = String(text || "");
+    if (!options?.streaming) return md.render(src, options);
+    const splitAt = safeStreamingSplitIndex(src);
+    if (splitAt < 0) return md.render(src, options);
+    const prefix = src.slice(0, splitAt);
+    const tail = src.slice(splitAt);
+    if (streamCache.prefix && prefix.startsWith(streamCache.prefix)) {
+      const delta = prefix.slice(streamCache.prefix.length);
+      if (delta) streamCache = { prefix, html: streamCache.html + md.render(delta, { streaming: false }) };
+    } else {
+      streamCache = { prefix, html: md.render(prefix, { streaming: false }) };
+    }
+    return streamCache.html + md.render(tail, options);
+  }
+
+  globalThis.ViniperMarkdown = { render: renderMarkdown, preview };
 })();

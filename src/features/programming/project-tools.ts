@@ -165,7 +165,11 @@ class ProjectEditTool extends ProjectToolBase implements ToolExecutor {
     type: "object" as const,
     properties: {
       path: { type: "string" as const, description: "项目内相对文件路径。" },
-      edits: { type: "array" as const, description: "oldText/newText/expectedMatches 组成的替换清单。" },
+      edits: { type: "array" as const, description: "逐项精确替换。省略 expectedMatches 时只允许唯一匹配。",
+        items: { type: "object" as const, properties: {
+          oldText: { type: "string" as const }, newText: { type: "string" as const },
+          expectedMatches: { type: "integer" as const, minimum: 1, default: 1 },
+        }, required: ["oldText", "newText"], additionalProperties: false } },
     },
     required: ["path", "edits"],
     additionalProperties: false,

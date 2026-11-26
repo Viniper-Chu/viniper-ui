@@ -139,7 +139,7 @@ function rowHtml(task, kind) {
   const toggle = !goal && task.status !== "project-invalid";
   const stateText = !toggle || !["已启用","已暂停"].includes(status);
   const name = escape(title);
-  const row = `<button class="record-row" data-record-kind="${kind}" data-record-id="${escape(task.id)}" data-hint="查看${goal ? "目标" : "定时任务"}详情"><span class="card-icon">${icon(goal ? "target" : "clock")}</span><span class="capability-copy"><span class="capability-name">${name}</span><small>${escape(meta)}</small></span>${stateText ? `<small class="record-state" data-tone="${group}">${escape(status)}</small>` : ""}${goal ? icon("arrowRight") : ""}</button>`;
+  const row = `<button class="record-row" data-record-kind="${kind}" data-record-id="${escape(task.id)}" data-hint="查看${goal ? "目标" : "定时任务"}详情"><span class="card-icon">${icon(goal ? "target" : "clock")}</span><span class="capability-copy"><span class="capability-name">${name}</span><small>${escape(meta)}</small></span>${stateText ? `<small class="record-state" data-tone="${group}">${escape(status)}</small>` : ""}${goal ? `<span class="row-chevron" aria-hidden="true">${icon("chevron")}</span>` : ""}</button>`;
   if (!toggle) return row;
   const verb = task.enabled ? "暂停" : "恢复";
   return `<div class="routine-row">${row}<button class="schedule-switch" role="switch" aria-checked="${Boolean(task.enabled)}" aria-label="${name}定时执行" data-hint="${verb}此定时任务" data-task-action="${task.enabled ? "pause" : "resume"}" data-schedule-id="${escape(task.id)}" ${changingSchedules.has(task.id) ? "disabled" : ""}></button></div>`;
@@ -165,7 +165,7 @@ export function renderTasks() {
     const empty = query || taskFilter !== "all" ? `没有匹配的${label}` : `还没有${label}`;
     const error = taskLoads[kind] === "error";
     $(`#${stem}-count`).textContent = ready ? `${visible.length} 项` : "";
-    const fallback = `<div class="task-empty" role="status">${error ? "暂时无法读取" + label : ready ? empty : "正在读取…"}${error ? '<button class="text-button" data-action="refresh-tasks">重新读取</button>' : ""}</div>`;
+    const fallback = `<div class="task-empty" role="status">${ready && !error ? `<span class="task-empty-icon" aria-hidden="true">${icon(goal ? "target" : "clock")}</span>` : ""}<span>${error ? "暂时无法读取" + label : ready ? empty : "正在读取…"}</span>${error ? '<button class="text-button" data-action="refresh-tasks">重新读取</button>' : ""}</div>`;
     setHtml($(`#${stem}-list`), ready && visible.length ? visible.map(item=>rowHtml(item,kind)).join("") : fallback);
   }
   if (focus && !focus.isConnected && !selected && !editor && state.view === "tasks") {

@@ -1,3 +1,4 @@
+import { cloudEffort } from "../shared/cloud-effort";
 import { deepSeekEffort } from "../shared/deepseek-effort";
 import {
   ProviderEvent,
@@ -39,6 +40,7 @@ export class AnthropicMessagesProvider implements ModelProvider {
       signal,
       headers: { "Content-Type": "application/json", ...cache.headers },
       body: JSON.stringify({ ...serializeAnthropicMessages(request, this.options.profile, cache.body),
+        ...cloudEffort(this.transport.endpoint(), request.selectedModel, request.reasoning, "anthropic"),
         ...deepSeekEffort(this.transport.endpoint(), request.selectedModel, request.reasoning, "anthropic-messages") }),
     });
     if (!response.body) throw new Error("Provider 未返回流式响应体。");

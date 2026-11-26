@@ -20,6 +20,7 @@ import {
   toolTitle,
   workingLabel,
   copyAnswer,
+  refreshLiveRunStatus,
 } from "./conversation.js";
 import { option, showMenu, closeMenu, menuContent, sessionMenuContent } from "./menus.js";
 import {
@@ -40,7 +41,88 @@ let busySending = false;
 let submitting = null;
 let sessionsVersion = 0;
 let busySteering = false;
+let busyPermissionAnswer = false;
+let lastAnnouncedInteractionKey = "";
 let draftDirectory = "";
+let switchingTargetId = null;
+const UI_SESSION_STORAGE_KEY = "viniper.ui.sessionState.v1";
+
+function announcePolite(text) {
+  const el = $("#sr-announcer");
+  if (!el || !text) return;
+  el.textContent = "";
+  setTimeout(() => { el.textContent = text; }, 20);
+}
+
+function persistUiSessionState() {
+  try {
+    const store = globalThis.sessionStorage;
+    if (!store) return;
+    const drafts = {};
+    for (const [k, v] of state.drafts.entries()) {
+      if (v) drafts[k] = v;
+    }
+    store.setItem(UI_SESSION_STORAGE_KEY, JSON.stringify({
+      activeSessionId: state.session?.session_id || "",
+      draftDirectory,
+      drafts,
+    }));
+  } catch {}
+}
+
+function restoreUiSessionState() {
+  try {
+    const raw = globalThis.sessionStorage?.getItem(UI_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed?.drafts && typeof parsed.drafts === "object") {
+      for (const [k, v] of Object.entries(parsed.drafts)) {
+        if (typeof v === "string" && v) state.drafts.set(k, v);
+      }
+    }
+    if (typeof parsed?.draftDirectory === "string" && parsed.draftDirectory) {
+      draftDirectory = parsed.draftDirectory;
+    }
+    return typeof parsed?.activeSessionId === "string" ? parsed.activeSessionId : "";
+  } catch {
+    return null;
+  }
+}
+
+function renderQueueItems(items = []) {
+  const box = $("#queue");
+  if (!box) return;
+  box.hidden = !items.length;
+  setMarkup(box, items
+    .map(
+      (item) =>
+        `<div class="queued-message" data-queue-id="${escape(item.id)}"><span>${escape(item.text)}</span><button class="icon-button" data-cancel-queue="${escape(item.id)}" aria-label="移除待发送消息">${icon("close")}</button></div>`,
+    )
+    .join(""));
+}
+
+async function refreshQueue(sid = state.session?.session_id) {
+  if (!sid) {
+    renderQueueItems([]);
+    return;
+  }
+  const queue = await api(`/api/runs/${encodeURIComponent(sid)}/queue`);
+  const items = queue.items || queue.queue || [];
+  state.queues?.set(sid, items);
+  if (state.session?.session_id === sid) renderQueueItems(items);
+}
+
+function findPendingAssistant(messages) {
+  const visible = (messages || []).filter((m) => m.role === "user" || m.role === "assistant");
+  const pendingIndex = visible.findLastIndex((m) => m.role === "assistant" && m.pending);
+  if (pendingIndex < 0) return { message: null, node: null };
+  const message = visible[pendingIndex];
+  const children = [...($("#messages")?.children || [])];
+  const byId = message.id
+    ? children.find((el) => el.dataset?.messageId === String(message.id))
+    : null;
+  return { message, node: byId || children[pendingIndex] || null };
+}
 function setMarkup(element, html) {
   if (element._markup === html) return;
   element.innerHTML = html;
@@ -78,7 +160,13 @@ export function dialog(
       await onSubmit(new FormData(d.querySelector("form")));
       d.close();
     } catch (error) {
-      toast(error.message, true);
+      let alert = d.querySelector("#dialog-body [role=alert]");
+      if (!alert) {
+        alert = document.createElement("p");
+        alert.setAttribute("role", "alert");
+        $("#dialog-body").append(alert);
+      }
+      alert.textContent = error.message;
     } finally {
       button.disabled = false;
     }
@@ -87,28 +175,62 @@ export function dialog(
   d.showModal();
   d.querySelector("input,textarea")?.focus();
 }
-let settingsOrigin = "chat";
+const settingsDialog = $("#settings-view");
 let settingsOpener = null;
 
 function leaveSettings() {
-  view(settingsOrigin, { returning: true });
-  const opener = settingsOpener;
-  if (opener?.isConnected && opener.getClientRects().length) opener.focus({ preventScroll: true });
-  else if (settingsOrigin === "chat") $("#prompt").focus({ preventScroll: true });
+  if (!settingsDialog.open) return;
+  settingsDialog.close();
+  if (settingsOpener?.isConnected && settingsOpener.getClientRects().length)
+    settingsOpener.focus({ preventScroll: true });
+  settingsOpener = null;
 }
 
-export function view(name, { returning = false } = {}) {
-  if (name === "settings" && state.view !== "settings") {
-    settingsOrigin = state.view;
-    settingsOpener = document.activeElement;
+settingsDialog.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !event.isComposing && $("#preference-query").value) {
+    event.preventDefault();
+    event.stopPropagation();
     clearPreferenceSearch();
+    $("#preference-query").focus();
   }
-  if ((state.view === "extensions" && name !== "settings") ||
-      (state.view === "settings" && settingsOrigin === "extensions" && !returning && name !== "settings")) backToExtensions(false);
+});
+settingsDialog.addEventListener("cancel", event => {
+  event.preventDefault();
+  if ($("#preference-query").value) {
+    clearPreferenceSearch();
+    $("#preference-query").focus();
+  } else leaveSettings();
+});
+function onSettingsBackdrop(event) {
+  if (event.target !== settingsDialog) return false;
+  const rect = settingsDialog.getBoundingClientRect();
+  return event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom;
+}
+let pressedBackdrop = false;
+settingsDialog.addEventListener("pointerdown", event => { pressedBackdrop = onSettingsBackdrop(event); });
+settingsDialog.addEventListener("click", event => {
+  if (pressedBackdrop && onSettingsBackdrop(event)) leaveSettings();
+  pressedBackdrop = false;
+});
+
+export function view(name) {
+  if (name === "settings") {
+    if (!settingsDialog.open) {
+      settingsOpener = document.activeElement;
+      closeMenu();
+      clearPreferenceSearch();
+      settingsDialog.showModal();
+      $(".settings-navigation [aria-selected=true]").focus({ preventScroll: true });
+      return Promise.resolve(loadSettings()).catch(e => toast(e.message, true));
+    }
+    return;
+  }
+  if (settingsDialog.open) leaveSettings();
+  if (state.view === "extensions") backToExtensions(false);
   state.view = name;
   $("#return-chat").hidden = name === "chat";
   $("#app").dataset.view = name;
-  for (const page of ["chat", "extensions", "tasks", "settings"])
+  for (const page of ["chat", "extensions", "tasks"])
     $(`#${page}-view`).hidden = page !== name;
   document
     .querySelectorAll("[data-view]")
@@ -119,14 +241,10 @@ export function view(name, { returning = false } = {}) {
   $("#room-header").hidden = name !== "chat" || !state.session?.discussion;
   closeMenu();
   let loading;
-  if (name === "extensions" && !returning)
+  if (name === "extensions")
     loading = loadExtensions().catch((e) => toast(e.message, true));
   if (name === "tasks") loading = loadTasks().catch((e) => toast(e.message, true));
-  if (name === "settings") {
-    $(".settings-navigation [aria-selected=true]").focus({ preventScroll: true });
-    Promise.resolve(loadSettings()).catch((e) => toast(e.message, true));
-  }
-  if (innerWidth <= 860 && name !== "settings" && !returning) $("#app").classList.add("sidebar-collapsed");
+  if (innerWidth <= 860) $("#app").classList.add("sidebar-collapsed");
   return loading;
 }
 export async function loadStatus() {
@@ -249,48 +367,73 @@ function renderSessions() {
   for (const row of rows.values()) row.remove();
 }
 export async function selectSession(id) {
-  rememberDraft();
+  const leavingKey = switchingTargetId || state.session?.session_id || "new";
+  rememberDraft(leavingKey);
+  switchingTargetId = id;
   const generation = ++switchVersion;
-  const session = await api(`/api/sessions/${encodeURIComponent(id)}`);
+  let session;
+  try {
+    session = await api(`/api/sessions/${encodeURIComponent(id)}`);
+  } finally {
+    if (generation === switchVersion) switchingTargetId = null;
+  }
   if (generation !== switchVersion) return;
   state.session = session;
-  state.model = (state.status?.models || []).some((m) => m.id === session.model)
+  const savedComposer = state.composerDrafts?.get(id);
+  const defaultModel = (state.status?.models || []).some((m) => m.id === session.model)
     ? session.model
     : state.status?.model;
+  state.model = savedComposer?.model && (state.status?.models || []).some((m) => m.id === savedComposer.model)
+    ? savedComposer.model
+    : defaultModel;
   state.workdir = session.workdir;
-  state.mode = session.task_mode || "execute";
+  state.mode = savedComposer?.mode || session.task_mode || "execute";
+  state.attachments = savedComposer?.attachments ? [...savedComposer.attachments] : [];
+  state.selectedSkills = savedComposer?.selectedSkills ? [...savedComposer.selectedSkills] : [];
   const activeModel = state.status?.models?.find(m => m.id === state.model);
-  state.reasoning = selectedEffort(activeModel, activeModel?.reasoning_options?.includes("auto") ? session.local_reasoning_preference : session.reasoning);
+  state.reasoning = selectedEffort(
+    activeModel,
+    savedComposer?.reasoning ?? (activeModel?.reasoning_options?.includes("auto") ? session.local_reasoning_preference : session.reasoning),
+  );
   view("chat");
   $("#project-name").textContent =
     session.workdir?.split("/").filter(Boolean).slice(-1)[0] || "选择工作目录";
   $("#prompt").value = state.drafts.get(id) || "";
+  renderQueueItems(state.queues?.get(id) || []);
+  void refreshQueue(id).catch(() => {});
   renderMessages(session.messages.map(message =>
     session.active_run?.active && message.pending
       ? { ...message, streaming: true, working: "正在接续输出" }
       : message));
   renderSessions();
   syncComposer();
+  persistUiSessionState();
   bottom(true);
   const running = state.runs.get(id);
   if (running?.active) {
-    const pendingIndex = session.messages.findLastIndex(message => message.role === "assistant" && message.pending);
-    running.node = $("#messages").children[pendingIndex] || null;
+    running.node = findPendingAssistant(session.messages).node;
     paintRun(running);
   } else if (session.active_run?.active)
     resumeRun(session).catch((e) => toast(e.message, true));
   await refreshGoalBanner();
 }
 export function newChat() {
-  rememberDraft();
+  const leavingKey = switchingTargetId || state.session?.session_id || "new";
+  rememberDraft(leavingKey);
+  switchingTargetId = null;
   switchVersion++;
   state.session = null;
-  state.reasoning = selectedEffort(state.status?.models?.find(m => m.id === state.model), null);
-  state.workdir = draftDirectory || state.status?.settings?.workspace?.default_root || "";
-  state.mode = "execute";
-  state.attachments = [];
-  state.selectedSkills = [];
+  const savedNew = state.composerDrafts?.get("new");
+  if (savedNew?.model && (state.status?.models || []).some((m) => m.id === savedNew.model)) {
+    state.model = savedNew.model;
+  }
+  state.reasoning = selectedEffort(state.status?.models?.find(m => m.id === state.model), savedNew?.reasoning ?? null);
+  state.workdir = savedNew?.workdir || draftDirectory || state.status?.settings?.workspace?.default_root || "";
+  state.mode = savedNew?.mode || "execute";
+  state.attachments = savedNew?.attachments ? [...savedNew.attachments] : [];
+  state.selectedSkills = savedNew?.selectedSkills ? [...savedNew.selectedSkills] : [];
   $("#task-banner").hidden = true;
+  renderQueueItems([]);
   view("chat");
   $("#project-name").textContent =
     state.workdir?.split("/").filter(Boolean).slice(-1)[0] || "选择工作目录";
@@ -298,10 +441,20 @@ export function newChat() {
   renderMessages([]);
   renderSessions();
   syncComposer();
+  persistUiSessionState();
   $("#prompt").focus();
 }
-function rememberDraft() {
-  state.drafts.set(state.session?.session_id || "new", $("#prompt").value);
+function rememberDraft(targetKey = switchingTargetId || state.session?.session_id || "new") {
+  state.drafts.set(targetKey, $("#prompt").value);
+  state.composerDrafts?.set(targetKey, {
+    attachments: [...state.attachments],
+    selectedSkills: [...state.selectedSkills],
+    mode: state.mode,
+    model: state.model,
+    reasoning: state.reasoning,
+    workdir: state.workdir,
+  });
+  persistUiSessionState();
 }
 export async function ensureSession() {
   if (state.session) return state.session;
@@ -420,7 +573,7 @@ export function syncComposer() {
 
   $("#stop-button").hidden = !active;
   $("#stop-button").disabled = stopping;
-  $("#stop-button").dataset.hint = stopping ? "正在等待当前任务停止" : "停止当前任务";
+  $("#stop-button").dataset.hint = stopping ? "正在等待当前任务停止" : "停止当前任务  ⌘.";
   $("#steer-button").hidden = !active;
   const sendGlyph = active ? "enqueue" : "send";
   const sendButton = $("#send-button");
@@ -481,9 +634,19 @@ export function syncComposer() {
   resizePrompt();
   $("#interaction").hidden = !pending;
   if (pending) {
+    const interactionKey = `${state.session?.session_id || ""}:${pending.call_id || pending.request_id || ""}`;
     const call = run?.message?.segments?.find(s => s.type === "tool_start" && (s.call_id || s.tool_id) === (pending.call_id || pending.request_id));
     const detail = call?.input?.command || call?.input?.path || pending.summary || pending.description || pending.content || "允许使用此项能力？";
-    setMarkup($("#interaction"), `<div class="interaction-copy"><h3>${icon("shield")}允许${escape(toolTitle(pending.tool_name || "此项能力"))}</h3><p>${escape(detail)}</p><small>确认后记住此能力，后续任务直接执行。</small></div><div class="interaction-actions"><button class="secondary-button" data-permission-answer="reject" data-hint="拒绝本次工具调用">拒绝</button><button class="primary-button" data-permission-answer="allow-always" data-hint="允许此能力并记住选择">允许并记住</button></div>`);
+    setMarkup($("#interaction"), `<div class="interaction-copy"><h3>${icon("shield")}允许${escape(toolTitle(pending.tool_name || "此项能力"))}</h3><p>${escape(detail)}</p><small>确认后记住此能力，后续任务直接执行。</small></div><div class="interaction-actions"><button class="secondary-button" data-permission-answer="reject" data-hint="拒绝本次工具调用"${busyPermissionAnswer ? " disabled" : ""}>拒绝</button><button class="primary-button" data-permission-answer="allow-always" data-hint="允许此能力并记住选择"${busyPermissionAnswer ? " disabled" : ""}>允许并记住</button></div>`);
+    if (interactionKey !== lastAnnouncedInteractionKey) {
+      lastAnnouncedInteractionKey = interactionKey;
+      announcePolite(`需要确认权限：允许${toolTitle(pending.tool_name || "此项能力")}`);
+      if (document.activeElement === document.body) {
+        $("#interaction [data-permission-answer='allow-always']")?.focus({ preventScroll: true });
+      }
+    }
+  } else {
+    lastAnnouncedInteractionKey = "";
   }
 }
 async function send() {
@@ -503,12 +666,15 @@ async function send() {
   const visible = () => generation === switchVersion;
   const clear = () => {
     if (!preview || !state.drafts.get(originalId) || state.drafts.get(originalId).trim() === text) state.drafts.delete(originalId);
+    state.composerDrafts?.delete(originalId);
+    if (state.session?.session_id) state.composerDrafts?.delete(state.session.session_id);
     if (visible()) {
       if (!preview) $("#prompt").value = "";
       $("#prompt").style.height = "";
       state.attachments = state.attachments.filter(a => !controls.attachments.includes(a));
       syncComposer();
     }
+    if (typeof persistUiSessionState === "function") persistUiSessionState();
   };
   const alreadyActive = state.runs.get(originalId)?.active || state.session?.active_run?.active;
   const preview = !alreadyActive && controls.mode !== "goal" ? newRun(originalId, null) : null;
@@ -536,6 +702,7 @@ async function send() {
         },
       });
       clear();
+      if (typeof refreshQueue === "function") void refreshQueue(sid).catch(() => {});
       toast("已加入待发送队列");
       return;
     }
@@ -640,8 +807,7 @@ async function resumeRun(session) {
   if (state.runs.get(sid)?.active) return;
   const snapshot = session.active_run;
   const run = newRun(sid, snapshot.run_id);
-  const pendingIndex = session.messages?.findLastIndex(message => message.role === "assistant" && message.pending) ?? -1;
-  const last = session.messages?.[pendingIndex];
+  const { message: last, node: pendingNode } = findPendingAssistant(session.messages);
   run.guidanceIds = new Set((session.messages || []).map(message => message.guidance_id).filter(Boolean));
   if (last?.role === "assistant") {
     run.message = { ...run.message, ...last, streaming: true };
@@ -649,7 +815,7 @@ async function resumeRun(session) {
       last.elapsed_seconds ?? last.elapsed ?? last.turn_usage?.elapsed_seconds ?? 0,
     );
     run.started -= run.message.elapsed * 1000;
-    run.node = $("#messages").children[pendingIndex];
+    run.node = pendingNode;
   }
   if (snapshot.turn_started_at > 0) run.started = snapshot.turn_started_at * 1000;
   run.phase = snapshot.activity_phase;
@@ -667,30 +833,77 @@ async function resumeRun(session) {
 }
 async function consume(response, run) {
   const renderer = globalThis.AgentStream.createRenderScheduler();
+  let current = response;
   try {
-    await globalThis.AgentStream.readJsonEvents(response.body, (event) => {
-      projectEvent(run, event);
-      renderer.schedule(run.sessionId, () => {
-        paintRun(run);
-        if (state.session?.session_id === run.sessionId) syncComposer();
-        else if (run.sidebarPhase !== activePhase(run)) {
-          run.sidebarPhase = activePhase(run);
-          renderSessions();
-        }
-      });
-    });
-    if (!run.done) {
-      const result = await globalThis.AgentStream.confirmRunState(
-        fetch,
-        run.sessionId,
-        run.runId,
-      );
-      if (result.kind === "active") {
-        const next = await fetch(
-          `/api/runs/${run.sessionId}/events?${query({ run_id: run.runId, after_sequence: run.sequence })}`,
-        );
-        return await consume(next, run);
+    while (current && !run.done) {
+      let streamError = null;
+      try {
+        if (!current.body) throw new Error("未收到流式响应体");
+        await globalThis.AgentStream.readJsonEvents(current.body, (event) => {
+          projectEvent(run, event);
+          const isPermRequest = event?.type === "permission_request" || event?.type === "interaction_request";
+          if (isPermRequest && typeof announcePolite === "function") {
+            announcePolite(`需要确认工具权限：${event.tool_name || "工具操作"}`);
+          }
+          renderer.schedule(run.sessionId, () => {
+            paintRun(run);
+            if (state.session?.session_id === run.sessionId) {
+              syncComposer();
+              if (isPermRequest && document.activeElement !== $("#prompt")) {
+                document.querySelector('[data-permission-answer="allow_once"], [data-permission-answer]')?.focus({ preventScroll: true });
+              }
+            }
+            else if (run.sidebarPhase !== activePhase(run)) {
+              run.sidebarPhase = activePhase(run);
+              renderSessions();
+            }
+          });
+        });
+      } catch (error) {
+        streamError = error;
       }
+      if (run.done) break;
+      let nextResponse = null;
+      let lastError = streamError;
+      const delays = [0, 400, 900, 1800, 3200, 5000, 7000, 8000];
+      for (const delay of delays) {
+        if (run.done) break;
+        if (delay > 0) {
+          run.phase = "resume";
+          run.message.working = "连接波动，正在重连…";
+          paintRun(run);
+          if (state.session?.session_id === run.sessionId) syncComposer();
+          await new Promise((r) => setTimeout(r, delay));
+        }
+        try {
+          const result = await globalThis.AgentStream.confirmRunState(
+            fetch,
+            run.sessionId,
+            run.runId,
+          );
+          if (result.kind === "active") {
+            const candidate = await fetch(
+              `/api/runs/${encodeURIComponent(run.sessionId)}/events?${query({ run_id: run.runId, after_sequence: run.sequence })}`,
+            );
+            if (!candidate.ok || !candidate.body) throw new Error(`重连失败 (${candidate.status})`);
+            nextResponse = candidate;
+            break;
+          }
+          if (result.kind === "terminal" || result.kind === "replaced") {
+            run.done = true;
+            break;
+          }
+        } catch (err) {
+          lastError = err;
+        }
+      }
+      if (run.done) break;
+      if (nextResponse) {
+        current = nextResponse;
+        continue;
+      }
+      if (lastError) throw lastError;
+      break;
     }
   } catch (error) {
     run.error = true;
@@ -718,6 +931,9 @@ async function consume(response, run) {
       } catch {}
     }
     void loadSessions();
+    if (typeof announcePolite === "function") {
+      announcePolite(run.error ? "任务未完成" : run.message.cancelled ? "任务已停止" : "任务已完成");
+    }
     window.viniperDesktop?.conversationCompleted();
   }
 }
@@ -770,20 +986,28 @@ async function stop() {
   }
 }
 async function permissionAnswer(action) {
-  const sid = state.session.session_id,
-    run = state.runs.get(sid),
-    pending = run?.interaction || state.session.pending_interaction;
-  await api(`/api/runs/${sid}/interaction`, {
-    method: "POST",
-    body: {
-      action,
-      call_id: pending.call_id || pending.request_id,
-      run_id: run?.runId || state.session.active_run?.run_id,
-    },
-  });
-  if (run) run.interaction = null;
-  state.session.pending_interaction = null;
+  if (busyPermissionAnswer) return;
+  const sid = state.session?.session_id,
+    run = sid ? state.runs.get(sid) : null,
+    pending = run?.interaction || state.session?.pending_interaction;
+  if (!sid || !pending) return;
+  busyPermissionAnswer = true;
   syncComposer();
+  try {
+    await api(`/api/runs/${sid}/interaction`, {
+      method: "POST",
+      body: {
+        action,
+        call_id: pending.call_id || pending.request_id,
+        run_id: run?.runId || state.session.active_run?.run_id,
+      },
+    });
+    if (run) run.interaction = null;
+    if (state.session?.session_id === sid) state.session.pending_interaction = null;
+  } finally {
+    busyPermissionAnswer = false;
+    syncComposer();
+  }
 }
 async function project() {
   const current = state.session?.workdir || state.workdir;
@@ -862,9 +1086,12 @@ async function deleteSession(id = state.session?.session_id) {
     onSubmit: async () => {
       await api(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" });
       state.runs.delete(id);
+      state.composerDrafts?.delete(id);
+      state.queues?.delete(id);
       // loadSessions preserves any unsent input if this was the current chat.
       await loadSessions();
       state.drafts.delete(id);
+      if (typeof persistUiSessionState === "function") persistUiSessionState();
     },
   });
 }
@@ -951,6 +1178,7 @@ async function handleMenu(action, value) {
   if (action === "attach") $("#file-input").click();
   else if (action === "mode") {
     state.mode = state.mode === value ? "execute" : value;
+    rememberDraft();
     syncComposer();
     $("#prompt").focus();
   } else if (action === "model") {
@@ -960,6 +1188,7 @@ async function handleMenu(action, value) {
     state.model = value;
     const nextModel = state.status.models.find(m => m.id === value);
     state.reasoning = selectedEffort(nextModel, nextModel?.reasoning_options?.includes("auto") ? state.session?.local_reasoning_preference : state.reasoning);
+    rememberDraft();
     await refreshModelNotice();
     const sid = state.session?.session_id;
     syncComposer();
@@ -994,10 +1223,10 @@ function applyStarter(button) {
   resizePrompt(); rememberDraft(); syncComposer(); prompt.focus();
 }
 function openPreference(section, field) {
-  view("settings");
+  const loading = view("settings") || ($("#settings-fields").disabled ? loadSettings() : null);
   selectSettingsSection(section);
-  Promise.resolve(loadSettings()).then(() => {
-    if (state.view !== "settings" || document.getElementById(section).hidden) return;
+  Promise.resolve(loading).then(() => {
+    if (!settingsDialog.open || document.getElementById(section).hidden) return;
     if (field) focusPreference(field);
     else document.querySelector('[aria-controls="' + section + '"]').focus();
   }).catch(() => {});
@@ -1056,12 +1285,14 @@ async function dispatch(action) {
   if (action === "clear-mode") {
     state.mode = "execute";
     state.selectedSkills = [];
+    rememberDraft();
     return syncComposer();
   }
   if (action === "implement-plan") {
     state.mode = "execute";
     syncComposer();
     $("#prompt").value = "按刚才的计划开始实施，完成后验证结果。";
+    rememberDraft();
     resizePrompt();
     $("#prompt").focus();
   }
@@ -1096,11 +1327,19 @@ async function click(event) {
       return;
     }
     if (b.dataset.cancelQueue) {
+      const sid = state.session?.session_id;
+      if (!sid) {
+        renderQueueItems([]);
+        return;
+      }
       await api(
-        `/api/runs/${state.session.session_id}/queue/${b.dataset.cancelQueue}`,
+        `/api/runs/${encodeURIComponent(sid)}/queue/${encodeURIComponent(b.dataset.cancelQueue)}`,
         { method: "DELETE" },
       );
-      b.closest(".queued-message").remove();
+      const nextItems = (state.queues?.get(sid) || []).filter(item => String(item.id) !== b.dataset.cancelQueue);
+      state.queues?.set(sid, nextItems);
+      b.closest(".queued-message")?.remove();
+      $("#queue").hidden = !$("#queue").children.length;
       return;
     }
     if (b.dataset.view) {
@@ -1161,6 +1400,7 @@ async function click(event) {
     }
     if (b.dataset.removeAttachment !== undefined) {
       state.attachments.splice(Number(b.dataset.removeAttachment), 1);
+      rememberDraft();
       syncComposer();
       return;
     }
@@ -1251,14 +1491,6 @@ $("#prompt").addEventListener("keydown", (event) => {
 });
 document.addEventListener("keydown", (event) => {
   if (event.isComposing || document.querySelector("dialog[open]")) return;
-  if (state.view === "settings" && event.key === "Escape" && !event.defaultPrevented) {
-    event.preventDefault();
-    if ($("#preference-query").value) {
-      clearPreferenceSearch();
-      $("#preference-query").focus();
-    } else leaveSettings();
-    return;
-  }
   if (event.key === "Escape" && state.view === "tasks" && $("#task-catalog").hidden) {
     event.preventDefault();
     if ($("#task-editor").hidden) backToTasks(); else cancelTaskEdit();
@@ -1271,6 +1503,17 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault();
     backToExtensions();
     return;
+  }
+  if (
+    ((event.metaKey || event.ctrlKey) && event.key === ".")
+    || (event.key === "Escape" && state.view === "chat" && $("#popover").hidden && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName))
+  ) {
+    const activeRun = state.runs.get(state.session?.session_id);
+    if ((activeRun?.active || state.session?.active_run?.active) && !isStopping()) {
+      event.preventDefault();
+      stop().catch((error) => toast(error.message, true));
+      return;
+    }
   }
   if ((event.metaKey || event.ctrlKey) && event.shiftKey && event.key.toLowerCase() === "k") {
     event.preventDefault(); navigate("quick"); return;
@@ -1301,6 +1544,7 @@ $("#file-input").addEventListener("change", async () => {
       });
       state.attachments.push({ name: file.name, type: file.type, data });
     }
+    rememberDraft();
     syncComposer();
   } catch (e) {
     toast(e.message, true);
@@ -1312,6 +1556,7 @@ setupTooltips();
 setupConversationScroll();
 window.viniperDesktop?.onCommand((payload) => {
   const cmd = payload.command || payload.action;
+  if (settingsDialog.open) return;
   if (["new-session", "new-chat", "new-viniper-session"].includes(cmd))
     newChat();
   if (["settings", "open-settings"].includes(cmd)) view("settings");
@@ -1330,49 +1575,73 @@ if (innerWidth <= 860) $("#app").classList.add("sidebar-collapsed");
 hydrateIcons();
 bindEffortControl($("#popover"), value => {
   state.reasoning = value;
+  rememberDraft();
   syncComposer();
 });
 setupFunctionField($("#chat-view"));
+const restoredSessionId = restoreUiSessionState();
+if (!restoredSessionId && state.drafts.get("new")) {
+  $("#prompt").value = state.drafts.get("new");
+  resizePrompt();
+}
 await Promise.all([loadStatus(), loadSessions()]).catch((error) =>
   toast(`连接尚未就绪：${error.message}`, true),
 );
-setInterval(async () => {
-  try {
-    if (document.hidden) return;
-    await refreshModelNotice();
-    await loadSessions();
-    if (state.session) {
-      const queue = await api(`/api/runs/${state.session.session_id}/queue`);
-      const items = queue.items || queue.queue || [];
-      $("#queue").hidden = !items.length;
-      setMarkup($("#queue"), items
-        .map(
-          (item) =>
-            `<div class="queued-message"><span>${escape(item.text)}</span><button class="icon-button" data-cancel-queue="${escape(item.id)}" aria-label="移除待发送消息">${icon("close")}</button></div>`,
-        )
-        .join(""));
+if (restoredSessionId && state.sessions.some((s) => s.id === restoredSessionId)) {
+  await selectSession(restoredSessionId).catch((error) => toast(error.message, true));
+} else if (state.drafts.get("new")) {
+  $("#prompt").value = state.drafts.get("new");
+  syncComposer();
+}
+async function backgroundPollTick() {
+  if (!document.hidden) {
+    if (!state.status) {
+      await loadStatus().catch(() => {});
+    } else {
+      await refreshModelNotice().catch(() => {});
     }
-    if (state.view === "tasks") await loadTasks();
+    await loadSessions().catch(() => {});
     if (state.session) {
-      await refreshGoalBanner();
-      const listed = state.sessions.find(
-        (s) => s.id === state.session.session_id,
-      );
+      await refreshQueue(state.session.session_id).catch(() => {});
+    }
+    if (!settingsDialog.open && state.view === "tasks") {
+      await loadTasks().catch(() => {});
+    }
+    if (state.session) {
+      await refreshGoalBanner().catch(() => {});
+      const sid = state.session.session_id;
+      const listed = state.sessions.find((s) => s.id === sid);
       if (
-        state.view === "chat" && listed?.active_run?.active &&
-        !state.runs.get(listed.id)?.active && !busySending
-      )
-        await selectSession(listed.id);
+        !settingsDialog.open && state.view === "chat" && listed?.active_run?.active &&
+        !state.runs.get(sid)?.active && !busySending
+      ) {
+        try {
+          const fresh = await api(`/api/sessions/${encodeURIComponent(sid)}`);
+          if (state.session?.session_id === sid && !state.runs.get(sid)?.active) {
+            state.session.messages = fresh.messages;
+            state.session.active_run = fresh.active_run;
+            renderMessages(fresh.messages.map((m) =>
+              fresh.active_run?.active && m.pending ? { ...m, streaming: true, working: "正在接续输出" } : m
+            ), { preserveView: true });
+            if (fresh.active_run?.active) void resumeRun(fresh).catch((e) => toast(e.message, true));
+          }
+        } catch {}
+      }
     }
-  } catch {}
-}, 4000);
+  }
+  setTimeout(backgroundPollTick, 4000);
+}
+setTimeout(backgroundPollTick, 4000);
 
 setInterval(() => {
   for (const run of state.runs.values())
     if (run.active) {
       run.message.elapsed = Math.round((Date.now() - run.started) / 1000);
-      // Timer updates only the small status line; token events own transcript rendering.
-      if (state.session?.session_id === run.sessionId) syncComposer();
+      // Timer updates only the small status line and waiting/thinking elapsed label.
+      if (state.session?.session_id === run.sessionId) {
+        syncComposer();
+        refreshLiveRunStatus(run);
+      }
     }
 }, 1000);
 

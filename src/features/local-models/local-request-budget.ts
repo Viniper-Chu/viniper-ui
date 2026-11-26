@@ -6,9 +6,55 @@ type Message = { role: string; content?: unknown; [key: string]: unknown };
 type ToolCall = { id: string; function: { name: string; arguments: string } };
 type ToolExchange = { request: Message; calls: ToolCall[]; receipts: Message[] };
 
+interface SessionCompactionAnchor {
+  coveredCount: number;
+  coveredFingerprint: string;
+  summaryContent: string;
+}
+
+const MAX_SESSION_ANCHORS = 64;
+const sessionCompactionAnchors = new Map<string, SessionCompactionAnchor>();
+
+function rememberAnchor(sessionKey: string, anchor: SessionCompactionAnchor): void {
+  sessionCompactionAnchors.delete(sessionKey);
+  sessionCompactionAnchors.set(sessionKey, anchor);
+  if (sessionCompactionAnchors.size > MAX_SESSION_ANCHORS) {
+    const oldest = sessionCompactionAnchors.keys().next().value;
+    if (oldest !== undefined) sessionCompactionAnchors.delete(oldest);
+  }
+}
+
+function fingerprintMessages(slice: readonly Message[]): string {
+  if (!slice.length) return "0";
+  const first = slice[0];
+  const last = slice[slice.length - 1];
+  const head = typeof first.content === "string" ? first.content.slice(0, 96) : JSON.stringify(first.tool_calls ?? "").slice(0, 96);
+  const tail = typeof last.content === "string" ? last.content.slice(-96) : JSON.stringify(last.tool_calls ?? "").slice(-96);
+  return `${slice.length}:${first.role}:${head.length}:${head}|${last.role}:${tail.length}:${tail}`;
+}
+
+function formatHistorySummary(old: readonly Message[]): string {
+  const excerpts = old
+    .filter((message) => ["user", "assistant"].includes(message.role) && typeof message.content === "string" && message.content)
+    .slice(-8)
+    .map((message) => `${message.role === "user" ? "用户原话" : "助手报告"}：${excerpt(String(message.content), 320)}`)
+    .join("\n");
+  return `历史摘录（细节已省略，完整原文保留在会话中）。历史任务不自动重做，以当前用户要求为准。\n${excerpts}`;
+}
+
+export function clearLocalCompactionAnchors(): void {
+  sessionCompactionAnchors.clear();
+}
+
 /** Count the rendered wire request, not the accounting estimate or just history. */
 export async function boundLocalRequest(
-  body: Record<string, unknown>, policy: LocalAgentPolicy, transport: ProviderTransport, signal: AbortSignal, imageTokens = 0, roomHistory: readonly string[] = [],
+  body: Record<string, unknown>,
+  policy: LocalAgentPolicy,
+  transport: ProviderTransport,
+  signal: AbortSignal,
+  imageTokens = 0,
+  roomHistory: readonly string[] = [],
+  sessionKey?: string,
 ): Promise<LocalContextReduction> {
   const endpoint = new URL(policy.endpoint).origin;
   const json = async (route: string, value: unknown): Promise<any> => {
@@ -22,7 +68,8 @@ export async function boundLocalRequest(
     const templateMessages = imageTokens ? messages.map((message) => ({ ...message,
       content: Array.isArray(message.content) ? message.content.filter((part) => part.type !== "image_url") : message.content })) : messages;
     const rendered = await json("/apply-template", { messages: templateMessages, ...(body.tools ? { tools: body.tools } : {}),
-      add_generation_prompt: true, chat_template_kwargs: body.chat_template_kwargs });
+      add_generation_prompt: true, chat_template_kwargs: body.chat_template_kwargs,
+      ...(policy.nativeEfforts && !policy.nativeEffortInTemplate ? { reasoning_effort: body.reasoning_effort } : {}) });
     if (typeof rendered.prompt !== "string") throw new Error("本机模型未返回可核算的请求模板。");
     const tokenized = await json("/tokenize", { content: rendered.prompt, add_special: true });
     if (!Array.isArray(tokenized.tokens)) throw new Error("本机模型未返回实际输入 token；请检查本地模型服务。");
@@ -36,9 +83,16 @@ export async function boundLocalRequest(
     const live = [...messages].reverse().find(message => message.role === "user");
     if (!live || typeof live.content !== "string") throw new Error("群聊缺少本轮请求文本。");
     const original = live.content;
+    const taskMarker = "\n\n[当前请求]\n";
+    const instructionStart = original.indexOf("[Viniper Harness 独立指令]\n");
+    const taskStart = instructionStart < 0 ? -1 : original.indexOf(taskMarker, instructionStart);
+    // The native host's fixed harness instructions stay before changing room
+    // history, so a warm slot can reuse that entire prefix on the next handoff.
+    const prefix = taskStart < 0 ? "" : original.slice(0, taskStart + taskMarker.length);
+    const task = original.slice(prefix.length);
     const include = (items: readonly string[], omitted: boolean) => {
       const heading = omitted ? "此前群聊节选（更早内容已省略）" : "此前群聊发言";
-      live.content = heading + "（历史资料）：\n" + items.join("\n") + "\n\n本轮请求与交接：\n" + original;
+      live.content = prefix + heading + "（历史资料）：\n" + items.join("\n") + "\n\n本轮请求与交接：\n" + task;
     };
     include(roomHistory, false);
     const inputBefore = await count();
@@ -72,22 +126,75 @@ export async function boundLocalRequest(
     }
     return {...base, inputBefore, inputAfter, historyTurns:base.historyTurns + roomHistory.length - retained};
   }
+  const rawOriginalMessages = sessionKey ? [...messages] : undefined;
+  if (sessionKey) {
+    const anchor = sessionCompactionAnchors.get(sessionKey);
+    const initStart = messages.findIndex((message) => message.role !== "system");
+    const initRevUser = [...messages].reverse().findIndex((message) => message.role === "user");
+    const initLive = initRevUser < 0 ? -1 : messages.length - 1 - initRevUser;
+    if (
+      anchor
+      && initStart >= 0
+      && initLive >= initStart + anchor.coveredCount
+      && fingerprintMessages(messages.slice(initStart, initStart + anchor.coveredCount)) === anchor.coveredFingerprint
+    ) {
+      rememberAnchor(sessionKey, anchor);
+      messages.splice(initStart, anchor.coveredCount, { role: "assistant", content: anchor.summaryContent });
+    }
+  }
   const inputBefore = await count();
   if (inputBefore <= limit) return { inputBefore, inputAfter: inputBefore, outputReserved, historyTurns: 0, toolResults: 0 };
   let inputAfter = inputBefore, historyTurns = 0;
   const reducedReceipts = new Set<Message>();
   // Completed turns may be replaced by labelled quotations. The live user's
   // complete input, system instructions and tool schemas are never truncated.
+  if (rawOriginalMessages) {
+    messages.splice(0, messages.length, ...rawOriginalMessages);
+  }
   const reversedUser = [...messages].reverse().findIndex((message) => message.role === "user");
   const live = reversedUser < 0 ? -1 : messages.length - 1 - reversedUser;
   const start = messages.findIndex((message) => message.role !== "system");
   if (live > start && start >= 0) {
-    const old = messages.slice(start, live);
-    historyTurns = old.filter((message) => message.role === "user").length;
-    const excerpts = old.filter((message) => ["user", "assistant"].includes(message.role) && typeof message.content === "string" && message.content)
-      .slice(-8).map((message) => `${message.role === "user" ? "用户原话" : "助手报告"}：${excerpt(String(message.content), 320)}`).join("\n");
-    messages.splice(start, live - start, { role: "assistant", content: `历史摘录（细节已省略，完整原文保留在会话中）。历史任务不自动重做，以当前用户要求为准。\n${excerpts}` });
-    inputAfter = await count();
+    const allOld = messages.slice(start, live);
+    // Hysteresis: when sessionKey is tracked and there are enough prior messages,
+    // keep the most recent completed turn intact if doing so drops below 72% of limit,
+    // so subsequent turns append cleanly onto an immutable summary prefix.
+    let coveredCount = allOld.length;
+    if (sessionKey && allOld.length >= 4) {
+      const lastOldUserOffset = allOld.slice(0, -1).map((m) => m.role).lastIndexOf("user");
+      if (lastOldUserOffset >= 2) {
+        const candidateOld = allOld.slice(0, lastOldUserOffset);
+        const candidateSummary = formatHistorySummary(candidateOld);
+        const snapshot = [...messages];
+        messages.splice(start, candidateOld.length, { role: "assistant", content: candidateSummary });
+        const candidateTokens = await count();
+        if (candidateTokens <= Math.floor(limit * 0.72)) {
+          coveredCount = candidateOld.length;
+          historyTurns = candidateOld.filter((message) => message.role === "user").length;
+          inputAfter = candidateTokens;
+          rememberAnchor(sessionKey, {
+            coveredCount,
+            coveredFingerprint: fingerprintMessages(candidateOld),
+            summaryContent: candidateSummary,
+          });
+        } else {
+          messages.splice(0, messages.length, ...snapshot);
+        }
+      }
+    }
+    if (historyTurns === 0) {
+      historyTurns = allOld.filter((message) => message.role === "user").length;
+      const summaryContent = formatHistorySummary(allOld);
+      messages.splice(start, live - start, { role: "assistant", content: summaryContent });
+      inputAfter = await count();
+      if (sessionKey) {
+        rememberAnchor(sessionKey, {
+          coveredCount: allOld.length,
+          coveredFingerprint: fingerprintMessages(allOld),
+          summaryContent,
+        });
+      }
+    }
   }
   // The live turn can contain many completed operations, including entire
   // scripts/files in arguments. Shortening only their results never bounds

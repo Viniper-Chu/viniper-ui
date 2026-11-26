@@ -90,6 +90,8 @@ export interface HarnessApplicationFactoryOptions {
   maxConcurrentRuns?: number;
   /** Host-owned per-run Provider budget override for bounded acceptance processes. */
   providerRequestLimits?: ProviderRequestLimits;
+  /** Crash recovery policy for unfinished runs found during startup. */
+  interruptedRunPolicy?: "replay" | "fail";
   systemNotificationAdapter?: SystemNotificationAdapter;
   /** Enables Preview-only defaults without changing the canonical runtime defaults used by tests and other hosts. */
   previewFullAccessDefaults?: boolean;
@@ -341,6 +343,7 @@ export async function createHarnessApplication(
     extensionSnapshotProvider: () => extensionManager.beginRunSnapshot(),
     maxConcurrentRuns: options.maxConcurrentRuns,
     providerRequestLimits: options.providerRequestLimits,
+    interruptedRunPolicy: options.interruptedRunPolicy,
     modelAvailability: (providerId, modelId) => providerSettings.isModelAvailable(providerId, modelId)
       || localModelService.isModelAvailable(providerId, modelId)
       || Boolean(registry.list().find((provider) => provider.id === providerId)?.models.some((model) => model.id === modelId)),

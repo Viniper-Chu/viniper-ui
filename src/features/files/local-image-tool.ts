@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { extname, isAbsolute } from "node:path";
+import { basename, extname, isAbsolute } from "node:path";
 import { ProviderRegistry } from "../providers/provider-registry";
 import { ToolExecutor } from "../tools/tool-registry";
 
@@ -11,7 +11,10 @@ export function createLocalImageTool(registry: ProviderRegistry): ToolExecutor {
     async execute(request, context) {
       try {
         const path = String(request.input?.path ?? "");
-        const mime = ({ ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" } as Record<string, string>)[extname(path).toLowerCase()];
+        // Older uploads with an all-Chinese stem were stored as "<10 hex>_png".
+        const legacy = /^[0-9a-f]{10}_(png|jpe?g|webp)$/i.exec(basename(path));
+        const extension = legacy ? "." + legacy[1].toLowerCase() : extname(path).toLowerCase();
+        const mime = ({ ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp" } as Record<string, string>)[extension];
         if (!isAbsolute(path) || !mime) throw new Error("请提供 PNG/JPEG/WebP 图片的绝对路径。");
         const snapshot = context.providerSnapshot;
         if (!snapshot) throw new Error("缺少本轮模型连接。");

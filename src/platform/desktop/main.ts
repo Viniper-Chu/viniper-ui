@@ -251,7 +251,7 @@ async function createWindow(): Promise<void> {
   mainWindow.on("unmaximize", publishWindowState);
   mainWindow.on("show", () => refreshTrayMenu());
   mainWindow.on("hide", () => refreshTrayMenu());
-  await mainWindow.loadFile(join(__dirname, "../../renderer/shell/index.html"));
+  await mainWindow.loadFile(join(__dirname, "../../../../resources/viniper-ui/static/index.html"));
 }
 
 function createTray(): void {

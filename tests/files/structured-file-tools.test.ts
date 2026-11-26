@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createStructuredFileTools } from "../../src/features/files/structured-file-tools";
@@ -100,4 +100,32 @@ with ZipFile(sys.argv[1],'w') as z:
       assert.match(receipt.content_coverage.warning, /不能据此认定原题完整/u);
     }
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("declarative SVG motion sampling distinguishes a displaced axle from a locally rotating rim", async t => {
+  const helpers = join(process.cwd(), "agent-helpers");
+  const python = process.env.VINIPER_HARNESS_PYTHON ?? (process.platform === "win32" ? "python" : "python3");
+  const browser = execFileSync(python, ["-I","-B","-c","import sys;sys.path.insert(0,sys.argv[1]);from svg_motion import browser_path;print(browser_path() or '')", helpers], {encoding:"utf8"}).trim();
+  if (!browser) { t.skip("Chromium browser is unavailable"); return; }
+  const maintenance = join(process.cwd(), "codex", "运行残留");
+  await mkdir(maintenance, {recursive:true});
+  const root = await mkdtemp(join(maintenance, "svg-motion-"));
+  try {
+    const path = join(root, "motion.html");
+    await writeFile(path, `<style>.spin{animation:spin 1s linear infinite}@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}</style>
+      <svg viewBox="0 0 300 200"><g transform="translate(80 80)"><g id="fixed"><circle id="hub" r="20"/>
+      <animateTransform attributeName="transform" type="rotate" from="0 0 0" to="360 0 0" dur="1s" repeatCount="indefinite"/></g></g>
+      <line id="end" x2="80" y2="80"/><g id="offset" class="spin" style="transform-origin:50px 20px"><circle r="20"/></g></svg>
+      <script>document.querySelector('svg').remove()</script>`);
+    const tool = createStructuredFileTools(new LocalFileHelperHost(helpers, python)).find(s => s.name === "file.svg.inspect_motion")!;
+    const result = await tool.execute({id:"check", name:tool.name, input:{path,contacts:[{tip:"end",target:"hub"},{tip:"missing",target:"hub"}]}, readOnly:true, scope:"computer", summary:"inspect"}, {sessionId:"s",runId:"r",signal:new AbortController().signal});
+    const data = result.data as {ok:boolean; contacts:{samples:number;max_gap:number|null}[]; ring_centers:{element:string;max_center_shift:number;initial_svg_center:number[]}[]};
+    assert.ok(data.ok,result.text);
+    assert.ok(data.contacts[0].samples>=4);
+    assert.equal(data.contacts[0].max_gap,0);
+    assert.deepEqual([data.contacts[1].max_gap,data.contacts[1].samples],[null,0]);
+    assert.equal(data.ring_centers.find(c => c.element === "fixed")?.max_center_shift,0);
+    assert.deepEqual(data.ring_centers.find(c => c.element === "fixed")?.initial_svg_center,[80,80]);
+    assert.ok(data.ring_centers.find(c => c.element === "offset")!.max_center_shift > 20);
+  } finally { await rm(root,{recursive:true,force:true}); }
 });

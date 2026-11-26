@@ -74,6 +74,8 @@ export interface AgentIntent {
   userText?: string;
   /** Task plus selected attachments/skills, before global host instructions. */
   documentContext?: string;
+  /** Host-owned global/completion instructions placed once in the system project segment. */
+  hostInstructions?: string;
   /** The host supplied the room transcript and handoffs in this message. */
   roomTranscript?: boolean;
   roomHistory?: string[];
@@ -109,6 +111,7 @@ export interface AgentMessage {
 
 export interface QueuedIntent {
   documentContext?: string;
+  hostInstructions?: string;
   /** The host supplied the room transcript and handoffs in this message. */
   roomTranscript?: boolean;
   roomHistory?: string[];

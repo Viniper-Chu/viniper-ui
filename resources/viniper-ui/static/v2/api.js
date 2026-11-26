@@ -40,6 +40,8 @@ export const state = {
   sessions: [],
   runs: new Map(),
   drafts: new Map(),
+  composerDrafts: new Map(),
+  queues: new Map(),
   attachments: [],
   mode: "execute",
   model: "",

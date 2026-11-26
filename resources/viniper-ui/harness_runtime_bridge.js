@@ -204,7 +204,7 @@ async function ensureSession(request, provider, { setActive = true } = {}) {
   const nativeId = String(request.native_session_id || request.session_id || "");
   if (!nativeId) throw new Error("native session id is required");
   const existing = sessionMap.sessions[nativeId];
-  let session = existing?.harnessSessionId ? runtime.getSession(existing.harnessSessionId) : null;
+  let session = existing?.harnessSessionId ? runtime.getSessionRoute(existing.harnessSessionId) : null;
   const workdir = String(request.workdir || process.cwd()).trim() || process.cwd();
   if (!session) {
     session = isManagedWorkdir(workdir)
@@ -241,7 +241,7 @@ async function ensureSession(request, provider, { setActive = true } = {}) {
     updatedAt: new Date().toISOString(),
   };
   await saveSessionMap();
-  return runtime.getSession(session.id) || session;
+  return runtime.getSessionRoute(session.id) || session;
 }
 
 function waitForRunTerminal(sessionId, nativeSessionId, seenEvents, secrets) {
@@ -318,28 +318,59 @@ async function connectDesktopMcp() {
 async function run(request) {
   const nativeSessionId = String(request.native_session_id || "");
   if (activeRuns.has(nativeSessionId)) throw new Error("Harness Application Port already owns this session run");
-  await connectDesktopMcp();
-  const provider = await configureProvider(request);
-  const secrets = knownSecrets(provider.secret);
-  const session = await ensureSession(request, provider);
-  const seenEvents = { count: session.events?.length || 0 };
-  const terminal = waitForRunTerminal(session.id, nativeSessionId, seenEvents, secrets);
-  activeRuns.set(nativeSessionId, { nativeSessionId, harnessSessionId: session.id });
-  writeLine({
-    type: "runtime.started",
-    engine: "harness-runtime",
-    contract: "harness-application-port.v2",
-    session_id: session.id,
-    native_session_id: String(request.native_session_id || ""),
-    provider_id: provider.providerId,
-    model: provider.model,
-  });
+  const owned = { nativeSessionId, harnessSessionId: "", cancelRequested: false };
+  activeRuns.set(nativeSessionId, owned);
   try {
+    await connectDesktopMcp();
+    if (owned.cancelRequested) {
+      writeLine({
+        type: "runtime.completed",
+        engine: "harness-runtime",
+        contract: "harness-application-port.v2",
+        session_id: "",
+        native_session_id: nativeSessionId,
+        status: "run.cancelled",
+        accepted: true,
+        queued: false,
+        event_count: 0,
+      });
+      return;
+    }
+    const provider = await configureProvider(request);
+    const secrets = knownSecrets(provider.secret);
+    const session = await ensureSession(request, provider);
+    owned.harnessSessionId = session.id;
+    writeLine({
+      type: "runtime.started",
+      engine: "harness-runtime",
+      contract: "harness-application-port.v2",
+      session_id: session.id,
+      native_session_id: nativeSessionId,
+      provider_id: provider.providerId,
+      model: provider.model,
+    });
+    if (owned.cancelRequested) {
+      writeLine({
+        type: "runtime.completed",
+        engine: "harness-runtime",
+        contract: "harness-application-port.v2",
+        session_id: session.id,
+        native_session_id: nativeSessionId,
+        status: "run.cancelled",
+        accepted: true,
+        queued: false,
+        event_count: runtime.getSessionRoute(session.id)?.eventCount || 0,
+      });
+      return;
+    }
+    const seenEvents = { count: session.eventCount || 0 };
+    const terminal = waitForRunTerminal(session.id, nativeSessionId, seenEvents, secrets);
     const result = await runtime.send({
       sessionId: session.id,
       text: String(request.prompt || ""),
       userText: request.user_text == null ? undefined : String(request.user_text),
       documentContext: typeof request.document_context === "string" ? request.document_context : undefined,
+      hostInstructions: typeof request.host_instructions === "string" ? request.host_instructions : undefined,
       selectedModel: session.selectedModel,
       permissionMode: session.permissionMode,
       origin: { kind: "user" },
@@ -349,6 +380,7 @@ async function run(request) {
       planning: request.planning === true,
     });
     if (!result.accepted) throw new Error(`Harness run rejected: ${result.reason || "unknown"}`);
+    if (owned.cancelRequested) await runtime.cancel(session.id);
     const terminalEvent = await terminal;
     await runtime.flushRunPersistence(String(terminalEvent?.runId || terminalEvent?.payload?.runId || ""));
     writeLine({
@@ -356,11 +388,11 @@ async function run(request) {
       engine: "harness-runtime",
       contract: "harness-application-port.v2",
       session_id: session.id,
-      native_session_id: String(request.native_session_id || ""),
+      native_session_id: nativeSessionId,
       status: String(terminalEvent?.type || "run.completed"),
       accepted: true,
       queued: Boolean(result.queued),
-      event_count: runtime.getSession(session.id)?.events?.length || 0,
+      event_count: runtime.getSessionRoute(session.id)?.eventCount || 0,
     });
   } finally {
     activeRuns.delete(nativeSessionId);
@@ -912,6 +944,7 @@ async function bootstrap() {
     previewFullAccessDefaults: true,
     externalScheduleDispatch: true,
     maxConcurrentRuns: 3,
+    interruptedRunPolicy: "fail",
     ...(reviewProviderLimit ? { providerRequestLimits: { review: reviewProviderLimit } } : {}),
     claudeCode: { enabled: false },
     allowExternalNetwork,
@@ -937,7 +970,10 @@ async function main() {
     if (!command || typeof command !== "object") return;
     if (command.op === "cancel") {
       const owned = activeRuns.get(String(command.native_session_id || ""));
-      if (owned?.harnessSessionId) void runtime.cancel(owned.harnessSessionId);
+      if (owned) {
+        owned.cancelRequested = true;
+        if (owned.harnessSessionId) void runtime.cancel(owned.harnessSessionId);
+      }
       return;
     }
     if (command.op === "run") {

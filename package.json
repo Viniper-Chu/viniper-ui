@@ -3,7 +3,7 @@
   "version": "3.0.1",
   "private": true,
   "description": "Viniper — focused local Agent workspace",
-  "main": "dist/src/platform/desktop/main.js",
+  "main": "resources/viniper-ui/desktop/main.js",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "node scripts/clean-dist.mjs && tsc && node scripts/copy-assets.mjs",

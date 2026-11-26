@@ -12,9 +12,11 @@ import asyncio
 import copy
 import json
 import os
+import re
 import shutil
 import sys
 import uuid
+from collections import deque
 from collections.abc import AsyncIterable
 from pathlib import Path
 from typing import Any
@@ -470,6 +472,11 @@ class HarnessApplicationPort:
         self._control_owners: dict[str, asyncio.subprocess.Process] = {}
         self._active_runs: dict[str, asyncio.subprocess.Process] = {}
         self._run_stopped: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._stderr_tail: deque[str] = deque(maxlen=100)
+
+    def recent_stderr(self) -> list[str]:
+        """Host-only bounded stderr ring buffer for bridge diagnostics."""
+        return list(self._stderr_tail)
 
     def active_run(self, session_id: str) -> bool:
         process = self._active_runs.get(str(session_id))
@@ -589,10 +596,16 @@ class HarnessApplicationPort:
     async def _drain_stderr(self, process: asyncio.subprocess.Process) -> None:
         if process.stderr is None:
             return
-        async for _ in process.stderr:
-            # Node/Electron diagnostics stay owned by the host and are not
-            # copied into renderer logs or report artifacts.
-            continue
+        secret_pattern = re.compile(r"(?i)(?:sk-[A-Za-z0-9_-]{12,}|bearer\s+\S+|api[-_]?key\s*[:=]\s*\S+|secret\s*[:=]\s*\S+)")
+        try:
+            async for raw_line in process.stderr:
+                # Node/Electron diagnostics stay owned by the host and are not
+                # copied into renderer logs or report artifacts.
+                text = raw_line.decode("utf-8", errors="replace").strip()
+                if text:
+                    self._stderr_tail.append(secret_pattern.sub("[REDACTED]", text)[:400])
+        except (OSError, ValueError):
+            pass
 
     async def _ensure_bridge(self) -> None:
         async with self._bridge_lock:
@@ -673,7 +686,7 @@ class HarnessApplicationPort:
             "permission.resolve", "collaboration.snapshot", "collaboration.send",
             "collaboration.delegate", "collaboration.wait", "collaboration.cancel-wait",
             "collaboration.mark-read", "subagent.spawn", "subagent.cancel",
-            "subagents.snapshot", "capabilities.snapshot", "sessions.ensure", "permissions.snapshot",
+            "subagents.snapshot", "capabilities.snapshot", "sessions.ensure", "sessions.snapshot", "sessions.delete", "harness.snapshot", "permissions.snapshot",
         }
         if operation not in concurrent_controls and any(self.active_run(session_id) for session_id in tuple(self._active_runs)):
             raise RuntimeError("Harness control operations are unavailable while a run owns the Application Port")
@@ -771,6 +784,7 @@ class HarnessApplicationPort:
         reasoning: str | None = None,
         user_text: str | None = None,
         document_context: str | None = None,
+        host_instructions: str | None = None,
         planning: bool = False,
         room_transcript: bool = False,
         room_history: list[str] | None = None,
@@ -802,6 +816,7 @@ class HarnessApplicationPort:
             "reasoning": reasoning,
             "user_text": user_text,
             "document_context": document_context,
+            "host_instructions": host_instructions,
             "planning": bool(planning),
             "room_transcript": room_transcript,
             "room_history": room_history,

@@ -37,11 +37,13 @@ export class OpenAIChatProvider implements ModelProvider {
   readonly descriptor;
   private readonly transport: ProviderTransport;
   private readonly localPolicy?: LocalAgentPolicy;
+  private readonly now: () => number;
 
   constructor(private readonly options: ProtocolProviderOptions) {
     this.descriptor = descriptorFor(options);
     this.transport = new ProviderTransport(options);
     this.localPolicy = loadLocalAgentPolicy(options.configuration.endpoint ?? options.profile.endpoint.defaultUrl ?? "");
+    this.now = options.now ?? Date.now;
   }
 
   runtimePolicyFor(model: string): LocalAgentPolicy | undefined {
@@ -83,10 +85,12 @@ export class OpenAIChatProvider implements ModelProvider {
       let text = "", receivedCharacters = 0, lastActivityAt = 0;
       let finishReason = "";
       let finalUsage: ChatChunk["usage"];
+      let finalTimings: ChatChunk["timings"];
       for await (const frame of readSseFrames(response.body, signal)) {
         if (!frame.data || frame.data === "[DONE]") continue;
         const value = JSON.parse(frame.data) as ChatChunk;
         if (value.usage) finalUsage = value.usage;
+        if (value.timings) finalTimings = value.timings;
         let changed = false;
         for (const choice of value.choices ?? []) {
           if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -96,21 +100,21 @@ export class OpenAIChatProvider implements ModelProvider {
           receivedCharacters += content.length + reasoning.length;
           changed ||= Boolean(content || reasoning);
         }
-        if (changed && Date.now() - lastActivityAt >= 1000) {
+        if (changed && this.now() - lastActivityAt >= 1000) {
           await onActivity?.({ kind: "provider.activity", phase: "image-output", receivedCharacters });
-          lastActivityAt = Date.now();
+          lastActivityAt = this.now();
         }
       }
       if (finishReason === "length") throw new Error("图片检查达到单次输出上限，结果不完整；不能据此声明页面已通过，请缩小本次检查范围后重试。");
       if (!text.trim()) throw new Error("本机图像解析未返回可见结果。");
-      return { text: text.trim(), usage: finalUsage ? mapChatUsage(finalUsage) : undefined };
+      return { text: text.trim(), usage: (finalUsage || finalTimings) ? mapChatUsage(finalUsage ?? {}, finalTimings) : undefined };
     } finally { lease.release(); }
   }
 
   private async *streamRequest(request: ProviderRequest, signal: AbortSignal): AsyncIterable<ProviderEvent> {
     const toolNames = createOpenAIChatToolNameProjection(this.options.profile, request.tools);
     const cache = projectCachePolicy(this.options.profile, request);
-    const body = serializeOpenAIChat(request, this.options.profile, this.options.profile.cachePolicyId === "provider-reported" ? {} : cache.body);
+    let body = serializeOpenAIChat(request, this.options.profile, this.options.profile.cachePolicyId === "provider-reported" ? {} : cache.body);
     const guidance = this.runtimePolicyFor(request.selectedModel)?.mathOutputGuidance;
     if (guidance) {
       const messages = body.messages as Array<{ role: string; content: unknown }>;
@@ -118,10 +122,10 @@ export class OpenAIChatProvider implements ModelProvider {
       else messages.unshift({ role: "system", content: guidance });
     }
     Object.assign(body, deepSeekEffort(this.transport.endpoint(), request.selectedModel, request.reasoning, "openai-chat"));
-    Object.assign(body, localRequestOverrides(request, this.localPolicy));
+    body = localRequestOverrides(request, this.localPolicy, body);
     const local = this.runtimePolicyFor(request.selectedModel);
     if (local) {
-      const reduction = await boundLocalRequest(body, local, this.transport, signal, 0, request.roomHistory);
+      const reduction = await boundLocalRequest(body, local, this.transport, signal, 0, request.roomHistory, request.sessionId);
       if (reduction.inputBefore !== reduction.inputAfter) yield { kind: "context.compacted", ...reduction };
       yield { kind: "context.budget", inputCount: reduction.inputAfter, windowSize: local.contextTokens, outputReserved: local.outputTokens };
       // Local cold prefill of a full 12K input can exceed 90s before any SSE
@@ -143,11 +147,18 @@ export class OpenAIChatProvider implements ModelProvider {
     let reasoningStarted = false;
     let reasoningText = "";
     let finishReason = "";
+    let lastTimings: ChatChunk["timings"];
+    let emittedUsage = false;
     try {
     for await (const frame of readSseFrames(response.body, signal)) {
       capture?.frame(frame.data);
       if (!frame.data || frame.data === "[DONE]") continue;
       const payload = JSON.parse(frame.data) as ChatChunk;
+      if (payload.error) {
+        const msg = typeof payload.error === "string" ? payload.error : payload.error.message || "Provider 流式返回错误";
+        throw new Error(msg);
+      }
+      if (payload.timings) lastTimings = payload.timings;
       for (const choice of payload.choices ?? []) {
         if (choice.finish_reason) finishReason = choice.finish_reason;
         const delta = choice.delta ?? {};
@@ -164,7 +175,7 @@ export class OpenAIChatProvider implements ModelProvider {
         for (const fragment of delta.tool_calls ?? []) {
           mergeToolCall(calls, fragment);
           receivedCharacters += (fragment.function?.arguments || "").length;
-          const now = Date.now();
+          const now = this.now();
           if ((fragment.function?.name || fragment.function?.arguments) && now - lastToolProgressAt >= 1000) {
             lastToolProgressAt = now;
             // A large file/command can stream for minutes before its JSON is
@@ -173,7 +184,13 @@ export class OpenAIChatProvider implements ModelProvider {
           }
         }
       }
-      if (payload.usage) yield { kind: "usage.completed", usage: mapChatUsage(payload.usage) };
+      if (payload.usage) {
+        emittedUsage = true;
+        yield { kind: "usage.completed", usage: mapChatUsage(payload.usage, lastTimings) };
+      }
+    }
+    if (!emittedUsage && lastTimings) {
+      yield { kind: "usage.completed", usage: mapChatUsage({}, lastTimings) };
     }
     } finally { await capture?.finish(finishReason); }
     if (reasoningStarted) {
@@ -190,7 +207,14 @@ export class OpenAIChatProvider implements ModelProvider {
         if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected tool object");
         args = value;
         if (finishReason === "length") argumentsError = "output-limit";
-      } catch { argumentsError = finishReason === "length" ? "output-limit" : "invalid-json"; }
+      } catch {
+        const repaired = finishReason !== "length" ? repairCompletedToolJson(call.argumentsText) : undefined;
+        if (repaired) {
+          args = repaired;
+        } else {
+          argumentsError = finishReason === "length" ? "output-limit" : "invalid-json";
+        }
+      }
       yield {
         kind: "tool-call.completed",
         call: {
@@ -213,18 +237,22 @@ export function serializeOpenAIChat(
   cacheBody: Record<string, unknown> = {},
 ): Record<string, unknown> {
   const instructions = stableInstructions(request.contextProfile.history, request.contextProfile.stableSegments);
+  const stripLegacyHostPrefix = instructions.includes("[Viniper Harness 独立指令]") || instructions.includes("[通用 Agent 收尾指令]");
   const toolNames = createOpenAIChatToolNameProjection(profile, request.tools);
   const tools = isProviderCapabilityEnabled(profile, "tools") ? request.tools : [];
   return {
     model: request.selectedModel,
     messages: [
       ...(instructions ? [{ role: "system", content: instructions }] : []),
-      ...chatMessages(request.history, profile, toolNames, tools.length > 0),
+      ...chatMessages(request.history, profile, toolNames, tools.length > 0, stripLegacyHostPrefix),
     ],
-    ...(tools.length ? { tools: tools.map((tool) => ({
-      type: "function",
-      function: { name: toolNames.toProvider(tool.name), description: tool.description, parameters: tool.inputSchema },
-    })) } : { tool_choice: "none" }),
+    ...(tools.length ? {
+      tools: tools.map((tool) => ({
+        type: "function",
+        function: { name: toolNames.toProvider(tool.name), description: tool.description, parameters: tool.inputSchema },
+      })),
+      ...(request.toolChoice === "none" ? { tool_choice: "none" } : {}),
+    } : { tool_choice: "none" }),
     stream: true,
     stream_options: { include_usage: true },
     ...(profile.id === "deepseek" ? { user_id: deepSeekSessionUserId(request.sessionId) } : {}),
@@ -247,16 +275,27 @@ export function createOpenAIChatToolNameProjection(
   return createToolNameProjection(tools, { strictReverse: false });
 }
 
+function stripRepeatedLegacyHostHeader(text: string): string {
+  const marker = "\n\n[当前请求]\n";
+  if (text.includes("[Viniper Harness 独立指令]")) {
+    const idx = text.indexOf(marker);
+    if (idx >= 0) return text.slice(idx + marker.length);
+  }
+  return text.replace(/^(?:\[Viniper [^\]]+\]\n\n)?\[通用 Agent 收尾指令\]\n[^\n]+\n\n/u, "");
+}
+
 function chatMessages(
   history: ProviderHistoryEntry[],
   profile: ProviderProfile,
   toolNames: OpenAIChatToolNameProjection,
   offersTools: boolean,
+  stripLegacyHostPrefix = false,
 ): Array<Record<string, unknown>> {
   const messages: Array<Record<string, unknown>> = [];
   for (const entry of history) {
     if (entry.role === "user") {
-      messages.push({ role: "user", content: entry.items.filter((item) => item.type === "text").map((item) => item.text).join("") });
+      const raw = entry.items.filter((item) => item.type === "text").map((item) => item.text).join("");
+      messages.push({ role: "user", content: stripLegacyHostPrefix ? stripRepeatedLegacyHostHeader(raw) : raw });
       continue;
     }
     if (entry.role === "tool") {
@@ -313,6 +352,29 @@ interface ChatChunk {
     prompt_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
     completion_tokens_details?: { reasoning_tokens?: number };
   };
+  timings?: {
+    prompt_n?: number;
+    cache_n?: number;
+    prompt_ms?: number;
+    predicted_n?: number;
+    predicted_ms?: number;
+  };
+  error?: string | { message?: string; code?: number | string };
+}
+
+function repairCompletedToolJson(raw: string): Record<string, unknown> | undefined {
+  let candidate = String(raw || "").trim();
+  if (!candidate) return undefined;
+  const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/iu.exec(candidate);
+  if (fenced) candidate = fenced[1].trim();
+  candidate = candidate.replace(/,\s*([}\]])/gu, "$1");
+  try {
+    const parsed = JSON.parse(candidate) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {}
+  return undefined;
 }
 
 function replayArguments(item: ProviderToolCallItem): string {
@@ -345,19 +407,33 @@ function mergeToolCall(calls: Map<number, ToolCallAccumulator>, fragment: {
   calls.set(index, current);
 }
 
-function mapChatUsage(value: NonNullable<ChatChunk["usage"]>) {
-  const input = numberOrZero(value.prompt_tokens);
-  const output = numberOrZero(value.completion_tokens);
-  const cacheHit = value.prompt_cache_hit_tokens ?? value.prompt_tokens_details?.cached_tokens;
+function mapChatUsage(value: NonNullable<ChatChunk["usage"]>, timings?: ChatChunk["timings"]) {
+  const timingCacheHit = typeof timings?.cache_n === "number" && timings.cache_n >= 0 ? Math.trunc(timings.cache_n) : undefined;
+  const timingPromptEval = typeof timings?.prompt_n === "number" && timings.prompt_n >= 0 ? Math.trunc(timings.prompt_n) : undefined;
+  const rawInput = numberOrZero(value.prompt_tokens);
+  const input = rawInput > 0 ? rawInput : (timingCacheHit ?? 0) + (timingPromptEval ?? 0);
+  const output = numberOrZero(value.completion_tokens) || (typeof timings?.predicted_n === "number" ? Math.max(0, Math.trunc(timings.predicted_n)) : 0);
+  const cacheHit = value.prompt_cache_hit_tokens ?? value.prompt_tokens_details?.cached_tokens ?? timingCacheHit;
+  const cacheMiss = value.prompt_cache_miss_tokens !== undefined
+    ? numberOrZero(value.prompt_cache_miss_tokens)
+    : timingPromptEval !== undefined ? timingPromptEval : null;
   const cacheWrite = value.cache_write_tokens ?? value.prompt_tokens_details?.cache_write_tokens;
+  const promptMs = typeof timings?.prompt_ms === "number" && Number.isFinite(timings.prompt_ms) && timings.prompt_ms >= 0
+    ? Math.round(timings.prompt_ms)
+    : undefined;
+  const outputMs = typeof timings?.predicted_ms === "number" && Number.isFinite(timings.predicted_ms) && timings.predicted_ms >= 0
+    ? Math.round(timings.predicted_ms)
+    : undefined;
   return usage({
     input,
     cacheHitInput: numberOrNull(cacheHit),
-    cacheMissInput: value.prompt_cache_miss_tokens === undefined ? null : numberOrZero(value.prompt_cache_miss_tokens),
+    cacheMissInput: cacheMiss,
     cacheWriteInput: numberOrNull(cacheWrite),
     output,
     reasoning: numberOrZero(value.completion_tokens_details?.reasoning_tokens),
     total: value.total_tokens === undefined ? input + output : numberOrZero(value.total_tokens),
+    ...(promptMs !== undefined ? { promptMs } : {}),
+    ...(outputMs !== undefined ? { outputMs } : {}),
   });
 }
 

@@ -1,3 +1,4 @@
+import { cloudEffort } from "../shared/cloud-effort";
 import {
   ProviderEvent,
   ProviderHistoryEntry,
@@ -36,7 +37,8 @@ export class OpenAIResponsesProvider implements ModelProvider {
       method: "POST",
       signal,
       headers: { "Content-Type": "application/json", ...cache.headers },
-      body: JSON.stringify(serializeOpenAIResponses(request, this.options.profile, cache.body)),
+      body: JSON.stringify({ ...serializeOpenAIResponses(request, this.options.profile, cache.body),
+        ...cloudEffort(this.transport.endpoint(), request.selectedModel, request.reasoning, "openai") }),
     });
     if (!response.body) throw new Error("Provider 未返回流式响应体。");
 

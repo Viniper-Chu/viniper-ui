@@ -25,8 +25,8 @@ test("Windows x64 portable packaging carries the Viniper workstation branding co
   assert.match(source, /brandingManifest\.nativeSmall/u);
   assert.match(source, /brandingManifest\.windowsIco/u);
   assert.match(source, /assets/iu);
-  const shell = await readFile(join(root, "src", "renderer", "shell", "index.html"), "utf8");
-  assert.match(shell, /src=["']\.\.\/\.\.\/\.\.\/\.\.\/assets\/branding\/viniper-harness-circuit-node\.png/u);
+  const shell = await readFile(join(root, "resources", "viniper-ui", "static", "index.html"), "utf8");
+  assert.match(shell, /src=["']\/static\/v2\/app\.js/u);
   const brandingManifest = JSON.parse(await readFile(join(root, "assets", "branding", "manifest.json"), "utf8")) as {
     asset: string;
     nativeFallback: string;

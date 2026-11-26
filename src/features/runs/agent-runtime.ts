@@ -79,7 +79,7 @@ import type { FrozenRunContext } from "../../core/composition-contracts";
 import { engineScopedId, engineScopeOf } from "../../core/engine-identity";
 import { runtimeErrorEnvelope } from "../../core/runtime-error-contracts";
 import { ClaudeCodeEngineAdapter, ViniperEngineAdapter } from "../agent-engines/engine-adapters";
-import { documentHints, isInlineMathExercise, legacyDocumentHints, relevantFileTools, toolsForCurrentTurn } from "./current-turn-tools";
+import { documentHints, filterLocalModelTools, isInlineMathExercise, legacyDocumentHints, relevantFileTools, toolsForCurrentTurn } from "./current-turn-tools";
 
 export interface SendResult {
   accepted: boolean;
@@ -97,6 +97,7 @@ interface RunControl {
   text: string;
   userText?: string;
   documentContext?: string;
+  hostInstructions?: string;
   roomTranscript?: boolean;
   roomHistory?: string[];
   status: RunStatus;
@@ -159,6 +160,8 @@ export interface AgentRuntimeOptions {
   maxSessionQueue?: number;
   /** Host-owned bounded acceptance override. Production defaults remain review=6/fullAccess=10. */
   providerRequestLimits?: ProviderRequestLimits;
+  /** Crash recovery policy for unfinished runs found during startup. Defaults to "replay". */
+  interruptedRunPolicy?: "replay" | "fail";
   modelAvailability?: (providerId: string, modelId: string) => boolean;
   composition?: CompositionService;
   lifecycle?: LifecycleInterceptorService;
@@ -231,6 +234,8 @@ export class AgentRuntime {
         return recovery.changed ? { ...session, providerHistory: recovery.history } : session;
       });
       const recoveryCandidates: Array<{ sessionId: string; runId: string; text: string; origin: IntentOrigin; createdAt: number }> = [];
+      const interruptedEvents: RuntimeEvent[] = [];
+      const failInterruptedRuns = this.options.interruptedRunPolicy === "fail";
       const sessions: SessionSnapshot[] = normalizedSessions.map((session) => {
         const persistedEvents = [...(eventsBySession.get(session.id) ?? [])]
           .sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));
@@ -247,7 +252,53 @@ export class AgentRuntime {
           }
         }
         const unfinished = unfinishedRunEntries(restored);
-        if (unfinished.length > 0) {
+        if (unfinished.length > 0 && failInterruptedRuns) {
+          const interruptedAt = this.now();
+          for (const item of unfinished) {
+            const activityId = engineScopedId(engineId, "item", newId("activity"));
+            const failedEvent: RuntimeEvent = {
+              id: engineScopedId(engineId, "event", newId("event")),
+              engineId,
+              sessionId: restored.id,
+              threadId: restored.id,
+              turnId: item.runId,
+              itemId: activityId,
+              type: "run.failed",
+              timestamp: interruptedAt,
+              payload: {
+                runId: item.runId,
+                reason: "interrupted_by_restart",
+                activity: {
+                  id: activityId,
+                  itemId: activityId,
+                  engineId,
+                  sessionId: restored.id,
+                  runId: item.runId,
+                  kind: "error" as const,
+                  title: "任务因重启中断",
+                  detail: "应用在任务完成前重新启动；本轮已中断，可重新发送。",
+                  status: "failed" as const,
+                  createdAt: interruptedAt,
+                },
+              },
+            };
+            applyRuntimeEvent(restored, failedEvent);
+            interruptedEvents.push(failedEvent);
+            this.runSnapshots.set(item.runId, {
+              runId: item.runId,
+              turnId: item.runId,
+              engineId,
+              sessionId: restored.id,
+              origin: { ...item.origin },
+              text: item.text,
+              status: "failed",
+              createdAt: item.createdAt,
+              updatedAt: interruptedAt,
+            });
+          }
+          delete restored.activeRunId;
+          delete restored.activeRunIds;
+        } else if (unfinished.length > 0) {
           restored.activeRunIds = unfinished.map((item) => item.runId);
           restored.activeRunId = unfinished[0].runId;
           restored.status = "running";
@@ -259,7 +310,15 @@ export class AgentRuntime {
         }
         return restored;
       });
-      if (recoveredHistory) {
+      if (interruptedEvents.length > 0) {
+        for (const event of interruptedEvents) {
+          await this.options.persistence.appendEvent(event);
+        }
+        await this.options.persistence.saveSnapshot({
+          ...saved.application,
+          sessions: sessions.map(({ events: _journal, ...persisted }) => persisted),
+        });
+      } else if (recoveredHistory) {
         await this.options.persistence.saveSnapshot({
           ...saved.application,
           sessions: normalizedSessions,
@@ -372,6 +431,13 @@ export class AgentRuntime {
 
   getSession(sessionId: string): SessionSnapshot | undefined {
     return clone(this.catalog.get(sessionId));
+  }
+
+  getSessionRoute(sessionId: string) {
+    const session = this.catalog.get(sessionId);
+    if (!session) return undefined;
+    const { id, selectedModel, permissionMode, projectAccess, events } = session;
+    return { id, selectedModel, permissionMode, projectAccess: projectAccess && { ...projectAccess }, eventCount: events.length };
   }
 
   listSessions(): SessionSnapshot[] {
@@ -540,6 +606,7 @@ export class AgentRuntime {
   }
 
   async setActiveSession(sessionId: string): Promise<boolean> {
+    if (this.catalog.getActiveSessionId() === sessionId && this.catalog.get(sessionId)?.unread === false) return true;
     if (!this.catalog.setActive(sessionId)) return false;
     const session = this.catalog.get(sessionId)!;
     if (session.unread) await this.record(session, "session.updated", { unread: false });
@@ -589,6 +656,7 @@ export class AgentRuntime {
     const session = this.catalog.get(sessionId);
     if (!session || this.hasSessionRuns(sessionId) || sessionAgentEngine(session.engineId) !== "viniper") return false;
     if (reasoning !== undefined && !["off", "none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(reasoning)) return false;
+    if (session.reasoning === reasoning) return true;
     await this.record(session, "session.updated", { reasoning });
     return true;
   }
@@ -598,6 +666,7 @@ export class AgentRuntime {
     if (!session || this.hasSessionRuns(sessionId)) return false;
     const provider = this.registry.list().find((item) => item.id === providerId);
     if (!provider?.available || !provider.models.some((model) => model.id === selectedModel)) return false;
+    if (session.selectedProviderId === providerId && session.selectedModel === selectedModel) return true;
     await this.advanceContextProfile(session, { selectedProviderId: providerId, selectedModel });
     return true;
   }
@@ -605,6 +674,7 @@ export class AgentRuntime {
   async setPermissionMode(sessionId: string, permissionMode: PermissionMode): Promise<boolean> {
     const session = this.catalog.get(sessionId);
     if (!session || this.hasSessionRuns(sessionId)) return false;
+    if (session.permissionMode === permissionMode) return true;
     await this.record(session, "session.updated", { permissionMode });
     return true;
   }
@@ -731,6 +801,7 @@ export class AgentRuntime {
         roomTranscript: intent.roomTranscript,
         roomHistory: intent.roomHistory,
         documentContext,
+        hostInstructions: intent.hostInstructions,
       });
       await this.record(session, "queue.updated", { queue });
       return { accepted: true, queued: true };
@@ -757,6 +828,7 @@ export class AgentRuntime {
       roomTranscript: intent.roomTranscript,
       roomHistory: intent.roomHistory,
       documentContext,
+      hostInstructions: intent.hostInstructions,
     };
     this.registerRun(session, control);
     const queued = await this.startOrQueueRun(session, control);
@@ -948,19 +1020,40 @@ export class AgentRuntime {
       // explicit restrictions still come only from the current user turn.
       const previousHints = session.providerHistory.filter(entry => entry.role === "user").flatMap(entry =>
         entry.documentHints ?? entry.items.flatMap(item => item.type === "text" ? legacyDocumentHints(item.text) : []));
+      const previousToolNames = session.providerHistory.filter(entry => entry.role === "assistant").flatMap(entry =>
+        entry.items.flatMap(item => item.type === "tool-call" ? [item.name] : []));
+      const previousSessionTools = session.cachePlan?.stableSegments?.find(s => s.name === "tool-schemas")?.text
+        ? (() => {
+            try {
+              const parsed = JSON.parse(session.cachePlan.stableSegments.find(s => s.name === "tool-schemas")!.text);
+              return Array.isArray(parsed) ? parsed.map((t: any) => String(t?.name || "")).filter(Boolean) : [];
+            } catch { return []; }
+          })()
+        : [];
       const userRequest = control.userText ?? text;
       const documentContext = control.documentContext ?? userRequest;
+      const sessionHints = new Set([...documentHints(documentContext), ...previousHints]);
       const turnTools = control.planning ? availableTools.filter((tool) => tool.readOnly) : availableTools;
-      const inlineExercise = isInlineMathExercise(documentContext);
-      const candidates = inlineExercise
-        ? turnTools.filter(tool => tool.name.startsWith("math."))
+      const rawInlineExercise = isInlineMathExercise(documentContext);
+      // Keep tool declarations monotonically stable across multi-turn local
+      // sessions once non-math workspace tools have been advertised.
+      const hadWorkspaceTools = Boolean(
+        localPolicy && !control.roomTranscript && session.providerHistory.length > 0
+        && previousSessionTools.some((name) => !name.startsWith("math.")),
+      );
+      const inlineExercise = rawInlineExercise && !hadWorkspaceTools;
+      const baseTurnTools = localPolicy
+        ? filterLocalModelTools(turnTools, userRequest, [...previousToolNames, ...(hadWorkspaceTools ? previousSessionTools : [])])
         : turnTools;
+      const candidates = inlineExercise
+        ? baseTurnTools.filter(tool => tool.name.startsWith("math."))
+        : baseTurnTools;
       const toolDefinitions = engineId === "viniper" ? toolsForCurrentTurn(userRequest,
-        relevantFileTools(documentContext, candidates, localPolicy?.visionEnabled, previousHints)) : [];
+        relevantFileTools(documentContext, candidates, localPolicy?.visionEnabled, [...previousHints])) : [];
       const enabledSkills = engineId === "viniper"
         ? stableContextSkills(await (this.options.skillLoader?.loadForRun(session.id) ?? Promise.resolve([])))
         : [];
-      const roomProvidesHistory = Boolean(control.roomTranscript && inlineExercise && !control.recovery);
+      const roomProvidesHistory = Boolean(control.roomTranscript && rawInlineExercise && !control.recovery);
       if (!localPolicy && !roomProvidesHistory) await this.options.compactionService?.maybeCompact({
         sessionId: session.id,
         providerId: control.providerSnapshot!.providerId,
@@ -984,6 +1077,9 @@ export class AgentRuntime {
       const memoryText = memoryEntries.length > 0
         ? `\n\n可用记忆（来源与作用域已由应用记录）：\n${memoryEntries.map((entry) => `- [${entry.source}/${entry.scope}] ${entry.text}`).join("\n")}`
         : "";
+      // Dynamic per-query memories are appended to the live turn copy for local
+      // or multi-turn conversations so the system segment remains byte-identical.
+      const keepMemoryOutOfSystem = Boolean(memoryText && (localPolicy || contextHistory.length > 0));
       const contextProfile = buildContextProfile({
         generation: session.cachePlan.profileGeneration,
         providerId: control.providerSnapshot!.providerId,
@@ -994,7 +1090,11 @@ export class AgentRuntime {
         // Absolute file tools need the same directory as the native terminal.
         // Only the matched local deployment receives this host path context.
         ...(localPolicy ? { taskDirectory: workspaceRoot ?? session.workingDirectory } : {}),
-        projectInstructions: `${projectInstructions.text ?? ""}${memoryText}${control.planning ? "\n\n本轮为规划模式：只读调研，给出可执行的方案、取舍和验证方法。不得修改文件、运行有副作用命令或启动其他执行任务。完成方案后等待用户选择开始实施。" : ""}`,
+        ...(control.hostInstructions ? { hostInstructions: control.hostInstructions } : {}),
+        projectInstructions: `${projectInstructions.text ?? ""}${keepMemoryOutOfSystem ? "" : memoryText}${control.planning ? "\n\n本轮为规划模式：只读调研，给出可执行的方案、取舍和验证方法。不得修改文件、运行有副作用命令或启动其他执行任务。完成方案后等待用户选择开始实施。" : ""}`,
+        ...(engineId === "viniper" && !control.planning && sessionHints.has("animated-svg")
+          && toolDefinitions.some(t => t.name === "file.edit") && toolDefinitions.some(t => t.name === "file.write")
+          ? { animatedSvg: { chunkTokens: localPolicy?.animatedSvgChunkTokens } } : {}),
         taskWorkflow: engineId === "viniper" && !(localPolicy && (inlineExercise || !toolDefinitions.length)),
       });
       const cachePlan = buildCachePlan(text, contextProfile);
@@ -1077,6 +1177,19 @@ export class AgentRuntime {
         : this.registry.get(control.providerSnapshot!.providerId);
       if (!provider) throw new Error("CLAUDE_CODE_ENGINE_ADAPTER_UNAVAILABLE");
       if (engineId === "viniper") providerForReview = provider as ReturnType<ProviderRegistry["get"]>;
+      const rawRequestHistory = roomHistory ?? projectHistory();
+      const outgoingHistory = keepMemoryOutOfSystem
+        ? rawRequestHistory.map((entry, idx) =>
+            idx === rawRequestHistory.length - 1 && entry.role === "user"
+              ? {
+                  ...entry,
+                  items: entry.items.map((item, itemIdx) =>
+                    itemIdx === entry.items.length - 1 && item.type === "text"
+                      ? { ...item, text: `${item.text}${memoryText}` }
+                      : item),
+                }
+              : entry)
+        : rawRequestHistory;
       providerRequest = {
         engineId,
         sessionId: session.id,
@@ -1090,7 +1203,7 @@ export class AgentRuntime {
         reasoning: control.providerSnapshot!.reasoning,
         currentUserText: control.userText ?? text,
         roomHistory: control.roomHistory,
-        history: roomHistory ?? projectHistory(),
+        history: outgoingHistory,
         tools: engineId === "viniper" ? toolDefinitions : [],
         cachePlan,
         contextProfile,
@@ -1175,7 +1288,7 @@ export class AgentRuntime {
         runId: effectiveRunId,
         // A successful batch closes the calculation phase of a standalone exercise.
         // An explicit request for tools, an attachment, or a document task retains the ordinary loop.
-        ...(inlineExercise && localPolicy ? { finishRepeatedArithmetic: true, finishRoomArithmetic: roomProvidesHistory, completesVerification: (call: ProviderToolCallItem, result: ProviderToolResultItem) =>
+        ...(rawInlineExercise && localPolicy ? { finishRepeatedArithmetic: true, finishRoomArithmetic: roomProvidesHistory, completesVerification: (call: ProviderToolCallItem, result: ProviderToolResultItem) =>
           call.name === "math.quadratic.check" && !result.isError } : {}),
         // Local deployment limits come from its host-owned contract. Explicit
         // acceptance overrides still take precedence; cloud defaults stay bounded.
@@ -1392,6 +1505,7 @@ export class AgentRuntime {
         roomTranscript: next.roomTranscript,
         roomHistory: next.roomHistory,
         documentContext: next.documentContext,
+        hostInstructions: next.hostInstructions,
         status: "queued",
         createdAt: this.now(),
         workspaceMode: next.workspaceMode,
@@ -1729,15 +1843,17 @@ export class AgentRuntime {
       timestamp: this.now(),
       payload,
     };
-    this.persistChain = this.persistChain.then(async () => {
+    const task = this.persistChain.then(async () => {
       const delta = ["message.delta", "thinking.delta", "provider.activity", "turn.usage.updated"].includes(type);
       let receipt;
       if (delta && this.options.persistence.commitDeltaEvent) {
         receipt = await this.options.persistence.commitDeltaEvent(event);
       } else {
-        const projected = clone(session);
+        // The journal is committed separately and the store checks event IDs
+        // transactionally. The projected snapshot only needs the reduced state.
+        const projected = clone({ ...session, events: [] as RuntimeEvent[] });
         applyRuntimeEvent(projected, event);
-        receipt = await this.options.persistence.commitEvent(event, this.serializeWithSession(projected));
+        receipt = await this.options.persistence.commitEvent(event, this.serialize(projected, true));
       }
       if (!receipt.duplicate) {
         applyRuntimeEvent(session, receipt.event);
@@ -1756,7 +1872,8 @@ export class AgentRuntime {
       });
       throw Object.assign(new Error(envelope.message), { envelope });
     });
-    await this.persistChain;
+    this.persistChain = task.catch(() => undefined);
+    await task;
   }
 
   private async recordSteeringReceipt(receipt: SteeringReceipt): Promise<void> {
@@ -1840,29 +1957,24 @@ export class AgentRuntime {
     };
   }
 
-  private serialize() {
-    return clone({
+  private serialize(projected?: SessionSnapshot, shallowUnchanged = false) {
+    return {
       schemaVersion: 3 as const,
       productVersion: PRODUCT_VERSION,
       activeSessionId: this.catalog.getActiveSessionId(),
-      sessions: this.catalog.values().map(({ events: _events, ...session }) => session),
-    });
-  }
-
-  private serializeWithSession(projected: SessionSnapshot) {
-    const application = this.serialize();
-    application.sessions = application.sessions.map((session) => {
-      if (session.id !== projected.id) return session;
-      const { events: _events, ...persisted } = projected;
-      return clone(persisted);
-    });
-    return application;
+      sessions: this.catalog.values().map(session => {
+        const useProjection = projected?.id === session.id;
+        const { events: _journal, ...persisted } = useProjection ? projected : session;
+        return useProjection || shallowUnchanged ? persisted : clone(persisted);
+      }),
+    };
   }
 
   private async persistSnapshot(): Promise<void> {
     const payload = this.serialize();
-    this.persistChain = this.persistChain.then(() => this.options.persistence.saveSnapshot(payload));
-    await this.persistChain;
+    const task = this.persistChain.then(() => this.options.persistence.saveSnapshot(payload));
+    this.persistChain = task.catch(() => undefined);
+    await task;
   }
 
   private publish(): void {
@@ -1884,6 +1996,8 @@ function addProviderUsage(current: TokenUsage | undefined, next: TokenUsage): To
     reasoning: current.reasoning + next.reasoning,
     toolUse: current.toolUse + next.toolUse,
     total: current.total + next.total,
+    ...(current.promptMs != null || next.promptMs != null ? { promptMs: (current.promptMs ?? 0) + (next.promptMs ?? 0) } : {}),
+    ...(current.outputMs != null || next.outputMs != null ? { outputMs: (current.outputMs ?? 0) + (next.outputMs ?? 0) } : {}),
     source: "provider",
   };
 }

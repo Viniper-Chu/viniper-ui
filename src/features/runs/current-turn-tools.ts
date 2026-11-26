@@ -91,7 +91,7 @@ export function isInlineMathExercise(request: string): boolean {
 function isOriginalMathTopic(text: string): boolean {
   const discussesTopic = /数学.{0,5}(?:话题|议题|命题)|(?:数学|几何|代数)(?:讨论|辩论)/u.test(text)
     && /讨论|开题|论证|辩论|探讨|选题|自拟|自编|出.{0,6}题/u.test(text);
-  const authorsProblem = /(?:自拟|自编|原创|设计|出).{0,16}(?:参数题|含参.{0,6}题)/u.test(text)
+  const authorsProblem = /(?:自拟|自编|原创|设计|出|换一[道个]).{0,16}(?:参数题|含参.{0,6}题)|(?:参数题|含参.{0,6}题).{0,16}(?:自拟|自编|原创|自行设计)/u.test(text)
     && /数学|函数|方程|不等式|高中/u.test(text);
   return discussesTopic || authorsProblem;
 }
@@ -104,8 +104,11 @@ export function documentHints(text: string): string[] {
     || /file\.math\.handout\b|(?:编译|出|做成|排成).{0,8}(?:师生|学生版|教师版)|\b(?:create|generate|format|compile)\b.{0,30}\b(?:handout|worksheet|exam)\b/iu.test(text);
   const pdf = handout || /\.pdf\b|\bPDF\b|排版|版式|页面/iu.test(text);
   const image = handout || /\.(?:png|jpe?g|webp|pdf)\b|图片|图像|截图|页面|版式|排版|读图|看图|题图|如图/iu.test(text);
+  const animatedSvg = /\bsvg\b|矢量图/iu.test(text) && /动画|动效|转动|旋转|摆动|animate|animation|motion|rotate/iu.test(text);
   return [
+    ...(animatedSvg ? ["animated-svg"] : []),
     ...(/math\.quadratic\.check|二次|方程|实根|根的个数|根数|判别式|抛物线|抛物線|quadratic|real roots/iu.test(text) ? ["quadratic"] : []),
+    ...(/算式|验算|计算|数值|求值|三角|角度|夹角|四面体|外接球|math\.rational\.evaluate/iu.test(text) ? ["rational"] : []),
     ...(/\.docx\b|\bDOCX\b|Word\s*文档/iu.test(text) ? ["docx"] : []),
     ...(/\.sqlite(?:3)?\b|\bSQLite\b|\.db\b/iu.test(text) ? ["sqlite"] : []),
     ...(handout ? ["handout"] : []), ...(pdf ? ["pdf"] : []), ...(image ? ["image"] : []),
@@ -122,11 +125,38 @@ export function legacyDocumentHints(text: string): string[] {
 export function relevantFileTools(text: string, tools: ProviderToolDefinition[], vision = false, previous: string[] = []): ProviderToolDefinition[] {
   const hints = new Set([...documentHints(text), ...previous]);
   const originalTopic = isOriginalMathTopic(text);
-  return tools.filter((tool) => (tool.name !== "math.quadratic.check" || hints.has("quadratic") || originalTopic)
-    && (tool.name !== "math.rational.evaluate" || hints.has("quadratic") || originalTopic || /算式|验算|计算|数值|求值|三角|角度|夹角|四面体|外接球|math\.rational\.evaluate/iu.test(text))
+  return tools.filter((tool) => (tool.name !== "file.svg.inspect_motion" || hints.has("animated-svg") || text.includes("file.svg.inspect_motion"))
+    && (tool.name !== "math.quadratic.check" || hints.has("quadratic") || originalTopic)
+    && (tool.name !== "math.rational.evaluate" || hints.has("quadratic") || hints.has("rational") || originalTopic)
     && (!tool.name.startsWith("file.docx.") || hints.has("docx"))
     && (!tool.name.startsWith("file.sqlite.") || hints.has("sqlite"))
     && (!tool.name.startsWith("file.pdf.") || hints.has("pdf"))
     && (tool.name !== "file.math.handout" || hints.has("handout"))
     && (tool.name !== "file.image.analyze" || (vision && hints.has("image"))));
+}
+
+/**
+ * Trim redundant built-in desktop tool groups for a local model so cold prefill
+ * stays ~1K tokens (~9-12 core tools) instead of ~3.5K tokens (35 tools), while
+ * preserving any custom test tools or explicitly mentioned capabilities.
+ */
+export function filterLocalModelTools(
+  tools: ProviderToolDefinition[],
+  text: string,
+  previousToolNames: readonly string[] = [],
+): ProviderToolDefinition[] {
+  const retained = new Set(previousToolNames);
+  const hasFileTools = tools.some((t) => t.name === "file.read");
+  return tools.filter((tool) => {
+    if (retained.has(tool.name) || text.includes(tool.name)) return true;
+    if (tool.name === "demo.read-only-preview") return false;
+    if (tool.name.startsWith("coordination.")) return false;
+    if (tool.name.startsWith("workspace.")) return false;
+    if (tool.name.startsWith("review.")) return false;
+    if (tool.name.startsWith("github.")) return false;
+    if (tool.name.startsWith("git.")) return /\bgit\b/iu.test(text);
+    if (tool.name.startsWith("web.")) return /联网|网页|搜索网络|\bhttps?:\/\//iu.test(text);
+    if (hasFileTools && tool.name.startsWith("project.")) return false;
+    return true;
+  });
 }

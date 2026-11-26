@@ -26,6 +26,19 @@ server.stream_viniper_with_queue=fixture_stream
 server.get_skills=lambda *_args,**_kwargs:[]
 server.allowed_model=lambda *_args,**_kwargs:'fixture'
 async def main():
+    # The installed picker gets the same model-specific levels as the wire adapters.
+    for service,model,expected in (
+        ('openai','gpt-6.2-sol',['low','medium','high','xhigh','max']),
+        ('anthropic','claude-opus-4-6',['low','medium','high','max']),
+        ('deepseek','deepseek-v4-pro',['none','low','high','max']),
+        ('openai','unlisted-model',[]),
+    ):
+        cfg={'base_url':server.MODEL_SERVICES[service]['endpoint']}
+        selected=service+'::'+model
+        assert server.model_capabilities_for_connection(cfg,selected)['reasoning_options']==expected
+    cfg={'base_url':server.DEEPSEEK_CHAT_ENDPOINT}
+    assert server.run_reasoning(cfg,'deepseek-flash',None,'off')=='none'
+    assert server.run_reasoning(cfg,'deepseek-flash','off',None)=='none'
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=server.app),base_url='http://127.0.0.1:17959') as client:
         created=await client.post('/api/sessions',json={'mode':'viniper','workdir':str(root),'permission_mode':'ask'})
         assert created.status_code==200,created.text

@@ -271,27 +271,28 @@ test("R15 S4 reducer projects canonical plan and turn diff timeline events", () 
 });
 
 test("R15 S4/S8 conversation consumes canonical plan, diff and per-turn usage events", async () => {
-  const source = await readFile("src/renderer/conversation/conversation.js", "utf8");
-  const module = await new Function("specifier", "return import(specifier)")(
-    `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`,
-  ) as { projectConversationSegments(session: Record<string, unknown>, options: Record<string, unknown>): Record<string, any> };
-  const session = {
-    id: "viniper__session-ui", engineId: "viniper", messages: [], activities: [], status: "idle",
-    events: [
-      { id: "e1", type: "plan.updated", timestamp: 1, turnId: "viniper__run-ui", payload: { plan: { explanation: "red-green", steps: [{ id: "s1", step: "红灯", status: "completed" }] } } },
-      { id: "e2", type: "turn.diff.updated", timestamp: 2, turnId: "viniper__run-ui", payload: { diff: { summary: "1 file", files: [{ path: "a.ts", additions: 2, deletions: 1 }], patch: "+ok\n-old" } } },
-      { id: "e3", type: "turn.usage.updated", timestamp: 3, turnId: "viniper__run-ui", payload: { usage: { total: 9, source: "provider" }, status: "reconciled" } },
-      { id: "e4", type: "run.completed", timestamp: 4, turnId: "viniper__run-ui", payload: { runId: "viniper__run-ui" } },
-    ],
+  const vm = await import("node:vm");
+  const ctx = vm.createContext({ URLSearchParams, console, atob, fetch: async () => ({ ok: true, json: async () => ({ ok: true }) }) });
+  for (const file of ["vendor/markdown-it.js", "vendor/katex/katex.min.js", "conversation-markdown.js"]) {
+    vm.runInContext(await readFile(`resources/viniper-ui/static/${file}`, "utf8"), ctx);
+  }
+  for (const file of ["api", "icons", "conversation"]) {
+    const src = (await readFile(`resources/viniper-ui/static/v2/${file}.js`, "utf8")).replace(/^import .*;\s*$/gm, "").replace(/\bexport /g, "");
+    vm.runInContext(src, ctx);
+  }
+  const run: Record<string, any> = {
+    sequence: 0,
+    sessionId: "viniper__session-ui",
+    message: { role: "assistant", content: "", thinking: "", segments: [], streaming: true },
+    done: false,
   };
-  const view = module.projectConversationSegments(session, {
-    runs: [{ runId: "viniper__run-ui", sessionId: session.id, status: "completed", createdAt: 0, updatedAt: 4 }],
-    telemetry: { sessions: [{ sessionId: session.id, cumulative: { total: 999, source: "estimated" } }] },
-  });
-  assert.equal(view.usage.total, 9);
-  assert.equal(view.usage.source, "provider");
-  assert.equal(view.plan.steps[0].step, "红灯");
-  assert.equal(view.turnDiff.files[0].path, "a.ts");
+  ctx.projectEvent(run, { type: "plan", sequence: 1, steps: [{ step: "红灯", status: "completed" }] });
+  ctx.projectEvent(run, { type: "turn_diff", sequence: 2, summary: "1 file", files: [{ path: "a.ts", additions: 2, deletions: 1 }] });
+  ctx.projectEvent(run, { type: "turn_usage", sequence: 3, turn_usage: { total_tokens: 9, source: "provider" } });
+  assert.equal(run.message.turn_usage.total_tokens, 9);
+  assert.equal(run.message.turn_usage.source, "provider");
+  assert.equal(run.message.segments[0].type, "plan");
+  assert.equal(run.message.segments[1].type, "turn_diff");
 });
 
 test("R15 S5 approval lifecycle carries stable owner, target item and resolution timestamps", async () => {

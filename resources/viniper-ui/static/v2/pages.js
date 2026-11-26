@@ -66,7 +66,7 @@ export function renderExtensions() {
     plugins
       .map(
         (p) =>
-          `<button class="capability-card" data-plugin="${escape(p.id)}" data-hint="${escape(p.description || p.name || p.id)}"><span class="card-icon">${icon(p.icon || "plugin")}</span><span class="capability-copy"><span class="capability-name">${escape(p.name || p.id)}</span><small>${escape(p.description || "")}</small></span>${p.status === "unavailable" ? '<small class="card-state">待配置</small>' : (p.tools?.length ? `<small class="card-state">${p.tools.length} 个工具</small>` : "")}</button>`,
+          `<button class="capability-card" data-plugin="${escape(p.id)}" data-hint="${escape(p.description || p.name || p.id)}"><span class="card-icon">${icon(p.icon || "plugin")}</span><span class="capability-copy"><span class="capability-name">${escape(p.name || p.id)}</span><small>${escape(p.description || "")}</small></span>${p.status === "unavailable" ? '<small class="card-state">待配置</small>' : (p.tools?.length ? `<small class="card-state">${p.tools.length} 个工具</small>` : "")}<span class="row-chevron" aria-hidden="true">${icon("chevron")}</span></button>`,
       )
       .join("") || extensionEmpty("plugins", "当前没有匹配的已连接插件。");
   const favorites = [
@@ -94,7 +94,7 @@ export function renderExtensions() {
     visibleSkills
       .map(
         (s) =>
-          `<button class="capability-card" data-skill="${escape(s.id || s.filename)}" data-hint="${escape(s.display_description || s.description || s.name || s.id)}"><span class="card-icon">${icon(skillIcon(s))}</span><span class="capability-copy"><span class="capability-name">${escape(s.display_name || s.name || s.command || s.id)}</span><small>${escape(s.display_description || s.description || "")}</small></span>${state.selectedSkills?.includes(s.id || s.filename) ? '<small class="card-state">本轮已选</small>' : ""}</button>`,
+          `<button class="capability-card" data-skill="${escape(s.id || s.filename)}" data-hint="${escape(s.display_description || s.description || s.name || s.id)}"><span class="card-icon">${icon(skillIcon(s))}</span><span class="capability-copy"><span class="capability-name">${escape(s.display_name || s.name || s.command || s.id)}</span><small>${escape(s.display_description || s.description || "")}</small></span>${state.selectedSkills?.includes(s.id || s.filename) ? '<small class="card-state">本轮已选</small>' : ""}<span class="row-chevron" aria-hidden="true">${icon("chevron")}</span></button>`,
       )
       .join("") ||
     extensionEmpty("skills", q ? "没有匹配的技能，试试其他关键词" : "尚未读取到技能，安装到本机技能目录后刷新");
@@ -164,7 +164,7 @@ export function showPlugin(id) {
   $("#detail-content").innerHTML =
     (plugin.description ? `<p class="detail-intro">${escape(plugin.description)}</p>` : "") +
     (plugin.status === "unavailable" ? '<p class="status-note">待配置</p>' : "") +
-    (rows ? `<h2 class="group-title">工具<span class="section-count" id="tool-count">${tools.length} 项</span></h2><label class="field search-field tool-search"><span aria-hidden="true">${icon("search")}</span><input type="search" id="tool-search" aria-label="筛选插件工具" placeholder="查找工具名称或 ID"></label><ul class="tool-directory">${rows}</ul><p id="no-matching-tool" role="status" hidden>没有匹配的工具</p>` : "");
+    (rows ? `<div class="tool-section-head"><h2 class="group-title">包含工具<span class="section-count" id="tool-count">${tools.length} 项</span></h2><label class="field search-field tool-search"><span aria-hidden="true">${icon("search")}</span><input type="search" id="tool-search" aria-label="筛选插件工具" placeholder="查找工具名称或 ID"></label></div><ul class="tool-directory">${rows}</ul><p id="no-matching-tool" class="empty-state" role="status" hidden>没有匹配的工具</p>` : "");
   const search = $("#tool-search");
   if (search) search.addEventListener("input", () => {
     const query = search.value.trim().toLocaleLowerCase();
@@ -201,7 +201,14 @@ export async function showSkill(id) {
     if (generation !== detailVersion) return;
     skillRecord = skill;
     const body = skillText(skill.content);
-    $("#detail-content").innerHTML = `<div class="answer skill-body">${globalThis.ViniperMarkdown.render(body)}</div>`;
+    const metaTags = [
+      record?.command || skill.command,
+      skill.editable ? "可编辑说明" : "只读内置说明",
+    ].filter(Boolean);
+    const metaStrip = metaTags.length
+      ? `<div class="detail-meta-strip">${metaTags.map(tag => `<span class="detail-meta-tag">${escape(tag)}</span>`).join("")}</div>`
+      : "";
+    $("#detail-content").innerHTML = `${metaStrip}<div class="answer skill-body">${globalThis.ViniperMarkdown.render(body)}</div>`;
     selectedSkill = id;
     const running = state.runs.get(state.session?.session_id)?.active || state.session?.active_run?.active;
     $("#detail-actions button").textContent = running ? "用于下一轮任务" : "用于当前任务";

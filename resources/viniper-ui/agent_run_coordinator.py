@@ -587,7 +587,7 @@ class AgentRunCoordinator:
         self,
         decode: Callable[[Any], Iterable[dict[str, Any]]] | None = None,
         *,
-        max_events: int = 2048,
+        max_events: int = 16384,
     ) -> None:
         self._records: dict[str, AgentRunRecord] = {}
         self._decode = decode or self._default_decode
@@ -676,7 +676,7 @@ class AgentRunCoordinator:
                 return
             for event in ready:
                 cursor = max(cursor, int(event.get("sequence") or 0))
-                yield copy.deepcopy(event)
+                yield dict(event)
 
     async def commit_interaction_response(
         self,
@@ -784,8 +784,8 @@ class AgentRunCoordinator:
     }
 
     async def _publish(self, record: AgentRunRecord, payload: dict[str, Any]) -> dict[str, Any]:
-        event = copy.deepcopy(payload)
-        kind = event.get("type")
+        kind = payload.get("type")
+        event = dict(payload) if kind in {"text", "thinking", "thinking_delta", "heartbeat", "working_status"} else copy.deepcopy(payload)
         phase = self._activity_phases.get(kind)
         if kind == "working_status":
             phase = event.get("phase") or "notice"

@@ -15,6 +15,11 @@ export function createStructuredFileTools(options: StructuredFileHost): ToolExec
   const tool = (operation: string, readOnly: boolean, description: string, properties: NonNullable<JsonSchema["properties"]> = {}, required: string[] = []) =>
     new StructuredFileTool(operation, readOnly, description, { type: "object", properties: { path: pathProperty, ...properties }, required: ["path", ...required], additionalProperties: false }, options);
   return [
+    tool("svg.inspect_motion", true, "用本机无头浏览器采样 HTML/独立 SVG 中的内联 CSS 和 SMIL 动画。返回旋转件中圆心相对父级的位移；预期绕自身轴旋转时应接近 0。contacts 可比较关节、脚与踏板等接触点。未测的部件不能声称通过。不执行网页脚本。", {
+      contacts: {type:"array", description:"可选，最多8对实际元素 ID（不含#）。tip 取路径或线段末端，其他图形取中心；target 取另一图形中心。返回同一时刻在 SVG 坐标系内的最大间距。", items: {
+        type:"object", properties:{tip:{type:"string"},target:{type:"string"}}, required:["tip","target"], additionalProperties:false,
+      }},
+    }),
     tool("docx.inspect", true, "读取 DOCX 普通文字、表格及带格式的文本 run，返回从 0 开始的位置、style_id 和 content_coverage。段落索引包含标题，不等于正文序号；按样式与内容定位用户所说的正文段落，不能直接用正文序号减一。检测到公式/嵌入对象/图形时文字视图不完整，须核对原页面或已有 TeX，不能据缺失公式的文字编造题目。"),
     tool("docx.replace", false, "优先用此工具局部替换 DOCX 文字。先 inspect 定位真实段落，提供该段完整原文 expect 和待替换 old_text/new_text；自动保留各文本片段的格式并回读。不等长替换跨越多个格式片段时会说明需显式映射，再用 docx.edit。" + verifiedDocxReadback, {
       paragraph: { type: "number", description: "inspect 返回的段落索引，包含标题；不是正文序号。" },

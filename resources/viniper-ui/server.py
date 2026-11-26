@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import sys
 import time
 import urllib.request
@@ -35,7 +36,7 @@ from agent_queue import AgentQueueStore
 from agent_run_coordinator import AgentRunCoordinator, AgentRunJournal, DurableInteractionStore
 from native_project_browser import browse_project_files, preview_project_file, ProjectBrowserError
 from skill_sync import localized_skill_fields
-from math_review import inconsistent_equality
+from math_review import inconsistent_equality, verify_structured_math_check
 from discussion import addressed, discussion_events, room_members, validate_members
 from local_agent_contract import choose_local_effort, local_agent_contract, local_placeholder_auth, local_model_notice
 from harness_application_port import HarnessApplicationPort
@@ -736,16 +737,17 @@ def session_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, float, floa
     )
 
 
-def load_sessions_from_disk() -> dict[str, dict[str, Any]]:
-    if not SESSIONS_FILE.exists():
-        return {}
-    try:
-        raw = json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    if not isinstance(raw, dict):
-        return {}
+_sessions_corrupt_lock = False
+_sessions_corrupt_backed_up = False
 
+
+def _parse_normalized_sessions(text: str) -> dict[str, dict[str, Any]] | None:
+    try:
+        raw = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
     loaded: dict[str, dict[str, Any]] = {}
     for session_id, session in raw.items():
         if isinstance(session, dict):
@@ -753,11 +755,107 @@ def load_sessions_from_disk() -> dict[str, dict[str, Any]]:
     return loaded
 
 
-def save_sessions_to_disk() -> None:
+def load_sessions_from_disk() -> dict[str, dict[str, Any]]:
+    global _sessions_corrupt_lock, _sessions_corrupt_backed_up
+    if not SESSIONS_FILE.exists():
+        _sessions_corrupt_lock = False
+        _sessions_corrupt_backed_up = False
+        return {}
+    try:
+        raw_text = SESSIONS_FILE.read_text(encoding="utf-8")
+    except Exception:
+        raw_text = ""
+    loaded = _parse_normalized_sessions(raw_text) if raw_text.strip() else None
+    if loaded is not None:
+        _sessions_corrupt_lock = False
+        _sessions_corrupt_backed_up = False
+        return loaded
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_path = SESSIONS_FILE.with_suffix(".json.tmp")
-    tmp_path.write_text(json.dumps(sessions, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(SESSIONS_FILE)
+    backup_target = SESSIONS_FILE.with_name(f"sessions.corrupt-{int(time.time() * 1000)}.json")
+    backed_up = False
+    try:
+        if not backup_target.exists():
+            shutil.copy2(SESSIONS_FILE, backup_target)
+        backed_up = backup_target.exists()
+    except OSError:
+        backed_up = False
+
+    bak_path = SESSIONS_FILE.with_suffix(".json.bak")
+    if bak_path.exists():
+        try:
+            recovered = _parse_normalized_sessions(bak_path.read_text(encoding="utf-8"))
+        except Exception:
+            recovered = None
+        if recovered is not None:
+            _sessions_corrupt_lock = False
+            _sessions_corrupt_backed_up = backed_up
+            print(f"  Warning: sessions.json corrupted (backed up to {backup_target.name}); restored {len(recovered)} sessions from sessions.json.bak.", file=sys.stderr)
+            return recovered
+
+    _sessions_corrupt_lock = True
+    _sessions_corrupt_backed_up = backed_up
+    print(f"  Warning: sessions.json failed to parse; refusing to overwrite original file (backup={backed_up}).", file=sys.stderr)
+    return {}
+
+
+_sessions_write_lock = threading.Lock()
+_sessions_debounce_timer: threading.Timer | None = None
+
+
+def _write_sessions_serialized(serialized: str) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = SESSIONS_FILE.with_name(f".sessions.{os.getpid()}.{uuid.uuid4().hex[:8]}.json.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if SESSIONS_FILE.exists():
+            try:
+                if SESSIONS_FILE.stat().st_size > 2:
+                    shutil.copy2(SESSIONS_FILE, SESSIONS_FILE.with_suffix(".json.bak"))
+            except OSError:
+                pass
+        os.replace(tmp_path, SESSIONS_FILE)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def save_sessions_to_disk(immediate: bool = True) -> None:
+    global _sessions_corrupt_lock, _sessions_debounce_timer
+    if _sessions_corrupt_lock:
+        if not sessions or not _sessions_corrupt_backed_up:
+            return
+        _sessions_corrupt_lock = False
+    if not immediate:
+        serialized = json.dumps(sessions, ensure_ascii=False, indent=2)
+
+        def _flush_bg(payload: str) -> None:
+            global _sessions_debounce_timer
+            with _sessions_write_lock:
+                _sessions_debounce_timer = None
+                _write_sessions_serialized(payload)
+
+        with _sessions_write_lock:
+            if _sessions_debounce_timer is not None:
+                _sessions_debounce_timer.cancel()
+            timer = threading.Timer(0.25, _flush_bg, args=(serialized,))
+            timer.daemon = True
+            _sessions_debounce_timer = timer
+            timer.start()
+        return
+
+    serialized = json.dumps(sessions, ensure_ascii=False, indent=2)
+    with _sessions_write_lock:
+        if _sessions_debounce_timer is not None:
+            _sessions_debounce_timer.cancel()
+            _sessions_debounce_timer = None
+        _write_sessions_serialized(serialized)
 
 
 def _source_epoch_seconds(value: Any, fallback: float | None = None) -> float:
@@ -1278,14 +1376,33 @@ def normalize_settings(raw: dict[str, Any] | None = None) -> dict[str, Any]:
     return settings
 
 
+_app_settings_cache: dict[str, Any] = {"key": None, "value": None}
+_secret_status_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+
+
 def load_app_settings() -> dict[str, Any]:
     if not SETTINGS_FILE.exists():
-        return normalize_settings()
+        key = ("missing", str(SETTINGS_FILE))
+        if _app_settings_cache.get("key") != key:
+            _app_settings_cache["key"] = key
+            _app_settings_cache["value"] = normalize_settings()
+        return copy.deepcopy(_app_settings_cache["value"])
+    try:
+        stat = SETTINGS_FILE.stat()
+        key = ("present", str(SETTINGS_FILE), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = None
+    if key is not None and _app_settings_cache.get("key") == key and isinstance(_app_settings_cache.get("value"), dict):
+        return copy.deepcopy(_app_settings_cache["value"])
     try:
         raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except Exception:
         raw = {}
-    return normalize_settings(raw if isinstance(raw, dict) else {})
+    normalized = normalize_settings(raw if isinstance(raw, dict) else {})
+    if key is not None:
+        _app_settings_cache["key"] = key
+        _app_settings_cache["value"] = normalized
+    return copy.deepcopy(normalized)
 
 
 def save_app_settings(settings: dict[str, Any]) -> None:
@@ -1294,6 +1411,8 @@ def save_app_settings(settings: dict[str, Any]) -> None:
     tmp_path = SETTINGS_FILE.with_suffix(".json.tmp")
     tmp_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(SETTINGS_FILE)
+    _app_settings_cache.clear()
+    _secret_status_cache.clear()
     cache = globals().get("_status_base_cache")
     if isinstance(cache, dict):
         cache.clear()
@@ -1350,15 +1469,24 @@ def _host_secret_request(mode: Any, endpoint: str) -> dict[str, Any]:
         return {}
     service = str(mode).removeprefix("service-")
     is_service = str(mode).startswith("service-") and service in MODEL_SERVICES
-    selected_mode = mode if mode == "discussion" or is_service else normalize_provider_mode(mode)
+    selected_mode = str(mode if mode == "discussion" or is_service else normalize_provider_mode(mode))
+    now_mono = time.monotonic()
+    cache_key = (port, selected_mode)
+    if endpoint == "status":
+        cached = _secret_status_cache.get(cache_key)
+        if cached is not None and now_mono - cached[0] < 0.35:
+            return dict(cached[1])
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/secret/{endpoint}?mode={selected_mode}",
         headers={"Authorization": f"Bearer {token}"},
     )
     try:
-        with urllib.request.urlopen(request, timeout=1.2) as response:
+        with urllib.request.urlopen(request, timeout=0.6) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        return payload if isinstance(payload, dict) else {}
+        result = payload if isinstance(payload, dict) else {}
+        if endpoint == "status":
+            _secret_status_cache[cache_key] = (now_mono, dict(result))
+        return result
     except Exception:
         return {}
 
@@ -1486,11 +1614,14 @@ def format_bytes(size: int) -> str:
 
 
 def safe_attachment_filename(name: Any) -> str:
-    original = Path(str(name or "attachment.bin")).name
-    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", original).strip(" ._")
-    if not cleaned:
-        cleaned = "attachment.bin"
-    return cleaned[:120]
+    original = Path(str(name or "attachment.bin").replace("\\", "/")).name
+    suffix = Path(original).suffix
+    suffix = suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,12}", suffix) else ""
+    stem = original[:-len(suffix)] if suffix else original
+    stem = re.sub(r"[^\w. -]+", "_", stem).strip(" ._") or "attachment"
+    # Reserve bytes for the extension even for a long, multi-byte original name.
+    stem = stem.encode("utf-8")[:120-len(suffix)].decode("utf-8", "ignore")
+    return stem + suffix
 
 
 def save_run_attachments(session_id: str, raw_items: Any) -> list[dict[str, Any]]:
@@ -1894,21 +2025,32 @@ def model_capabilities_for_connection(provider, model):
     local = local_agent_contract(endpoint, model)
     if local:
         return {"reasoning_options": local["reasoning_options"], "default_reasoning": local["default_reasoning"],
+                "none_disables_thinking": local["none_disables_thinking"], "reasoning_aliases": local["reasoning_aliases"],
                 "context": local["context_tokens"], "context_window": local["context_tokens"],
                 "max_output_tokens": local["output_tokens"], "context_status": "verified",
                 "context_source": "本机模型部署配置", "context_source_url": ""}
     if endpoint in OFFICIAL_DEEPSEEK_ENDPOINTS and provider_model_id(model) in {DEFAULT_DEEPSEEK_MODEL, "deepseek-v4-pro"}:
-        return {"reasoning_options": ["off", "low", "high", "max"], "default_reasoning": "high"}
+        return {"reasoning_options": ["none", "low", "high", "max"], "default_reasoning": "high", "none_disables_thinking": True}
+    model_id = re.sub(r"-(?:\d{4}-\d{2}-\d{2}|\d{8})$", "", provider_model_id(model))
+    for service in MODEL_SERVICES.values():
+        if endpoint == service["endpoint"]:
+            for group in service.get("effort_groups", []):
+                if model_id in group["models"]:
+                    return {"reasoning_options": group["levels"], "default_reasoning": group["default"]}
+            break
     return {"reasoning_options": [], "default_reasoning": None}
 
 
 def run_reasoning(provider, model, requested, previous):
     capability = model_capabilities_for_connection(provider, model)
     options = capability["reasoning_options"]
+    aliases = {"off": "none", **capability.get("reasoning_aliases", {})}
+    requested = aliases.get(requested, requested) if isinstance(requested, str) else requested
+    previous = aliases.get(previous, previous) if isinstance(previous, str) else previous
     if requested and requested not in options:
-        if requested in {"off", "minimal", "low", "medium", "high"} and not options:
+        if requested in {"none", "minimal", "low", "medium", "high"} and not options:
             return None  # Older clients sent a level even for an automatic provider.
-        if capability["default_reasoning"] == "high" and requested == "medium":
+        if capability.get("none_disables_thinking") and capability["default_reasoning"] == "high" and requested == "medium":
             return "high"  # Older cloud sessions used the service default.
         raise HTTPException(400, "当前模型不支持所选思考档位")
     return requested or (previous if previous in options else capability["default_reasoning"])
@@ -2948,6 +3090,8 @@ PROVIDER_USAGE_ALIASES: dict[str, tuple[str, ...]] = {
         "prompt_cache_miss_tokens",
         "cache_miss_tokens",
     ),
+    "prompt_ms": ("prompt_ms", "promptMs"),
+    "output_ms": ("output_ms", "outputMs", "predicted_ms"),
 }
 HARNESS_RUNTIME_SYSTEM_PREFIX = (
     "Viniper Harness Runtime v1. Keep the ordered conversation context intact "
@@ -3023,6 +3167,108 @@ class HarnessRuntimeTransport:
             raise ValueError("Harness Application Port is required")
         self.application_port = application_port
 
+    async def blind_math_check(
+        self,
+        session_id: str,
+        problem_text: str,
+        model: str | None = None,
+        permission_mode: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        *,
+        speaker: str = "",
+    ) -> str:
+        """Run an isolated unanchored blind solve + tool verification on the raw problem statement alone."""
+        problem = str(problem_text or "").strip()
+        if not problem or not isinstance(self.application_port, HarnessApplicationPort):
+            return ""
+        session = safe_session(session_id)
+        attachments = attachments or []
+        workdir_hint = str(session.get("workdir") or "")
+        doc_ctx = append_attachment_prompt(expand_skill_prompt(problem, workdir_hint), attachments)
+        harness_instructions = read_agent_instructions(MODE_VINIPER).strip()
+        selected_permission_mode = allowed_permission_mode(permission_mode or session.get("permission_mode"), MODE_VINIPER)
+        host_parts: list[str] = []
+        if selected_permission_mode == "review":
+            host_parts.append("[Viniper 规划自动审核：先维护结构化计划与检查点；仅项目内受控动作可在审核通过后自动执行，越界或高风险动作直接拒绝。]")
+        elif selected_permission_mode == "fullAccess":
+            host_parts.append("[Viniper 完全访问：仅在已注册工具与产品硬边界内自动执行。]")
+        host_parts.append(f"[通用 Agent 收尾指令]\n{AGENT_COMPLETION_INSTRUCTIONS}")
+        if harness_instructions:
+            host_parts.append(f"[Viniper Harness 独立指令]\n{harness_instructions}")
+        host_instructions = "\n\n".join(host_parts)
+
+        offline_demo = env_value("VINIPER_UI_DEMO_ONLY", "").strip() == "1"
+        cfg = provider_config(model, MODE_VINIPER, resolve_secret=False)
+        if not offline_demo:
+            cfg = await asyncio.to_thread(provider_config, model, MODE_VINIPER)
+            if await asyncio.to_thread(local_model_notice, cfg["base_url"], cfg["model"]) or not cfg.get("api_key"):
+                return ""
+        selected_model = "demo-default" if offline_demo else cfg["model"]
+        provider_model = provider_model_id(selected_model)
+        local = local_agent_contract(cfg["base_url"], selected_model)
+        effort = "low" if local and "low" in local.get("reasoning_options", []) else run_reasoning(cfg, model, "low", "low")
+        workdir = existing_workdir(workdir_hint)
+        blind_sid = f"blind-{session_id}-{uuid.uuid4().hex[:8]}"
+        blind_prompt = (
+            "【独立盲解阶段 · 尚未查看任何初解】请仅依据下方原题独立推导并优先用已注册数学工具（math.quadratic.check / math.rational.evaluate）验算，"
+            "简明列出：\n1. 原题定义域与等价变形充要条件；\n2. 各单调分支与像集（值域）；\n"
+            "3. 每一个开闭端点及共同顶点（重根只计一次）的归属；\n4. 最终结论或完整参数分段根数表。\n\n原题：\n"
+            + doc_ctx
+        )
+        notes: list[str] = []
+        tool_receipts: list[str] = []
+        stream = None
+        try:
+            async with asyncio.timeout(150.0):
+                stream = self.application_port.stream(
+                    session_id=blind_sid,
+                    prompt=blind_prompt,
+                    document_context=doc_ctx,
+                    user_text=problem,
+                    model=provider_model,
+                    workdir=str(workdir),
+                    permission_mode=harness_permission_mode(selected_permission_mode),
+                    provider_id="demo" if offline_demo else cfg.get("provider"),
+                    base_url="" if offline_demo else cfg.get("base_url", ""),
+                    host_secret_value="" if offline_demo else cfg.get("api_key", ""),
+                    memory_enabled=False,
+                    reasoning=effort,
+                    planning=False,
+                    host_instructions=host_instructions,
+                )
+                async for envelope in stream:
+                    if envelope.get("type") != "provider.event":
+                        continue
+                    ev = envelope.get("event")
+                    if not isinstance(ev, dict):
+                        continue
+                    etype = str(ev.get("type") or "")
+                    if etype in {"text", "text_delta"}:
+                        chunk = clean_stream_text(str(ev.get("content") or ev.get("text") or ""))
+                        if chunk:
+                            notes.append(chunk)
+                    elif etype == "tool_result" and ev.get("status") in {"success", "completed"}:
+                        tname = str(ev.get("tool_name") or ev.get("name") or "")
+                        tcontent = str(ev.get("content") or "").strip()
+                        if tname.startswith("math.") and tcontent:
+                            tool_receipts.append(f"[{tname} 盲算回执] {tcontent[:1200]}")
+        except Exception:
+            return ""
+        finally:
+            if stream is not None:
+                try:
+                    await stream.aclose()
+                except Exception:
+                    pass
+            try:
+                await self.application_port.delete_session(blind_sid)
+            except Exception:
+                pass
+        body = "".join(notes).strip()
+        if tool_receipts:
+            body = ("\n".join(tool_receipts) + "\n\n" + body).strip()
+        return body[:4000]
+
     async def stream(
         self,
         session_id: str,
@@ -3054,16 +3300,21 @@ class HarnessRuntimeTransport:
         # Names, role instructions and quoted teammates must not expand the user's tool scope.
         document_context = append_attachment_prompt(expand_skill_prompt(display_prompt, workdir_hint), attachments) if speaker and display_prompt else runtime_prompt
         harness_instructions = read_agent_instructions(MODE_VINIPER).strip()
-        if harness_instructions:
-            runtime_prompt = f"[Viniper Harness 独立指令]\n{harness_instructions}\n\n[当前请求]\n{runtime_prompt}"
-        runtime_prompt = f"[通用 Agent 收尾指令]\n{AGENT_COMPLETION_INSTRUCTIONS}\n\n{runtime_prompt}"
         selected_permission_mode = allowed_permission_mode(permission_mode or session.get("permission_mode"), MODE_VINIPER)
+        host_instruction_parts: list[str] = []
         if selected_permission_mode == "review":
-            runtime_prompt = "[Viniper 规划自动审核：先维护结构化计划与检查点；仅项目内受控动作可在审核通过后自动执行，越界或高风险动作直接拒绝。]\n\n" + runtime_prompt
+            host_instruction_parts.append("[Viniper 规划自动审核：先维护结构化计划与检查点；仅项目内受控动作可在审核通过后自动执行，越界或高风险动作直接拒绝。]")
         elif selected_permission_mode == "fullAccess":
-            runtime_prompt = "[Viniper 完全访问：仅在已注册工具与产品硬边界内自动执行。]\n\n" + runtime_prompt
+            host_instruction_parts.append("[Viniper 完全访问：仅在已注册工具与产品硬边界内自动执行。]")
         elif selected_permission_mode == "plan":
-            runtime_prompt = "[Viniper 计划模式：只分析并维护计划，不执行文件修改或有副作用的工具。]\n\n" + runtime_prompt
+            host_instruction_parts.append("[Viniper 计划模式：只分析并维护计划，不执行文件修改或有副作用的工具。]")
+        host_instruction_parts.append(f"[通用 Agent 收尾指令]\n{AGENT_COMPLETION_INSTRUCTIONS}")
+        if harness_instructions:
+            host_instruction_parts.append(f"[Viniper Harness 独立指令]\n{harness_instructions}")
+        host_instructions = "\n\n".join(host_instruction_parts)
+        supports_host_instructions = isinstance(self.application_port, HarnessApplicationPort)
+        if not supports_host_instructions:
+            runtime_prompt = f"{host_instructions}\n\n[当前请求]\n{runtime_prompt}"
         cfg = provider_config(model, MODE_VINIPER, resolve_secret=False)
         workdir = existing_workdir(str(session.get("workdir") or ""))
         watched_file_roots = file_change_watch_roots(workdir)
@@ -3086,12 +3337,38 @@ class HarnessRuntimeTransport:
         elif speaker:
             preference = run_reasoning(cfg, model, None, session.get("reasoning"))
         elif local and session.get("task_mode") != "goal":
-            preference = session.get("local_reasoning_preference") or "auto"
+            preference = run_reasoning(cfg, model, None, session.get("local_reasoning_preference"))
         else:
             preference = run_reasoning(cfg, model, None, session.get("reasoning"))
-        effective_effort = choose_local_effort(display_prompt or prompt, local,
-            task_mode=session.get("task_mode", "execute"), attachments=bool(attachments),
-            skills=bool(session.get("selected_skills"))) if local and preference == "auto" else preference
+        if local and preference == "auto":
+            candidate_effort = choose_local_effort(
+                display_prompt or prompt,
+                local,
+                task_mode=session.get("task_mode", "execute"),
+                attachments=bool(attachments),
+                skills=bool(session.get("selected_skills")),
+            )
+            effort_rank = {name: idx for idx, name in enumerate(("off", "none", "minimal", "low", "medium", "high", "xhigh", "max"))}
+            locked_effort = session.get("locked_local_auto_effort") if not speaker else None
+            has_prior_turns = any(isinstance(m, dict) and m.get("role") == "assistant" for m in session.get("messages", []))
+            if (
+                not speaker
+                and has_prior_turns
+                and isinstance(locked_effort, str)
+                and locked_effort in local["reasoning_options"]
+                and effort_rank.get(locked_effort, 0) > effort_rank.get("none", 1)
+            ):
+                # Keep reasoning_effort monotonic within a multi-turn local session so
+                # follow-ups do not invalidate the entire KV prefix right after system.
+                effective_effort = candidate_effort if effort_rank.get(candidate_effort, 0) > effort_rank.get(locked_effort, 0) else locked_effort
+            else:
+                effective_effort = candidate_effort
+            if not speaker and effort_rank.get(effective_effort, 0) > effort_rank.get("none", 1):
+                session["locked_local_auto_effort"] = effective_effort
+        else:
+            if not speaker and preference != "auto":
+                session.pop("locked_local_auto_effort", None)
+            effective_effort = preference
         message_created_at = now_ts()
         user_message: dict[str, Any] = {
             "role": "user",
@@ -3205,7 +3482,7 @@ class HarnessRuntimeTransport:
             session.setdefault("messages", []).append(message)
             session["updated"] = now_ts()
             sessions[session_id] = session
-            save_sessions_to_disk()
+            save_sessions_to_disk(immediate=force)
 
         def update_pending(force: bool = False) -> None:
             nonlocal last_save
@@ -3215,23 +3492,23 @@ class HarnessRuntimeTransport:
                         "content": assistant_text,
                         "thinking": thinking_text,
                         "model": selected_model,
-                        "segments": copy.deepcopy(segments),
+                        "segments": list(segments),
                         "elapsed_seconds": max(0, round(time.monotonic() - message_started)),
                         "planned": session.get("task_mode") == "plan",
                         "updated_at": now_ts(),
                     })
                     if turn_usage:
-                        message["turn_usage"] = copy.deepcopy(turn_usage)
+                        message["turn_usage"] = dict(turn_usage)
                     thinking_elapsed = thinking_elapsed_seconds()
                     if thinking_elapsed > 0:
                         message["thinking_elapsed_seconds"] = thinking_elapsed
                     else:
                         message.pop("thinking_elapsed_seconds", None)
                     now = time.monotonic()
-                    if force or now - last_save >= 1.0:
+                    if force or now - last_save >= 2.5:
                         last_save = now
                         session["updated"] = now_ts()
-                        save_sessions_to_disk()
+                        save_sessions_to_disk(immediate=force)
                     return
 
         def capture_file_changes() -> list[dict[str, Any]]:
@@ -3325,6 +3602,7 @@ class HarnessRuntimeTransport:
                 memory_enabled=bool(load_app_settings().get("runtime", {}).get("memory_enabled", True)),
                 reasoning=effective_effort,
                 planning=planning,
+                **({"host_instructions": host_instructions} if supports_host_instructions else {}),
                 **({"room_transcript": True, "room_history": room_history if local else None} if speaker else {}),
             )
             async for envelope in event_stream:
@@ -3628,7 +3906,9 @@ class HarnessRuntimeTransport:
             if thinking_started:
                 yield {"type": "thinking_complete", "elapsed": finish_thinking()}
             await close_owned_stream()
-            issue = inconsistent_equality(assistant_text) if verify_final_math else ""
+            if may_have_written and captured_file_changes is None:
+                await asyncio.to_thread(capture_file_changes)
+            issue = inconsistent_equality(assistant_text) if verify_final_math else verify_structured_math_check(assistant_text)
             note = "定稿算式未通过核算。" + issue if issue else ""
             finalize_assistant("failed" if issue else "completed", note)
             if issue:
@@ -3645,6 +3925,8 @@ class HarnessRuntimeTransport:
             yield done
         except asyncio.CancelledError:
             await close_owned_stream()
+            if may_have_written and captured_file_changes is None:
+                await asyncio.to_thread(capture_file_changes)
             note = ("已发送停止请求。" + stop_warning if stop_warning
                     else "本轮已停止；已完成的文件修改已保留。")
             finalize_assistant("cancelled", note)
@@ -3653,6 +3935,8 @@ class HarnessRuntimeTransport:
             raise
         except Exception as exc:
             await close_owned_stream()
+            if may_have_written and captured_file_changes is None:
+                await asyncio.to_thread(capture_file_changes)
             note = f"Viniper 运行失败：{exc}"
             if stop_warning:
                 note += "\n\n" + stop_warning
@@ -3667,6 +3951,7 @@ class HarnessRuntimeTransport:
                 done["thinking_elapsed_seconds"] = thinking_elapsed_seconds()
             yield done
         finally:
+            daily_usage_ledger().flush()
             await close_owned_stream()
 
 
@@ -3978,8 +4263,10 @@ async def favicon():
 @app.get("/api/attachments/{session_id}/{filename}")
 async def attachment_file(session_id: str, filename: str):
     safe_id = safe_attachment_filename(session_id)
-    safe_name = safe_attachment_filename(Path(filename).name)
-    target = (ATTACHMENTS_DIR / safe_id / safe_name).resolve()
+    if filename in ("", ".", "..") or filename != Path(filename).name or "\\" in filename:
+        raise HTTPException(status_code=404, detail="attachment not found")
+    # This is the stored path component, including its generated unique prefix.
+    target = (ATTACHMENTS_DIR / safe_id / filename).resolve()
     root = (ATTACHMENTS_DIR / safe_id).resolve()
     if root not in target.parents or not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="attachment not found")
@@ -5403,11 +5690,14 @@ async def get_session(session_id: str):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="session not found")
     require_canonical_mode(sessions[session_id].get("mode"))
+    before_count = len(sessions[session_id].get("messages", []))
     sanitize_goal_session_messages(session_id)
     session = safe_session(session_id)
+    was_unread = bool(session.get("unread"))
     session["unread"] = False
     sessions[session_id] = session
-    save_sessions_to_disk()
+    if was_unread or len(session.get("messages", [])) != before_count:
+        save_sessions_to_disk()
     return clean_payload_value({
         "session_id": session_id,
         "mode": normalize_session_mode(session.get("mode")), "discussion": session.get("discussion") is True,
@@ -5454,7 +5744,11 @@ async def update_session(session_id: str, request: Request):
             raise HTTPException(400, "本会话不是群聊")
         if agent_run_coordinator().has_active(session_id):
             raise HTTPException(409, "请在本轮结束后调整成员")
-        session["members"] = checked_room_members(body["members"])
+        members = checked_room_members(body["members"])
+        previous_models = {m["model"] for m in room_members(session, None)}
+        if session.get("model") in previous_models and all(m["model"] != session["model"] for m in members):
+            session["model"] = members[0]["model"]
+        session["members"] = members
     metadata_changed = False
     if "name" in body:
         session["name"] = str(body.get("name") or "")
@@ -5732,6 +6026,7 @@ def _startup_cleanup() -> None:
     sessions.clear()
     sessions.update(loaded)
     recovered = []
+    any_changed = False
     for sid, session in sessions.items():
         if session.get("mode") != MODE_VINIPER: continue
         cleaned_messages = []
@@ -5757,7 +6052,9 @@ def _startup_cleanup() -> None:
         session["messages"] = cleaned_messages
         if session_changed:
             session["updated"] = now_ts()
-    save_sessions_to_disk()
+            any_changed = True
+    if not _sessions_corrupt_lock and (any_changed or (sessions and not SESSIONS_FILE.exists())):
+        save_sessions_to_disk()
     _session_locks.clear()
     print(f"  Startup cleanup: {len(sessions)} sessions normalized; {len(recovered)} journal entries reconciled.")
 

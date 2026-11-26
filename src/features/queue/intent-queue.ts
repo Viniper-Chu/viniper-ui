@@ -17,6 +17,7 @@ export function enqueueIntent(
     planning?: boolean;
     userText?: string;
     documentContext?: string;
+    hostInstructions?: string;
     roomTranscript?: boolean;
     roomHistory?: string[];
   },
@@ -26,6 +27,7 @@ export function enqueueIntent(
     id: engineScopedId(engineId, "queue", newId("queue")), engineId, sessionId: session.id, text, createdAt: now, origin,
     ...(controls?.roomTranscript ? {roomTranscript:true, roomHistory:controls.roomHistory} : {}),
     ...(controls?.documentContext !== undefined ? { documentContext: controls.documentContext } : {}),
+    ...(controls?.hostInstructions !== undefined ? { hostInstructions: controls.hostInstructions } : {}),
     ...(controls?.workspaceMode ? { workspaceMode: controls.workspaceMode } : {}),
     ...(controls?.reviewPolicy ? { reviewPolicy: controls.reviewPolicy } : {}),
     ...(controls?.commitRequested !== undefined ? { commitRequested: controls.commitRequested } : {}),

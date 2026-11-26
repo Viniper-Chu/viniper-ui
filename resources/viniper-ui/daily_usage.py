@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import os
 import threading
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -288,8 +289,21 @@ class DailyUsageLedger:
             if changed:
                 merged["updated_at"] = observed_text
                 self._runs[local_run_id] = merged
-                self._persist()
+                now_mono = time.monotonic()
+                if is_new or now_mono - getattr(self, "_last_persist_at", 0.0) >= 2.0:
+                    self._persist()
+                    self._last_persist_at = now_mono
+                    self._dirty = False
+                else:
+                    self._dirty = True
             return dict(merged)
+
+    def flush(self) -> None:
+        with self._lock:
+            if getattr(self, "_dirty", False):
+                self._persist()
+                self._last_persist_at = time.monotonic()
+                self._dirty = False
 
     def daily(self, days: int = 14, mode: str | None = None) -> dict[str, Any]:
         """Return oldest-to-newest continuous local-date buckets, including zero days."""

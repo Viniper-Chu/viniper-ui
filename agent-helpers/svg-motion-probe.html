@@ -1,0 +1,110 @@
+<!doctype html><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-viniper-probe'; frame-src 'self' about:; style-src 'unsafe-inline'; base-uri 'none'">
+<iframe sandbox="allow-same-origin" width="900" height="520" srcdoc="<!doctype html><meta http-equiv='Content-Security-Policy' content=&quot;default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'&quot;><body></body>"></iframe>
+<script nonce="viniper-probe">
+window.onload = () => {
+  const result = document.createElement('pre');
+  result.id = 'result';
+  try {
+    const frame = document.querySelector('iframe').contentDocument;
+    const template = document.createElement('template');
+    template.innerHTML = new TextDecoder().decode(Uint8Array.from(atob('__SOURCE_BASE64__'), c => c.charCodeAt(0)));
+    // Only declarative drawing elements enter the scriptless frame. Inline CSS inherits its offline policy.
+    const tags = new Set('svg g defs symbol use path circle ellipse rect line polyline polygon text tspan linearGradient radialGradient stop pattern marker mask clipPath animate animateMotion animateTransform mpath set title desc style'.split(' '));
+    const htmlTags = new Set(['div','main','section','figure','style']);
+    function copy(parent, elements) {
+      for (const node of elements) {
+        if (node.nodeType === Node.TEXT_NODE) { parent.append(frame.createTextNode(node.data)); continue; }
+        if (node.nodeType !== Node.ELEMENT_NODE) continue;
+        const svg = node.namespaceURI === 'http://www.w3.org/2000/svg';
+        if (!(svg ? tags : htmlTags).has(node.localName)) continue;
+        const element = frame.createElementNS(node.namespaceURI, node.localName);
+        for (const attr of node.attributes) {
+          if (/^on|^src|^nonce$|^xml:base$/i.test(attr.name)) continue;
+          if (/href$/i.test(attr.name) && !attr.value.startsWith('#')) continue;
+          element.setAttributeNS(attr.namespaceURI, attr.name, attr.value);
+        }
+        parent.append(element);
+        copy(element, node.childNodes);
+      }
+    }
+    copy(frame.body, template.content.childNodes);
+    const svgs = [...frame.querySelectorAll('svg')].filter(s => !s.ownerSVGElement);
+    if (!svgs.length) throw Error('未找到可采样的内联 SVG。脚本或外部资源生成的画面需单独验证。');
+    svgs.forEach(svg => { svg.pauseAnimations(); svg.getBoundingClientRect(); });
+    const css = frame.getAnimations();
+    const smil = [...frame.querySelectorAll('animate, animateTransform, animateMotion, set')];
+    const rotors = new Set();
+    for (const a of css) {
+      a.pause();
+      if (a.effect.getKeyframes().some(k => k.rotate || /rotate/i.test(k.transform || ''))) rotors.add(a.effect.target);
+    }
+    for (const a of smil) if (a.getAttribute('type') === 'rotate' && a.targetElement) rotors.add(a.targetElement);
+    const rings = [];
+    for (const target of rotors) {
+      if (!target.ownerSVGElement || !target.parentElement.getScreenCTM) continue;
+      const circles = target.localName === 'circle' ? [target] : [...target.querySelectorAll('circle')];
+      const outer = circles.sort((a,b) => b.r.baseVal.value - a.r.baseVal.value)[0];
+      if (outer && outer.r.baseVal.value > 0) rings.push({target,outer,points:[], initial:null});
+    }
+    // All linked components must be measured on one clock, even when delays or periods differ.
+    const times = new Set([0,.25,.5,.75]);
+    function addCycle(start,duration) {
+      if (Number.isFinite(start) && Number.isFinite(duration) && duration>0)
+        for (let i=0; i<8; i++) times.add(Math.max(0,start)+duration*i/8);
+    }
+    for (const a of css) {
+      const t=a.effect.getTiming();
+      addCycle(t.delay/1000,Number(t.duration)/1000);
+    }
+    for (const a of smil) {
+      try { addCycle(a.getStartTime(),a.getSimpleDuration()); } catch { /* Event-based begin is unscheduled. */ }
+    }
+    const ordered=[...times].sort((a,b)=>a-b);
+    const seconds=ordered.length<=64 ? ordered : Array.from({length:64},(_,i)=>ordered[Math.round(i*(ordered.length-1)/63)]);
+    const contacts=JSON.parse(atob('__CONTACTS_BASE64__')).map(({tip,target})=>({
+      tip,target,left:frame.getElementById(tip),right:frame.getElementById(target),gaps:[]
+    }));
+    function anchor(el,tip,svg) {
+      let p;
+      if (tip && el.localName==='path') p=el.getPointAtLength(el.getTotalLength());
+      else if (tip && el.localName==='line') p=new DOMPoint(el.x2.animVal.value,el.y2.animVal.value);
+      else {const b=el.getBBox();p=new DOMPoint(b.x+b.width/2,b.y+b.height/2);}
+      return new DOMPoint(p.x,p.y).matrixTransform(svg.getScreenCTM().inverse().multiply(el.getScreenCTM()));
+    }
+    for (const t of seconds) {
+      svgs.forEach(svg => svg.setCurrentTime(t));
+      for (const a of css) a.currentTime=t*1000;
+      for (const pair of contacts) {
+        const {left,right}=pair;
+        if (!left?.getBBox || !right?.getBBox || !left.ownerSVGElement || left.ownerSVGElement!==right.ownerSVGElement) continue;
+        const a=anchor(left,true,left.ownerSVGElement), b=anchor(right,false,left.ownerSVGElement);
+        const gap=Math.hypot(a.x-b.x,a.y-b.y);
+        if (Number.isFinite(gap)) pair.gaps.push(gap);
+      }
+      for (const ring of rings) {
+        const {target,outer,points} = ring;
+        const parent=target.parentElement.getScreenCTM(), child=outer.getScreenCTM();
+        if (!parent || !child) continue;
+        const p=new DOMPoint(outer.cx.animVal.value,outer.cy.animVal.value).matrixTransform(parent.inverse().multiply(child));
+        if (!ring.initial) {
+          const svg = outer.ownerSVGElement;
+          const v = new DOMPoint(outer.cx.animVal.value,outer.cy.animVal.value)
+            .matrixTransform(svg.getScreenCTM().inverse().multiply(child));
+          ring.initial = [v.x,v.y].map(n => Math.round(n*100)/100);
+        }
+        if (Number.isFinite(p.x) && Number.isFinite(p.y)) points.push(p);
+      }
+    }
+    const centers=rings.filter(r=>r.points.length>1).slice(0,24).map(({target,points,initial})=>({
+      element: target.id || target.getAttribute('class') || target.localName,
+      initial_svg_center: initial, max_center_shift: Math.round(100*Math.max(...points.map(p=>Math.hypot(p.x-points[0].x,p.y-points[0].y))))/100
+    }));
+    result.textContent=JSON.stringify({ok:true, sampled_phases:seconds.length, css_animations:css.length, svg_animations:smil.length,
+      ring_centers:centers,
+      contacts:contacts.map(({tip,target,gaps})=>({tip,target,samples:gaps.length,max_gap:gaps.length?Math.round(100*Math.max(...gaps))/100:null})),
+      scope:'离线采样内联 CSS/SMIL。圆心位移以父级为参照，接触间距以所在 SVG 坐标系计。绕自身轴转动的圆心应固定；公转或偏心件按设计判断。未执行页面脚本或加载外部资源。'});
+  } catch(e) { result.textContent=JSON.stringify({ok:false,error:String(e.message)}); }
+  document.body.replaceChildren(result);
+};
+</script>

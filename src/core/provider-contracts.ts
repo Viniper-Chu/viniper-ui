@@ -180,9 +180,18 @@ export interface ProviderHistoryEntry {
   items: ProviderContentItem[];
 }
 
+export interface JsonSchemaProperty {
+  type: "string" | "number" | "integer" | "boolean" | "object" | "array";
+  description?: string;
+  properties?: Record<string, JsonSchemaProperty>;
+  required?: string[];
+  additionalProperties?: boolean;
+  items?: JsonSchema | JsonSchemaProperty;
+}
+
 export interface JsonSchema {
   type: "object";
-  properties?: Record<string, { type: "string" | "number" | "boolean" | "object" | "array"; description?: string }>;
+  properties?: Record<string, JsonSchemaProperty>;
   required?: string[];
   additionalProperties?: boolean;
 }
@@ -210,6 +219,7 @@ export interface ProviderRequest {
   /** Older speaker-attributed room messages, independent of the complete live task. */
   roomHistory?: string[];
   tools: ProviderToolDefinition[];
+  toolChoice?: "auto" | "none";
   cachePlan: CachePlan;
   contextProfile: ContextProfile;
   reasoning?: string;

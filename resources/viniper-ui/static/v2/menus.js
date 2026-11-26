@@ -124,7 +124,19 @@ export function menuContent(kind) {
   }
   if (kind === "context") {
     const u = composerContextUsage();
-    return `<div class="context-details"><strong>上下文窗口</strong><p>${u.used_tokens ?? "—"} / ${u.context_limit ?? "—"} tokens</p><small>${escape(u.source === "real" ? "按实际模型输入计数" : u.usage_label || "等待模型用量回执")}<br>达到阈值时自动整理，原有会话记录保留。</small></div>`;
+    const lastTurnUsage = [...(state.session?.messages || [])]
+      .reverse()
+      .find(m => m?.role === "assistant" && m?.turn_usage)?.turn_usage;
+    const cacheRead = Number(lastTurnUsage?.cache_read_tokens || 0);
+    const hitPct = lastTurnUsage?.cache_hit_ratio != null
+      ? Math.round(Number(lastTurnUsage.cache_hit_ratio) * 100)
+      : 0;
+    const promptMs = Number(lastTurnUsage?.prompt_ms || 0);
+    const perfLines = [];
+    if (cacheRead > 0) perfLines.push(`最近缓存命中：${cacheRead.toLocaleString("zh-CN")} tokens（${hitPct}%）`);
+    if (promptMs > 0) perfLines.push(`最近预填充耗时：${(promptMs / 1000).toFixed(1)} 秒`);
+    const perfHtml = perfLines.length ? `<br>${escape(perfLines.join(" · "))}` : "";
+    return `<div class="context-details"><strong>上下文窗口</strong><p>${u.used_tokens ?? "—"} / ${u.context_limit ?? "—"} tokens</p><small>${escape(u.source === "real" ? "按实际模型输入计数" : u.usage_label || "等待模型用量回执")}${perfHtml}<br>达到阈值时自动整理，原有会话记录保留。</small></div>`;
   }
   return (
     option({ label: "选择工作目录", image: "folder", action: "project" }) +

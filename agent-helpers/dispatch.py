@@ -21,6 +21,9 @@ def dispatch(request):
     if operation == 'math.rational.evaluate':
         return verify_arithmetic(request)
     path = request['path']
+    if operation == 'svg.inspect_motion':
+        from svg_motion import inspect_motion
+        return inspect_motion(path, request.get("contacts", []))
     if operation == 'docx.inspect':
         return inspect_docx(path)
     if operation == 'docx.edit':

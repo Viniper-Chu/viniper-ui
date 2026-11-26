@@ -11,6 +11,8 @@ export interface TokenUsage {
   reasoning: number;
   toolUse: number;
   total: number;
+  promptMs?: number | null;
+  outputMs?: number | null;
   source: UsageSource;
 }
 

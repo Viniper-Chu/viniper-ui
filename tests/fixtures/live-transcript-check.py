@@ -53,3 +53,32 @@ for text, expected in [
     assert contract.choose_local_effort(text,policy)==expected, text
 assert contract.choose_local_effort("你好",policy,attachments=True)=="medium"
 assert contract.choose_local_effort("你好",policy,task_mode="plan")=="high"
+
+native = {"api_model":"inkling-2-mini","endpoint":"http://127.0.0.1:19092/v1","context_tokens":16384,
+          "compaction_trigger_tokens":12288,"output_limit":4096,"max_iterations":96,
+          "thinking_control":{"protocol":"reasoning_effort","supported_efforts":["none","medium","high"],"default":"medium"}}
+profile.write_text(json.dumps(native))
+chosen = contract.local_agent_contract(native["endpoint"], native["api_model"])
+assert chosen["reasoning_options"] == ["auto","none","medium","high"]
+assert contract.choose_local_effort("请证明",chosen) == "high" and contract.choose_local_effort("你好",chosen) == "none"
+assert contract.local_agent_contract(native["endpoint"], "qwen-local") is None
+native["thinking_control"].update(supported_efforts=["medium","xhigh","max"], default="xhigh", effort_aliases={"xhigh":"max"})
+profile.write_text(json.dumps(native))
+aliased = contract.local_agent_contract(native["endpoint"])
+assert aliased["reasoning_options"] == ["auto","medium","max"]
+assert aliased["normal_reasoning"] == "max" and aliased["reasoning_aliases"] == {"xhigh":"max"}
+native["thinking_control"]["supported_efforts"] = ["medium"]
+profile.write_text(json.dumps(native))
+assert contract.choose_local_effort("你好",contract.local_agent_contract(native["endpoint"])) == "medium"
+
+# The same generated path must remain a usable image path when the filename is Chinese or long.
+import re
+from typing import Any
+files = {"Path":Path, "re":re, "Any":Any}
+node = next(n for n in module.body if isinstance(n,ast.FunctionDef) and n.name=="safe_attachment_filename")
+exec(compile(ast.Module(body=[node],type_ignores=[]),"attachment-filename","exec"),files)
+clean = files["safe_attachment_filename"]
+assert clean("题图.png") == "题图.png"
+assert clean("../几何题/图像.jpg") == "图像.jpg"
+long_name = clean("长" * 180 + ".webp")
+assert long_name.endswith(".webp") and len(long_name.encode("utf-8")) <= 120

@@ -172,3 +172,15 @@ test("a 16K room drops older background before the latest correction and preserv
   }
   await assert.rejects(boundLocalRequest({messages:[{role:"user",content:"本轮".repeat(7000)}]},policy,transport,sig,0,["旧记录"]),/超过本机输入预算/u);
 });
+
+test("native room instructions remain a stable prefix while the current user task follows the changing background", async () => {
+  const {transport} = fixture();
+  const prefix = "[Viniper Harness 独立指令]\n按用户要求验算\n\n[当前请求]\n";
+  for (const background of ["昨日初稿", "昨日初稿、新的订正"]) {
+    const body = {messages:[{role:"user",content:prefix + "当前题面"}]};
+    await boundLocalRequest(body,policy,transport,new AbortController().signal,0,[background]);
+    assert.ok(body.messages[0].content.startsWith(prefix));
+    assert.ok(body.messages[0].content.includes(background));
+    assert.ok(body.messages[0].content.endsWith("当前题面"));
+  }
+});

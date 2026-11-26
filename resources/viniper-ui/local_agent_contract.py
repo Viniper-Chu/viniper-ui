@@ -44,16 +44,37 @@ def local_agent_contract(base_url, model=None):
         if not data:
             return None
         control = data.get('thinking_control', {})
-        budgets = control.get('budget_tokens', {'low': 256, 'medium': 512, 'high_and_above': 1024})
-        options = ['off'] + [level for level in ('minimal', 'low', 'medium', 'high', 'xhigh', 'max')
-                             if budgets.get(level, budgets.get('high_and_above') if level == 'high' else 0)]
+        levels = ('minimal', 'low', 'medium', 'high', 'xhigh', 'max')
         default = control.get('default', 'medium')
+        if default == 'off':
+            default = 'none'
+        aliases = {}
+        if control.get('protocol') == 'reasoning_effort':
+            supported = control.get('supported_efforts')
+            if not isinstance(supported, list):
+                return None
+            options = [level for level in ('none', *levels) if level in supported]
+            declared_aliases = control.get('effort_aliases', {})
+            if isinstance(declared_aliases, dict):
+                aliases = {key: value for key, value in declared_aliases.items()
+                           if key in options and value in options and value not in declared_aliases}
+                options = [level for level in options if level not in aliases]
+                default = aliases.get(default, default)
+            if not options:
+                return None
+            if default not in options:
+                default = options[0]
+        else:
+            budgets = control.get('budget_tokens', {'low': 256, 'medium': 512, 'high_and_above': 1024})
+            options = ['none'] + [level for level in levels if budgets.get(level, budgets.get('high_and_above') if level == 'high' else 0)]
         return {'model': data['api_model'], 'context_tokens': data['context_tokens'],
                 'compact_at_tokens': data['compaction_trigger_tokens'], 'output_tokens': data['output_limit'],
                 'max_iterations': data['max_iterations'],
                 'default_reasoning': 'auto',
                 'normal_reasoning': default if default in options else options[-1],
                 'reasoning_options': ['auto', *options],
+                'reasoning_aliases': aliases,
+                'none_disables_thinking': control.get('protocol') != 'reasoning_effort',
                 'structured_tools_json': data.get('structured_tools_json') is True}
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -64,6 +85,7 @@ def choose_local_effort(text, contract, *, task_mode="execute", attachments=Fals
     prompt = re.sub(r"^(?:@[\w-]+[：:,，\s]+)+", "", str(text or "").strip())
     options = contract["reasoning_options"]
     normal = contract["normal_reasoning"]
+    quiet = "none" if "none" in options else "off" if "off" in options else normal
     if re.search(r"证明|论证|推导|参数题|参数.{0,12}(?:范围|取值)|含参|实根|单调|分类讨论|复核|验算|定稿|解方程|不等式|排查|调试|规划|\b(?:prove|proof|derive|debug)\b", prompt, re.I) or task_mode in {"plan", "goal"}:
         return "high" if "high" in options else normal
     if attachments or skills:
@@ -72,9 +94,9 @@ def choose_local_effort(text, contract, *, task_mode="execute", attachments=Fals
     arithmetic = r"(?:请)?(?:帮我)?(?:心算|计算|算一下|算算|求)?\s*[-+]?\d{1,2}\s*[+＋×*÷/−-]\s*[-+]?\d{1,2}(?:\s*(?:=|等于|是)?\s*(?:多少|几))?"
     suffix = r"(?:[，,。；;]\s*(?:只(?:需)?(?:回复|回答)(?:阿拉伯数字|数字|结果|答案)|本轮不使用工具))*[。.!！?？\s]*"
     if re.fullmatch(r"(?:" + greeting + "|" + arithmetic + ")" + suffix, prompt, re.I):
-        return "off"
+        return quiet
     if re.fullmatch(r"(?:请)?只(?:需)?(?:回复|输出|回答)[：:\s]*[“「][^”」\n]{1,64}[”」][。！!\s]*", prompt):
-        return "off"
+        return quiet
     return normal
 
 

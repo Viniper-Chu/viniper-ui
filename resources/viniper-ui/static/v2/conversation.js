@@ -56,6 +56,7 @@ function patchChildren(parent, next) {
       return;
     }
     if (current.nodeType !== 1) return;
+    if (!current.querySelector?.("details[open], [data-expanded-output]") && current.isEqualNode?.(fresh)) return;
     for (const attr of [...current.attributes])
       if (!fresh.hasAttribute(attr.name) && !(current.tagName === "DETAILS" && attr.name === "open")) current.removeAttribute(attr.name);
     for (const attr of fresh.attributes)
@@ -173,11 +174,55 @@ export async function readTerminalOutput(button) {
   try {
     const offset = Number(button.dataset.outputOffset || 0);
     const data = await api(`/api/sessions/${encodeURIComponent(state.session.session_id)}/terminal/${encodeURIComponent(button.dataset.terminal)}?stream=${button.dataset.outputStream}&offset=${offset}`);
-    const pre = button.closest(".terminal-stream").querySelector("pre");
+    const streamSection = button.closest(".terminal-stream");
+    const pre = streamSection.querySelector("pre");
     pre.textContent = (offset ? pre.textContent : "") + data.text;
-    if (data.nextOffset == null) button.remove();
-    else { button.dataset.outputOffset = data.nextOffset; button.textContent = "继续读取输出"; }
+    streamSection.dataset.expandedOutput = "true";
+    if (data.nextOffset == null) {
+      streamSection.dataset.expandedDone = "true";
+      button.remove();
+    } else {
+      streamSection.dataset.expandedOffset = String(data.nextOffset);
+      button.dataset.outputOffset = data.nextOffset;
+      button.textContent = "继续读取输出";
+    }
   } finally { button.disabled = false; }
+}
+
+function captureExpandedOutputs(root) {
+  const saved = new Map();
+  for (const sec of root.querySelectorAll?.('.terminal-stream[data-expanded-output="true"]') || []) {
+    const key = sec.dataset.outputKey;
+    const pre = sec.querySelector("pre");
+    if (key && pre) {
+      saved.set(key, {
+        text: pre.textContent,
+        done: sec.dataset.expandedDone === "true",
+        nextOffset: sec.dataset.expandedOffset || "",
+      });
+    }
+  }
+  return saved;
+}
+
+function restoreExpandedOutputs(root, saved) {
+  if (!saved.size) return;
+  for (const sec of root.querySelectorAll?.(".terminal-stream[data-output-key]") || []) {
+    const entry = saved.get(sec.dataset.outputKey);
+    if (!entry) continue;
+    const pre = sec.querySelector("pre");
+    if (pre) pre.textContent = entry.text;
+    sec.dataset.expandedOutput = "true";
+    const btn = sec.querySelector("button[data-terminal]");
+    if (entry.done) {
+      sec.dataset.expandedDone = "true";
+      btn?.remove();
+    } else if (btn && entry.nextOffset) {
+      sec.dataset.expandedOffset = entry.nextOffset;
+      btn.dataset.outputOffset = entry.nextOffset;
+      btn.textContent = "继续读取输出";
+    }
+  }
 }
 function toolHtml(tool, streaming) {
   const status =
@@ -284,9 +329,16 @@ function activityData(message, parts) {
   const count = parts.filter(p => p.kind === "tool" && ["tool", "tool_start", "tool_result"].includes(p.tool.type)).length;
   const elapsed = message.elapsed ?? message.elapsed_seconds ?? message.turn_usage?.elapsed_seconds ?? 0;
   const outcome = message.cancelled ? "已停止 · " : message.steered ? "已按引导中断 · " : message.error ? "未完成 · " : "";
+  const cacheHit = Number(message.turn_usage?.cache_read_tokens || 0);
+  const hitPct = cacheHit > 0 && message.turn_usage?.cache_hit_ratio != null
+    ? Math.round(Number(message.turn_usage.cache_hit_ratio) * 100)
+    : 0;
+  const summaryBits = [];
+  if (count) summaryBits.push(`${count} 次操作`);
+  if (hitPct > 0) summaryBits.push(`缓存命中 ${hitPct}%`);
   return {
     label: `${outcome}用时 ${elapsed ? timeLabel(elapsed) : "不足 1 秒"}`,
-    count: count ? `${count} 次操作` : "",
+    count: summaryBits.join(" · "),
     expandable: parts.some(part => isFoldable(part)),
     outcome,
   };
@@ -297,16 +349,45 @@ function isFoldable(part) {
   if (!["tool", "tool_start", "tool_result"].includes(tool.type) || tool.is_error) return false;
   return ["success", "completed"].includes(tool.status || (tool.type === "tool_start" ? "running" : "success"));
 }
-function timelinePartHtml(part, streaming, live, thinkingActive) {
+function formatCharCount(length) {
+  if (!length || length < 20) return "";
+  return length >= 1000 ? `${(length / 1000).toFixed(1)}k 字` : `${length} 字`;
+}
+function thoughtStepLabel(part, message, thinkingActive) {
+  if (thinkingActive) {
+    const bits = ["正在思考"];
+    const sec = Math.max(0, Math.floor(Number(message.elapsed) || 0));
+    if (sec >= 2) bits.push(timeLabel(sec));
+    const chars = formatCharCount(part.content?.length || 0);
+    if (chars) bits.push(chars);
+    return bits.join(" · ");
+  }
+  const doneSec = Number(message.thinking_elapsed_seconds || 0);
+  return doneSec > 0 ? `思考过程 · ${timeLabel(doneSec)}` : "思考过程";
+}
+function waitingPlaceholderLabel(message, lastActivityAt = 0) {
+  const base = workingLabel(message.working || "正在连接模型");
+  const sec = Math.max(0, Math.floor(Number(message.elapsed) || 0));
+  const idleSec = lastActivityAt ? Math.round((Date.now() - lastActivityAt) / 1000) : sec;
+  const elapsedPart = sec >= 2 ? ` · ${timeLabel(sec)}` : "";
+  if (message.stopping) return `正在停止${elapsedPart}`;
+  if (idleSec >= 45) return `${base}${elapsedPart}（可继续等待，或按 ⌘. 停止）`;
+  if (sec >= 20) return `${base}${elapsedPart}（本地模型首段推理可能需约 1 分钟）`;
+  return `${base}${elapsedPart}`;
+}
+function timelinePartHtml(part, streaming, live, thinkingActive, message = {}) {
   if (part.kind === "text") return `<div class="answer${part.final ? " final-answer" : " progress-answer"}">${markdown(part.content, streaming && live)}</div>`;
   if (part.kind === "tool") return toolHtml(part.tool, streaming);
-  return `<details class="thought-step"><summary data-hint="思考记录" class="step-heading"><span class="step-glyph">${icon("thought")}</span><span class="step-label">${thinkingActive ? "正在思考" : "思考过程"}</span><span class="step-chevron">${icon("chevron")}</span></summary><div class="thinking-content"></div></details>`;
+  return `<details class="thought-step"><summary data-hint="思考记录" class="step-heading"><span class="step-glyph">${icon("thought")}</span><span class="step-label">${escape(thoughtStepLabel(part, message, thinkingActive))}</span><span class="step-chevron">${icon("chevron")}</span></summary><div class="thinking-content"></div></details>`;
 }
 function timelineHtml(message, parts) {
+  if (!parts.length && message.streaming) {
+    return `<div class="timeline-part waiting-placeholder" data-kind="waiting" data-foldable="false" data-part-key="waiting-live"><div class="step-heading"><span class="step-glyph"><i class="spinner"></i></span><span class="step-label">${escape(waitingPlaceholderLabel(message))}</span></div></div>`;
+  }
   return parts.map((part, i) => {
     const last = i === parts.length - 1;
     const thinking = Boolean(message.streaming && last && part.kind === "thinking" && message.working === "正在思考");
-    return `<div class="timeline-part" data-kind="${part.kind}" data-foldable="${isFoldable(part)}" data-thinking="${thinking}" data-part-key="${escape(part.key)}">${timelinePartHtml(part, Boolean(message.streaming), last, thinking)}</div>`;
+    return `<div class="timeline-part" data-kind="${part.kind}" data-foldable="${isFoldable(part)}" data-thinking="${thinking}" data-part-key="${escape(part.key)}">${timelinePartHtml(part, Boolean(message.streaming), last, thinking, message)}</div>`;
   }).join("");
 }
 export function copyAnswer(message) {
@@ -357,35 +438,54 @@ function updateMessage(node, message) {
   }
   const list = node.querySelector(".turn-timeline");
   const existing = new Map([...list.children].map(slot => [slot.dataset.partKey, slot]));
-  parts.forEach((part, index) => {
-    let slot = existing.get(part.key);
+  if (!parts.length && message.streaming) {
+    let slot = existing.get("waiting-live");
     if (!slot) {
-      slot = document.createElement("div"); slot.className = "timeline-part"; slot.dataset.partKey = part.key;
-      slot.innerHTML = timelinePartHtml(part, Boolean(message.streaming), index === parts.length - 1);
+      slot = document.createElement("div");
+      slot.className = "timeline-part waiting-placeholder";
+      slot.dataset.kind = "waiting";
+      slot.dataset.foldable = "false";
+      slot.dataset.partKey = "waiting-live";
+      slot.innerHTML = `<div class="step-heading"><span class="step-glyph"><i class="spinner"></i></span><span class="step-label"></span></div>`;
+      list.replaceChildren(slot);
     }
-    slot.dataset.kind = part.kind;
-    slot.dataset.foldable = String(isFoldable(part));
-    const thinking = Boolean(message.streaming && index === parts.length - 1 && part.kind === "thinking" && message.working === "正在思考");
-    slot.dataset.thinking = String(thinking);
-    if (list.children[index] !== slot) list.insertBefore(slot, list.children[index] || null);
-    const previousPart = slot._part, wasStreaming = slot._streaming;
-    slot._part = part; slot._streaming = message.streaming;
-    if (part.kind === "text") {
-      const answer = slot.querySelector(".answer");
-      answer.classList.toggle("final-answer", part.final); answer.classList.toggle("progress-answer", !part.final);
-      updateMarkdown(answer, part.content, Boolean(message.streaming) && index === parts.length - 1);
-    } else if (part.kind === "tool") {
-      if (previousPart?.source !== part.source || previousPart?.resultSource !== part.resultSource || wasStreaming !== message.streaming) updateMarkup(slot, toolHtml(part.tool, Boolean(message.streaming)));
-    }
-    else {
-      const detail = slot.querySelector("details"), label = detail.querySelector(".step-label");
-      const text = thinking ? "正在思考" : "思考过程";
-      if (label.textContent !== text) label.textContent = text;
-      if (detail.open) updateMarkdown(detail.querySelector(".thinking-content"), part.content, Boolean(message.streaming));
-    }
-  });
-  const retained = new Set(parts.map(p => p.key));
-  for (const slot of [...list.children]) if (!retained.has(slot.dataset.partKey)) slot.remove();
+    const labelEl = slot.querySelector(".step-label");
+    const nextLabel = waitingPlaceholderLabel(message);
+    if (labelEl && labelEl.textContent !== nextLabel) labelEl.textContent = nextLabel;
+  } else {
+    parts.forEach((part, index) => {
+      let slot = existing.get(part.key);
+      const thinking = Boolean(message.streaming && index === parts.length - 1 && part.kind === "thinking" && message.working === "正在思考");
+      if (!slot) {
+        slot = document.createElement("div"); slot.className = "timeline-part"; slot.dataset.partKey = part.key;
+        slot.innerHTML = timelinePartHtml(part, Boolean(message.streaming), index === parts.length - 1, thinking, message);
+      }
+      slot.dataset.kind = part.kind;
+      slot.dataset.foldable = String(isFoldable(part));
+      slot.dataset.thinking = String(thinking);
+      if (list.children[index] !== slot) list.insertBefore(slot, list.children[index] || null);
+      const previousPart = slot._part, wasStreaming = slot._streaming;
+      slot._part = part; slot._streaming = message.streaming;
+      if (part.kind === "text") {
+        const answer = slot.querySelector(".answer");
+        answer.classList.toggle("final-answer", part.final); answer.classList.toggle("progress-answer", !part.final);
+        updateMarkdown(answer, part.content, Boolean(message.streaming) && index === parts.length - 1);
+      } else if (part.kind === "tool") {
+        if (previousPart?.source !== part.source || previousPart?.resultSource !== part.resultSource || wasStreaming !== message.streaming) {
+          const expanded = captureExpandedOutputs(slot);
+          updateMarkup(slot, toolHtml(part.tool, Boolean(message.streaming)));
+          restoreExpandedOutputs(slot, expanded);
+        }
+      } else {
+        const detail = slot.querySelector("details"), label = detail.querySelector(".step-label");
+        const text = thoughtStepLabel(part, message, thinking);
+        if (label.textContent !== text) label.textContent = text;
+        if (detail.open) updateMarkdown(detail.querySelector(".thinking-content"), part.content, Boolean(message.streaming));
+      }
+    });
+    const retained = new Set(parts.map(p => p.key));
+    for (const slot of [...list.children]) if (!retained.has(slot.dataset.partKey)) slot.remove();
+  }
   updateMarkup(node.querySelector(".message-results"), resultFiles(message));
   updateMarkup(node.querySelector(".message-plan"), message.planned && !message.streaming ? '<button class="secondary-button" data-action="implement-plan" data-hint="将实施要求填入输入框">按此计划开始实施</button>' : "");
   const actions = node.querySelector(".message-actions");
@@ -404,9 +504,12 @@ export function renderMessages(messages, { preserveView = false } = {}) {
   if (!preserveView) { list.replaceChildren(); followingLatest = true; lastScrollTop = 0; }
   visible.forEach((message, index) => {
     const node = list.children[index];
-    if (node && node._message?.role === message.role) updateMessage(node, message);
-    else {
-      const added = appendMessage(message, index);
+    if (node && node._message?.role === message.role) {
+      if (message.id) node.dataset.messageId = String(message.id);
+      else delete node.dataset.messageId;
+      updateMessage(node, message);
+    } else {
+      const added = appendMessage(message, index, { skipRail: true });
       if (node) list.replaceChild(added, node);
     }
   });
@@ -414,7 +517,7 @@ export function renderMessages(messages, { preserveView = false } = {}) {
   updateRail();
   if (preserveView) bottom();
 }
-export function appendMessage(message, index = $("#messages").children.length) {
+export function appendMessage(message, index = $("#messages").children.length, { skipRail = false } = {}) {
   $("#welcome").hidden = true;
   $("#chat-view").classList.remove("is-empty");
   $("#starters").hidden = true;
@@ -423,6 +526,7 @@ export function appendMessage(message, index = $("#messages").children.length) {
   node.classList.toggle("peer-pending", Boolean(message.peer_pending));
   node.id = `message-${index}`;
   node.dataset.messageIndex = index;
+  if (message.id) node.dataset.messageId = String(message.id);
   node._message = message;
   node.innerHTML = messageHtml(message);
   node.addEventListener("toggle", (event) => {
@@ -440,8 +544,23 @@ export function appendMessage(message, index = $("#messages").children.length) {
   });
   $("#messages").append(node);
   decorateFiles(node);
-  updateRail();
+  if (!skipRail) updateRail();
   return node;
+}
+export function refreshLiveRunStatus(run) {
+  if (!run?.node?.isConnected || state.session?.session_id !== run.sessionId || state.view !== "chat") return;
+  const waitingLabel = run.node.querySelector(".waiting-placeholder .step-label");
+  if (waitingLabel) {
+    const text = waitingPlaceholderLabel(run.message, run.lastActivityAt);
+    if (waitingLabel.textContent !== text) waitingLabel.textContent = text;
+    return;
+  }
+  const activeThought = run.node.querySelector('.timeline-part[data-thinking="true"]');
+  if (activeThought?._part) {
+    const label = activeThought.querySelector(".step-label");
+    const text = thoughtStepLabel(activeThought._part, run.message, true);
+    if (label && label.textContent !== text) label.textContent = text;
+  }
 }
 export function paintRun(run) {
   if (state.session?.session_id !== run.sessionId || state.view !== "chat")
@@ -484,7 +603,27 @@ export function projectEvent(run, event) {
     run.message.model = event.model;
   }
   if (event.type === "assistant_start" && event.created_at) run.message.created_at = event.created_at;
+  if (event.type === "queue_removed") {
+    const itemId = String(event.item_id || "");
+    if (itemId && state.queues?.has(run.sessionId)) {
+      state.queues.set(run.sessionId, (state.queues.get(run.sessionId) || []).filter(item => String(item.id) !== itemId));
+    }
+    if (typeof document !== "undefined" && state.session?.session_id === run.sessionId) {
+      const box = $("#queue");
+      if (box) {
+        for (const el of box.querySelectorAll?.(".queued-message") || []) {
+          if (el.dataset?.queueId === itemId) el.remove();
+        }
+        box.hidden = !box.children?.length;
+      }
+    }
+    return;
+  }
   if (event.type === "queue_dispatch") {
+    const dispatchedId = String(event.item?.id || "");
+    if (dispatchedId && state.queues?.has(run.sessionId)) {
+      state.queues.set(run.sessionId, (state.queues.get(run.sessionId) || []).filter(item => String(item.id) !== dispatchedId));
+    }
     run.done = false;
     run.message = {
       role: "assistant",
@@ -496,6 +635,13 @@ export function projectEvent(run, event) {
     };
     if (!event.turn_started_at) run.started = Date.now();
     if (state.session?.session_id === run.sessionId) {
+      const box = typeof document !== "undefined" ? $("#queue") : null;
+      if (box && dispatchedId) {
+        for (const el of box.querySelectorAll?.(".queued-message") || []) {
+          if (el.dataset?.queueId === dispatchedId) el.remove();
+        }
+        box.hidden = !box.children?.length;
+      }
       appendMessage({ role: "user", content: event.item?.text || "" });
       run.node = appendMessage(run.message);
     }
@@ -547,10 +693,14 @@ export function projectEvent(run, event) {
     const errorText = `\n\n${event.content || "本次任务未完成"}`;
     m.content += errorText;
     appendLiveSegment(m, "text", errorText);
+  } else if (type === "thinking_complete") {
+    if (event.elapsed > 0) m.thinking_elapsed_seconds = event.elapsed;
+    m.working = "等待模型继续";
   } else if (type === "done") {
     run.done = true;
     m.streaming = false;
     m.stopping = false;
+    if (event.thinking_elapsed_seconds > 0) m.thinking_elapsed_seconds = event.thinking_elapsed_seconds;
     if (run.cancelAcknowledged) m.cancelled = true;
     run.interaction = null;
   } else if (type === "steering") {
@@ -585,19 +735,28 @@ export function updateRail() {
     )
     .join("");
 }
+let scrollFramePending = false;
 export function trackScroll() {
   const top = $("#conversation").scrollTop;
   if (top < lastScrollTop - 1) followingLatest = false;
   else if (!holdingPointer && nearBottom()) followingLatest = true;
   lastScrollTop = top;
   $("#jump-bottom").hidden = nearBottom();
-  const area = $("#conversation").getBoundingClientRect();
-  let active = "";
-  for (const node of $("#messages").querySelectorAll(".message.user"))
-    if (node.getBoundingClientRect().top <= area.top + 120) active = node.id;
-  $("#message-rail")
-    .querySelectorAll("button")
-    .forEach((b) => b.classList.toggle("active", b.dataset.jump === active));
+  if (scrollFramePending) return;
+  scrollFramePending = true;
+  const measure = () => {
+    scrollFramePending = false;
+    const area = $("#conversation")?.getBoundingClientRect();
+    if (!area) return;
+    let active = "";
+    for (const node of $("#messages").querySelectorAll(".message.user"))
+      if (node.getBoundingClientRect().top <= area.top + 120) active = node.id;
+    $("#message-rail")
+      .querySelectorAll("button")
+      .forEach((b) => b.classList.toggle("active", b.dataset.jump === active));
+  };
+  if (typeof globalThis.requestAnimationFrame === "function") globalThis.requestAnimationFrame(measure);
+  else measure();
 }
 export function decorateFiles(root, answer = false) {
   root.querySelectorAll("a[href]").forEach((a) => {

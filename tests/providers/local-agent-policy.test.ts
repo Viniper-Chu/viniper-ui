@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { loadLocalAgentPolicy, localRequestOverrides } from "../../src/features/local-models/local-agent-policy";
-import { protocolRequest, testProfile } from "./protocol-test-kit";
+import { protocolRequest, runProtocolToolLoop, testProfile } from "./protocol-test-kit";
 import { toolsForCurrentTurn, relevantFileTools } from "../../src/features/runs/current-turn-tools";
 import { OpenAIChatProvider } from "../../src/features/providers/protocols/openai-chat/openai-chat-provider";
 import { providerOptions } from "./protocol-test-kit";
@@ -140,3 +140,86 @@ test("local provider serializes streams and forwards current manual reasoning to
     await rm(root, { recursive: true, force: true });
   }
 });
+
+for (const nested of [false, true]) {
+  test(`native effort in ${nested ? "template kwargs" : "the top level"} matches counting, generation, tool continuation and vision`, async () => {
+    const maintenance = join(process.cwd(), "codex", "运行残留");
+    await mkdir(maintenance, { recursive: true });
+    const directory = await mkdtemp(join(maintenance, "native-effort-"));
+    const previous = process.env.VINIPER_LOCAL_AGENT_PROFILE;
+    try {
+      const path = join(directory, "profile.json");
+      const model = "inkling-2-mini";
+      const endpoint = "http://127.0.0.1:19092/v1/chat/completions";
+      await writeFile(path, JSON.stringify({ endpoint, api_model: model, context_tokens: 16384, compaction_trigger_tokens: 12288,
+        output_limit: 4096, max_iterations: 96, vision: {enabled:true, image_max_tokens:2048},
+        ...(nested ? {chat_template_kwargs:{fixture_marker:"keep"}} : {}),
+        thinking_control: {protocol:"reasoning_effort", ...(nested ? {wire_parameter:"chat_template_kwargs.reasoning_effort"} : {}), supported_efforts:["none","medium","high","xhigh","max"], effort_aliases:{xhigh:"max"}, default:"medium"} }));
+      process.env.VINIPER_LOCAL_AGENT_PROFILE = path;
+      const profile = testProfile("openai-chat", endpoint);
+      const policy = loadLocalAgentPolicy(endpoint,path)!;
+      if (nested) {
+        const existing = {reasoning_effort:"high", chat_template_kwargs:{per_request:true, reasoning_effort:"max"}};
+        const merged = localRequestOverrides({...protocolRequest(profile,model),reasoning:"off"},policy,existing);
+        assert.equal(Object.hasOwn(merged,"reasoning_effort"),false);
+        assert.deepEqual(merged.chat_template_kwargs,{fixture_marker:"keep",per_request:true,reasoning_effort:"none"});
+        assert.equal(existing.reasoning_effort,"high");
+      }
+      const effortOnWire = (body: Record<string,any>): string => {
+        if (!nested) {
+          assert.equal(body.chat_template_kwargs,undefined);
+          return body.reasoning_effort;
+        }
+        assert.equal(Object.hasOwn(body,"reasoning_effort"),false);
+        assert.equal(body.chat_template_kwargs.fixture_marker,"keep");
+        return body.chat_template_kwargs.reasoning_effort;
+      };
+      assert.ok(policy.nativeEfforts?.includes("max") && !policy.nativeEfforts.includes("xhigh"));
+      const restored = localRequestOverrides({...protocolRequest(profile,model),reasoning:"xhigh"},policy);
+      assert.equal(effortOnWire(restored),"max");
+      const efforts: string[] = [];
+      const counted: string[] = [];
+      const provider = new OpenAIChatProvider({...providerOptions(profile, model), fetchImpl: async (url, init) => {
+        const body = JSON.parse(String(init?.body));
+        if (String(url).endsWith("/apply-template")) {
+          counted.push(effortOnWire(body));
+          return Response.json({prompt:"rendered local template"});
+        }
+        if (String(url).endsWith("/tokenize")) return Response.json({tokens:[1,2]});
+        efforts.push(effortOnWire(body));
+        assert.equal(body.model,model);
+        for (const key of ["reasoning_format","reasoning_budget_tokens","reasoning_budget_message"]) {
+          assert.equal(body[key],undefined,key);
+        }
+        const last = body.messages.at(-1);
+        let deltas;
+        if (Array.isArray(last.content)) {
+          assert.equal(last.content[1].type,"image_url");
+          deltas = [{content:"读图结果"}];
+        } else if (last.role === "tool") {
+          assert.equal(last.tool_call_id,"native-call");
+          assert.match(last.content,/队列正常/u);
+          deltas = [{content:"已完成复核"}];
+        } else {
+          deltas = [{reasoning_content:"fixture thought"}, {tool_calls:[{index:0,id:"native-call",
+            function:{name:"demo.inspect",arguments:'{"topic":'}}]}, {tool_calls:[{index:0,function:{arguments:'"queue"}'}}]}];
+        }
+        return new Response(deltas.map(delta => "data: " + JSON.stringify({choices:[{delta}]}) + "\n\n").join("") + "data: [DONE]\n\n");
+      }});
+      const request = protocolRequest(profile,model);
+      request.reasoning = "high";
+      const result = await runProtocolToolLoop(provider,request);
+      assert.deepEqual(result.executedCallIds,["native-call"]);
+      assert.ok(result.projected.some(event => event.kind === "reasoning.delta"));
+      assert.equal(result.result.assistantText,"已完成复核");
+      const vision = await provider.analyzeImage({model,image:"data:image/png;base64,fixture",prompt:"读图",reasoning:"off"},new AbortController().signal);
+      assert.equal(vision.text,"读图结果");
+      assert.deepEqual(efforts,["high","high","none"]);
+      assert.deepEqual(counted,efforts);
+      assert.equal(provider.runtimePolicyFor("qwen-local"),undefined);
+    } finally {
+      if (previous === undefined) delete process.env.VINIPER_LOCAL_AGENT_PROFILE; else process.env.VINIPER_LOCAL_AGENT_PROFILE = previous;
+      await rm(directory,{recursive:true,force:true});
+    }
+  });
+}

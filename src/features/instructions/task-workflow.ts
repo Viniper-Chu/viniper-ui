@@ -9,3 +9,13 @@ export const TASK_WORKFLOW_DIRECTIVE = [
   "交付前核对用户要求与实际文件：数量、范围、答案与推理、格式和可打开性分别验证。编译/保存成功只证明生成成功，不证明内容正确；指出已发现的实质缺陷并继续修复，不能用完成口吻掩盖缺项。数学答案须独立代入或推导复核，源文和模型答案冲突时回查。",
   "工具失败先按错误修正参数或内容，再验证；只有输入或文件已变化才重跑相同失败动作。依据工具结果报告已完成、实际验证与仍未完成的内容。",
 ].join("\n");
+
+/** Specific only to declarative animation work; the budget includes a separate thinking/JSON reserve. */
+export function svgMotionWorkflow(chunkTokens?: number, canInspect = false): string {
+  return [
+    "以用户要求的文件格式交付。制作较长的 SVG 动画时从第一笔开始分段：先写含 viewBox、闭合标签及唯一插入标记的可打开文件，再用 file.edit 在标记处逐段加入画面及运动，最后移除标记。已有文件先读再局部修改。",
+    chunkTokens ? `当前本机部署建议每次工具正文约 ${chunkTokens} tokens 以内，给思考、JSON 转义和结尾留余量。分段不减功能或尺寸。` : "",
+    "先在同一坐标系内确定转轴、关节和接触点。外层 g 定位，内层绕局部原点旋转；在同一元素上用动画 transform 会覆盖原 translate。联动部件共用相位与端点。圆周运动和直线关键帧插值的轨迹不同，复杂坐标或重复采样用可用的计算工具生成，避免逐点手算。画清主体最具辨识度的外形，让承重点落在支撑物上。",
+    canInspect ? "成品写完后用 file.svg.inspect_motion 采样。绕自身轴的圆心相对安装点应固定；若有意外位移，调整分组或旋转中心后重新检查。关节或脚踏联动还需核对接触点，在 SVG 中为末端与支撑件设置 ID，传 contacts 检查同一时刻的距离；单验圆心不能证明接触关系。回执只覆盖它实测到的部分；脚本动画或未测到的部件另验。" : "",
+  ].filter(Boolean).join("\n");
+}

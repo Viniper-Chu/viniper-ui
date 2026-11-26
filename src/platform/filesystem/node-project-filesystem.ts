@@ -479,17 +479,18 @@ export class NodeProjectFilesystem implements ProjectFilesystem {
       const before = await readTextBytes(target.absolute);
       let nextText = before.toString("utf8");
       for (const [index, edit] of input.edits.entries()) {
+        const expectedMatches = edit?.expectedMatches === undefined ? 1 : edit.expectedMatches;
         if (!edit || typeof edit.oldText !== "string" || typeof edit.newText !== "string"
-          || !Number.isInteger(edit.expectedMatches) || edit.expectedMatches < 1 || edit.oldText.length === 0) {
-          throw new ProjectFilesystemError("EDIT_INVALID", `第 ${index + 1} 项替换参数无效；全部未写入。`);
+          || !Number.isInteger(expectedMatches) || expectedMatches < 1 || edit.oldText.length === 0) {
+          throw new ProjectFilesystemError("EDIT_INVALID", `第 ${index + 1} 项需要非空 oldText、字符串 newText；expectedMatches 须为正整数，省略时为 1。全部未写入。`);
         }
         mutationText(edit.oldText, "旧文本");
         mutationText(edit.newText, "新文本");
         const matches = countOccurrences(nextText, edit.oldText);
-        if (matches !== edit.expectedMatches) {
+        if (matches !== expectedMatches) {
           throw new ProjectFilesystemError(
             "EDIT_CONFLICT",
-            `第 ${index + 1} 项旧文本期望匹配 ${edit.expectedMatches} 次，实际 ${matches} 次；全部未写入。`,
+            `第 ${index + 1} 项旧文本期望匹配 ${expectedMatches} 次，实际 ${matches} 次；全部未写入。`,
           );
         }
         nextText = nextText.split(edit.oldText).join(edit.newText);

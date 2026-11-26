@@ -160,6 +160,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
   let completeText = "";
   let verified = false;
   let retryingAnswer = false;
+  let reasoningRecoveryRound = 0;
   let arithmeticOnly = false;
   let silentArithmeticRounds = 0;
   let verifiedEvidence: string[] = [];
@@ -214,6 +215,7 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       await options.emit("steering.updated", { receipt, startNewMessage: receipt === firstSteer });
     }
     if (firstSteer) {
+      reasoningRecoveryRound = 0;
       verified = false;
       retryingAnswer = false;
       arithmeticOnly = false;
@@ -225,13 +227,17 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
       repeatedReads.clear();
       reviewFingerprints.clear();
     }
-    const stepTools = verified ? [] : frozenTools;
-    // With tools disabled, native tool-call history can prime a local chat template to emit XML as prose.
-    // Feed the writer the original conversation and the actual numeric receipt as ordinary text.
+    const isLocalModel = Boolean(options.provider.runtimePolicyFor?.(options.request.selectedModel));
+    // M4: On local models (Inkling/llama.cpp), tool declarations sit at the very front of the Jinja
+    // prompt. Keep tools + tool_choice:"none" and append trailing writer instructions instead of
+    // wiping tools or slicing out tool-call turns, preserving the entire KV prefix across rounds.
+    const stepTools = verified && !isLocalModel ? [] : frozenTools;
     let requestHistory = clone(history);
     if (verified) {
-      const lastUser = requestHistory.map(entry => entry.role).lastIndexOf("user");
-      requestHistory = requestHistory.slice(0, lastUser + 1);
+      if (!isLocalModel) {
+        const lastUser = requestHistory.map(entry => entry.role).lastIndexOf("user");
+        requestHistory = requestHistory.slice(0, lastUser + 1);
+      }
       const writerInstructions = [
         options.finishRoomArithmetic
           ? "你已取得本轮数值验算记录。请依照原群题面和你被分配的角色，写出这一位成员的发言和所需交接。不再调用算术工具。"
@@ -243,13 +249,17 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
         "如果原题为根式方程 √U=V，先写成 U=V² 且 V≥0。此时 U 非负已由等式保证，不再引入一个移动的区间端点。只保留必要步骤与结论。",
       ].join("\n");
       const task = requestHistory.at(-1);
-      if (options.finishRoomArithmetic && task?.role === "user") {
+      if (!isLocalModel && options.finishRoomArithmetic && task?.role === "user") {
         // Keep the protected live room prompt and its receipts in the same message.
         // A second user message would make the original handoff eligible for compaction.
         task.items.push({ type: "text", text: "\n\n" + writerInstructions });
       } else {
         requestHistory.push({ id: newId("verified-answer"), role: "user", items: [{ type: "text", text: writerInstructions }] });
       }
+    }
+    if (round === reasoningRecoveryRound) {
+      const task = [...requestHistory].reverse().find(entry => entry.role === "user");
+      task?.items.push({type:"text", text:"\n[本机运行回执] 上一请求只产生了未完成的思考，未写入或调用工具。继续原任务，沿用已有文件及最近的工具回执。复杂坐标、数列或重复计算先用本轮允许的计算工具求值。若需操作，先完成一个短步骤；已有充分证据时直接给出最终结果。"});
     }
     const stepController = new AbortController();
     const stepSignal = AbortSignal.any([options.signal, stepController.signal]);
@@ -334,7 +344,9 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
           signal: stepSignal,
           stream: () => options.provider.stream({
             ...options.request,
-            ...(verified && !arithmeticOnly ? { reasoning: "none" } : {}),
+            ...(round === reasoningRecoveryRound && ["high", "xhigh", "max"].includes(String(options.request.reasoning || "")) ? { reasoning: "low" } : {}),
+            ...(verified && !arithmeticOnly && !isLocalModel ? { reasoning: "none" } : {}),
+            ...(verified && isLocalModel ? { toolChoice: "none" as const } : {}),
             tools: clone(stepTools),
             frozenRunContext: options.frozenRunContext,
             history: requestHistory,
@@ -389,6 +401,17 @@ export async function runAgentToolLoop(options: AgentToolLoopOptions): Promise<A
         completeText += roundText;
         appendAdjacentText(roundItems, roundText);
         await options.onProviderEvent({ kind: "text.delta", text: roundText });
+      }
+      if (incompleteOutput && !toolCalls.length && !roundText.trim() && reasoningText.trim()
+          && options.provider.runtimePolicyFor?.(options.request.selectedModel)) {
+        // Reasoning deltas have already reached the event stream. Replaying an entire
+        // exhausted private draft as assistant history can consume the next budget too.
+        if (reasoningRecoveryRound || round === maxRounds) {
+          throw new Error("本地模型仅产生了未完成的思考，已到本轮续跑上限。现有文件与工具回执已保留，任务尚未完成。");
+        }
+        reasoningRecoveryRound = round + 1;
+        await options.emit("run.checkpoint", {phase:"local-reasoning-recovery", status:"started", round});
+        continue;
       }
       if (reasoningText && !roundItems.some((item) => item.type === "reasoning")) {
         roundItems.unshift({
@@ -661,7 +684,13 @@ export async function dispatchToolCall(
   const owner = options.toolRegistry.managedOwner(call.name);
   if (call.argumentsError) {
     const reason = call.argumentsError === "output-limit" ? "模型达到单次输出上限，工具参数被截断" : "模型生成的工具参数不是完整的 JSON 对象";
-    const message = `${reason}；本次操作未执行。保持原任务范围、题量、答案和完整原解不变。将完整内容分批写入请求文件，每次只写一个完整短片段；file.math.handout 使用 questions_file 和原计划的 expected_question_count 生成。不要把分批执行改成减少交付内容，也不要以精炼版替代完整原解。`;
+    let recovery = "检查工具的参数名称、类型和 JSON 边界，只重发完整调用。";
+    if (call.argumentsError === "output-limit") {
+      if (call.name === "file.math.handout") recovery = "保留原题量和完整原解，逐题写入 JSONL，再传 questions_file 与原计划的 expected_question_count。";
+      else if (["file.write", "file.edit", "project.write", "project.edit"].includes(call.name)) recovery = "先确认目标文件当前内容。新文件分段写骨架、再用同一工具组的 edit 在唯一锚点逐段补全；已有文件按已确认的短片段精确编辑。只重试未写入的部分，保留完整交付范围。";
+      else recovery = "按该工具的参数定义缩小单次输入，分批完成原任务。";
+    }
+    const message = `${reason}；本次操作未执行。${recovery}`;
     await options.emit("tool.requested", activity({ id: activityId, kind: "tool", title: "操作内容未生成完整", detail: message,
       status: "failed", callId: call.callId, toolName: call.name, now: options.now }));
     await options.emit("tool.failed", { activityId, result: message });

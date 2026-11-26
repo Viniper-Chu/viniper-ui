@@ -622,3 +622,30 @@ test("two distinct silent arithmetic rounds in a room lead to prose with one int
   for (const required of ["原群完整题面与分工","1+1","2+1","所需交接"]) assert.ok(JSON.stringify(writer.history).includes(required));
   assert.equal(writer.reasoning,request.reasoning);
 });
+
+test("an exhausted local reasoning-only response resumes once from confirmed history and respects the request budget", async () => {
+  const limit: ProviderEvent[] = [{kind:"reasoning.delta",text:"unfinished draft"}, {kind:"response.incomplete",reason:"output-limit"}];
+  const success: ProviderEvent[] = [{kind:"text.delta",text:"finished"}];
+  async function run(rounds:ProviderEvent[][], local:boolean, budget=3) {
+    const scripted=new ScriptedProvider(rounds);
+    const provider:ModelProvider = {descriptor:scripted.descriptor,stream:scripted.stream.bind(scripted),runtimePolicyFor:()=>local ? {
+      model:"scripted-model",endpoint:"http://localhost/v1",contextTokens:32768,compactAtTokens:24576,outputTokens:4096,
+      maxIterations:10,defaultReasoning:"low",reasoningBudgets:{},parallelToolCalls:false,visionEnabled:false,structuredToolsJson:false,helperRevision:"test"
+    } : undefined};
+    const registry=new ToolRegistry(),request=providerRequest(registry,"auto");
+    const result=runAgentToolLoop({provider,request,toolRegistry:registry,maxProviderRequests:budget,now:()=>0,signal:new AbortController().signal,
+      onProviderEvent:async()=>{},appendHistory:async()=>{},emit:async()=>{}});
+    return {scripted,result};
+  }
+  const finite=await run([limit,success],true);
+  assert.equal((await finite.result).assistantText,"finished");
+  assert.equal(finite.scripted.requests.length,2);
+  const retried=finite.scripted.requests[1];
+  assert.ok(JSON.stringify(retried.history).includes("本机运行回执"));
+  assert.ok(!JSON.stringify(retried.history).includes("unfinished draft"));
+  for (const [local,budget,expected] of [[true,3,2],[false,3,1],[true,1,1]] as const) {
+    const stop=await run([limit,limit,success],local,budget);
+    await assert.rejects(stop.result);
+    assert.equal(stop.scripted.requests.length,expected);
+  }
+});

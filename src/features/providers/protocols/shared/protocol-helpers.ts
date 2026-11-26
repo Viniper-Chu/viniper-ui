@@ -16,6 +16,7 @@ export interface ProtocolProviderOptions {
   resolveSecret(fieldId: string): Promise<string | null>;
   fetchImpl?: typeof fetch;
   allowExternalNetwork?: boolean;
+  now?: () => number;
 }
 
 export function descriptorFor(options: ProtocolProviderOptions): ProviderDescriptor {
@@ -96,6 +97,8 @@ export function usage(input: Partial<TokenUsage> & Pick<TokenUsage, "input" | "o
     reasoning: numberOrZero(input.reasoning),
     toolUse: numberOrZero(input.toolUse),
     total: numberOrZero(input.total),
+    ...(input.promptMs !== undefined ? { promptMs: input.promptMs } : {}),
+    ...(input.outputMs !== undefined ? { outputMs: input.outputMs } : {}),
     source: input.source ?? "provider",
   };
 }

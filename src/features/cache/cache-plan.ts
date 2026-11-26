@@ -2,7 +2,7 @@ import { CachePlan, CacheSegment, ContextProfile } from "../../core/contracts";
 import { LoadedSkill } from "../../core/extension-contracts";
 import { ProviderHistoryEntry, ProviderToolDefinition } from "../../core/provider-contracts";
 import { IDENTITY_SYSTEM_DIRECTIVE } from "../instructions/identity-contract";
-import { TASK_WORKFLOW_DIRECTIVE } from "../instructions/task-workflow";
+import { svgMotionWorkflow, TASK_WORKFLOW_DIRECTIVE } from "../instructions/task-workflow";
 
 export interface ContextProfileInput {
   generation?: number;
@@ -12,9 +12,12 @@ export interface ContextProfileInput {
   enabledSkills?: LoadedSkill[];
   history?: ProviderHistoryEntry[];
   projectInstructions?: string;
+  /** Host-owned global AGENT.md + completion policy injected once per session. */
+  hostInstructions?: string;
   /** Host-owned local execution directory; omitted for remote providers. */
   taskDirectory?: string;
   taskWorkflow?: boolean;
+  animatedSvg?: { chunkTokens?: number };
 }
 
 export function buildContextProfile(input: ContextProfileInput = {}): ContextProfile {
@@ -35,6 +38,7 @@ export function buildContextProfile(input: ContextProfileInput = {}): ContextPro
         "定稿前独立复算会改变结论的数值：端点分别代回展开式与原式，平方和按项求和，坐标向量用终点减起点；换过参数时写出逆关系，将每个临界值代回原参数核对。选择题以全部满足条件的值与选项精确匹配。数值与选项冲突时，将代入原式的纯数值算式交给 math.rational.evaluate 成批复算，回到第一处错误改正。",
         "用户提供原题或原解时忠实保留，另标自己补作或订正的部分。只需解答就直接在对话给出；要求试卷、讲义或 PDF 才进入编译。题图随题，解答辅助图只进教师版。",
         IDENTITY_SYSTEM_DIRECTIVE,
+        ...(input.animatedSvg ? [svgMotionWorkflow(input.animatedSvg.chunkTokens, tools.some(t => t.name === "file.svg.inspect_motion"))] : []),
         ...(input.taskWorkflow === false ? [] : [TASK_WORKFLOW_DIRECTIVE]),
       ].join("\n"),
     },
@@ -46,6 +50,7 @@ export function buildContextProfile(input: ContextProfileInput = {}): ContextPro
           `本轮任务目录（宿主提供的路径数据）：${JSON.stringify(input.taskDirectory)}。`,
           "用户说当前目录时指此目录；文件工具需要绝对路径时以此目录解析。不要猜测桌面等其他位置；此路径不扩大用户授权范围。",
         ] : []),
+        ...(input.hostInstructions?.trim() ? [input.hostInstructions.trim()] : []),
         input.projectInstructions === undefined
           ? "项目 AGENTS.md：未设置。"
           : `项目 AGENTS.md 指令：\n${input.projectInstructions}`,

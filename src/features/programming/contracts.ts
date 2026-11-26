@@ -113,7 +113,7 @@ export interface ProjectWriteInput {
 export interface ProjectEditOperation {
   oldText: string;
   newText: string;
-  expectedMatches: number;
+  expectedMatches?: number;
 }
 
 export interface ProjectEditInput {

@@ -1,5 +1,6 @@
 import { api, state, escape } from "./api.js";
 import { ui } from "./ui.js";
+import { icon } from "./icons.js";
 
 export function readingSize(id) {
   return ({xs: "13px", sm: "14px", normal: "15px", lg: "17px", xl: "19px"})[id] || "15px";
@@ -10,7 +11,7 @@ export function preferenceFields() {
     const panel = row.closest('[role="tabpanel"]');
     return {
       label: row.dataset.pref, name: row.dataset.control || row.querySelector("[name]").name, sectionId: panel.id,
-      section: panel.querySelector("h2").textContent, aliases: row.dataset.alias || "",
+      section: document.getElementById(panel.getAttribute("aria-labelledby")).textContent.trim(), aliases: row.dataset.alias || "",
     };
   });
 }
@@ -26,6 +27,8 @@ export function clearPreferenceSearch() {
   document.querySelector("#preference-query").value = "";
   document.querySelector("#preference-results").hidden = true;
   form().hidden = false;
+  document.querySelector("#preferences-page-title").textContent =
+    document.querySelector(".settings-navigation [aria-selected=true]").textContent.trim();
 }
 
 export function setupPreferenceSearch(openField) {
@@ -36,13 +39,14 @@ export function setupPreferenceSearch(openField) {
     const query = input.value.trim().toLocaleLowerCase();
     results.hidden = !query;
     form().hidden = Boolean(query);
-    if (!query) return;
+    if (!query) { clearPreferenceSearch(); return; }
+    document.querySelector("#preferences-page-title").textContent = "搜索结果";
     const matches = preferenceFields().filter(field =>
       [field.label, field.name, field.section, field.aliases].join(" ").toLocaleLowerCase().includes(query));
     list.innerHTML = matches.map(field =>
       `<button class="preference-match" data-match="${escape(field.name)}" data-panel="${escape(field.sectionId)}"><span>${escape(field.label)}</span><small>${escape(field.section)}</small></button>`
     ).join("") || "<p role=\"status\">没有匹配的设置</p>";
-    results.parentElement.scrollTop = 0;
+    results.scrollTop = 0;
   });
   list.addEventListener("click", event => {
     const match = event.target.closest("button[data-match]");
@@ -61,11 +65,12 @@ export function setupPreferenceSearch(openField) {
 
 export function selectSettingsSection(id) {
   clearPreferenceSearch();
-  document.querySelector(".preferences-content").scrollTop = 0;
+  document.querySelector(".preferences-scroll").scrollTop = 0;
   for (const tab of document.querySelectorAll("[data-settings-section]")) {
     const selected = tab.dataset.settingsSection === id;
     tab.setAttribute("aria-selected", String(selected));
     tab.tabIndex = selected ? 0 : -1;
+    if (selected) document.querySelector("#preferences-page-title").textContent = tab.textContent.trim();
     document.getElementById(tab.dataset.settingsSection).hidden = !selected;
   }
 }
@@ -101,7 +106,7 @@ export function editModelService(id) {
 }
 function renderServices() {
   document.querySelector("#registered-services").innerHTML = services.filter(s => serviceModels[s.id]?.length).map(s =>
-    `<button type="button" class="text-button" data-model-service="${escape(s.id)}" data-hint="编辑服务模型">${escape(s.label)} · ${serviceModels[s.id].length}</button>`).join("");
+    `<button type="button" class="preferences-service" data-model-service="${escape(s.id)}" title="编辑服务模型"><span>${escape(s.label)}</span><small>${serviceModels[s.id].length} 个模型</small>${icon("arrowRight")}</button>`).join("");
 }
 let baseline = null;
 let pending = null;
@@ -160,6 +165,8 @@ async function readSettings() {
     form.elements["api-key"].placeholder = p.api_key_access === "local-placeholder" ? "本地模型无需密钥" : p.api_key_configured
       ? "已安全保存；留空保留现有密钥"
       : "输入 API key";
+    document.querySelector("#primary-model-options").innerHTML = (p.models || []).map(m =>
+      `<option value="${escape(m.id)}">${escape(m.label || m.id)}</option>`).join("");
     services = settings.model_services || [];
     serviceModels = s.service_models || {};
     renderServices();
@@ -257,7 +264,7 @@ export async function saveSettings() {
     await ui.loadStatus();
     result().textContent = "设置已保存";
   } catch (error) {
-    result().textContent = changed().length ? "仍有更改尚未保存" : "设置已写入，状态刷新失败";
+    result().textContent = (changed().length ? "仍有更改尚未保存" : "设置已写入，状态刷新失败") + " · " + error.message;
     throw error;
   } finally {
     saving = false;

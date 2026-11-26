@@ -165,7 +165,7 @@
                   >
                     <span class="compact-model-icon" data-icon="model"></span><span id="model-label">选择模型</span
                     ><span class="model-divider">·</span
-                    ><span id="reasoning-label">medium</span
+                    ><span id="reasoning-label">模型默认</span
                     ><span data-icon="chevron"></span></button
                   >
                 </div>
@@ -330,84 +330,83 @@
           </article>
         </section>
       </main>
-      <section id="settings-view" class="preferences" aria-label="设置" hidden>
-        <aside class="preferences-sidebar" aria-label="设置导航">
-          <div class="preferences-nav-head">
-            <button type="button" class="text-button back-link" data-action="leave-settings" data-hint="返回打开设置前的页面"><span data-icon="back"></span>返回应用</button>
-            <h1>设置</h1>
-          </div>
-          <label class="preferences-search">
-            <span data-icon="search"></span><input id="preference-query" type="search" aria-label="搜索设置" placeholder="搜索设置" autocomplete="off" spellcheck="false">
-          </label>
-          <div class="settings-navigation" role="tablist" aria-label="设置章节">
-            <button data-hint="模型连接" id="connection-tab" type="button" role="tab" aria-controls="connection-settings" aria-selected="true" tabindex="0" data-settings-section="connection-settings"><span data-icon="model"></span>模型连接</button>
-            <button data-hint="外观" id="appearance-tab" type="button" role="tab" aria-controls="appearance-settings" aria-selected="false" tabindex="-1" data-settings-section="appearance-settings"><span data-icon="appearance"></span>外观</button>
-            <button data-hint="默认工作目录" id="workspace-tab" type="button" role="tab" aria-controls="workspace-settings" aria-selected="false" tabindex="-1" data-settings-section="workspace-settings"><span data-icon="folder"></span>工作目录</button>
-            <button data-hint="协作规则" id="instruction-tab" type="button" role="tab" aria-controls="instruction-settings" aria-selected="false" tabindex="-1" data-settings-section="instruction-settings"><span data-icon="book"></span>协作规则</button>
-          </div>
-          <small class="preferences-version">Viniper <span id="version">3.0.1</span></small>
-        </aside>
-        <main class="preferences-content" aria-label="设置内容">
-          <section id="preference-results" aria-label="设置搜索结果" hidden>
-            <h2>搜索结果</h2>
-            <div id="preference-matches"></div>
-          </section>
-          <form id="settings-form">
+    </div>
+    <dialog id="settings-view" class="preferences" aria-labelledby="preferences-title">
+      <aside class="preferences-sidebar" aria-label="设置导航">
+        <h1 id="preferences-title">设置</h1>
+        <label class="preferences-search">
+          <span data-icon="search"></span><input id="preference-query" type="search" aria-label="搜索设置" placeholder="搜索设置" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="settings-navigation" role="tablist" aria-label="设置分区">
+          <button type="button" id="workspace-tab" role="tab" aria-controls="workspace-settings" aria-selected="true" tabindex="0" data-settings-section="workspace-settings"><span data-icon="settings"></span>通用</button>
+          <button type="button" id="appearance-tab" role="tab" aria-controls="appearance-settings" aria-selected="false" tabindex="-1" data-settings-section="appearance-settings"><span data-icon="appearance"></span>外观</button>
+          <button type="button" id="connection-tab" role="tab" aria-controls="connection-settings" aria-selected="false" tabindex="-1" data-settings-section="connection-settings"><span data-icon="model"></span>模型连接</button>
+          <button type="button" id="instruction-tab" role="tab" aria-controls="instruction-settings" aria-selected="false" tabindex="-1" data-settings-section="instruction-settings"><span data-icon="book"></span>协作规则</button>
+        </div>
+      </aside>
+      <div class="preferences-content">
+        <header class="preferences-page-head">
+          <h2 id="preferences-page-title">通用</h2>
+          <button type="button" class="icon-button preferences-close" data-action="leave-settings" aria-label="关闭设置" title="关闭设置 · Esc"><span data-icon="close"></span></button>
+        </header>
+        <section id="preference-results" aria-label="设置搜索结果" hidden><div id="preference-matches"></div></section>
+        <form id="settings-form">
+          <div class="preferences-scroll">
             <fieldset id="settings-fields" disabled>
-              <section id="connection-settings" class="settings-section" role="tabpanel" aria-labelledby="connection-tab">
-                <h2>模型连接</h2>
-                <fieldset class="pref-group"><legend>服务连接</legend>
-                  <label class="field pref-row" data-pref="服务名称"><span>服务名称</span><input name="provider-label" autocomplete="off"></label>
-                  <label class="field pref-row" data-pref="协议"><span>协议</span><select name="provider-id"><option value="custom">OpenAI 兼容</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option></select></label>
-                  <label class="field pref-row" data-pref="服务地址"><span>服务地址</span><input name="base-url" type="url" placeholder="http://127.0.0.1:18080/v1"></label>
-                  <label class="field pref-row" data-pref="可选模型"><span>可选模型</span><textarea name="model-list" rows="2" placeholder="每行一个模型 ID"></textarea></label>
-                  <label class="field pref-row" data-pref="模型 ID"><span>默认模型 ID</span><input name="model-id" autocomplete="off"></label>
-                </fieldset>
-                <fieldset class="pref-group"><legend>访问密钥</legend>
-                  <label class="field pref-row" data-pref="API 密钥" data-alias="key 钥匙串"><span>API 密钥</span><input name="api-key" type="password" autocomplete="new-password" placeholder="留空保留现有密钥"></label>
-                </fieldset>
-                <fieldset class="pref-group"><legend>其他模型服务</legend><div id="registered-services"></div><button class="text-button" type="button" data-action="add-model-service" data-hint="连接额外服务供会话与群聊选择">添加模型服务</button></fieldset>
-                <fieldset class="pref-group"><legend>DeepSeek 云端</legend>
-                  <div class="pref-row"><span>模型</span><output id="cloud-model"></output></div>
-                  <div class="pref-row"><span>官方接口</span><output id="cloud-endpoint"></output></div>
-                  <label class="field pref-row" data-pref="DeepSeek API 密钥" data-alias="讨论组 云端 Flash"><span>DeepSeek API 密钥</span><input name="discussion-key" type="password" autocomplete="new-password"></label>
-
-                </fieldset>
+              <section id="workspace-settings" class="settings-section" role="tabpanel" aria-labelledby="workspace-tab">
+                <h3>新会话</h3>
+                <div class="pref-group">
+                  <label class="field pref-row" data-pref="默认模型" data-alias="模型 ID 默认服务"><span>默认模型</span><input name="model-id" list="primary-model-options" autocomplete="off" spellcheck="false"></label>
+                  <datalist id="primary-model-options"></datalist>
+                  <div class="field pref-row" data-pref="默认工作目录" data-alias="文件夹 路径">
+                    <label for="pref-workdir">工作目录</label><div class="path-control"><input name="workdir" id="pref-workdir" spellcheck="false"><button aria-label="选择工作目录" title="选择工作目录" type="button" class="icon-button" id="browse-workdir" hidden><span data-icon="folder"></span></button></div>
+                  </div>
+                </div>
+                <h3>关于</h3>
+                <div class="pref-group"><div class="pref-row"><span>Viniper 版本</span><output id="version">3.0.1</output></div></div>
               </section>
               <section id="appearance-settings" class="settings-section" role="tabpanel" aria-labelledby="appearance-tab" hidden>
-                <h2>外观</h2>
-                <fieldset class="theme-choices" data-pref="主题" data-alias="配色 明亮 深色 石墨 跟随系统"><legend>主题</legend>
+                <fieldset class="theme-choices" data-pref="主题" data-alias="配色 明亮 浅色 深色 石墨 跟随系统"><legend>主题</legend>
                   <label class="theme-choice"><input type="radio" name="theme" value="system"><span class="theme-swatch" data-palette="system" aria-hidden="true"><i></i><b></b></span><span class="theme-caption">跟随系统<span class="choice-check" data-icon="check" aria-hidden="true"></span></span></label>
-                  <label class="theme-choice"><input type="radio" name="theme" value="light"><span class="theme-swatch" data-palette="light" aria-hidden="true"><i></i><b></b></span><span class="theme-caption">明亮<span class="choice-check" data-icon="check" aria-hidden="true"></span></span></label>
-                  <label class="theme-choice"><input type="radio" name="theme" value="dark"><span class="theme-swatch" data-palette="dark" aria-hidden="true"><i></i><b></b></span><span class="theme-caption">石墨<span class="choice-check" data-icon="check" aria-hidden="true"></span></span></label>
+                  <label class="theme-choice"><input type="radio" name="theme" value="light"><span class="theme-swatch" data-palette="light" aria-hidden="true"><i></i><b></b></span><span class="theme-caption">浅色<span class="choice-check" data-icon="check" aria-hidden="true"></span></span></label>
+                  <label class="theme-choice"><input type="radio" name="theme" value="dark"><span class="theme-swatch" data-palette="dark" aria-hidden="true"><i></i><b></b></span><span class="theme-caption">深色<span class="choice-check" data-icon="check" aria-hidden="true"></span></span></label>
                 </fieldset>
-                <div class="pref-row type-row" data-control="font-size" data-pref="文字大小" data-alias="字号 字体 阅读大小">
-                  <span id="type-label">文字大小</span>
-                  <div class="size-options" role="radiogroup" aria-labelledby="type-label"></div>
-                </div>
+                <h3>阅读</h3>
+                <div class="pref-group"><div class="pref-row type-row" data-control="font-size" data-pref="文字大小" data-alias="字号 字体 阅读大小"><span id="type-label">文字大小</span><div class="size-options" role="radiogroup" aria-labelledby="type-label"></div></div></div>
                 <figure id="reading-preview" aria-label="解答阅读预览"><figcaption>解答预览</figcaption><div class="preview-answer"></div></figure>
               </section>
-              <section id="workspace-settings" class="settings-section" role="tabpanel" aria-labelledby="workspace-tab" hidden>
-                <h2>工作目录</h2>
-                <div class="field pref-row" data-pref="默认工作目录" data-alias="文件夹 路径">
-                  <label for="pref-workdir">默认工作目录</label>
-                  <div class="path-control"><input name="workdir" id="pref-workdir"><button data-hint="选择工作目录" aria-label="选择工作目录" type="button" class="icon-button" id="browse-workdir" hidden><span data-icon="folder"></span></button></div>
+              <section id="connection-settings" class="settings-section" role="tabpanel" aria-labelledby="connection-tab" hidden>
+                <h3>主服务</h3>
+                <div class="pref-group">
+                  <label class="field pref-row" data-pref="服务名称"><span>名称</span><input name="provider-label" autocomplete="off"></label>
+                  <label class="field pref-row" data-pref="协议"><span>协议</span><select name="provider-id"><option value="custom">OpenAI 兼容</option><option value="deepseek">DeepSeek</option><option value="openai">OpenAI</option></select></label>
+                  <label class="field pref-row" data-pref="服务地址"><span>服务地址</span><input name="base-url" type="url" placeholder="http://127.0.0.1:18080/v1" spellcheck="false"></label>
+                  <label class="field pref-row" data-pref="可选模型"><span>可选模型</span><textarea name="model-list" rows="2" placeholder="每行一个模型 ID" spellcheck="false"></textarea></label>
+                  <label class="field pref-row" data-pref="API 密钥" data-alias="key 钥匙串"><span>API 密钥</span><input name="api-key" type="password" autocomplete="new-password" placeholder="留空保留现有密钥"></label>
                 </div>
+                <h3>DeepSeek 云端</h3>
+                <div class="pref-group">
+                  <div class="pref-row"><span>模型</span><output id="cloud-model"></output></div>
+                  <div class="pref-row"><span>官方接口</span><output id="cloud-endpoint"></output></div>
+                  <label class="field pref-row" data-pref="DeepSeek API 密钥" data-alias="讨论组 云端 Flash"><span>API 密钥</span><input name="discussion-key" type="password" autocomplete="new-password"></label>
+                </div>
+                <div class="pref-group-heading"><h3>其他模型服务</h3><button class="text-button" type="button" data-action="add-model-service" title="添加模型服务"><span data-icon="plus"></span>添加服务</button></div>
+                <div id="registered-services" class="pref-group"></div>
               </section>
               <section id="instruction-settings" class="settings-section" role="tabpanel" aria-labelledby="instruction-tab" hidden>
-                <h2>协作规则</h2><label class="field" data-pref="长期协作规则" data-alias="指令 AGENT.md"><span>适用于所有任务</span><textarea name="instructions" rows="10" aria-label="长期协作规则" placeholder="输入适用于所有任务的协作约定…"></textarea></label>
+                <label class="field instruction-field" data-pref="长期协作规则" data-alias="指令 AGENTS.md AGENT.md"><span>适用于所有任务</span><textarea name="instructions" rows="10" aria-label="长期协作规则" placeholder="输入适用于所有任务的协作约定…"></textarea></label>
               </section>
             </fieldset>
-            <div class="form-actions" hidden>
-              <span id="settings-result" role="status"></span>
-              <button data-hint="重新读取已保存的设置" class="text-button" type="button" data-action="reload-settings" hidden>重新读取</button>
-              <button data-hint="撤销各分区尚未保存的更改" class="text-button" type="button" data-action="discard-settings" hidden>撤销更改</button>
-              <button class="primary-button" type="submit" disabled>保存设置</button>
-            </div>
-          </form>
-        </main>
-      </section>
-    </div>
+          </div>
+          <div class="form-actions" hidden>
+            <span id="settings-result" role="status"></span>
+            <button title="重新读取已保存的设置" class="text-button" type="button" data-action="reload-settings" hidden>重新读取</button>
+            <button title="撤销各分区尚未保存的更改" class="text-button" type="button" data-action="discard-settings" hidden>撤销更改</button>
+            <button class="primary-button" type="submit" disabled>保存更改</button>
+          </div>
+        </form>
+      </div>
+    </dialog>
     <input id="file-input" type="file" multiple hidden />
     <div id="popover" class="popover" hidden></div>
     <dialog id="navigator" class="navigator" aria-labelledby="navigator-title">
@@ -442,5 +441,6 @@
       </form>
     </dialog>
     <div id="toast" class="toast" role="status" hidden></div>
+    <div id="sr-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
   </body>
 </html>

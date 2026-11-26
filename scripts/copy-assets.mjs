@@ -15,9 +15,6 @@ for (const file of ["katex.min.js", "katex.min.css", "fonts"]) {
   cpSync(join(root, "node_modules", "katex", "dist", file), join(terminalVendor, "katex", file), { recursive: true });
 }
 cpSync(join(root, "node_modules", "katex", "LICENSE"), join(terminalVendor, "katex", "LICENSE"));
-const destination = join(root, "dist", "src", "renderer");
-mkdirSync(destination, { recursive: true });
-cpSync(join(root, "src", "renderer"), destination, { recursive: true });
 
 const desktopAssets = join(root, "dist", "src", "platform", "desktop");
 mkdirSync(desktopAssets, { recursive: true });
@@ -42,6 +39,7 @@ cpSync(join(root, "node_modules", "typescript", "lib", "typescript.js"), join(ru
 
 // Keep the desktop connector picker on the same fixed endpoints as the Runtime.
 const { PROVIDER_PROFILES } = createRequire(import.meta.url)("../dist/src/features/providers/profiles/index.js");
+const { cloudEffortGroups } = createRequire(import.meta.url)("../dist/src/features/providers/protocols/shared/cloud-effort.js");
 const services = PROVIDER_PROFILES.filter(p => p.endpoint.mode === "fixed" && p.endpoint.defaultUrl.startsWith("https://")
-  && p.auth.length === 1 && p.auth[0].id === "api-key").map(p => ({id:p.id, label:p.label, endpoint:p.endpoint.defaultUrl}));
+  && p.auth.length === 1 && p.auth[0].id === "api-key").map(p => ({id:p.id, label:p.label, endpoint:p.endpoint.defaultUrl, effort_groups:cloudEffortGroups[p.id]}));
 writeFileSync(join(root,"resources","viniper-ui","harness-runtime","model-services.json"), JSON.stringify(services));
